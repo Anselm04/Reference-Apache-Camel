@@ -1,0 +1,69 @@
+= ChatScript Component
+:doctitle: ChatScript
+:shortname: chatscript
+:artifactid: camel-chatscript
+:description: Chat with a ChatScript Server.
+:since: 3.0
+:supportlevel: Stable
+:tabs-sync-option:
+:component-header: Only producer is supported
+//Manually maintained attributes
+:group: AI
+
+*Since Camel {since}*
+
+*{component-header}*
+
+The ChatScript component allows you to interact with https://github.com/ChatScript/ChatScript[ChatScript Server] and have conversations. This component is stateless and relies on ChatScript to maintain chat history.
+
+[NOTE]
+====
+Refer to the file https://github.com/apache/camel/blob/main/components/camel-chatscript/src/main/java/org/apache/camel/component/chatscript/ChatScriptMessage.java[`ChatScriptMessage.java`] for details and samples.
+====
+
+
+// component options: START
+include::partial$component-configure-options.adoc[]
+include::partial$component-endpoint-options.adoc[]
+include::partial$component-endpoint-headers.adoc[]
+// component options: END
+
+== Usage
+
+This component expects a `ChatScriptMessage`, or its JSON as a String with the following fields:
+
+[source,json]
+----
+{
+  "username": "name here",
+  "botname": "name here",
+  "message": "message here"
+}
+----
+
+The bot name comes from the endpoint, and the reply is the `reply` field of the `ChatScriptMessage` the producer returns
+(`response` in its JSON form). The headers of the message are kept.
+
+The first message of the endpoint starts the conversation of its user with an empty message, as the ChatScript
+protocol requires, and is then sent to the bot. A first message with an empty text only starts the conversation, and its
+reply is the greeting of the bot. With `resetChat=true` every message first resets the conversation of its user (the
+`username` of the message, or the `chatUserName` option when the message has none) and then starts a new one.
+
+The following route sends the message body to the bot `Harry` as the user in the `user` header:
+
+[source,yaml]
+----
+- route:
+    from:
+      uri: direct:chat
+      steps:
+        - setBody:
+            expression:
+              simple:
+                expression: '{"username": "${header.user}", "message": "${body}"}'
+        - to:
+            uri: chatscript:localhost:1024/Harry
+        - log:
+            message: "${body.reply}"
+----
+

@@ -1,0 +1,253 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.camel.main;
+
+import org.apache.camel.spi.BootstrapCloseable;
+import org.apache.camel.spi.Configurer;
+import org.apache.camel.vault.HashicorpVaultConfiguration;
+
+/**
+ * Configuration for access to Hashicorp Vault Secret.
+ */
+@Configurer(extended = true)
+public class HashicorpVaultConfigurationProperties extends HashicorpVaultConfiguration implements BootstrapCloseable {
+
+    private MainConfigurationProperties parent;
+
+    public HashicorpVaultConfigurationProperties(MainConfigurationProperties parent) {
+        this.parent = parent;
+    }
+
+    public MainConfigurationProperties end() {
+        return parent;
+    }
+
+    @Override
+    public void close() {
+        parent = null;
+    }
+
+    // getter and setters
+    // --------------------------------------------------------------
+
+    // these are inherited from the parent class
+
+    // fluent builders
+    // --------------------------------------------------------------
+
+    /**
+     * The Hashicorp Vault token
+     */
+    public HashicorpVaultConfigurationProperties withToken(String token) {
+        setToken(token);
+        return this;
+    }
+
+    /**
+     * How to log in to Hashicorp Vault: token, approle, kubernetes, jwt, cert, aws-iam, azure-msi or gcp-gce
+     */
+    public HashicorpVaultConfigurationProperties withAuthentication(String authentication) {
+        setAuthentication(authentication);
+        return this;
+    }
+
+    /**
+     * The role ID of the AppRole, for the approle login
+     */
+    public HashicorpVaultConfigurationProperties withRoleId(String roleId) {
+        setRoleId(roleId);
+        return this;
+    }
+
+    /**
+     * The secret ID of the AppRole, for the approle login
+     */
+    public HashicorpVaultConfigurationProperties withSecretId(String secretId) {
+        setSecretId(secretId);
+        return this;
+    }
+
+    /**
+     * The Hashicorp Vault role to log in as, for the kubernetes, jwt, cert, aws-iam, azure-msi and gcp-gce logins
+     */
+    public HashicorpVaultConfigurationProperties withRole(String role) {
+        setRole(role);
+        return this;
+    }
+
+    /**
+     * The JWT to log in with, for the jwt and kubernetes logins
+     */
+    public HashicorpVaultConfigurationProperties withJwt(String jwt) {
+        setJwt(jwt);
+        return this;
+    }
+
+    /**
+     * The file to read the JWT from at every login, for the jwt and kubernetes logins
+     */
+    public HashicorpVaultConfigurationProperties withJwtFile(String jwtFile) {
+        setJwtFile(jwtFile);
+        return this;
+    }
+
+    /**
+     * The path the login method is mounted at (without auth/), when it is not the default path of the login method
+     */
+    public HashicorpVaultConfigurationProperties withAuthMountPath(String authMountPath) {
+        setAuthMountPath(authMountPath);
+        return this;
+    }
+
+    /**
+     * The file with the certificates to trust for the TLS connection to Hashicorp Vault: a PKCS12 or JKS trust store,
+     * or PEM certificates
+     */
+    public HashicorpVaultConfigurationProperties withTrustStore(String trustStore) {
+        setTrustStore(trustStore);
+        return this;
+    }
+
+    /**
+     * The password of the trust store, when it is a PKCS12 or JKS trust store
+     */
+    public HashicorpVaultConfigurationProperties withTrustStorePassword(String trustStorePassword) {
+        setTrustStorePassword(trustStorePassword);
+        return this;
+    }
+
+    /**
+     * The file with the TLS client certificate and its private key: a PKCS12 or JKS key store, or PEM
+     */
+    public HashicorpVaultConfigurationProperties withKeyStore(String keyStore) {
+        setKeyStore(keyStore);
+        return this;
+    }
+
+    /**
+     * The password of the key store and of its private key, when it is a PKCS12 or JKS key store
+     */
+    public HashicorpVaultConfigurationProperties withKeyStorePassword(String keyStorePassword) {
+        setKeyStorePassword(keyStorePassword);
+        return this;
+    }
+
+    /**
+     * The value of the X-Vault-AWS-IAM-Server-ID header of the aws-iam login
+     */
+    public HashicorpVaultConfigurationProperties withAwsIamServerId(String awsIamServerId) {
+        setAwsIamServerId(awsIamServerId);
+        return this;
+    }
+
+    /**
+     * The AWS region the aws-iam login signs its request for
+     */
+    public HashicorpVaultConfigurationProperties withAwsRegion(String awsRegion) {
+        setAwsRegion(awsRegion);
+        return this;
+    }
+
+    /**
+     * The AWS STS endpoint of the aws-iam login
+     */
+    public HashicorpVaultConfigurationProperties withAwsStsEndpoint(String awsStsEndpoint) {
+        setAwsStsEndpoint(awsStsEndpoint);
+        return this;
+    }
+
+    /**
+     * The resource (audience) of the managed identity token of the azure-msi login
+     */
+    public HashicorpVaultConfigurationProperties withAzureResource(String azureResource) {
+        setAzureResource(azureResource);
+        return this;
+    }
+
+    /**
+     * The client ID of a user-assigned managed identity, for the azure-msi login
+     */
+    public HashicorpVaultConfigurationProperties withAzureClientId(String azureClientId) {
+        setAzureClientId(azureClientId);
+        return this;
+    }
+
+    /**
+     * The Hashicorp Vault host
+     */
+    public HashicorpVaultConfigurationProperties withHost(String host) {
+        setHost(host);
+        return this;
+    }
+
+    /**
+     * The Hashicorp Vault port
+     */
+    public HashicorpVaultConfigurationProperties withPort(String port) {
+        setPort(port);
+        return this;
+    }
+
+    /**
+     * The Hashicorp Vault scheme
+     */
+    public HashicorpVaultConfigurationProperties withScheme(String scheme) {
+        setScheme(scheme);
+        return this;
+    }
+
+    /**
+     * The Hashicorp Vault Cloud deployment
+     */
+    public HashicorpVaultConfigurationProperties withCloud(boolean cloud) {
+        setCloud(cloud);
+        return this;
+    }
+
+    /**
+     * The Hashicorp Vault Cloud deployment Namespace
+     */
+    public HashicorpVaultConfigurationProperties withNamespace(String namespace) {
+        setNamespace(namespace);
+        return this;
+    }
+
+    /**
+     * Whether to automatically reload Camel upon secrets being updated in Hashicorp Vault
+     */
+    public HashicorpVaultConfigurationProperties withRefreshEnabled(boolean refreshEnabled) {
+        setRefreshEnabled(refreshEnabled);
+        return this;
+    }
+
+    /**
+     * The period (millis) between checking Hashicorp Vault for updated secrets
+     */
+    public HashicorpVaultConfigurationProperties withRefreshPeriod(long refreshPeriod) {
+        setRefreshPeriod(refreshPeriod);
+        return this;
+    }
+
+    /**
+     * Specify the secret names (or pattern) to check for updates. Multiple secrets can be separated by comma
+     */
+    public HashicorpVaultConfigurationProperties withSecrets(String secrets) {
+        setSecrets(secrets);
+        return this;
+    }
+
+}

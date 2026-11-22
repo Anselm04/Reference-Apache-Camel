@@ -1,0 +1,183 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.camel.component.whatsapp;
+
+import java.io.IOException;
+import java.io.InputStream;
+import java.net.URLDecoder;
+import java.nio.charset.StandardCharsets;
+import java.security.GeneralSecurityException;
+import java.security.MessageDigest;
+import java.util.HashMap;
+import java.util.HexFormat;
+import java.util.Map;
+
+import javax.crypto.Mac;
+import javax.crypto.spec.SecretKeySpec;
+
+import org.apache.camel.AsyncCallback;
+import org.apache.camel.AsyncProcessor;
+import org.apache.camel.Exchange;
+import org.apache.camel.Processor;
+import org.apache.camel.support.AsyncProcessorConverterHelper;
+import org.apache.camel.support.AsyncProcessorSupport;
+import org.apache.camel.util.ObjectHelper;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+public class WhatsAppWebhookProcessor extends AsyncProcessorSupport {
+    private static final Logger LOG = LoggerFactory.getLogger(WhatsAppWebhookProcessor.class);
+
+    private static final String MODE_QUERY_PARAM = "hub.mode";
+    private static final String VERIFY_TOKEN_QUERY_PARAM = "hub.verify_token";
+    private static final String CHALLENGE_QUERY_PARAM = "hub.challenge";
+    private static final String HUB_SIGNATURE_HEADER = "X-Hub-Signature-256";
+
+    private final WhatsAppConfiguration configuration;
+
+    private AsyncProcessor next;
+
+    public WhatsAppWebhookProcessor(Processor next, WhatsAppConfiguration configuration) {
+        this.next = AsyncProcessorConverterHelper.convert(next);
+        this.configuration = configuration;
+    }
+
+    @Override
+    public boolean process(Exchange exchange, AsyncCallback callback) {
+        String content;
+        boolean event = !"GET".equalsIgnoreCase(exchange.getIn().getHeader(Exchange.HTTP_METHOD, String.class));
+
+        if (!event) {
+            // Parse params from the webhook verification request
+            Map<String, String> queryParams;
+            try {
+                queryParams = parseQueryParam(exchange);
+            } catch (IllegalArgumentException e) {
+                LOG.warn("Rejecting WhatsApp webhook verification request with an invalid query: {}", e.getMessage());
+                exchange.getMessage().setHeader(Exchange.HTTP_RESPONSE_CODE, 400);
+                callback.done(true);
+                return true;
+            }
+
+            String mode = queryParams.get(MODE_QUERY_PARAM);
+            String token = queryParams.get(VERIFY_TOKEN_QUERY_PARAM);
+            String challenge = queryParams.get(CHALLENGE_QUERY_PARAM);
+
+            if (mode != null && token != null) {
+                if ("subscribe".equals(mode) && token.equals(configuration.getWebhookVerifyToken())) {
+                    LOG.info("WhatsApp Webhook verified and subscribed");
+                    content = challenge;
+                } else {
+                    content = null;
+                    exchange.getMessage().setHeader(Exchange.HTTP_RESPONSE_CODE, 403);
+                }
+            } else {
+                LOG.error("{} or {} missing from request query param", MODE_QUERY_PARAM, VERIFY_TOKEN_QUERY_PARAM);
+                content = null;
+                exchange.getMessage().setHeader(Exchange.HTTP_RESPONSE_CODE, 400);
+            }
+        } else {
+            byte[] requestBody;
+            try (InputStream body = exchange.getIn().getBody(InputStream.class)) {
+                requestBody = body != null ? body.readAllBytes() : new byte[0];
+            } catch (IOException e) {
+                exchange.setException(e);
+                callback.done(true);
+                return true;
+            }
+
+            // verify the X-Hub-Signature-256 payload signature, unless verification is turned off
+            if (configuration.isWebhookVerification() && !isValidSignature(requestBody,
+                    exchange.getIn().getHeader(HUB_SIGNATURE_HEADER, String.class), configuration.getWebhookSecret())) {
+                LOG.warn("Rejecting WhatsApp webhook event with missing or invalid {} signature", HUB_SIGNATURE_HEADER);
+                exchange.getMessage().setHeader(Exchange.HTTP_RESPONSE_CODE, 403);
+                exchange.getMessage().setBody(null);
+                callback.done(true);
+                return true;
+            }
+
+            content = new String(requestBody, StandardCharsets.UTF_8);
+        }
+
+        exchange.getMessage().setBody(content);
+
+        return next.process(exchange, doneSync -> {
+            if (event) {
+                // an event is answered with an empty 200
+                exchange.getMessage().setBody(null);
+                if (!exchange.isFailed() && exchange.getMessage().getHeader(Exchange.HTTP_RESPONSE_CODE) == null) {
+                    exchange.getMessage().setHeader(Exchange.HTTP_RESPONSE_CODE, 200);
+                }
+            } else {
+                exchange.getMessage().setBody(content);
+            }
+
+            callback.done(doneSync);
+        });
+    }
+
+    /**
+     * Verifies the {@code X-Hub-Signature-256} header against an HMAC-SHA256 of the raw request body keyed by the
+     * configured webhook secret, using a constant-time comparison.
+     */
+    static boolean isValidSignature(byte[] payload, String signatureHeader, String secret) {
+        if (signatureHeader == null || ObjectHelper.isEmpty(secret)) {
+            return false;
+        }
+        try {
+            Mac mac = Mac.getInstance("HmacSHA256");
+            mac.init(new SecretKeySpec(secret.getBytes(StandardCharsets.UTF_8), "HmacSHA256"));
+            String expected = "sha256=" + HexFormat.of().formatHex(mac.doFinal(payload));
+            return MessageDigest.isEqual(
+                    expected.getBytes(StandardCharsets.UTF_8),
+                    signatureHeader.getBytes(StandardCharsets.UTF_8));
+        } catch (GeneralSecurityException e) {
+            return false;
+        }
+    }
+
+    /**
+     * Parses the query parameters of the webhook verification request. The raw query is preferred (netty-http provides
+     * the decoded query in {@link Exchange#HTTP_QUERY}), and every key and value is URL decoded once. A parameter with
+     * an empty value or without {@code =} gets an empty value.
+     *
+     * @throws IllegalArgumentException if the query has an invalid URL encoding
+     */
+    static Map<String, String> parseQueryParam(Exchange exchange) {
+        Map<String, String> queryParams = new HashMap<>();
+
+        String query = exchange.getIn().getHeader(Exchange.HTTP_RAW_QUERY, String.class);
+        if (query == null) {
+            query = exchange.getIn().getHeader(Exchange.HTTP_QUERY, String.class);
+        }
+        if (query != null) {
+            for (String pair : query.split("&")) {
+                if (pair.isEmpty()) {
+                    continue;
+                }
+                int pos = pair.indexOf('=');
+                String key = pos == -1 ? pair : pair.substring(0, pos);
+                String value = pos == -1 ? "" : pair.substring(pos + 1);
+                queryParams.put(URLDecoder.decode(key, StandardCharsets.UTF_8),
+                        URLDecoder.decode(value, StandardCharsets.UTF_8));
+            }
+        }
+
+        return queryParams;
+    }
+
+}

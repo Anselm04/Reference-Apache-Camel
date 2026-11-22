@@ -1,0 +1,217 @@
+= AMQP Component
+:doctitle: AMQP
+:shortname: amqp
+:artifactid: camel-amqp
+:description: Messaging with AMQP protocol using Apache Qpid Client.
+:since: 1.2
+:supportlevel: Stable
+:tabs-sync-option:
+:component-header: Both producer and consumer are supported
+
+*Since Camel {since}*
+
+*{component-header}*
+
+The AMQP component supports the
+http://www.amqp.org/[AMQP 1.0 protocol]
+using the JMS Client API of the http://qpid.apache.org/[Qpid]
+project.
+
+Maven users will need to add the following dependency to their `pom.xml`
+for this component:
+
+[source,xml]
+----
+<dependency>
+    <groupId>org.apache.camel</groupId>
+    <artifactId>camel-amqp</artifactId>
+    <version>${camel.version}</version> <!-- use the same version as your Camel core version -->
+</dependency>
+----
+
+== URI format
+
+._Java-only: URI format syntax_
+[source,java]
+----
+amqp:[queue:|topic:]destinationName[?options]
+----
+
+// component options: START
+include::partial$component-configure-options.adoc[]
+include::partial$component-endpoint-options.adoc[]
+include::partial$component-endpoint-headers.adoc[]
+// component options: END
+
+
+== Usage
+
+As AMQP component is inherited from JMS component, the usage of the
+former is almost identical to the latter:
+
+*Using AMQP component*
+
+[tabs]
+====
+Java::
++
+[source,java]
+----
+// Consuming from AMQP queue
+from("amqp:queue:incoming").
+  to(...);
+
+// Sending messages to the AMQP topic
+from(...).
+  to("amqp:topic:notify");
+----
+
+YAML::
++
+[source,yaml]
+----
+- route:
+    from:
+      uri: amqp:queue:incoming
+      steps:
+        - log:
+            message: "Received ${body}"
+- route:
+    from:
+      uri: timer:notify
+      parameters:
+        period: 5000
+      steps:
+        - setBody:
+            expression:
+              constant:
+                expression: Hello from Camel
+        - to:
+            uri: amqp:topic:notify
+----
+====
+
+== Configuring AMQP component
+
+*Creating AMQP 1.0 component*
+
+AMQPComponents may be created using the provided factory methods, for example:
+
+._Java-only: Java programmatic component factory_
+[source,java]
+----
+AMQPComponent amqp = AMQPComponent.amqpComponent("amqp://localhost:5672");
+
+AMQPComponent authorizedAmqp = AMQPComponent.amqpComponent("amqp://localhost:5672", "user", "password");
+----
+
+Without Java code, for example with YAML routes, set the URL of the broker on the component in `application.properties`:
+
+[source,properties]
+----
+camel.component.amqp.broker-url = amqp://localhost:5672
+----
+
+Alternatively, the AMQP Component can be initialized by providing one or more of the available options for
+configuring SSL, authentication, and AMQP Broker host and port.
+
+*SSL configuration*
+
+The component can be configured to connect to an AMQP broker using SSL by setting the
+`useSsl` option and providing keystore and truststore details, for example:
+
+._Java-only: Java programmatic SSL configuration_
+[source,java]
+----
+AMQPComponent component = new AMQPComponent();
+component.setUseSsl(true);
+component.setTrustStoreLocation(
+        getClass().getClassLoader().getResource("server-ca-truststore.p12").getFile());
+component.setTrustStorePassword("securepass");
+component.setTrustStoreType("PKCS12");
+component.setKeyStoreLocation(
+        getClass().getClassLoader().getResource("server-keystore.p12").getFile());
+component.setKeyStorePassword("securepass");
+component.setKeyStoreType("PKCS12");
+----
+
+*Authentication configuration*
+
+A username and password may be provided for AMQP broker authentication:
+
+._Java-only: Java programmatic component configuration_
+[source,java]
+----
+AMQPComponent component = new AMQPComponent();
+component.setUsername("camel");
+component.setPassword("rider");
+----
+
+*AMQP Broker host and port configuration*
+
+._Java-only: Java programmatic component configuration_
+[source,java]
+----
+AMQPComponent amqpComponent = new AMQPComponent();
+amqpComponent.setHost("remoteHost");
+amqpComponent.setPort(5555);
+----
+
+If `host` or `port` options have not been provided and the component is initialized using one or more of the other available
+options the host on the AMQP JMSConnectionFactory URI is set to 'localhost' if not provided, and the port is set to '5672'
+if not provided.
+
+*Connections of the producers*
+
+When the component creates the connection factory, from `brokerUrl`, from the `host`, `port`, `username`, `password`
+and `useSsl` options, or with the `amqpComponent` factory methods, its producers send over one shared connection to
+the broker. The component closes it when it stops. This also applies to request/reply and to the polling consumer (for
+example `pollEnrich`). The consumers keep their own connections, and a message sent in a transacted route takes part
+in the transaction as before.
+
+To open and close a connection for every message sent instead, turn the `cacheConnection` option off:
+
+[source,properties]
+----
+camel.component.amqp.cache-connection = false
+----
+
+A `connectionFactory` that you set yourself, on the component or on an endpoint, is used as it is, and so is the
+connection factory of an endpoint with its own `username` and `password`. Without a connection pool around such a
+factory, the producer opens a new connection for every message it sends: put a pool around it, for example the
+`JmsPoolConnectionFactory` of https://github.com/messaginghub/pooled-jms[pooled-jms], as shown for the
+xref:jms-component.adoc[JMS] component.
+
+
+*Enabling AMQP specific options*
+
+If you, for example, need to enable `amqp.traceFrames` you can do that by appending the option to your URI, like the following example:
+
+._Java-only: Java programmatic component factory_
+[source,java]
+----
+AMQPComponent amqp = AMQPComponent.amqpComponent("amqp://localhost:5672?amqp.traceFrames=true");
+----
+
+For reference, take a look at the https://qpid.apache.org/releases/qpid-jms-1.7.0/docs/index.html[QPID JMS client configuration]
+
+== Using topics
+
+To have using topics working with `camel-amqp` you need to configure the
+component to use `topic://` as topic prefix, as shown below:
+
+[source,xml]
+----
+ <bean id="amqp" class="org.apache.camel.component.amqp.AmqpComponent">
+   <property name="connectionFactory">
+     <bean class="org.apache.qpid.jms.JmsConnectionFactory" factory-method="createFromURL">
+       <property name="remoteURI" value="amqp://localhost:5672" />
+       <property name="topicPrefix" value="topic://" />  <!-- only necessary when connecting to ActiveMQ over AMQP 1.0 -->
+     </bean>
+   </property>
+ </bean>
+----
+
+
+Keep in mind that the factory methods `AMQPComponent#amqpComponent(String)` and `AMQPComponent#amqpComponent(String, String, String)` configure
+the Topic prefix as `topic://` by default, so you don't have to configure it explicitly.

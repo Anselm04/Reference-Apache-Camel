@@ -1,0 +1,117 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.camel.component.kafka.producer.support;
+
+import java.util.ArrayList;
+import java.util.List;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.atomic.AtomicInteger;
+
+import org.apache.camel.AsyncCallback;
+import org.apache.camel.Exchange;
+import org.apache.camel.component.kafka.consumer.KafkaExactlyOnceMetadata;
+import org.apache.camel.util.ObjectHelper;
+import org.apache.kafka.clients.producer.Callback;
+import org.apache.kafka.clients.producer.RecordMetadata;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import static org.apache.camel.component.kafka.producer.support.ProducerUtil.setException;
+import static org.apache.camel.component.kafka.producer.support.ProducerUtil.setRecordMetadata;
+
+public final class KafkaProducerCallBack implements Callback {
+    private static final Logger LOG = LoggerFactory.getLogger(KafkaProducerCallBack.class);
+
+    private final Object body;
+    private final AsyncCallback callback;
+    private final AtomicInteger count = new AtomicInteger(1);
+    private final ExecutorService workerPool;
+    private final boolean record;
+    private final boolean failureHandlerDelivery;
+    private final List<RecordMetadata> recordMetadataList = new ArrayList<>();
+
+    public KafkaProducerCallBack(Object body, AsyncCallback callback, ExecutorService workerPool,
+                                 boolean record) {
+        this(body, callback, workerPool, record, false);
+    }
+
+    public KafkaProducerCallBack(
+                                 Object body, AsyncCallback callback, ExecutorService workerPool, boolean record,
+                                 boolean failureHandlerDelivery) {
+        this.body = body;
+        this.callback = callback;
+        // The worker pool should be created for both sync and async modes, so checking it
+        // is merely a safeguard
+        this.workerPool = ObjectHelper.notNull(workerPool, "workerPool");
+        this.record = record;
+        this.failureHandlerDelivery = failureHandlerDelivery;
+
+        if (record) {
+            setRecordMetadata(body, recordMetadataList);
+        }
+    }
+
+    public void increment() {
+        count.incrementAndGet();
+    }
+
+    /**
+     * Undoes an {@link #increment()} for a record whose dispatch failed synchronously, so that no Kafka callback will
+     * ever fire for it. Unlike {@link #onCompletion} it never continues routing: it is only called while the initial
+     * hold is still in place (a mid-batch dispatch failure in {@code KafkaProducer.doSend}), so the counter cannot
+     * reach zero here (CAMEL-24783).
+     */
+    public void decrement() {
+        count.decrementAndGet();
+    }
+
+    public boolean allSent() {
+        if (count.decrementAndGet() == 0) {
+            LOG.trace("All messages sent, continue routing.");
+            // was able to get all the work done while queuing the requests
+            callback.done(true);
+
+            return true;
+        }
+
+        return false;
+    }
+
+    @Override
+    public void onCompletion(RecordMetadata recordMetadata, Exception e) {
+        if (e != null && body instanceof Exchange exchange) {
+            KafkaExactlyOnceMetadata.recordSendFailure(exchange, e, failureHandlerDelivery);
+        }
+        setException(body, e);
+
+        if (record) {
+            recordMetadataList.add(recordMetadata);
+        }
+
+        if (count.decrementAndGet() == 0) {
+            // use worker pool to continue routing the exchange
+            // as this thread is from Kafka Callback and should not be used
+            // by Camel routing
+            workerPool.submit(this::doContinueRouting);
+        }
+    }
+
+    private void doContinueRouting() {
+        LOG.trace("All messages sent, continue routing (within thread).");
+        callback.done(false);
+    }
+}

@@ -1,0 +1,216 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.camel.dsl.jbang.core.commands.action;
+
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Comparator;
+import java.util.Iterator;
+import java.util.List;
+
+import com.github.freva.asciitable.AsciiTable;
+import com.github.freva.asciitable.Column;
+import com.github.freva.asciitable.HorizontalAlign;
+import com.github.freva.asciitable.OverflowBehaviour;
+import org.aesh.command.CommandDefinition;
+import org.aesh.command.option.Argument;
+import org.aesh.command.option.Mixin;
+import org.aesh.command.option.Option;
+import org.apache.camel.dsl.jbang.core.common.CompletionCandidates;
+import org.apache.camel.dsl.jbang.core.common.JsonOutput;
+import org.apache.camel.dsl.jbang.core.common.ProcessFinder.CamelProcess;
+import org.apache.camel.dsl.jbang.core.common.RowSort;
+import org.apache.camel.dsl.jbang.core.common.TerminalWidthHelper;
+import org.apache.camel.util.json.JsonArray;
+import org.apache.camel.util.json.JsonObject;
+
+@CommandDefinition(name = "heap-histogram",
+                   description = "Display class-level heap memory usage in a running Camel integration", generateHelp = true,
+                   footer = {
+                           "Examples:",
+                           "  camel cmd heap-histogram",
+                           "  camel cmd heap-histogram --sort instances",
+                           "  camel cmd heap-histogram --filter camel --top 30" })
+public class CamelHeapHistogram extends ActionWatchCommand {
+
+    private static final RowSort<Row> ORDER = new RowSort<Row>()
+            .by("bytes", Comparator.comparingLong((Row r) -> r.bytes).reversed())
+            .by("instances", Comparator.comparingLong((Row r) -> r.instances).reversed())
+            .text("className", r -> r.className);
+
+    public static class SortCompletionCandidates extends CompletionCandidates {
+
+        public SortCompletionCandidates() {
+        }
+
+        @Override
+        public Iterator<String> iterator() {
+            return List.of("bytes", "instances", "className").iterator();
+        }
+    }
+
+    @Argument(description = "Name or pid of running Camel integration")
+    String name = "*";
+
+    @Option(name = "sort", description = "Sort by bytes, instances, or className", defaultValue = "bytes",
+            completer = SortCompletionCandidates.class)
+    String sort;
+
+    @Option(name = "top", description = "Show only the top N classes", defaultValue = "50")
+    int top;
+
+    @Option(name = "filter", description = "Filter class names (use all to include all classes)", defaultValue = "all")
+    String filter;
+
+    @Option(name = "json", hasValue = false, description = "Output in JSON Format")
+    boolean jsonOutput;
+
+    @Mixin
+    ActionTimeoutMixin timeoutOption;
+
+    private volatile long pid;
+
+    @Override
+    public Integer doWatchCall() throws Exception {
+        List<Row> rows = new ArrayList<>();
+
+        CamelProcess process = findOne(name);
+        this.pid = process.pid();
+
+        JsonObject jo = executeAction(process, "heap-histogram", null);
+        long totalInstances = jo.getLongOrDefault("totalInstances", 0);
+        long totalBytes = jo.getLongOrDefault("totalBytes", 0);
+
+        JsonArray arr = (JsonArray) jo.get("classes");
+        if (arr != null) {
+            for (int i = 0; i < arr.size(); i++) {
+                JsonObject jc = (JsonObject) arr.get(i);
+
+                Row row = new Row();
+                row.num = jc.getIntegerOrDefault("num", 0);
+                row.className = jc.getString("className");
+                row.instances = jc.getLongOrDefault("instances", 0);
+                row.bytes = jc.getLongOrDefault("bytes", 0);
+
+                if (!matchesFilter(row)) {
+                    continue;
+                }
+
+                rows.add(row);
+            }
+        }
+
+        rows.sort(ORDER.comparator(sort));
+
+        if (top > 0 && rows.size() > top) {
+            rows = rows.subList(0, top);
+        }
+
+        if (jsonOutput) {
+            JsonObject answer = new JsonObject();
+            answer.put("pid", pid);
+            answer.put("totalInstances", totalInstances);
+            answer.put("totalBytes", totalBytes);
+            answer.put("classes", rows.stream().map(r -> {
+                JsonObject jc = new JsonObject();
+                jc.put("num", r.num);
+                jc.put("className", r.className);
+                jc.put("instances", r.instances);
+                jc.put("bytes", r.bytes);
+                return jc;
+            }).toList());
+            JsonOutput.print(printer(), answer);
+            return 0;
+        }
+        if (watch) {
+            clearScreen();
+        }
+        if (!rows.isEmpty()) {
+            long visibleInstances = 0;
+            long visibleBytes = 0;
+            for (Row r : rows) {
+                visibleInstances += r.instances;
+                visibleBytes += r.bytes;
+            }
+            printer().printf("PID: %s\tClasses: %d\tInstances: %s\tBytes: %s%n",
+                    pid, rows.size(),
+                    formatNumber(visibleInstances), formatBytes(visibleBytes));
+            printTable(rows);
+        }
+
+        return 0;
+    }
+
+    private boolean matchesFilter(Row row) {
+        if ("all".equalsIgnoreCase(filter)) {
+            return true;
+        }
+        if (row.className == null) {
+            return false;
+        }
+        if ("non-jdk".equalsIgnoreCase(filter)) {
+            return !row.className.startsWith("java.")
+                    && !row.className.startsWith("javax.")
+                    && !row.className.startsWith("jdk.")
+                    && !row.className.startsWith("sun.")
+                    && !row.className.startsWith("com.sun.")
+                    && !row.className.startsWith("[");
+        }
+        return row.className.toLowerCase().contains(filter.toLowerCase());
+    }
+
+    protected void printTable(List<Row> rows) {
+        int tw = terminalWidth();
+        int fixedWidth = 6 + 14 + 14;
+        int borderOverhead = TerminalWidthHelper.noBorderOverhead(4);
+        int nameWidth = TerminalWidthHelper.flexWidth(tw, fixedWidth, borderOverhead, 30, 80);
+
+        printer().println(AsciiTable.getTable(AsciiTable.NO_BORDERS, rows, Arrays.asList(
+                new Column().header("#").headerAlign(HorizontalAlign.RIGHT).dataAlign(HorizontalAlign.RIGHT)
+                        .with(r -> Integer.toString(r.num)),
+                new Column().header("CLASS NAME").dataAlign(HorizontalAlign.LEFT)
+                        .maxWidth(nameWidth, OverflowBehaviour.ELLIPSIS_LEFT)
+                        .with(r -> r.className),
+                new Column().header("INSTANCES").headerAlign(HorizontalAlign.RIGHT).dataAlign(HorizontalAlign.RIGHT)
+                        .with(r -> formatNumber(r.instances)),
+                new Column().header("BYTES").headerAlign(HorizontalAlign.RIGHT).dataAlign(HorizontalAlign.RIGHT)
+                        .with(r -> formatBytes(r.bytes)))));
+    }
+
+    static String formatBytes(long bytes) {
+        if (bytes < 1024) {
+            return bytes + " B";
+        } else if (bytes < 1024 * 1024) {
+            return String.format(java.util.Locale.US, "%.1f KB", bytes / 1024.0);
+        } else if (bytes < 1024L * 1024 * 1024) {
+            return String.format(java.util.Locale.US, "%.1f MB", bytes / (1024.0 * 1024));
+        } else {
+            return String.format(java.util.Locale.US, "%.1f GB", bytes / (1024.0 * 1024 * 1024));
+        }
+    }
+
+    static String formatNumber(long num) {
+        return String.format(java.util.Locale.US, "%,d", num);
+    }
+
+    private static class Row {
+        int num;
+        String className;
+        long instances;
+        long bytes;
+    }
+}

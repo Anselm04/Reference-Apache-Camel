@@ -1,0 +1,170 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.camel.component.dapr.consumer;
+
+import java.util.HashMap;
+import java.util.Map;
+import java.util.concurrent.atomic.AtomicInteger;
+
+import io.dapr.client.DaprClient;
+import io.dapr.client.domain.ConfigurationItem;
+import io.dapr.client.domain.SubscribeConfigurationRequest;
+import io.dapr.client.domain.SubscribeConfigurationResponse;
+import io.dapr.client.domain.UnsubscribeConfigurationResponse;
+import org.apache.camel.AsyncCallback;
+import org.apache.camel.AsyncProcessor;
+import org.apache.camel.CamelContext;
+import org.apache.camel.Exchange;
+import org.apache.camel.ExtendedCamelContext;
+import org.apache.camel.component.dapr.DaprConfiguration;
+import org.apache.camel.component.dapr.DaprConstants;
+import org.apache.camel.component.dapr.DaprEndpoint;
+import org.apache.camel.spi.ExchangeFactory;
+import org.apache.camel.support.DefaultExchange;
+import org.apache.camel.test.junit6.CamelTestSupport;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+import org.mockito.ArgumentCaptor;
+import reactor.core.publisher.Flux;
+import reactor.core.publisher.FluxSink;
+import reactor.core.publisher.Mono;
+
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyBoolean;
+import static org.mockito.ArgumentMatchers.anyString;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.timeout;
+import static org.mockito.Mockito.times;
+import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.when;
+
+public class DaprConfigurationConsumerTest extends CamelTestSupport {
+
+    private final CamelContext context = mock(CamelContext.class);
+    private final ExtendedCamelContext ecc = mock(ExtendedCamelContext.class);
+    private final ExchangeFactory ef = mock(ExchangeFactory.class);
+    private final AsyncProcessor processor = mock(AsyncProcessor.class);
+    private final DaprEndpoint endpoint = mock(DaprEndpoint.class);
+    private final DaprConfiguration configuration = mock(DaprConfiguration.class);
+    private final DaprClient mockClient = mock(DaprClient.class);
+
+    private final ArgumentCaptor<Exchange> exchangeCaptor = ArgumentCaptor.forClass(Exchange.class);
+    private final ArgumentCaptor<AsyncCallback> callbackCaptor = ArgumentCaptor.forClass(AsyncCallback.class);
+
+    private DaprConfigurationConsumer consumer;
+    private final String configKeys = "myKey1,myKey2";
+
+    @BeforeEach
+    void beforeEach() throws Exception {
+        when(context.getCamelContextExtension()).thenReturn(ecc);
+        when(ecc.getExchangeFactory()).thenReturn(ef);
+        when(ef.newExchangeFactory(any())).thenReturn(ef);
+        when(ef.create(any(), anyBoolean()))
+                .thenAnswer(inv -> DefaultExchange.newFromEndpoint(inv.getArgument(0)));
+        when(endpoint.getCamelContext()).thenReturn(context);
+        when(endpoint.getConfiguration()).thenReturn(configuration);
+        when(endpoint.getClient()).thenReturn(mockClient);
+        when(configuration.getConfigStore()).thenReturn("myStore");
+        when(configuration.getConfigKeys()).thenReturn(configKeys);
+
+        consumer = new DaprConfigurationConsumer(endpoint, processor);
+    }
+
+    @Test
+    void testConfigurationConsumer() throws Exception {
+        final FluxSink<SubscribeConfigurationResponse>[] sinkHolder = new FluxSink[1];
+        Flux<SubscribeConfigurationResponse> flux = Flux.create(sink -> sinkHolder[0] = sink);
+        when(mockClient.subscribeConfiguration(any())).thenReturn(flux);
+        when(mockClient.unsubscribeConfiguration(anyString(), anyString()))
+                .thenReturn(Mono.just(new UnsubscribeConfigurationResponse(true, "")));
+
+        consumer.doStart();
+
+        verify(mockClient).subscribeConfiguration(any(SubscribeConfigurationRequest.class));
+
+        Map<String, ConfigurationItem> items = new HashMap<>();
+        items.put("myKey1", new ConfigurationItem("myKey1", "myVal1", "myVer1"));
+        items.put("myKey2", new ConfigurationItem("myKey2", "myVal2", "myVer2"));
+        SubscribeConfigurationResponse response = new SubscribeConfigurationResponse("mySubId", items);
+        Map<String, String> mockBody = Map.of("myKey1", "myVal1", "myKey2", "myVal2");
+
+        sinkHolder[0].next(response);
+
+        verify(processor).process(exchangeCaptor.capture(), callbackCaptor.capture());
+
+        Exchange exchange = exchangeCaptor.getValue();
+        assertNotNull(exchange);
+
+        assertEquals("mySubId", exchange.getIn().getHeader(DaprConstants.SUBSCRIPTION_ID));
+        assertEquals(items, exchange.getIn().getHeader(DaprConstants.RAW_CONFIG_RESPONSE));
+        assertEquals(mockBody, exchange.getIn().getBody());
+
+        consumer.doStop();
+        verify(mockClient).unsubscribeConfiguration("mySubId", "myStore");
+        // the client belongs to the endpoint: it is not closed
+        verify(mockClient, never()).close();
+    }
+
+    @Test
+    void testConfigurationConsumerSubscribesAgainWhenTheStreamFails() throws Exception {
+        // the first stream ends with an error, as when the Dapr sidecar restarts; the second one delivers an update
+        AtomicInteger calls = new AtomicInteger();
+        when(mockClient.subscribeConfiguration(any())).thenAnswer(inv -> calls.incrementAndGet() == 1
+                ? Flux.just(new SubscribeConfigurationResponse("mySubId", Map.of()))
+                        .concatWith(Flux.error(new IllegalStateException("UNAVAILABLE: sidecar restarted")))
+                : Flux.just(new SubscribeConfigurationResponse("mySubId2", Map.of()), update("myVal2", "mySubId2"))
+                        .concatWith(Flux.never()));
+        when(mockClient.unsubscribeConfiguration(anyString(), anyString()))
+                .thenReturn(Mono.just(new UnsubscribeConfigurationResponse(true, "")));
+
+        consumer.doStart();
+
+        verify(mockClient, timeout(10000).times(2)).subscribeConfiguration(any(SubscribeConfigurationRequest.class));
+        verify(processor, timeout(10000)).process(exchangeCaptor.capture(), callbackCaptor.capture());
+        assertEquals(Map.of("myKey1", "myVal2"), exchangeCaptor.getValue().getIn().getBody());
+
+        consumer.doStop();
+        verify(mockClient).unsubscribeConfiguration("mySubId2", "myStore");
+    }
+
+    @Test
+    void testConfigurationConsumerSubscribesAgainWhenTheStreamCompletes() throws Exception {
+        // the first stream completes, as when the sidecar ends the call on shutdown
+        AtomicInteger calls = new AtomicInteger();
+        when(mockClient.subscribeConfiguration(any())).thenAnswer(inv -> calls.incrementAndGet() == 1
+                ? Flux.just(new SubscribeConfigurationResponse("mySubId", Map.of()))
+                : Flux.just(update("myVal3", "mySubId2")).concatWith(Flux.never()));
+        when(mockClient.unsubscribeConfiguration(anyString(), anyString()))
+                .thenReturn(Mono.just(new UnsubscribeConfigurationResponse(true, "")));
+
+        consumer.doStart();
+
+        verify(processor, timeout(10000)).process(exchangeCaptor.capture(), callbackCaptor.capture());
+        assertEquals(Map.of("myKey1", "myVal3"), exchangeCaptor.getValue().getIn().getBody());
+
+        consumer.doStop();
+        verify(mockClient, times(2)).subscribeConfiguration(any(SubscribeConfigurationRequest.class));
+    }
+
+    private static SubscribeConfigurationResponse update(String value, String subscriptionId) {
+        return new SubscribeConfigurationResponse(
+                subscriptionId, Map.of("myKey1", new ConfigurationItem("myKey1", value, "v")));
+    }
+}

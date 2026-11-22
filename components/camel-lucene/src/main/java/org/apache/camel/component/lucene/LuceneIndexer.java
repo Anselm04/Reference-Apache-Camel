@@ -1,0 +1,212 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.camel.component.lucene;
+
+import java.io.ByteArrayOutputStream;
+import java.io.File;
+import java.io.FileInputStream;
+import java.io.IOException;
+import java.io.InputStream;
+import java.util.Map;
+import java.util.Map.Entry;
+
+import org.apache.camel.Exchange;
+import org.apache.camel.util.IOHelper;
+import org.apache.lucene.analysis.Analyzer;
+import org.apache.lucene.document.Document;
+import org.apache.lucene.document.Field;
+import org.apache.lucene.document.FieldType;
+import org.apache.lucene.index.IndexOptions;
+import org.apache.lucene.index.IndexWriter;
+import org.apache.lucene.index.IndexWriterConfig;
+import org.apache.lucene.index.IndexWriterConfig.OpenMode;
+import org.apache.lucene.index.Term;
+import org.apache.lucene.store.NIOFSDirectory;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+public class LuceneIndexer {
+    private static final Logger LOG = LoggerFactory.getLogger(LuceneIndexer.class);
+    private static final FieldType TOKENIZED_FIELD_TYPE = createFieldType(true);
+    private static final FieldType NON_TOKENIZED_FIELD_TYPE = createFieldType(false);
+
+    private File sourceDirectory;
+    private Analyzer analyzer;
+    private NIOFSDirectory niofsDirectory;
+    private IndexWriter indexWriter;
+    private boolean sourceDirectoryIndexed;
+
+    public LuceneIndexer(File sourceDirectory, File indexDirectory, Analyzer analyzer) throws Exception {
+        if (indexDirectory != null) {
+            if (!indexDirectory.exists()) {
+                boolean result = indexDirectory.mkdir();
+                if (!result) {
+                    LOG.error("mkdir failed for {}. Maybe this folder was created externally", indexDirectory);
+                }
+            }
+            this.setNiofsDirectory(new NIOFSDirectory(indexDirectory.toPath()));
+        } else {
+            this.setNiofsDirectory(new NIOFSDirectory(new File("./indexDirectory").toPath()));
+        }
+
+        this.setAnalyzer(analyzer);
+
+        if (sourceDirectory != null && !sourceDirectoryIndexed) {
+            this.setSourceDirectory(sourceDirectory);
+            add(getSourceDirectory());
+            sourceDirectoryIndexed = true;
+        }
+    }
+
+    public synchronized void index(Exchange exchange) throws Exception {
+        // synchronized: the index writer is a field and Lucene allows one open writer per index directory
+        LOG.debug("Indexing {}", exchange);
+        openIndexWriter();
+        try {
+            // one document per exchange, so a hit on the body or on a header gives all the fields of its exchange
+            Document doc = new Document();
+            // before the headers: Document.get returns the first value of a field, so a header named
+            // exchangeId or contents does not replace them in the hit
+            add(doc, "exchangeId", exchange.getExchangeId(), true);
+            add(doc, "contents", exchange.getIn().getMandatoryBody(String.class), true);
+            Map<String, Object> headers = exchange.getIn().getHeaders();
+            for (Entry<String, Object> entry : headers.entrySet()) {
+                String field = entry.getKey();
+                String value = exchange.getContext().getTypeConverter().mandatoryConvertTo(String.class, entry.getValue());
+                add(doc, field, value, true);
+            }
+
+            indexWriter.addDocument(doc);
+            indexWriter.commit();
+        } catch (Exception e) {
+            // discard the document of this exchange and release the index write lock
+            try {
+                indexWriter.rollback();
+            } catch (Exception re) {
+                e.addSuppressed(re);
+            }
+            throw e;
+        }
+        indexWriter.close();
+    }
+
+    public NIOFSDirectory getNiofsDirectory() {
+        return niofsDirectory;
+    }
+
+    public void setNiofsDirectory(NIOFSDirectory niofsDirectory) {
+        this.niofsDirectory = niofsDirectory;
+    }
+
+    public File getSourceDirectory() {
+        return sourceDirectory;
+    }
+
+    public void setSourceDirectory(File sourceDirectory) {
+        this.sourceDirectory = sourceDirectory;
+    }
+
+    public Analyzer getAnalyzer() {
+        return analyzer;
+    }
+
+    public void setAnalyzer(Analyzer analyzer) {
+        this.analyzer = analyzer;
+    }
+
+    private static void add(Document doc, String field, String value, boolean analyzed) {
+        if (LOG.isTraceEnabled()) {
+            LOG.trace("Adding field: {}", field);
+            LOG.trace("       value: {}", value);
+        }
+
+        doc.add(new Field(field, value, analyzed ? TOKENIZED_FIELD_TYPE : NON_TOKENIZED_FIELD_TYPE));
+    }
+
+    private void add(File file) throws IOException {
+        if (file.canRead()) {
+            if (file.isDirectory()) {
+                String[] files = file.list();
+
+                if (files != null) {
+                    for (String child : files) {
+                        add(new File(file.getAbsolutePath(), child));
+                    }
+                }
+            } else {
+                LOG.trace("Adding {}", file);
+
+                String contents;
+                try (InputStream is = new FileInputStream(file)) {
+                    ByteArrayOutputStream bos = new ByteArrayOutputStream();
+                    IOHelper.copy(IOHelper.buffered(is), bos);
+                    contents = bos.toString();
+                }
+                // one document per file, so a hit on the contents gives the path of its file
+                Document doc = new Document();
+                add(doc, "path", file.getPath(), false);
+                add(doc, "contents", contents, true);
+                openIndexWriter();
+                try {
+                    // replace the document of this path: srcDir is indexed again each time the endpoint is created
+                    indexWriter.updateDocument(new Term("path", file.getPath()), doc);
+                    closeIndexWriter();
+                } catch (Exception e) {
+                    // discard the document of this file and release the index write lock
+                    try {
+                        indexWriter.rollback();
+                    } catch (Exception re) {
+                        e.addSuppressed(re);
+                    }
+                    throw e;
+                }
+
+                LOG.trace("Added {} successfully", file);
+            }
+        } else {
+            LOG.warn("Directory/File {} could not be read."
+                     + " This directory will not be indexed. Please check permissions and rebuild indexes.",
+                    file.getAbsolutePath());
+        }
+    }
+
+    private void openIndexWriter() throws IOException {
+        IndexWriterConfig indexWriterConfig;
+        // use create or append so we can reuse existing index if already exists
+        indexWriterConfig = new IndexWriterConfig(getAnalyzer()).setOpenMode(OpenMode.CREATE_OR_APPEND);
+        indexWriter = new IndexWriter(niofsDirectory, indexWriterConfig);
+    }
+
+    private void closeIndexWriter() throws IOException {
+        indexWriter.commit();
+        indexWriter.close();
+    }
+
+    private static FieldType createFieldType(boolean tokenized) {
+        FieldType answer = new FieldType();
+        // a FieldType is not indexed unless its index options are set (the default is IndexOptions.NONE)
+        answer.setIndexOptions(IndexOptions.DOCS_AND_FREQS_AND_POSITIONS);
+        answer.setStored(true);
+        answer.setTokenized(tokenized);
+
+        // freeze the answer so that it becomes immutable
+        answer.freeze();
+
+        return answer;
+    }
+
+}

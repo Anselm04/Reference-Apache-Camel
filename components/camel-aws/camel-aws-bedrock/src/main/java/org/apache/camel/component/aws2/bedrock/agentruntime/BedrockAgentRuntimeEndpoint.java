@@ -1,0 +1,200 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.camel.component.aws2.bedrock.agentruntime;
+
+import java.util.HashMap;
+import java.util.Map;
+import java.util.concurrent.locks.Lock;
+import java.util.concurrent.locks.ReentrantLock;
+
+import org.apache.camel.*;
+import org.apache.camel.component.aws2.bedrock.agentruntime.client.BedrockAgentRuntimeClientFactory;
+import org.apache.camel.spi.BodyType;
+import org.apache.camel.spi.BodyType.Carrier;
+import org.apache.camel.spi.BodyTypes;
+import org.apache.camel.spi.EndpointServiceLocation;
+import org.apache.camel.spi.UriEndpoint;
+import org.apache.camel.spi.UriParam;
+import org.apache.camel.support.ScheduledPollEndpoint;
+import org.apache.camel.util.ObjectHelper;
+import software.amazon.awssdk.services.bedrockagentruntime.BedrockAgentRuntimeAsyncClient;
+import software.amazon.awssdk.services.bedrockagentruntime.BedrockAgentRuntimeClient;
+
+/**
+ * Invoke Model of AWS Bedrock Agent Runtime service.
+ */
+@UriEndpoint(firstVersion = "4.5.0", scheme = "aws-bedrock-agent-runtime", title = "AWS Bedrock Agent Runtime",
+             syntax = "aws-bedrock-agent-runtime:label", producerOnly = true, category = { Category.AI, Category.CLOUD },
+             headersClass = BedrockAgentRuntimeConstants.class)
+@BodyTypes(producerIn = @BodyType(value = { Carrier.TEXT, Carrier.BYTES, Carrier.STREAM, Carrier.FILE, Carrier.MAP },
+                                  byOption = @BodyType.When(option = "operation", value = "invokeFlow",
+                                                            carriers = {
+                                                                    Carrier.TEXT, Carrier.BYTES, Carrier.STREAM, Carrier.FILE,
+                                                                    Carrier.MAP, Carrier.LIST, Carrier.POJO }),
+                                  description = "The question, the query or the input of the agent as text for"
+                                                + " retrieveAndGenerate, retrieve, invokeAgent and invokeInlineAgent: bytes, a"
+                                                + " stream or a file are read as text, a Map or a Jackson JsonNode is sent as"
+                                                + " JSON text, another POJO as its toString(), so take the text out of it"
+                                                + " first, and no body fails. invokeFlow"
+                                                + " takes a String, which becomes the document of the input node FlowInputNode,"
+                                                + " or a FlowInput or a List of FlowInput of the AWS SDK: another body is"
+                                                + " read as text, as for the other operations."
+                                                + " With pojoRequest=true the request of the AWS SDK for the operation, such as"
+                                                + " a RetrieveAndGenerateRequest: another body fails"),
+           producerOut = @BodyType(value = { Carrier.TEXT, Carrier.LIST },
+                                   byOption = {
+                                           @BodyType.When(option = "operation", value = "retrieveAndGenerate",
+                                                          carriers = Carrier.TEXT,
+                                                          javaType = "java.lang.String"),
+                                           @BodyType.When(option = "operation", value = "retrieve", carriers = Carrier.LIST,
+                                                          javaType = "java.util.List<software.amazon.awssdk.services.bedrockagentruntime.model.KnowledgeBaseRetrievalResult>"),
+                                           @BodyType.When(option = "operation", value = "invokeFlow",
+                                                          carriers = { Carrier.TEXT, Carrier.POJO, Carrier.UNCHANGED }) },
+                                   description = "The answer as text for retrieveAndGenerate, with the citations and the"
+                                                 + " session id in headers, and a List of KnowledgeBaseRetrievalResult for"
+                                                 + " retrieve. invokeAgent and invokeInlineAgent give the answer as text, or a"
+                                                 + " List of the chunks with streamOutputMode=chunks or the"
+                                                 + " CamelAwsBedrockAgentRuntimeAgentStreamOutputMode header; the text is empty"
+                                                 + " when the agent returns control. invokeFlow gives the document of the last"
+                                                 + " output of the flow as text, or as a Document of the AWS SDK for another"
+                                                 + " type, and keeps the body when the flow has no output"))
+public class BedrockAgentRuntimeEndpoint extends ScheduledPollEndpoint implements EndpointServiceLocation {
+
+    private BedrockAgentRuntimeClient bedrockAgentRuntimeClient;
+    private volatile BedrockAgentRuntimeAsyncClient bedrockAgentRuntimeAsyncClient;
+    private final Lock asyncClientLock = new ReentrantLock();
+
+    @UriParam
+    private BedrockAgentRuntimeConfiguration configuration;
+
+    public BedrockAgentRuntimeEndpoint(String uri, Component component, BedrockAgentRuntimeConfiguration configuration) {
+        super(uri, component);
+        this.configuration = configuration;
+    }
+
+    @Override
+    public Consumer createConsumer(Processor processor) throws Exception {
+        throw new UnsupportedOperationException("You cannot receive messages from this endpoint");
+    }
+
+    @Override
+    public Producer createProducer() throws Exception {
+        return new BedrockAgentRuntimeProducer(this);
+    }
+
+    @Override
+    public BedrockAgentRuntimeComponent getComponent() {
+        return (BedrockAgentRuntimeComponent) super.getComponent();
+    }
+
+    @Override
+    public void doStart() throws Exception {
+        super.doStart();
+
+        bedrockAgentRuntimeClient = ObjectHelper.isNotEmpty(configuration.getBedrockAgentRuntimeClient())
+                ? configuration.getBedrockAgentRuntimeClient()
+                : BedrockAgentRuntimeClientFactory.getBedrockAgentRuntimeClient(configuration);
+
+        // Only build the async client when the operation needs event-stream support (invokeFlow, invokeAgent,
+        // invokeInlineAgent), or when the user explicitly supplied one. This avoids creating a Netty-based async HTTP
+        // client for users that only need synchronous operations like retrieveAndGenerate. When the operation header
+        // picks one of these operations on an endpoint of another operation, the client is created on first use.
+        if (ObjectHelper.isNotEmpty(configuration.getBedrockAgentRuntimeAsyncClient())) {
+            bedrockAgentRuntimeAsyncClient = configuration.getBedrockAgentRuntimeAsyncClient();
+        } else if (configuration.getOperation() == BedrockAgentRuntimeOperations.invokeFlow
+                || configuration.getOperation() == BedrockAgentRuntimeOperations.invokeAgent
+                || configuration.getOperation() == BedrockAgentRuntimeOperations.invokeInlineAgent) {
+            bedrockAgentRuntimeAsyncClient
+                    = BedrockAgentRuntimeClientFactory.getBedrockAgentRuntimeAsyncClient(configuration);
+        }
+    }
+
+    @Override
+    public void doStop() throws Exception {
+        if (ObjectHelper.isEmpty(configuration.getBedrockAgentRuntimeClient())) {
+            if (ObjectHelper.isNotEmpty(bedrockAgentRuntimeClient)) {
+                bedrockAgentRuntimeClient.close();
+            }
+        }
+        if (ObjectHelper.isEmpty(configuration.getBedrockAgentRuntimeAsyncClient())) {
+            if (ObjectHelper.isNotEmpty(bedrockAgentRuntimeAsyncClient)) {
+                bedrockAgentRuntimeAsyncClient.close();
+            }
+        }
+        bedrockAgentRuntimeAsyncClient = null;
+        super.doStop();
+    }
+
+    public BedrockAgentRuntimeConfiguration getConfiguration() {
+        return configuration;
+    }
+
+    public BedrockAgentRuntimeClient getBedrockAgentRuntimeClient() {
+        return bedrockAgentRuntimeClient;
+    }
+
+    public BedrockAgentRuntimeAsyncClient getBedrockAgentRuntimeAsyncClient() {
+        return bedrockAgentRuntimeAsyncClient;
+    }
+
+    /**
+     * The async client that invokeFlow, invokeAgent and invokeInlineAgent need. It is created on first use when the
+     * operation of the endpoint does not need it, but the operation header picks one that does.
+     */
+    public BedrockAgentRuntimeAsyncClient getOrCreateBedrockAgentRuntimeAsyncClient() {
+        BedrockAgentRuntimeAsyncClient client = bedrockAgentRuntimeAsyncClient;
+        if (client == null) {
+            asyncClientLock.lock();
+            try {
+                if (bedrockAgentRuntimeAsyncClient == null) {
+                    bedrockAgentRuntimeAsyncClient
+                            = BedrockAgentRuntimeClientFactory.getBedrockAgentRuntimeAsyncClient(configuration);
+                }
+                client = bedrockAgentRuntimeAsyncClient;
+            } finally {
+                asyncClientLock.unlock();
+            }
+        }
+        return client;
+    }
+
+    @Override
+    public String getServiceUrl() {
+        if (!configuration.isOverrideEndpoint()) {
+            if (ObjectHelper.isNotEmpty(configuration.getRegion())) {
+                return configuration.getRegion();
+            }
+        } else if (ObjectHelper.isNotEmpty(configuration.getUriEndpointOverride())) {
+            return configuration.getUriEndpointOverride();
+        }
+        return null;
+    }
+
+    @Override
+    public String getServiceProtocol() {
+        return "bedrock-agent-runtime";
+    }
+
+    @Override
+    public Map<String, String> getServiceMetadata() {
+        HashMap<String, String> metadata = new HashMap<>();
+        if (ObjectHelper.isNotEmpty(configuration.getModelId())) {
+            metadata.put("modelId", configuration.getModelId());
+        }
+        return metadata;
+    }
+}

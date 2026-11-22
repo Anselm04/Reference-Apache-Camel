@@ -1,0 +1,386 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.camel.dsl.jbang.core.common;
+
+import java.io.File;
+import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.function.Consumer;
+
+import org.apache.camel.cli.connector.RepeatedSend;
+import org.apache.camel.dsl.jbang.run.common.PathUtils;
+import org.apache.camel.util.json.JsonArray;
+import org.apache.camel.util.json.JsonObject;
+import org.apache.camel.util.json.Jsoner;
+
+/**
+ * Shared helper for discovering running Camel processes and communicating with them via the file-based IPC protocol.
+ * <p>
+ * Camel CLI applications write status snapshots to {@code ~/.camel/{pid}-status.json}. Actions are requested by writing
+ * to {@code {pid}-action-{requestId}.json} and reading the response from {@code {pid}-output-{requestId}.json}. Each
+ * request gets a unique ID so concurrent callers (CLI, MCP server, etc.) don't interfere with each other.
+ * <p>
+ * This class is used by CLI commands, the TUI and the MCP server's {@code RuntimeService}.
+ *
+ * @since 4.21
+ */
+public final class RuntimeHelper {
+
+    private static final long ACTION_TIMEOUT_MS = 10_000;
+
+    /**
+     * Information about a discovered running Camel process.
+     *
+     * @param pid         the OS process ID
+     * @param name        the application name (extracted from status or process info)
+     * @param contextName the Camel context name, or {@code null} if not available
+     *
+     * @since             4.21
+     */
+    public record ProcessInfo(long pid, String name, String contextName) {
+    }
+
+    private RuntimeHelper() {
+    }
+
+    /**
+     * Discovers all running Camel processes by scanning {@code ~/.camel/} for {@code {pid}-status.json} files and
+     * verifying each PID is still alive.
+     * <p>
+     * This process is never one of them: it runs the tools (camel ask, the TUI, the MCP server), and a status file of
+     * its own comes from a CamelContext it ran for itself, not from an integration (CAMEL-26396).
+     */
+    public static List<ProcessInfo> discoverProcesses() {
+        List<ProcessInfo> result = new ArrayList<>();
+        for (ProcessFinder.CamelProcess p : others(ProcessFinder.findAll())) {
+            result.add(new ProcessInfo(p.pid(), p.name(), p.contextName()));
+        }
+        return result;
+    }
+
+    /**
+     * Finds a single Camel process matching the given name or PID. Returns {@code null} if no match is found or if
+     * multiple processes match. When {@code nameOrPid} is {@code null} and exactly one process is running, returns that
+     * process. This process never matches, also not by its pid (see {@link #discoverProcesses()}).
+     *
+     * @param nameOrPid a process name (with optional wildcard), a numeric PID string, or {@code null} for auto-detect
+     */
+    public static ProcessInfo findProcess(String nameOrPid) {
+        List<ProcessFinder.CamelProcess> found = others(nameOrPid != null && !nameOrPid.isBlank()
+                ? ProcessFinder.find(nameOrPid) : ProcessFinder.findAll());
+        if (found.size() == 1) {
+            ProcessFinder.CamelProcess p = found.get(0);
+            return new ProcessInfo(p.pid(), p.name(), p.contextName());
+        }
+        return null;
+    }
+
+    /**
+     * Whether the name or pid is the pid of this process, which {@link #findProcess(String)} never finds.
+     *
+     * @since 4.24
+     */
+    public static boolean isThisProcess(String nameOrPid) {
+        if (nameOrPid == null || !nameOrPid.matches("\\d{1,18}")) {
+            return false;
+        }
+        return Long.parseLong(nameOrPid) == ProcessHandle.current().pid();
+    }
+
+    private static List<ProcessFinder.CamelProcess> others(List<ProcessFinder.CamelProcess> processes) {
+        long self = ProcessHandle.current().pid();
+        return processes.stream().filter(p -> p.pid() != self).toList();
+    }
+
+    /**
+     * Reads the full status JSON for the given process.
+     *
+     * @return the parsed status object, or {@code null} if the status file does not exist or is unreadable
+     */
+    public static JsonObject readStatus(long pid) {
+        Path statusFile = CommandLineHelper.getCamelDir().resolve(pid + "-status.json");
+        return readStatusFromFile(statusFile);
+    }
+
+    /**
+     * Reads a specific section from the status JSON.
+     *
+     * @param  section the top-level key to extract (e.g., "context", "routes", "health")
+     * @return         the section value as a JSON string, or {@code "{}"} if absent
+     */
+    public static String readStatusSection(long pid, String section) {
+        JsonObject root = readStatus(pid);
+        if (root == null) {
+            return "No status available for PID " + pid;
+        }
+        Object value = root.get(section);
+        if (value instanceof JsonObject jo) {
+            return jo.toJson();
+        }
+        if (value != null) {
+            JsonObject wrapper = new JsonObject();
+            wrapper.put(section, value);
+            return wrapper.toJson();
+        }
+        return "{}";
+    }
+
+    /**
+     * Executes an action against a running Camel process using the file-based IPC protocol. Writes an action request
+     * file and polls for the output file within a timeout.
+     *
+     * @param  pid       the target process ID
+     * @param  action    the action name (e.g., "route", "top", "source")
+     * @param  configure optional callback to add extra fields to the request JSON
+     * @return           the raw response string, or a timeout message if no response was received
+     */
+    public static String executeAction(long pid, String action, Consumer<JsonObject> configure) {
+        return executeAction(pid, action, configure, ACTION_TIMEOUT_MS);
+    }
+
+    public static String executeAction(long pid, String action, Consumer<JsonObject> configure, long timeoutMs) {
+        JsonObject request = new JsonObject();
+        request.put("action", action);
+        if (configure != null) {
+            configure.accept(request);
+        }
+        try {
+            String response = ActionClient.executeText(pid, request, timeoutMs);
+            if (response != null) {
+                return response;
+            }
+        } catch (ActionClient.StoppedException e) {
+            return e.getMessage();
+        } catch (IOException e) {
+            // Preserve the existing text API's diagnostic when the request cannot be exchanged.
+        }
+        return "Timeout waiting for response from PID " + pid + " for action: " + action;
+    }
+
+    /**
+     * Executes a request and waits for a complete JSON object (see {@link ActionClient}). Each request uses independent
+     * files, published atomically, and removing an unfinished request asks the connector to cancel it.
+     *
+     * @return             the response, or {@code null} on timeout or interruption
+     * @throws IOException if publishing or cleaning up the request fails
+     */
+    public static JsonObject executeAction(long pid, JsonObject request, long timeoutMs) throws IOException {
+        return ActionClient.execute(pid, request, timeoutMs).reply();
+    }
+
+    /**
+     * Initiates a graceful shutdown of a running Camel application by deleting its PID file.
+     */
+    public static String stopApplication(long pid) {
+        Path pidFile = CommandLineHelper.getCamelDir().resolve(Long.toString(pid));
+        if (Files.exists(pidFile)) {
+            PathUtils.deleteFile(pidFile);
+            return "Graceful shutdown initiated for PID " + pid
+                   + ". The application will finish processing in-flight exchanges and shut down.";
+        } else {
+            return "PID file not found for " + pid + ". The process may already be stopping.";
+        }
+    }
+
+    /**
+     * Reads the error file for the given process.
+     *
+     * @return the parsed error data, or {@code null} if the file does not exist or is unreadable
+     */
+    public static JsonObject readErrorFile(long pid) {
+        Path errorFile = CommandLineHelper.getCamelDir().resolve(pid + "-error.json");
+        return readStatusFromFile(errorFile);
+    }
+
+    /**
+     * Reads the message history file for the given process (trace of the last completed exchange).
+     *
+     * @return the parsed history data, or {@code null} if the file does not exist or is unreadable
+     */
+    public static JsonObject readHistoryFile(long pid) {
+        Path historyFile = CommandLineHelper.getCamelDir().resolve(pid + "-history.json");
+        return readStatusFromFile(historyFile);
+    }
+
+    /**
+     * Sends a message to an endpoint of the integration.
+     *
+     * @param  headers                  the headers as key=value pairs separated by newlines, or null
+     * @throws IllegalArgumentException when a header is not a key=value pair
+     */
+    public static JsonObject sendMessage(long pid, String endpoint, String body, String headers) {
+        return sendMessage(pid, endpoint, body, headers, 0, null);
+    }
+
+    /**
+     * Sends a message, and with reply, waits for the answer of the route (InOut) and has it under message in the
+     * result. A request-reply over a broker (jms:, kafka:) waits for a reply that may not come: a reply suits direct:.
+     */
+    public static JsonObject sendMessage(long pid, String endpoint, String body, String headers, boolean reply) {
+        return sendMessage(pid, endpoint, body, headers, 0, null, reply);
+    }
+
+    /**
+     * Sends a message, or with a repeat or a body of {@code file:<folder>} several messages, with a pause between them;
+     * the answer is then a summary (sent, failed and the errors) rather than the reply.
+     *
+     * @param repeat   how many messages to send in all, going round the files of a folder; 0 to send once (each file of
+     *                 a folder once)
+     * @param interval the pause between two messages: millis, a duration such as 200ms, or a range such as 100..500 to
+     *                 draw each pause at random
+     */
+    public static JsonObject sendMessage(
+            long pid, String endpoint, String body, String headers, int repeat, String interval) {
+        return sendMessage(pid, endpoint, body, headers, repeat, interval, false);
+    }
+
+    private static JsonObject sendMessage(
+            long pid, String endpoint, String body, String headers, int repeat, String interval, boolean reply) {
+        JsonArray headerList = headers != null ? parseHeaders(headers) : null;
+        long[] pause = RepeatedSend.interval(interval);
+        String result = executeAction(pid, "send", root -> {
+            root.put("endpoint", endpoint);
+            if (reply) {
+                root.put("exchangePattern", "InOut");
+            }
+            if (body != null) {
+                root.put("body", body);
+            }
+            if (headerList != null) {
+                root.put("headers", headerList);
+            }
+            if (repeat > 0) {
+                root.put("repeat", repeat);
+            }
+            if (pause[1] > 0) {
+                root.put("interval", pause[0]);
+                if (pause[1] > pause[0]) {
+                    root.put("intervalMax", pause[1]);
+                }
+            }
+        }, sendTimeout(body, repeat, pause[1]));
+        try {
+            return (JsonObject) Jsoner.deserialize(result);
+        } catch (Exception e) {
+            JsonObject wrapper = new JsonObject();
+            wrapper.put("result", result);
+            return wrapper;
+        }
+    }
+
+    /**
+     * How long to wait for the answer of a send: for more messages also the pauses between them and a second for each.
+     * The files of a folder are counted when the folder is here (the integration reads it, relative to its working
+     * directory), else 100 are assumed.
+     */
+    static long sendTimeout(String body, int repeat, long interval) {
+        long count = repeat;
+        if (count <= 1 && body != null && body.startsWith("file:")) {
+            File folder = new File(body.substring(5));
+            String[] files = folder.list((d, n) -> !n.startsWith(".") && !n.endsWith(".properties"));
+            count = files != null ? files.length : folder.isFile() ? 1 : 100;
+        }
+        return count <= 1 ? ACTION_TIMEOUT_MS : ACTION_TIMEOUT_MS + count * (interval + 1000);
+    }
+
+    /**
+     * The headers as the send action of the CLI connector reads them: a key and a value for each header.
+     */
+    static JsonArray parseHeaders(String headers) {
+        return parseKeyValues(headers, "Header");
+    }
+
+    /**
+     * Lines of {@code key=value} as the actions of the CLI connector read them (the headers of the send action, the
+     * headers and variables of the eval action): a key and a value for each line.
+     *
+     * @param  text                     the lines
+     * @param  what                     what a line holds, for the error, such as Header
+     * @throws IllegalArgumentException when a line is not in the {@code key=value} form
+     */
+    public static JsonArray parseKeyValues(String text, String what) {
+        JsonArray list = new JsonArray();
+        for (String line : text.split("\\R")) {
+            String entry = line.strip();
+            if (entry.isEmpty()) {
+                continue;
+            }
+            int pos = entry.indexOf('=');
+            if (pos <= 0) {
+                throw new IllegalArgumentException(what + " must be in key=value format, was: " + entry);
+            }
+            JsonObject jo = new JsonObject();
+            jo.put("key", entry.substring(0, pos).strip());
+            jo.put("value", entry.substring(pos + 1));
+            list.add(jo);
+        }
+        return list;
+    }
+
+    public static JsonObject executeRowUpdate(
+            long pid, String table, String datasource, String pkValuesJson, String colValuesJson) {
+        String result = executeAction(pid, "sql-update-row", root -> {
+            root.put("table", table);
+            if (datasource != null) {
+                root.put("datasource", datasource);
+            }
+            root.put("primaryKeyValues", pkValuesJson);
+            root.put("columnValues", colValuesJson);
+        });
+        try {
+            return (JsonObject) Jsoner.deserialize(result);
+        } catch (Exception e) {
+            JsonObject wrapper = new JsonObject();
+            wrapper.put("result", result);
+            return wrapper;
+        }
+    }
+
+    public static JsonObject executeSqlQuery(long pid, String sql, String datasource, int maxRows, int queryTimeout) {
+        long timeout = (queryTimeout + 10) * 1000L;
+        String result = executeAction(pid, "sql-query", root -> {
+            root.put("sql", sql);
+            if (datasource != null) {
+                root.put("datasource", datasource);
+            }
+            root.put("maxRows", maxRows);
+            root.put("queryTimeout", queryTimeout);
+        }, timeout);
+        try {
+            return (JsonObject) Jsoner.deserialize(result);
+        } catch (Exception e) {
+            JsonObject wrapper = new JsonObject();
+            wrapper.put("result", result);
+            return wrapper;
+        }
+    }
+
+    public static JsonObject readStatusFromFile(Path path) {
+        try {
+            if (Files.exists(path) && path.toFile().length() > 0) {
+                String text = Files.readString(path);
+                return (JsonObject) Jsoner.deserialize(text);
+            }
+        } catch (Exception e) {
+            // ignore
+        }
+        return null;
+    }
+}

@@ -1,0 +1,303 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.camel.dsl.jbang.launcher;
+
+import java.io.IOException;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.security.MessageDigest;
+import java.util.ArrayList;
+import java.util.HexFormat;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
+
+import static java.nio.file.attribute.PosixFilePermission.OWNER_EXECUTE;
+import static java.nio.file.attribute.PosixFilePermission.OWNER_READ;
+import static java.nio.file.attribute.PosixFilePermission.OWNER_WRITE;
+
+/**
+ * Test helper that materializes fake {@code java} executables and a throwaway launcher home so the shared
+ * Java-discovery contract in camel.sh / camel.bat can be exercised without a real JDK.
+ */
+final class FakeJava {
+
+    private static final long PROCESS_TIMEOUT_SECONDS = 60;
+    private static final long CLEANUP_TIMEOUT_SECONDS = 10;
+
+    static final boolean WINDOWS = System.getProperty("os.name").toLowerCase().contains("win");
+
+    private FakeJava() {
+    }
+
+    record Result(int exitCode, String stdout, String stderr) {
+    }
+
+    static Path writeFakeJava(Path dir, String name, String versionBanner, int normalExit, String marker)
+            throws IOException {
+        Files.createDirectories(dir);
+        if (WINDOWS) {
+            Path exe = dir.resolve(name + ".bat");
+            String body = "@echo off\r\n"
+                          + "if \"%~1\"==\"-version\" (\r\n"
+                          + "  echo " + versionBanner + " 1>&2\r\n"
+                          + "  exit /b 0\r\n"
+                          + ")\r\n"
+                          + "echo RAN=" + marker + "\r\n"
+                          + "echo ARGS=%*\r\n"
+                          + "echo STDERR=" + marker + " 1>&2\r\n"
+                          + "more\r\n"
+                          + "exit /b " + normalExit + "\r\n";
+            Files.writeString(exe, body, StandardCharsets.UTF_8);
+            return exe;
+        }
+        Path exe = dir.resolve(name);
+        String body = "#!/bin/sh\n"
+                      + "if [ \"$1\" = \"-version\" ]; then\n"
+                      + "  echo '" + versionBanner + "' 1>&2\n"
+                      + "  exit 0\n"
+                      + "fi\n"
+                      + "echo \"RAN=" + marker + "\"\n"
+                      + "printf 'ARGS='; for a in \"$@\"; do printf '%s|' \"$a\"; done; echo\n"
+                      + "echo \"STDERR=" + marker + "\" 1>&2\n"
+                      + "cat\n"
+                      + "exit " + normalExit + "\n";
+        Files.writeString(exe, body, StandardCharsets.UTF_8);
+        Files.setPosixFilePermissions(exe, Set.of(OWNER_READ, OWNER_WRITE, OWNER_EXECUTE));
+        return exe;
+    }
+
+    /**
+     * A launcher home with the layout of the distribution: the script in bin/ and the launcher JAR in lib/.
+     *
+     * @return the bin/ directory, which has the script
+     */
+    static Path newLauncherHome(Path base, Path scriptResource) throws IOException {
+        Path home = Files.createTempDirectory(base, "launcher-home");
+        Path bin = Files.createDirectories(home.resolve("bin"));
+        Path script = bin.resolve(scriptResource.getFileName().toString());
+        Files.copy(scriptResource, script);
+        if (!WINDOWS) {
+            Files.setPosixFilePermissions(script, Set.of(OWNER_READ, OWNER_WRITE, OWNER_EXECUTE));
+        }
+        // A stub jar so the launcher's "camel-launcher-*.jar" glob resolves; fake java never reads it.
+        Files.writeString(Files.createDirectories(home.resolve("lib")).resolve("camel-launcher-9.9.9.jar"), "stub");
+        return bin;
+    }
+
+    /**
+     * The lib/ directory of a launcher home (see {@link #newLauncherHome(Path, Path)}).
+     */
+    static Path lib(Path bin) {
+        return bin.resolveSibling("lib");
+    }
+
+    static Result run(Path script, Map<String, String> env, String... args) throws Exception {
+        return runWithInput(script, env, null, args);
+    }
+
+    static Result runWithInput(Path script, Map<String, String> env, String input, String... args) throws Exception {
+        return runIn(null, script, env, input, args);
+    }
+
+    /**
+     * Runs the script with the given working directory (null for the one of this JVM).
+     */
+    static Result runIn(Path workDir, Path script, Map<String, String> env, String input, String... args)
+            throws Exception {
+        List<String> cmd = new ArrayList<>();
+        if (WINDOWS) {
+            cmd.add("cmd.exe");
+            cmd.add("/c");
+            cmd.add(script.toString());
+        } else {
+            cmd.add("/bin/sh");
+            cmd.add(script.toString());
+        }
+        for (String a : args) {
+            cmd.add(a);
+        }
+        ProcessBuilder pb = new ProcessBuilder(cmd);
+        pb.environment().clear();
+        // Keep a minimal PATH so /bin/sh and cmd.exe internals resolve; tests override as needed.
+        pb.environment().put("PATH", WINDOWS ? System.getenv("PATH") : "/usr/bin:/bin");
+        if (WINDOWS) {
+            pb.environment().put("SystemRoot", System.getenv("SystemRoot"));
+            pb.environment().put("OS", "Windows_NT");
+            pb.environment().put("PATHEXT", ".COM;.EXE;.BAT;.CMD");
+        }
+        pb.environment().putAll(env);
+        if (workDir != null) {
+            pb.directory(workDir.toFile());
+        }
+        Process p = pb.start();
+        ExecutorService collectors = Executors.newFixedThreadPool(2);
+        Throwable failure = null;
+        try {
+            Future<byte[]> stdout = collectors.submit(() -> p.getInputStream().readAllBytes());
+            Future<byte[]> stderr = collectors.submit(() -> p.getErrorStream().readAllBytes());
+            if (input != null) {
+                p.getOutputStream().write(input.getBytes(StandardCharsets.UTF_8));
+            }
+            p.getOutputStream().close();
+            if (!p.waitFor(PROCESS_TIMEOUT_SECONDS, TimeUnit.SECONDS)) {
+                terminate(p);
+                throw new IllegalStateException("launcher did not exit in time");
+            }
+            String out = new String(await(stdout, "stdout"), StandardCharsets.UTF_8);
+            String err = new String(await(stderr, "stderr"), StandardCharsets.UTF_8);
+            return new Result(p.exitValue(), out, err);
+        } catch (Exception | Error e) {
+            failure = e;
+            throw e;
+        } finally {
+            try {
+                cleanup(p, collectors);
+            } catch (Exception | Error cleanupFailure) {
+                if (failure != null) {
+                    failure.addSuppressed(cleanupFailure);
+                } else {
+                    throw cleanupFailure;
+                }
+            }
+        }
+    }
+
+    private static void cleanup(Process process, ExecutorService collectors) throws Exception {
+        Throwable failure = null;
+        try {
+            terminate(process);
+        } catch (Exception | Error e) {
+            failure = e;
+        }
+        collectors.shutdownNow();
+        try {
+            if (!collectors.awaitTermination(CLEANUP_TIMEOUT_SECONDS, TimeUnit.SECONDS)) {
+                throw new IllegalStateException("launcher stream collectors did not terminate");
+            }
+        } catch (Exception | Error e) {
+            if (failure != null) {
+                failure.addSuppressed(e);
+            } else {
+                failure = e;
+            }
+        }
+        if (failure instanceof Exception exception) {
+            throw exception;
+        }
+        if (failure instanceof Error error) {
+            throw error;
+        }
+    }
+
+    private static byte[] await(Future<byte[]> collector, String stream) throws Exception {
+        try {
+            return collector.get(CLEANUP_TIMEOUT_SECONDS, TimeUnit.SECONDS);
+        } catch (ExecutionException e) {
+            Throwable cause = e.getCause();
+            if (cause instanceof Exception exception) {
+                throw exception;
+            }
+            if (cause instanceof Error error) {
+                throw error;
+            }
+            throw new IllegalStateException("failed to collect launcher " + stream, cause);
+        } catch (TimeoutException e) {
+            throw new IllegalStateException("timed out collecting launcher " + stream, e);
+        }
+    }
+
+    private static void terminate(Process process) throws InterruptedException {
+        if (process.isAlive()) {
+            process.destroyForcibly();
+            if (!process.waitFor(CLEANUP_TIMEOUT_SECONDS, TimeUnit.SECONDS)) {
+                throw new IllegalStateException("launcher could not be terminated");
+            }
+        }
+    }
+
+    /**
+     * Computes the POSIX cksum hash of the given string, matching the shell expression
+     * {@code printf '%s' "$str" | cksum | cut -d' ' -f1} used in camel.sh for CDS directory hashing.
+     */
+    static String cksumHash(String str) throws Exception {
+        ProcessBuilder pb = new ProcessBuilder(
+                "/bin/sh", "-c",
+                "printf '%s' '" + str.replace("'", "'\\''") + "' | cksum | cut -d' ' -f1");
+        pb.environment().clear();
+        pb.environment().put("PATH", "/usr/bin:/bin");
+        Process p = pb.start();
+        byte[] out = p.getInputStream().readAllBytes();
+        p.waitFor(10, TimeUnit.SECONDS);
+        return new String(out, StandardCharsets.UTF_8).trim();
+    }
+
+    /**
+     * Computes the Windows CDS install-directory hash of the given string, matching the PowerShell expression used in
+     * camel.bat: SHA-256 of the UTF-8 bytes, first 4 bytes as lowercase hex (8 chars). Falls back to {@code "default"}
+     * if the hash cannot be computed (should not happen on Windows JVM).
+     */
+    static String batCdsHash(String str) {
+        try {
+            byte[] bytes = str.getBytes(StandardCharsets.UTF_8);
+            byte[] digest = MessageDigest.getInstance("SHA-256").digest(bytes);
+            return HexFormat.of().formatHex(digest, 0, 4);
+        } catch (Exception e) {
+            return "default";
+        }
+    }
+
+    /**
+     * Returns the Windows CDS BASEDIR string as computed by camel.bat: the {@code %~dp0} of the launcher script (the
+     * bin\ directory path with a trailing backslash), as cmd.exe resolves it. This may differ from
+     * {@code bin.toString() + "\\"} when Windows 8.3 short names are involved (e.g. {@code C:\\Users\\RUNNER~1\\} vs
+     * the full long path), so this method runs a helper batch to capture the actual {@code %~dp0} rather than inferring
+     * it from the Java Path.
+     */
+    static String batBasedirString(Path bin) throws Exception {
+        Path helper = Files.createTempFile(bin, "basedir-probe", ".bat");
+        try {
+            Files.writeString(helper, "@echo %~dp0\r\n", StandardCharsets.UTF_8);
+            String systemRoot = System.getenv("SystemRoot");
+            ProcessBuilder pb = new ProcessBuilder("cmd.exe", "/c", helper.toString());
+            pb.environment().clear();
+            pb.environment().put("PATH", systemRoot + "\\System32");
+            pb.environment().put("SystemRoot", systemRoot);
+            pb.environment().put("OS", "Windows_NT");
+            Process p = pb.start();
+            String out = new String(p.getInputStream().readAllBytes(), StandardCharsets.UTF_8).strip();
+            p.waitFor(5, TimeUnit.SECONDS);
+            return out; // e.g. "D:\\a\\...\\bin\\" (trailing backslash included by %~dp0)
+        } finally {
+            Files.deleteIfExists(helper);
+        }
+    }
+
+    /**
+     * The BASEDIR of a launcher home as computed by camel.sh: the directory of the script (bin/).
+     */
+    static Path basedir(Path bin) {
+        return bin;
+    }
+}

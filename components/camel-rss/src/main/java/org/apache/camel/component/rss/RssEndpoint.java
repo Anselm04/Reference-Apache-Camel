@@ -1,0 +1,113 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.camel.component.rss;
+
+import java.util.Arrays;
+
+import com.rometools.rome.feed.synd.SyndEntry;
+import com.rometools.rome.feed.synd.SyndFeed;
+import org.apache.camel.Category;
+import org.apache.camel.Exchange;
+import org.apache.camel.Processor;
+import org.apache.camel.Producer;
+import org.apache.camel.RuntimeCamelException;
+import org.apache.camel.component.feed.FeedComponent;
+import org.apache.camel.component.feed.FeedEndpoint;
+import org.apache.camel.component.feed.FeedPollingConsumer;
+import org.apache.camel.spi.BodyType;
+import org.apache.camel.spi.BodyType.Carrier;
+import org.apache.camel.spi.BodyTypes;
+import org.apache.camel.spi.EndpointServiceLocation;
+import org.apache.camel.spi.UriEndpoint;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+/**
+ * Poll RSS feeds.
+ */
+@UriEndpoint(firstVersion = "2.0.0", scheme = "rss", extendsScheme = "atom", title = "RSS",
+             syntax = "rss:feedUri", consumerOnly = true, category = { Category.DOCUMENT }, lenientProperties = true,
+             headersClass = RssConstants.class)
+@BodyTypes(consumerOut = @BodyType(value = Carrier.POJO, javaType = "com.rometools.rome.feed.synd.SyndFeed",
+                                   description = "A ROME SyndFeed: with splitEntries (the default) a copy of the feed with"
+                                                 + " the one entry in its entries, with splitEntries=false the whole feed"
+                                                 + " with all its entries. The CamelRssFeed header carries the whole feed"
+                                                 + " unless feedHeader=false"))
+public class RssEndpoint extends FeedEndpoint implements EndpointServiceLocation {
+    protected static final Logger LOG = LoggerFactory.getLogger(RssEndpoint.class);
+
+    public RssEndpoint() {
+    }
+
+    public RssEndpoint(String endpointUri, FeedComponent component, String feedUri) {
+        super(endpointUri, component, feedUri);
+    }
+
+    @Override
+    public String getServiceUrl() {
+        return feedUri;
+    }
+
+    @Override
+    public String getServiceProtocol() {
+        return "rss";
+    }
+
+    @Override
+    public Producer createProducer() throws Exception {
+        throw new UnsupportedOperationException("RssProducer is not implemented");
+    }
+
+    @Override
+    public Exchange createExchange(Object feed) {
+        Exchange exchange = createExchangeWithFeedHeader(feed, RssConstants.RSS_FEED);
+        exchange.getIn().setBody(feed);
+        return exchange;
+    }
+
+    @Override
+    public Exchange createExchange(Object feed, Object entry) {
+        Exchange exchange = createExchangeWithFeedHeader(feed, RssConstants.RSS_FEED);
+        try {
+            SyndFeed newFeed = (SyndFeed) ((SyndFeed) feed).clone();
+            newFeed.setEntries(Arrays.asList((SyndEntry) entry));
+            exchange.getIn().setBody(newFeed);
+        } catch (CloneNotSupportedException e) {
+            // keep the entry as the body so the error handler (such as a dead letter channel) does not lose it,
+            // and let the error handler log the failure
+            exchange.getIn().setBody(entry);
+            exchange.setException(new RuntimeCamelException("Could not clone the feed to hold the entry", e));
+        }
+        return exchange;
+    }
+
+    @Override
+    protected FeedPollingConsumer createEntryPollingConsumer(
+            FeedEndpoint feedEndpoint, Processor processor, boolean throttleEntries)
+            throws Exception {
+        RssEntryPollingConsumer answer = new RssEntryPollingConsumer(this, processor, throttleEntries);
+        configureConsumer(answer);
+        return answer;
+    }
+
+    @Override
+    protected FeedPollingConsumer createPollingConsumer(FeedEndpoint feedEndpoint, Processor processor) throws Exception {
+        RssPollingConsumer answer = new RssPollingConsumer(this, processor);
+        configureConsumer(answer);
+        return answer;
+    }
+}

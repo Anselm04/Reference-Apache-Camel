@@ -1,0 +1,1111 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.camel.component.openfga;
+
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.HashSet;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.function.Consumer;
+
+import dev.openfga.sdk.api.client.model.ClientBatchCheckClientResponse;
+import dev.openfga.sdk.api.client.model.ClientBatchCheckItem;
+import dev.openfga.sdk.api.client.model.ClientBatchCheckRequest;
+import dev.openfga.sdk.api.client.model.ClientBatchCheckResponse;
+import dev.openfga.sdk.api.client.model.ClientBatchCheckSingleResponse;
+import dev.openfga.sdk.api.client.model.ClientCheckRequest;
+import dev.openfga.sdk.api.client.model.ClientExpandRequest;
+import dev.openfga.sdk.api.client.model.ClientExpandResponse;
+import dev.openfga.sdk.api.client.model.ClientListObjectsRequest;
+import dev.openfga.sdk.api.client.model.ClientListRelationsRequest;
+import dev.openfga.sdk.api.client.model.ClientListUsersRequest;
+import dev.openfga.sdk.api.client.model.ClientReadChangesRequest;
+import dev.openfga.sdk.api.client.model.ClientReadChangesResponse;
+import dev.openfga.sdk.api.client.model.ClientReadRequest;
+import dev.openfga.sdk.api.client.model.ClientReadResponse;
+import dev.openfga.sdk.api.client.model.ClientRelationshipCondition;
+import dev.openfga.sdk.api.client.model.ClientTupleKey;
+import dev.openfga.sdk.api.client.model.ClientTupleKeyWithoutCondition;
+import dev.openfga.sdk.api.client.model.ClientWriteRequest;
+import dev.openfga.sdk.api.configuration.ClientBatchCheckClientOptions;
+import dev.openfga.sdk.api.configuration.ClientBatchCheckOptions;
+import dev.openfga.sdk.api.configuration.ClientDeleteTuplesOptions;
+import dev.openfga.sdk.api.configuration.ClientExpandOptions;
+import dev.openfga.sdk.api.configuration.ClientListObjectsOptions;
+import dev.openfga.sdk.api.configuration.ClientListRelationsOptions;
+import dev.openfga.sdk.api.configuration.ClientListUsersOptions;
+import dev.openfga.sdk.api.configuration.ClientReadChangesOptions;
+import dev.openfga.sdk.api.configuration.ClientReadOptions;
+import dev.openfga.sdk.api.configuration.ClientWriteOptions;
+import dev.openfga.sdk.api.configuration.ClientWriteTuplesOptions;
+import dev.openfga.sdk.api.model.ConsistencyPreference;
+import dev.openfga.sdk.api.model.FgaObject;
+import dev.openfga.sdk.api.model.ListObjectsRequest;
+import dev.openfga.sdk.api.model.RelationshipCondition;
+import dev.openfga.sdk.api.model.TupleChange;
+import dev.openfga.sdk.api.model.TupleKey;
+import dev.openfga.sdk.api.model.User;
+import dev.openfga.sdk.api.model.UserTypeFilter;
+import dev.openfga.sdk.api.model.UsersetTree;
+import dev.openfga.sdk.api.model.WriteRequestDeletes;
+import dev.openfga.sdk.api.model.WriteRequestWrites;
+import org.apache.camel.Exchange;
+import org.apache.camel.InvalidPayloadException;
+import org.apache.camel.health.HealthCheckHelper;
+import org.apache.camel.health.WritableHealthCheckRepository;
+import org.apache.camel.support.DefaultProducer;
+import org.apache.camel.util.ObjectHelper;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+public class OpenFgaProducer extends DefaultProducer {
+
+    private static final Logger LOG = LoggerFactory.getLogger(OpenFgaProducer.class);
+
+    private static final String DEFAULT_USER_FILTER = "user";
+
+    private final Set<OpenFgaObjectIterator> activeStreams = ConcurrentHashMap.newKeySet();
+    private ScheduledExecutorService streamScheduler;
+    private OpenFgaProducerHealthCheck producerHealthCheck;
+    private WritableHealthCheckRepository healthCheckRepository;
+
+    public OpenFgaProducer(final OpenFgaEndpoint endpoint) {
+        super(endpoint);
+    }
+
+    @Override
+    public OpenFgaEndpoint getEndpoint() {
+        return (OpenFgaEndpoint) super.getEndpoint();
+    }
+
+    @Override
+    protected void doStart() throws Exception {
+        super.doStart();
+
+        OpenFgaConfiguration configuration = getEndpoint().getConfiguration();
+        if (getEndpoint().getOperation() == OpenFgaOperation.streamedListObjects) {
+            streamScheduler = getEndpoint().getCamelContext().getExecutorServiceManager()
+                    .newSingleThreadScheduledExecutor(this, "OpenFgaStreamTimeout");
+        }
+        // an injected client can point anywhere and the endpoint has no way to ask it where, so there is no server
+        // this check would know the address of
+        if (configuration.getOpenFgaClient() != null || ObjectHelper.isEmpty(configuration.getApiUrl())) {
+            return;
+        }
+
+        // health-check is optional so discover and resolve
+        healthCheckRepository = HealthCheckHelper.getHealthCheckRepository(
+                getEndpoint().getCamelContext(),
+                "producers",
+                WritableHealthCheckRepository.class);
+
+        if (healthCheckRepository != null) {
+            producerHealthCheck = new OpenFgaProducerHealthCheck(
+                    configuration.getApiUrl(), configuration.getApiToken(), configuration.getStoreId(),
+                    // the endpoint URI is unique within the context, so two endpoints sharing a store but pointing at
+                    // different servers get distinct health-check ids instead of colliding
+                    getEndpoint().getEndpointUri(), getEndpoint().getSslContext());
+            producerHealthCheck.setEnabled(getEndpoint().getComponent().isHealthCheckProducerEnabled());
+            healthCheckRepository.addHealthCheck(producerHealthCheck);
+        }
+    }
+
+    /** The streamed object queries that opened a request and were not closed yet; the producer closes them on stop. */
+    int activeStreamCount() {
+        return activeStreams.size();
+    }
+
+    @Override
+    protected void doStop() throws Exception {
+        activeStreams.forEach(OpenFgaObjectIterator::close);
+        if (streamScheduler != null) {
+            getEndpoint().getCamelContext().getExecutorServiceManager().shutdownNow(streamScheduler);
+            streamScheduler = null;
+        }
+        if (healthCheckRepository != null && producerHealthCheck != null) {
+            healthCheckRepository.removeHealthCheck(producerHealthCheck);
+            producerHealthCheck.close();
+            producerHealthCheck = null;
+        }
+        super.doStop();
+    }
+
+    @Override
+    public void process(Exchange exchange) throws Exception {
+        OpenFgaAuthorizer authorizer = getEndpoint().getAuthorizer();
+        switch (getEndpoint().getOperation()) {
+            case check -> authorizer.check(exchange);
+            case batchCheck -> batchCheck(exchange, authorizer);
+            case listObjects -> listObjects(exchange, authorizer);
+            case streamedListObjects -> streamedListObjects(exchange, authorizer);
+            case listRelations -> listRelations(exchange, authorizer);
+            case listUsers -> listUsers(exchange, authorizer);
+            case writeTuples -> writeTuples(exchange, authorizer);
+            case write -> write(exchange, authorizer);
+            case readTuples -> readTuples(exchange, authorizer);
+            case readChanges -> readChanges(exchange, authorizer);
+            case expand -> expand(exchange, authorizer);
+            case deleteTuples -> deleteTuples(exchange, authorizer);
+            // unreachable today; here so that adding an operation to the enum without wiring it up fails loudly
+            // instead of silently letting the exchange through an endpoint that was asked to authorize it
+            default -> throw new IllegalArgumentException("Unsupported operation " + getEndpoint().getOperation());
+        }
+    }
+
+    /**
+     * Checks one subject against many objects, taken from the body, and replaces the body with the ones the check
+     * allowed - so a route can filter a collection down to what the caller may see in one step.
+     */
+    private void batchCheck(Exchange exchange, OpenFgaAuthorizer authorizer) throws Exception {
+        OpenFgaAuthorizer.clearDecisionHeaders(exchange);
+        List<String> objects = bodyAsList(exchange);
+        String user = authorizer.resolveUser(exchange);
+        String relation = authorizer.resolveRelation(exchange);
+        if (user == null || relation == null) {
+            // the subject or the permission could not be established, so none of the objects is allowed. The deny
+            // reason is already on the exchange
+            exchange.getMessage().setBody(List.of());
+            return;
+        }
+
+        List<ClientTupleKey> contextualTuples = authorizer.resolveContextualTuples(exchange);
+        if (contextualTuples == null) {
+            // a configured contextual tuple did not resolve, so no object is allowed; the reason is on the exchange
+            exchange.getMessage().setHeader(OpenFgaConstants.ALLOWED, false);
+            exchange.getMessage().setBody(List.of());
+            return;
+        }
+
+        List<ClientCheckRequest> requests = new ArrayList<>(objects.size());
+        for (String object : objects) {
+            if (OpenFgaIdentifiers.validate(object) != null) {
+                // an entry that cannot be an object of a check is not one the caller may have; leaving it out of the
+                // batch leaves it out of the result, which is the fail-closed answer
+                LOG.debug("Skipping '{}' in a batchCheck: not usable as an object identifier", object);
+                continue;
+            }
+            ClientCheckRequest item = new ClientCheckRequest().user(user).relation(relation)._object(object);
+            applyContext(item::contextualTuples, item::context, contextualTuples, authorizer);
+            requests.add(item);
+        }
+        if (requests.isEmpty()) {
+            // nothing in the body could be an object of a check, so nothing is allowed. Say so on the header as
+            // every other path does, rather than leaving the route to infer a verdict from an empty body
+            exchange.getMessage().setHeader(OpenFgaConstants.ALLOWED, false);
+            exchange.getMessage().setBody(List.of());
+            return;
+        }
+
+        List<String> allowed = getEndpoint().getConfiguration().getBatchCheckMode() == OpenFgaBatchCheckMode.server
+                ? serverBatchCheck(exchange, authorizer, requests)
+                : clientBatchCheck(exchange, authorizer, requests, objects, user, relation);
+        exchange.getMessage().setHeader(OpenFgaConstants.ALLOWED, !allowed.isEmpty());
+        exchange.getMessage().setBody(allowed);
+    }
+
+    private List<String> clientBatchCheck(
+            Exchange exchange, OpenFgaAuthorizer authorizer, List<ClientCheckRequest> requests,
+            List<String> objects, String user, String relation)
+            throws Exception {
+        int maxParallelRequests = getEndpoint().getConfiguration().getMaxParallelRequests();
+        ClientBatchCheckClientOptions options = new ClientBatchCheckClientOptions()
+                .maxParallelRequests(maxParallelRequests);
+        if (ObjectHelper.isNotEmpty(getEndpoint().getConfiguration().getAuthorizationModelId())) {
+            options.authorizationModelId(getEndpoint().getConfiguration().getAuthorizationModelId());
+        }
+        if (authorizer.getConsistency() != null) {
+            options.consistency(authorizer.getConsistency());
+        }
+
+        List<ClientBatchCheckClientResponse> responses = authorizer.await(
+                exchange, "batch check " + relation + " for " + user,
+                () -> authorizer.getClient().clientBatchCheck(requests, options),
+                // the batch fans out one request per object, maxParallelRequests at a time, so it needs more than a
+                // single request's budget - otherwise a large batch against a slow server is cancelled mid-flight
+                authorizer.batchAwaitTimeoutMillis(requests.size(), maxParallelRequests));
+
+        Set<String> permitted = new HashSet<>();
+        for (ClientBatchCheckClientResponse response : responses) {
+            if (response.getThrowable() != null) {
+                // one check in the batch never got an answer. Returning the rest would quietly present a partial
+                // filter as a complete one, so the whole operation fails - and unlike a single check, there is no
+                // failOpen here, because "proceed" for a filter would mean handing back everything unfiltered
+                throw new OpenFgaEvaluationException(
+                        "OpenFGA failed to answer part of a batch check for " + user, exchange,
+                        response.getThrowable());
+            }
+            if (Boolean.TRUE.equals(response.getAllowed())) {
+                permitted.add(response.getRequest().getObject());
+            }
+        }
+        // filter the body rather than collect the answers: the SDK issues the checks in parallel and hands them back
+        // in whatever order they completed, so building the result from the responses would reorder the caller's list
+        // between runs. A route that filters a list to render it wants the order it asked in
+        List<String> allowed = new ArrayList<>();
+        for (String object : objects) {
+            if (permitted.contains(object)) {
+                allowed.add(object);
+            }
+        }
+        return allowed;
+    }
+
+    private List<String> serverBatchCheck(Exchange exchange, OpenFgaAuthorizer authorizer, List<ClientCheckRequest> requests)
+            throws Exception {
+        List<ClientBatchCheckItem> checks = new ArrayList<>(requests.size());
+        Set<String> pending = new HashSet<>();
+        for (int i = 0; i < requests.size(); i++) {
+            ClientCheckRequest request = requests.get(i);
+            String correlation = Integer.toString(i);
+            pending.add(correlation);
+            checks.add(new ClientBatchCheckItem().user(request.getUser()).relation(request.getRelation())
+                    ._object(request.getObject()).context(request.getContext()).contextualTuples(request.getContextualTuples())
+                    .correlationId(correlation));
+        }
+        OpenFgaConfiguration configuration = getEndpoint().getConfiguration();
+        int batchSize = configuration.getMaxBatchSize();
+        ClientBatchCheckOptions options = new ClientBatchCheckOptions()
+                .maxBatchSize(batchSize).maxParallelRequests(configuration.getMaxParallelRequests());
+        applyModelAndConsistency(authorizer, options::authorizationModelId, options::consistency);
+        // The SDK chunks checks into native BatchCheck requests. Budget for waves of chunks, rather than for
+        // either one request or one request per object, retaining the bounded wait used by client-side batches.
+        int chunks = (int) ((requests.size() + (long) batchSize - 1) / batchSize);
+        ClientBatchCheckResponse response = authorizer.await(exchange, "batch check " + requests.size() + " objects",
+                () -> authorizer.getClient().batchCheck(new ClientBatchCheckRequest().checks(checks), options),
+                authorizer.batchAwaitTimeoutMillis(chunks, configuration.getMaxParallelRequests()));
+        if (response == null || response.getResult() == null) {
+            throw new OpenFgaEvaluationException("OpenFGA returned no batch check results", exchange, null);
+        }
+        Set<String> permitted = new HashSet<>();
+        for (ClientBatchCheckSingleResponse result : response.getResult()) {
+            if (result == null || !pending.remove(result.getCorrelationId())) {
+                throw new OpenFgaEvaluationException("OpenFGA returned an unexpected batch check correlation", exchange, null);
+            }
+            if (result.getError() != null) {
+                throw new OpenFgaEvaluationException(
+                        "OpenFGA failed to answer part of a batch check", exchange,
+                        new IllegalStateException(result.getError().getMessage()));
+            }
+            if (result.isAllowed()) {
+                permitted.add(result.getCorrelationId());
+            }
+        }
+        if (!pending.isEmpty()) {
+            throw new OpenFgaEvaluationException("OpenFGA returned an incomplete batch check", exchange, null);
+        }
+        List<String> allowed = new ArrayList<>();
+        for (int i = 0; i < requests.size(); i++) {
+            if (permitted.contains(Integer.toString(i))) {
+                allowed.add(requests.get(i).getObject());
+            }
+        }
+        return allowed;
+    }
+
+    /**
+     * Lists the objects of the configured type the subject can reach through the relation.
+     */
+    private void streamedListObjects(Exchange exchange, OpenFgaAuthorizer authorizer) throws Exception {
+        OpenFgaAuthorizer.clearDecisionHeaders(exchange);
+        OpenFgaConfiguration configuration = getEndpoint().getConfiguration();
+        String user = authorizer.resolveUser(exchange);
+        String relation = authorizer.resolveRelation(exchange);
+        List<ClientTupleKey> contextualTuples = authorizer.resolveContextualTuples(exchange);
+        ListObjectsRequest request = new ListObjectsRequest().user(user).relation(relation).type(configuration.getType());
+        applyModelAndConsistency(authorizer, request::authorizationModelId, request::consistency);
+        if (contextualTuples != null && !contextualTuples.isEmpty()) {
+            request.contextualTuples(ClientTupleKey.asContextualTupleKeys(contextualTuples));
+        }
+        if (authorizer.getConditionContext() != null) {
+            request.context(authorizer.getConditionContext());
+        }
+        OpenFgaObjectIterator iterator = new OpenFgaObjectIterator(
+                getEndpoint().getStreamingClient(),
+                configuration.getStoreId(), request, streamScheduler, configuration.getReadTimeout(),
+                configuration.getStreamMaxResults(), configuration.getStreamMaxLineLength(), activeStreams::add,
+                activeStreams::remove);
+        if (user == null || relation == null || contextualTuples == null) {
+            iterator.completeEmpty();
+        }
+        exchange.getMessage().setBody(iterator);
+    }
+
+    private void listObjects(Exchange exchange, OpenFgaAuthorizer authorizer) throws Exception {
+        OpenFgaAuthorizer.clearDecisionHeaders(exchange);
+        String type = getEndpoint().getConfiguration().getType();
+        String user = authorizer.resolveUser(exchange);
+        String relation = authorizer.resolveRelation(exchange);
+        if (user == null || relation == null) {
+            exchange.getMessage().setBody(List.of());
+            return;
+        }
+
+        ClientListObjectsRequest request = new ClientListObjectsRequest()
+                .user(user)
+                .relation(relation)
+                .type(type);
+        List<ClientTupleKey> contextualTuples = authorizer.resolveContextualTuples(exchange);
+        if (contextualTuples == null) {
+            exchange.getMessage().setBody(List.of());
+            return;
+        }
+        applyContext(request::contextualTupleKeys, request::context, contextualTuples, authorizer);
+        ClientListObjectsOptions options = new ClientListObjectsOptions();
+        applyModelAndConsistency(authorizer, options::authorizationModelId, options::consistency);
+
+        List<String> objects = authorizer.await(exchange, "list " + type + " objects " + user + " can " + relation,
+                () -> authorizer.getClient().listObjects(request, options)).getObjects();
+        exchange.getMessage().setBody(objects != null ? objects : List.of());
+    }
+
+    /**
+     * Lists which of the configured relations the subject holds on the object.
+     */
+    private void listRelations(Exchange exchange, OpenFgaAuthorizer authorizer) throws Exception {
+        OpenFgaAuthorizer.clearDecisionHeaders(exchange);
+        String user = authorizer.resolveUser(exchange);
+        String object = authorizer.resolveObject(exchange);
+        if (user == null || object == null) {
+            exchange.getMessage().setBody(List.of());
+            return;
+        }
+
+        List<String> configuredRelations = splitToList(getEndpoint().getConfiguration().getRelations());
+        ClientListRelationsRequest request = new ClientListRelationsRequest()
+                .user(user)
+                ._object(object)
+                .relations(configuredRelations);
+        List<ClientTupleKey> contextualTuples = authorizer.resolveContextualTuples(exchange);
+        if (contextualTuples == null) {
+            exchange.getMessage().setBody(List.of());
+            return;
+        }
+        applyContext(request::contextualTupleKeys, request::context, contextualTuples, authorizer);
+        ClientListRelationsOptions options = new ClientListRelationsOptions();
+        applyModelAndConsistency(authorizer, options::authorizationModelId, options::consistency);
+
+        List<String> held = authorizer.await(exchange, "list the relations " + user + " has on " + object,
+                () -> authorizer.getClient().listRelations(request, options)).getRelations();
+        // the SDK checks the relations in parallel and returns the ones that hold in completion order, which varies
+        // from call to call; return them in the order the relations option lists them so the result is deterministic
+        // (CAMEL-26197)
+        exchange.getMessage().setBody(inConfiguredOrder(configuredRelations, held));
+    }
+
+    /**
+     * Returns the relations the subject holds in the order the {@code relations} option lists them, rather than the
+     * order the SDK happened to return - which, because it checks the relations in parallel, changes from call to call.
+     */
+    private static List<String> inConfiguredOrder(List<String> configured, List<String> held) {
+        if (held == null || held.isEmpty()) {
+            return List.of();
+        }
+        Set<String> heldSet = new HashSet<>(held);
+        List<String> ordered = new ArrayList<>(held.size());
+        for (String relation : configured) {
+            if (heldSet.contains(relation)) {
+                ordered.add(relation);
+            }
+        }
+        return ordered;
+    }
+
+    /**
+     * Lists the subjects that hold the relation on the object.
+     */
+    private void listUsers(Exchange exchange, OpenFgaAuthorizer authorizer) throws Exception {
+        OpenFgaAuthorizer.clearDecisionHeaders(exchange);
+        String object = authorizer.resolveObject(exchange);
+        String relation = authorizer.resolveRelation(exchange);
+        if (object == null || relation == null) {
+            exchange.getMessage().setBody(List.of());
+            return;
+        }
+
+        ClientListUsersRequest request = new ClientListUsersRequest()
+                ._object(toFgaObject(object))
+                .relation(relation)
+                .userFilters(userFilters());
+        List<ClientTupleKey> contextualTuples = authorizer.resolveContextualTuples(exchange);
+        if (contextualTuples == null) {
+            exchange.getMessage().setBody(List.of());
+            return;
+        }
+        applyContext(request::contextualTupleKeys, request::context, contextualTuples, authorizer);
+        ClientListUsersOptions options = new ClientListUsersOptions();
+        applyModelAndConsistency(authorizer, options::authorizationModelId, options::consistency);
+
+        List<User> users = authorizer.await(exchange, "list the users with " + relation + " on " + object,
+                () -> authorizer.getClient().listUsers(request, options)).getUsers();
+        List<String> identifiers = new ArrayList<>();
+        if (users != null) {
+            for (User user : users) {
+                String identifier = toIdentifier(user);
+                if (identifier != null) {
+                    identifiers.add(identifier);
+                }
+            }
+        }
+        exchange.getMessage().setBody(identifiers);
+    }
+
+    /**
+     * Reads the stored relationship tuples, filtered by whichever of user, relation and object the endpoint configured.
+     * <p/>
+     * Unlike every other operation these three are optional here: a part the endpoint never set means "do not filter on
+     * this", and leaving all three unset reads the whole store a page at a time. That is why the raw resolvers are used
+     * rather than the check-path ones, which treat a blank value as a missing identity and deny. A part that WAS set
+     * and resolves to nothing is a different thing entirely - see {@link #readFilterPart}.
+     */
+    private void readTuples(Exchange exchange, OpenFgaAuthorizer authorizer) throws Exception {
+        String filterUser = readFilterPart(authorizer.hasConfiguredUser(), authorizer.rawUser(exchange), "user");
+        String filterRelation
+                = readFilterPart(authorizer.hasConfiguredRelation(), authorizer.rawRelation(exchange), "relation");
+        String filterObject = readFilterPart(authorizer.hasConfiguredObject(), authorizer.rawObject(exchange), "object");
+        validateReadFilter(filterUser, filterRelation, filterObject);
+
+        ClientReadRequest request = new ClientReadRequest();
+        if (filterUser != null) {
+            request.user(filterUser);
+        }
+        if (filterRelation != null) {
+            request.relation(filterRelation);
+        }
+        if (filterObject != null) {
+            request._object(filterObject);
+        }
+
+        ClientReadOptions options = new ClientReadOptions();
+        if (getEndpoint().getConfiguration().getPageSize() != null) {
+            options.pageSize(getEndpoint().getConfiguration().getPageSize());
+        }
+        String token = authorizer.rawContinuationToken(exchange);
+        if (ObjectHelper.isNotEmpty(token)) {
+            options.continuationToken(token);
+        }
+        if (authorizer.getConsistency() != null) {
+            options.consistency(authorizer.getConsistency());
+        }
+
+        ClientReadResponse response = authorizer.await(exchange, "read the stored tuples",
+                () -> authorizer.getClient().read(request, options));
+
+        List<Map<String, Object>> tuples = new ArrayList<>();
+        if (response.getTuples() != null) {
+            // qualified because this class already has its own Tuple, the holder the write paths use; that one is
+            // referenced far more often, so it keeps the simple name
+            for (dev.openfga.sdk.api.model.Tuple tuple : response.getTuples()) {
+                TupleKey key = tuple.getKey();
+                if (key == null) {
+                    continue;
+                }
+                // the user/relation/object keys are deliberately the ones writeTuples and deleteTuples accept, so a
+                // route can feed what it read straight back into a revoke without reshaping it
+                Map<String, Object> entry = new LinkedHashMap<>();
+                entry.put("user", key.getUser());
+                entry.put("relation", key.getRelation());
+                entry.put("object", key.getObject());
+                // a stored tuple can carry a relationship condition; surface it so a route can read it back and feed
+                // it straight into a write, the same way the identity parts round-trip
+                RelationshipCondition condition = key.getCondition();
+                if (condition != null) {
+                    entry.put("condition", conditionAsMap(condition));
+                }
+                entry.put("timestamp", tuple.getTimestamp());
+                tuples.add(entry);
+            }
+        }
+        setContinuationToken(exchange, response.getContinuationToken());
+        exchange.getMessage().setBody(tuples);
+    }
+
+    /**
+     * Reads the store's change log, so a route can keep something outside OpenFGA in step with the graph.
+     */
+    private void readChanges(Exchange exchange, OpenFgaAuthorizer authorizer) throws Exception {
+        ClientReadChangesRequest request = new ClientReadChangesRequest();
+        if (ObjectHelper.isNotEmpty(getEndpoint().getConfiguration().getType())) {
+            request.type(getEndpoint().getConfiguration().getType());
+        }
+        if (getEndpoint().getStartTime() != null) {
+            request.startTime(getEndpoint().getStartTime());
+        }
+
+        ClientReadChangesOptions options = new ClientReadChangesOptions();
+        if (getEndpoint().getConfiguration().getPageSize() != null) {
+            options.pageSize(getEndpoint().getConfiguration().getPageSize());
+        }
+        String token = authorizer.rawContinuationToken(exchange);
+        if (ObjectHelper.isNotEmpty(token)) {
+            options.continuationToken(token);
+        }
+
+        ClientReadChangesResponse response = authorizer.await(exchange, "read the change log",
+                () -> authorizer.getClient().readChanges(request, options));
+
+        List<Map<String, Object>> changes = new ArrayList<>();
+        if (response.getChanges() != null) {
+            for (TupleChange change : response.getChanges()) {
+                TupleKey key = change.getTupleKey();
+                if (key == null) {
+                    continue;
+                }
+                Map<String, Object> entry = new LinkedHashMap<>();
+                entry.put("user", key.getUser());
+                entry.put("relation", key.getRelation());
+                entry.put("object", key.getObject());
+                RelationshipCondition condition = key.getCondition();
+                if (condition != null) {
+                    entry.put("condition", conditionAsMap(condition));
+                }
+                // the enum's name rather than the enum, so a route can compare against "WRITE" without importing
+                // an SDK type, and so the body marshals without a custom serializer
+                entry.put("operation", change.getOperation() != null ? change.getOperation().name() : null);
+                entry.put("timestamp", change.getTimestamp());
+                changes.add(entry);
+            }
+        }
+        setContinuationToken(exchange, response.getContinuationToken());
+        exchange.getMessage().setBody(changes);
+    }
+
+    /**
+     * Expands a relation on an object into its userset tree.
+     * <p/>
+     * This is the one operation that does not leave a {@code List<String>} on the body, because its answer is not a
+     * list: it is a tree of usersets explaining how a relation resolves. The {@link UsersetTree} goes on the body as it
+     * comes back from the SDK rather than being flattened, since flattening is exactly what destroys the information
+     * the operation exists to provide.
+     */
+    private void expand(Exchange exchange, OpenFgaAuthorizer authorizer) throws Exception {
+        OpenFgaAuthorizer.clearDecisionHeaders(exchange);
+        String object = authorizer.resolveObject(exchange);
+        String relation = authorizer.resolveRelation(exchange);
+        if (object == null || relation == null) {
+            exchange.getMessage().setBody(null);
+            return;
+        }
+
+        ClientExpandRequest request = new ClientExpandRequest()
+                ._object(object)
+                .relation(relation);
+        ClientExpandOptions options = new ClientExpandOptions();
+        applyModelAndConsistency(authorizer, options::authorizationModelId, options::consistency);
+
+        ClientExpandResponse response = authorizer.await(exchange, "expand " + relation + " on " + object,
+                () -> authorizer.getClient().expand(request, options));
+        exchange.getMessage().setBody(response.getTree());
+    }
+
+    /**
+     * Resolves one part of a read filter, keeping "never configured" and "configured but resolved to nothing" apart.
+     * <p/>
+     * Only an option the endpoint never set means "do not filter on this". An option that IS set and evaluates to blank
+     * - {@code user=${header.who}} on an exchange carrying no such header - is a failure to resolve, and dropping it
+     * would make the read WIDER than the route asked for: a filter meant to select one subject's tuples would instead
+     * return every tuple on the object, and the documented {@code readTuples -> deleteTuples} route would then revoke
+     * all of them. Widening a filter on a value that went missing is the read-side form of failing open, so it is
+     * refused. Same reasoning as {@link OpenFgaAuthorizer#hasConfiguredTuple()} on the write path.
+     */
+    private static String readFilterPart(boolean configured, String value, String option) {
+        if (!configured) {
+            return null;
+        }
+        String trimmed = trimmedOrNull(value);
+        if (trimmed == null) {
+            throw new IllegalArgumentException(
+                    option + " is configured for the readTuples operation but resolved to nothing on this exchange:"
+                                               + " dropping it would read more than was asked for, so it is refused rather than widened");
+        }
+        return trimmed;
+    }
+
+    private static String trimmedOrNull(String value) {
+        if (ObjectHelper.isEmpty(value)) {
+            return null;
+        }
+        String trimmed = value.trim();
+        return trimmed.isEmpty() ? null : trimmed;
+    }
+
+    /**
+     * Checks a read filter against what OpenFGA's Read API actually accepts, which is narrower than "every part is
+     * optional".
+     * <p/>
+     * Measured against OpenFGA 1.21.0: no filter at all reads the whole store, {@code object=document:} with a user or
+     * a full {@code object=document:budget} are accepted, and a filter of user alone, relation alone, or object type
+     * alone is rejected with an HTTP 400 reading <em>"the 'tuple_key' field was provided but the object type field is
+     * required and both the object id and user cannot be empty"</em>. Catching it here turns that into something that
+     * names the option to change.
+     * <p/>
+     * Note that the object is deliberately not put through {@link OpenFgaIdentifiers#validateTupleValue}: a type-only
+     * {@code document:} is a legitimate read filter and not a legitimate identifier, so the two have different rules.
+     */
+    private static void validateReadFilter(String user, String relation, String object) {
+        if (user == null && relation == null && object == null) {
+            return;
+        }
+        // only the parts that were actually given: here an unset part means "do not filter on this", which is the
+        // opposite of what it means on the write path, where reject() must still fire for a configured part that
+        // resolved to nothing
+        if (user != null) {
+            reject(OpenFgaIdentifiers.validateTupleValue(user), "user", user, false);
+        }
+        if (relation != null) {
+            reject(OpenFgaIdentifiers.validateRelation(relation), "relation", relation, false);
+        }
+        if (object == null) {
+            throw new IllegalArgumentException(
+                    "A readTuples filter must include object: OpenFGA requires an object type as soon as any filter is"
+                                               + " given. Use object=<type>: to filter on the type alone, or leave"
+                                               + " user, relation and object all unset to read the whole store");
+        }
+        int separator = object.indexOf(':');
+        if (separator <= 0) {
+            throw new IllegalArgumentException(
+                    "The object filter '" + object + "' must name a type, as in document: or document:budget");
+        }
+        if (separator == object.length() - 1 && user == null) {
+            throw new IllegalArgumentException(
+                    "A readTuples filter of object type alone is not enough for OpenFGA: give an object id"
+                                               + " (object=" + object + "<id>) or a user (user=<type>:<id>) alongside"
+                                               + " object=" + object);
+        }
+    }
+
+    /**
+     * Records the page token, and removes a token a previous exchange left behind when the server returned none -
+     * otherwise a route looping on the header would read the same final page for ever.
+     * <p/>
+     * Which of the two happens is the server's choice, not this component's, and the two read operations differ
+     * (measured against OpenFGA 1.21.0): the Read API returns an empty token on its last page, so the header really
+     * does disappear once readTuples is done; readChanges echoes the request's token back with an empty page instead,
+     * because a change log is a tailing cursor rather than a finite list - that token is the bookmark the next poll
+     * resumes from, so it is deliberately left in place and an empty body is what signals "up to date". Removing it
+     * there would break incremental sync rather than improve it.
+     */
+    private static void setContinuationToken(Exchange exchange, String token) {
+        if (ObjectHelper.isNotEmpty(token)) {
+            exchange.getMessage().setHeader(OpenFgaConstants.CONTINUATION_TOKEN, token);
+        } else {
+            exchange.getMessage().removeHeader(OpenFgaConstants.CONTINUATION_TOKEN);
+        }
+    }
+
+    /**
+     * Writes relationship tuples, granting access.
+     */
+    private void writeTuples(Exchange exchange, OpenFgaAuthorizer authorizer) throws Exception {
+        List<ClientTupleKey> tuples = new ArrayList<>();
+        for (Tuple tuple : resolveTuples(exchange, authorizer)) {
+            ClientTupleKey key = new ClientTupleKey().user(tuple.user).relation(tuple.relation)._object(tuple.object);
+            if (tuple.condition != null) {
+                // carry the relationship condition from the input; rebuilding the tuple from its three identity parts
+                // alone would store an unconditioned tuple in place of the conditioned one the route asked for
+                key.condition(tuple.condition);
+            }
+            tuples.add(key);
+        }
+        // the write options carry no authorizationModelId - unlike every query's options - so the model this writes
+        // against is the one pinned on the client, which OpenFgaClientFactory already set from the configuration
+        if (getEndpoint().getConfiguration().getOnDuplicate() == OpenFgaWriteConflictMode.ignore) {
+            ClientWriteTuplesOptions options
+                    = new ClientWriteTuplesOptions().onDuplicate(WriteRequestWrites.OnDuplicateEnum.IGNORE);
+            authorizer.await(exchange, "write " + tuples.size() + " tuple(s)",
+                    () -> authorizer.getClient().writeTuples(tuples, options));
+        } else {
+            authorizer.await(exchange, "write " + tuples.size() + " tuple(s)",
+                    () -> authorizer.getClient().writeTuples(tuples));
+        }
+        exchange.getMessage().setHeader(OpenFgaConstants.WRITTEN_TUPLES, tuples.size());
+    }
+
+    /**
+     * Deletes relationship tuples, revoking access.
+     */
+    private void deleteTuples(Exchange exchange, OpenFgaAuthorizer authorizer) throws Exception {
+        List<ClientTupleKeyWithoutCondition> tuples = new ArrayList<>();
+        for (Tuple tuple : resolveTuples(exchange, authorizer)) {
+            tuples.add(new ClientTupleKeyWithoutCondition()
+                    .user(tuple.user).relation(tuple.relation)._object(tuple.object));
+        }
+        if (getEndpoint().getConfiguration().getOnMissing() == OpenFgaWriteConflictMode.ignore) {
+            ClientDeleteTuplesOptions options
+                    = new ClientDeleteTuplesOptions().onMissing(WriteRequestDeletes.OnMissingEnum.IGNORE);
+            authorizer.await(exchange, "delete " + tuples.size() + " tuple(s)",
+                    () -> authorizer.getClient().deleteTuples(tuples, options));
+        } else {
+            authorizer.await(exchange, "delete " + tuples.size() + " tuple(s)",
+                    () -> authorizer.getClient().deleteTuples(tuples));
+        }
+        exchange.getMessage().setHeader(OpenFgaConstants.DELETED_TUPLES, tuples.size());
+    }
+
+    private void write(Exchange exchange, OpenFgaAuthorizer authorizer) throws Exception {
+        List<Tuple> writes;
+        List<Tuple> deletes;
+        if (authorizer.hasConfiguredTuple()) {
+            // The same configured-tuple precedence as writeTuples: a body never adds extra mutations to it.
+            writes = resolveTuples(exchange, authorizer);
+            deletes = List.of();
+        } else {
+            Object body = exchange.getMessage().getBody();
+            if (!(body instanceof Map<?, ?> map) || !Set.of("writes", "deletes").containsAll(map.keySet())) {
+                throw new IllegalArgumentException("write requires a Map containing writes and/or deletes collections");
+            }
+            writes = mutationTuples(map.get("writes"));
+            deletes = mutationTuples(map.get("deletes"));
+        }
+        int count = writes.size() + deletes.size();
+        if (count < 1 || count > 100) {
+            throw new IllegalArgumentException("write requires between 1 and 100 tuples across writes and deletes");
+        }
+        List<ClientTupleKey> writeKeys = new ArrayList<>(writes.size());
+        for (Tuple tuple : writes) {
+            ClientTupleKey key = new ClientTupleKey().user(tuple.user).relation(tuple.relation)._object(tuple.object);
+            if (tuple.condition != null) {
+                key.condition(tuple.condition);
+            }
+            writeKeys.add(key);
+        }
+        List<ClientTupleKeyWithoutCondition> deleteKeys = new ArrayList<>(deletes.size());
+        for (Tuple tuple : deletes) {
+            deleteKeys
+                    .add(new ClientTupleKeyWithoutCondition().user(tuple.user).relation(tuple.relation)._object(tuple.object));
+        }
+        OpenFgaConfiguration configuration = getEndpoint().getConfiguration();
+        ClientWriteOptions options = new ClientWriteOptions().transactions(true)
+                .onDuplicate(configuration.getOnDuplicate() == OpenFgaWriteConflictMode.ignore
+                        ? WriteRequestWrites.OnDuplicateEnum.IGNORE : WriteRequestWrites.OnDuplicateEnum.ERROR)
+                .onMissing(configuration.getOnMissing() == OpenFgaWriteConflictMode.ignore
+                        ? WriteRequestDeletes.OnMissingEnum.IGNORE : WriteRequestDeletes.OnMissingEnum.ERROR);
+        if (ObjectHelper.isNotEmpty(configuration.getAuthorizationModelId())) {
+            options.authorizationModelId(configuration.getAuthorizationModelId());
+        }
+        ClientWriteRequest request = new ClientWriteRequest().writes(writeKeys).deletes(deleteKeys);
+        authorizer.await(exchange, "write " + writes.size() + " and delete " + deletes.size() + " tuple(s)",
+                () -> authorizer.getClient().write(request, options));
+        exchange.getMessage().setHeader(OpenFgaConstants.WRITTEN_TUPLES, writes.size());
+        exchange.getMessage().setHeader(OpenFgaConstants.DELETED_TUPLES, deletes.size());
+    }
+
+    private static final Set<String> MUTATION_KEYS = Set.of("user", "relation", "object");
+    private static final Set<String> ALLOWED_MUTATION_KEYS
+            = Set.of("user", "relation", "object", "timestamp", "condition");
+
+    private List<Tuple> mutationTuples(Object value) {
+        if (value == null) {
+            return List.of();
+        }
+        if (!(value instanceof Collection<?> collection)) {
+            throw new IllegalArgumentException("write mutation lists must be collections of user, relation and object Maps");
+        }
+        if (collection.size() > 100) {
+            throw new IllegalArgumentException(
+                    "a single write mutation list cannot exceed 100 entries, the limit of one atomic write");
+        }
+        List<Tuple> tuples = new ArrayList<>(collection.size());
+        for (Object element : collection) {
+            // the shape readTuples returns, so a page of tuples can be revoked as it is: its timestamp is ignored
+            if (!(element instanceof Map<?, ?> map) || !map.keySet().containsAll(MUTATION_KEYS)
+                    || !ALLOWED_MUTATION_KEYS.containsAll(map.keySet())) {
+                throw new IllegalArgumentException(
+                        "write entries must be Maps with user, relation and object entries, and at most a condition or timestamp");
+            }
+            tuples.add(toTuple(map));
+        }
+        return tuples;
+    }
+
+    /**
+     * Collects the tuples to write or delete, from the body when it carries any and from the endpoint's
+     * {@code user}/{@code relation}/{@code object} otherwise - so a route that just created a resource can grant access
+     * to it without assembling a payload.
+     * <p/>
+     * A typed wildcard is accepted here, unlike on the check path: {@code user:*} is exactly how a resource is shared
+     * with everyone, and writing that tuple is a deliberate act by the route rather than something a caller chose.
+     */
+    private List<Tuple> resolveTuples(Exchange exchange, OpenFgaAuthorizer authorizer) throws InvalidPayloadException {
+        // The endpoint wins whenever it names a tuple at all. This is an authorization component, so the same rule
+        // that governs the check governs the write: the configuration decides and the message does not. Reading the
+        // body in preference would mean a route that unmarshals an untrusted payload hands the caller the choice of
+        // which relationship to grant - and "user:attacker owner document:secret" is a legitimate-looking tuple.
+        // asked of the configuration, not of what it evaluated to: user=${header.u} with no such header evaluates to
+        // null, and judging by the value would read that as "nothing configured" and go on to take the tuple from the
+        // body - the very override configuring a tuple is meant to prevent
+        if (authorizer.hasConfiguredTuple()) {
+            // a part that is configured but resolved to nothing, like a partly configured triple, is a mistake rather
+            // than an invitation to fill the rest in from the message, so validated() reports which part it was
+            return List.of(validated(new Tuple(
+                    authorizer.rawUser(exchange), authorizer.rawRelation(exchange), authorizer.rawObject(exchange),
+                    null), true));
+        }
+
+        List<Tuple> tuples = new ArrayList<>();
+        Object body = exchange.getMessage().getBody();
+        if (body instanceof Collection<?> collection) {
+            for (Object element : collection) {
+                tuples.add(toTuple(element));
+            }
+        } else if (body instanceof Map || body instanceof ClientTupleKeyWithoutCondition) {
+            tuples.add(toTuple(body));
+        } else {
+            // neither a payload nor a configured triple: there is nothing to write, and guessing is not an option
+            throw new InvalidPayloadException(exchange, Collection.class);
+        }
+        if (tuples.isEmpty()) {
+            // an empty collection asks for no tuples at all, which OpenFGA rejects; saying so here names the cause
+            throw new InvalidPayloadException(exchange, Collection.class);
+        }
+        return tuples;
+    }
+
+    private Tuple toTuple(Object element) {
+        if (element instanceof ClientTupleKeyWithoutCondition key) {
+            // getCondition() lives on the ClientTupleKey subtype only, so a tuple that carries a relationship
+            // condition arrives here as the supertype; read the condition when the concrete type has one
+            ClientRelationshipCondition condition
+                    = key instanceof ClientTupleKey conditioned ? conditioned.getCondition() : null;
+            return validated(new Tuple(key.getUser(), key.getRelation(), key.getObject(), condition), false);
+        }
+        if (element instanceof Map<?, ?> map) {
+            return validated(new Tuple(
+                    stringValue(map, "user"), stringValue(map, "relation"), stringValue(map, "object"),
+                    toCondition(map.get("condition"))), false);
+        }
+        throw new IllegalArgumentException(
+                "A relationship tuple must be a Map with user, relation and object entries, or a ClientTupleKey, but was "
+                                           + (element == null ? "null" : element.getClass().getName()));
+    }
+
+    /**
+     * Rejects a tuple the component would otherwise send with a blank or malformed part. OpenFGA would reject it too,
+     * but naming the offending part here is the difference between a fixable message and a validation error from the
+     * server that does not say which of the tuples in the batch was at fault.
+     */
+    private Tuple validated(Tuple tuple, boolean fromConfiguration) {
+        reject(OpenFgaIdentifiers.validateTupleValue(tuple.user), "user", tuple.user, fromConfiguration);
+        reject(OpenFgaIdentifiers.validateRelation(tuple.relation), "relation", tuple.relation, fromConfiguration);
+        reject(OpenFgaIdentifiers.validateTupleValue(tuple.object), "object", tuple.object, fromConfiguration);
+        return tuple;
+    }
+
+    private static void reject(String reason, String what, String value, boolean fromConfiguration) {
+        if (reason == null) {
+            return;
+        }
+        if (value == null || value.isEmpty()) {
+            // distinct from a malformed value, because the cause and the remedy differ - and distinct between the two
+            // sources, because pointing at the configuration when the tuple came from the body sends the reader to
+            // the wrong place entirely
+            throw new IllegalArgumentException(
+                    fromConfiguration
+                            ? "The " + what + " configured for this relationship tuple resolved to nothing;"
+                              + " a configured tuple is never completed from the message body"
+                            : "A relationship tuple in the message body has no " + what);
+        }
+        throw new IllegalArgumentException(
+                "A relationship tuple has an unusable " + what + " (" + reason + "): '" + value + "'");
+    }
+
+    private static String stringValue(Map<?, ?> map, String key) {
+        Object value = map.get(key);
+        return value != null ? value.toString().trim() : null;
+    }
+
+    /**
+     * Builds the relationship condition a write should carry from the way the body expressed it: an SDK
+     * {@link ClientRelationshipCondition} as is, or a {@code Map} of {@code name} and {@code context} - the shape
+     * {@link #readTuples} and {@link #readChanges} project a stored condition as, so a route can feed one straight
+     * back. A body with no condition keeps writing an unconditioned tuple.
+     */
+    private static ClientRelationshipCondition toCondition(Object raw) {
+        if (raw == null) {
+            return null;
+        }
+        if (raw instanceof ClientRelationshipCondition condition) {
+            return condition;
+        }
+        if (raw instanceof Map<?, ?> map) {
+            String name = stringValue(map, "name");
+            if (ObjectHelper.isEmpty(name)) {
+                throw new IllegalArgumentException(
+                        "A relationship tuple condition must name a condition, but the condition entry had no name");
+            }
+            ClientRelationshipCondition condition = new ClientRelationshipCondition().name(name);
+            Object context = map.get("context");
+            if (context != null) {
+                condition.context(context);
+            }
+            return condition;
+        }
+        throw new IllegalArgumentException(
+                "A relationship tuple condition must be a Map with name and context entries or a"
+                                           + " ClientRelationshipCondition, but was " + raw.getClass().getName());
+    }
+
+    /**
+     * Projects a stored condition the server returned as a {@code Map} of {@code name} and {@code context}, mirroring
+     * how {@code operation} is projected as a {@code String} rather than an SDK type, so the read body marshals without
+     * a custom serializer and a route can round-trip it back into a write.
+     */
+    private static Map<String, Object> conditionAsMap(RelationshipCondition condition) {
+        Map<String, Object> projected = new LinkedHashMap<>();
+        projected.put("name", condition.getName());
+        projected.put("context", condition.getContext());
+        return projected;
+    }
+
+    /**
+     * Reads the objects a {@code batchCheck} should cover out of the body, accepting a collection or a single
+     * comma-separated value.
+     */
+    private List<String> bodyAsList(Exchange exchange) throws InvalidPayloadException {
+        Object body = exchange.getMessage().getBody();
+        if (body instanceof Collection<?> collection) {
+            List<String> objects = new ArrayList<>(collection.size());
+            for (Object element : collection) {
+                if (element != null) {
+                    objects.add(element.toString().trim());
+                }
+            }
+            return objects;
+        }
+        if (body instanceof Map) {
+            // a Map is the shape of a single relationship tuple (what writeTuples/deleteTuples accept), not a list of
+            // objects; converting it to a String would split its toString and send the pieces as objects, which
+            // OpenFGA rejects with an HTTP 400 that fails the whole exchange (CAMEL-26197)
+            throw new IllegalArgumentException(
+                    "batchCheck expects the objects to check as a List or a comma-separated String, but the body was a"
+                                               + " Map; pass the object identifiers as a List<String>");
+        }
+        String text = exchange.getMessage().getBody(String.class);
+        if (ObjectHelper.isEmpty(text)) {
+            throw new InvalidPayloadException(exchange, Collection.class);
+        }
+        return splitToList(text);
+    }
+
+    private List<UserTypeFilter> userFilters() {
+        String configured = getEndpoint().getConfiguration().getUserFilters();
+        List<String> entries = splitToList(ObjectHelper.isNotEmpty(configured) ? configured : DEFAULT_USER_FILTER);
+        List<UserTypeFilter> filters = new ArrayList<>(entries.size());
+        for (String entry : entries) {
+            UserTypeFilter filter = new UserTypeFilter();
+            int hash = entry.indexOf('#');
+            if (hash > 0) {
+                filter.type(entry.substring(0, hash)).relation(entry.substring(hash + 1));
+            } else {
+                filter.type(entry);
+            }
+            filters.add(filter);
+        }
+        return filters;
+    }
+
+    /**
+     * Renders one entry of a {@code listUsers} answer as an identifier, so the body is a list of strings a route can
+     * use rather than a list of SDK objects. OpenFGA answers with a concrete subject, a userset or a typed wildcard,
+     * and each has its own textual form.
+     */
+    private static String toIdentifier(User user) {
+        if (user.getObject() != null) {
+            return user.getObject().getType() + ":" + user.getObject().getId();
+        }
+        if (user.getUserset() != null) {
+            return user.getUserset().getType() + ":" + user.getUserset().getId() + "#" + user.getUserset().getRelation();
+        }
+        if (user.getWildcard() != null) {
+            return user.getWildcard().getType() + ":*";
+        }
+        return null;
+    }
+
+    private static FgaObject toFgaObject(String object) {
+        int separator = object.indexOf(':');
+        return new FgaObject().type(object.substring(0, separator)).id(object.substring(separator + 1));
+    }
+
+    private static List<String> splitToList(String value) {
+        List<String> values = new ArrayList<>();
+        if (ObjectHelper.isEmpty(value)) {
+            return values;
+        }
+        for (String element : value.split(",")) {
+            String trimmed = element.trim();
+            if (!trimmed.isEmpty()) {
+                values.add(trimmed);
+            }
+        }
+        return values;
+    }
+
+    /**
+     * Applies the resolved contextual tuples and the condition context to a request.
+     * <p/>
+     * Each request type names these differently - {@code contextualTuples} on a check, {@code contextualTupleKeys} on
+     * the list operations - and they share no supertype, so the setters are passed in rather than the request.
+     */
+    private static void applyContext(
+            Consumer<List<ClientTupleKey>> contextualTuples, Consumer<Object> context,
+            List<ClientTupleKey> resolved, OpenFgaAuthorizer authorizer) {
+        if (!resolved.isEmpty()) {
+            contextualTuples.accept(resolved);
+        }
+        Map<String, Object> conditionContext = authorizer.getConditionContext();
+        if (conditionContext != null && !conditionContext.isEmpty()) {
+            context.accept(conditionContext);
+        }
+    }
+
+    /**
+     * Applies the pinned authorization model and the configured consistency to whichever options object the operation
+     * uses; the SDK gives each operation its own type with no common supertype to set them through.
+     */
+    private void applyModelAndConsistency(
+            OpenFgaAuthorizer authorizer, Consumer<String> model, Consumer<ConsistencyPreference> consistency) {
+        if (ObjectHelper.isNotEmpty(getEndpoint().getConfiguration().getAuthorizationModelId())) {
+            model.accept(getEndpoint().getConfiguration().getAuthorizationModelId());
+        }
+        if (authorizer.getConsistency() != null) {
+            consistency.accept(authorizer.getConsistency());
+        }
+    }
+
+    /**
+     * A relationship tuple on its way to OpenFGA, before it is turned into whichever SDK type the operation needs. The
+     * condition is optional and only the write path carries it; a delete is by identity and ignores it.
+     */
+    private static final class Tuple {
+        private final String user;
+        private final String relation;
+        private final String object;
+        private final ClientRelationshipCondition condition;
+
+        private Tuple(String user, String relation, String object, ClientRelationshipCondition condition) {
+            this.user = user;
+            this.relation = relation;
+            this.object = object;
+            this.condition = condition;
+        }
+    }
+}

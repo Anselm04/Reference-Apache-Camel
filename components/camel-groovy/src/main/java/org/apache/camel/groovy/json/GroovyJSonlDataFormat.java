@@ -1,0 +1,105 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.camel.groovy.json;
+
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.OutputStream;
+import java.util.Collection;
+import java.util.Map;
+
+import groovy.json.JsonOutput;
+import groovy.json.JsonSlurper;
+import groovy.util.Node;
+import org.apache.camel.Exchange;
+import org.apache.camel.spi.BodyType;
+import org.apache.camel.spi.BodyType.Carrier;
+import org.apache.camel.spi.BodyTypes;
+import org.apache.camel.spi.DataFormat;
+import org.apache.camel.spi.DataFormatName;
+import org.apache.camel.spi.annotations.Dataformat;
+import org.apache.camel.support.ExchangeHelper;
+import org.apache.camel.support.service.ServiceSupport;
+
+@Dataformat("groovyJson")
+@BodyTypes(marshalIn = @BodyType(value = {
+        Carrier.TEXT, Carrier.BYTES, Carrier.STREAM, Carrier.FILE, Carrier.MAP,
+        Carrier.LIST, Carrier.POJO },
+                                 description = "A Map, a List, a Groovy Node or a Jackson JsonNode to write as JSON. Text,"
+                                               + " bytes, a stream or a file is written as it is"),
+           marshalOut = @BodyType(value = Carrier.STREAM, format = "json",
+                                  description = "The JSON in the stream cache, or a byte array when stream caching is off"),
+           unmarshalIn = @BodyType(value = { Carrier.TEXT, Carrier.BYTES, Carrier.STREAM, Carrier.FILE }, format = "json"),
+           unmarshalOut = @BodyType(value = { Carrier.MAP, Carrier.LIST },
+                                    description = "A Map (Groovy LazyMap) for a JSON object, a List (ArrayList) for an array"))
+public class GroovyJSonlDataFormat extends ServiceSupport implements DataFormat, DataFormatName {
+
+    private boolean prettyPrint = true;
+
+    public boolean isPrettyPrint() {
+        return prettyPrint;
+    }
+
+    public void setPrettyPrint(boolean prettyPrint) {
+        this.prettyPrint = prettyPrint;
+    }
+
+    @Override
+    public void marshal(Exchange exchange, Object graph, OutputStream stream) throws Exception {
+        if (graph instanceof Node n) {
+            graph = NodeToJsonHelper.nodeToJson(n);
+        }
+        if (graph instanceof Map || graph instanceof Collection) {
+            // a collection is written as a JSON array, as JsonOutput does
+            serialize(exchange, graph, stream);
+        } else {
+            // optional jackson 2.x or 3.x support
+            String type = graph.getClass().getName();
+            if (type.startsWith("com.fasterxml.jackson.databind") || type.startsWith("tools.jackson.databind")) {
+                var map = exchange.getContext().getTypeConverter().convertTo(Map.class, exchange, graph);
+                serialize(exchange, map, stream);
+            } else {
+                byte[] arr = exchange.getContext().getTypeConverter().mandatoryConvertTo(byte[].class, exchange, graph);
+                stream.write(arr);
+            }
+        }
+    }
+
+    @Override
+    public Object unmarshal(Exchange exchange, InputStream stream) throws Exception {
+        JsonSlurper parser = new JsonSlurper();
+        return parser.parse(stream);
+    }
+
+    @Override
+    public String getDataFormatName() {
+        return "groovyJson";
+    }
+
+    private void serialize(Exchange exchange, Object value, OutputStream stream) throws IOException {
+        String out = prettyPrint ? toPrettyJson(value) : JsonOutput.toJson(value);
+        stream.write(out.getBytes(ExchangeHelper.getCharset(exchange, true)));
+    }
+
+    /**
+     * Renders the value with the layout of {@link JsonOutput#prettyPrint(String)} in a single pass, instead of
+     * generating compact JSON and lexing it again.
+     */
+    static String toPrettyJson(Object value) {
+        return new PrettyJsonGenerator().toJson(value);
+    }
+}

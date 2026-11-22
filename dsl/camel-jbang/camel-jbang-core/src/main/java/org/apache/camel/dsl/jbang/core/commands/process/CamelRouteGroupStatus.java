@@ -1,0 +1,344 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.camel.dsl.jbang.core.commands.process;
+
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Comparator;
+import java.util.Iterator;
+import java.util.List;
+import java.util.Map;
+import java.util.stream.Collectors;
+
+import com.github.freva.asciitable.AsciiTable;
+import com.github.freva.asciitable.Column;
+import com.github.freva.asciitable.HorizontalAlign;
+import com.github.freva.asciitable.OverflowBehaviour;
+import org.aesh.command.CommandDefinition;
+import org.aesh.command.option.Argument;
+import org.aesh.command.option.Option;
+import org.aesh.command.option.OptionList;
+import org.apache.camel.dsl.jbang.core.common.CompletionCandidates;
+import org.apache.camel.dsl.jbang.core.common.ListingFormat;
+import org.apache.camel.dsl.jbang.core.common.ProcessHelper;
+import org.apache.camel.dsl.jbang.core.common.RowSort;
+import org.apache.camel.support.PatternHelper;
+import org.apache.camel.util.TimeUtils;
+import org.apache.camel.util.json.JsonArray;
+import org.apache.camel.util.json.JsonObject;
+import org.apache.camel.util.json.Jsoner;
+
+@CommandDefinition(name = "group", description = "Get status of Camel route groups", generateHelp = true,
+                   footer = {
+                           "Examples:",
+                           "  camel get route-group",
+                           "  camel get route-group --watch" })
+public class CamelRouteGroupStatus extends ProcessWatchCommand {
+
+    private static final RowSort<Row> ORDER = new RowSort<Row>()
+            .number("pid", r -> r.pid)
+            .text("name", r -> r.name)
+            .text("group", r -> r.group)
+            // the uptime of a route group is how long it runs: the oldest first, as the other listings (CAMEL-26929)
+            .numeric("age", r -> -r.uptime);
+
+    public static class PidNameAgeGroupCompletionCandidates extends CompletionCandidates {
+
+        public PidNameAgeGroupCompletionCandidates() {
+        }
+
+        @Override
+        public Iterator<String> iterator() {
+            return List.of("pid", "name", "age", "group").iterator();
+        }
+
+    }
+
+    @Argument(description = "Name or pid of running Camel integration")
+    String name = "*";
+
+    @Option(name = "sort", description = "Sort by pid, name, age or group", defaultValue = "pid",
+            completer = PidNameAgeGroupCompletionCandidates.class)
+    String sort;
+
+    @Option(name = "limit", description = "Filter groups by limiting to the given number of rows")
+    int limit;
+
+    @Option(name = "filter-mean", description = "Filter groups that must be slower than the given time (ms)")
+    long mean;
+
+    @Option(name = "running", hasValue = false, description = "Only include running groups")
+    boolean running;
+
+    @OptionList(name = "filter", valueSeparator = OptionList.NO_SEPARATOR, description = "Filter groups by name")
+    String[] filter;
+
+    @Override
+    public Integer doProcessWatchCall() throws Exception {
+        List<Row> rows = new ArrayList<>();
+
+        forEachIntegration(name, (ph, root) -> {
+            JsonObject context = (JsonObject) root.get("context");
+            if (context == null) {
+                return;
+            }
+            JsonArray array = (JsonArray) root.get("routeGroups");
+            if (array == null) {
+                return;
+            }
+            for (int i = 0; i < array.size(); i++) {
+                JsonObject o = (JsonObject) array.get(i);
+                Row row = new Row();
+                row.name = context.getString("name");
+                if ("CamelJBang".equals(row.name)) {
+                    row.name = ProcessHelper.extractName(root, ph);
+                }
+                row.pid = Long.toString(ph.pid());
+                row.group = o.getString("group");
+                row.size = o.getInteger("size");
+                row.routeIds = o.getCollection("routeIds");
+                row.state = o.getString("state");
+                row.age = o.getString("uptime");
+                row.uptime = row.age != null ? TimeUtils.toMilliSeconds(row.age) : 0;
+                Map<String, ?> stats = o.getMap("statistics");
+                if (stats != null) {
+                    Object load = stats.get("load01");
+                    if (load != null) {
+                        row.load01 = load.toString();
+                    }
+                    load = stats.get("load05");
+                    if (load != null) {
+                        row.load05 = load.toString();
+                    }
+                    load = stats.get("load15");
+                    if (load != null) {
+                        row.load15 = load.toString();
+                    }
+                    Object thp = stats.get("exchangesThroughput");
+                    if (thp != null) {
+                        row.throughput = thp.toString();
+                    }
+                    Object coverage = stats.get("coverage");
+                    if (coverage != null) {
+                        row.coverage = coverage.toString();
+                    }
+                    row.total = stats.get("exchangesTotal").toString();
+                    row.inflight = stats.get("exchangesInflight").toString();
+                    row.failed = stats.get("exchangesFailed").toString();
+                    row.mean = stats.get("meanProcessingTime").toString();
+                    if ("-1".equals(row.mean)) {
+                        row.mean = null;
+                    }
+                    row.max = stats.get("maxProcessingTime").toString();
+                    row.min = stats.get("minProcessingTime").toString();
+                    Object last = stats.get("lastProcessingTime");
+                    if (last != null) {
+                        row.last = last.toString();
+                    }
+                    last = stats.get("deltaProcessingTime");
+                    if (last != null) {
+                        row.delta = last.toString();
+                    }
+                    last = stats.get("lastCreatedExchangeTimestamp");
+                    if (last != null) {
+                        long time = Long.parseLong(last.toString());
+                        row.sinceLastStarted = TimeUtils.printSince(time);
+                    }
+                    last = stats.get("lastCompletedExchangeTimestamp");
+                    if (last != null) {
+                        long time = Long.parseLong(last.toString());
+                        row.sinceLastCompleted = TimeUtils.printSince(time);
+                    }
+                    last = stats.get("lastFailedExchangeTimestamp");
+                    if (last != null) {
+                        long time = Long.parseLong(last.toString());
+                        row.sinceLastFailed = TimeUtils.printSince(time);
+                    }
+                }
+
+                boolean add = true;
+                if (mean > 0 && (row.mean == null || Long.parseLong(row.mean) < mean)) {
+                    add = false;
+                }
+                if (add && filter != null) {
+                    boolean match = false;
+                    for (String f : filter) {
+                        if (!match) {
+                            match = PatternHelper.matchPattern(row.group, f);
+                        }
+                    }
+                    if (!match) {
+                        add = false;
+                    }
+                }
+                if (add && running) {
+                    add = "Started".equals(row.state);
+                }
+                if (add) {
+                    rows.add(row);
+                }
+            }
+        });
+
+        // sort rows
+        rows.sort(order());
+
+        if (limit > 0 && rows.size() > limit) {
+            rows.subList(limit, rows.size()).clear();
+        }
+
+        if (!rows.isEmpty() || jsonOutput) {
+            printTable(rows);
+        }
+
+        return 0;
+    }
+
+    protected void printTable(List<Row> rows) {
+        if (jsonOutput) {
+            printer().println(Jsoner.serialize(rows.stream().map(this::toJson).collect(Collectors.toList())));
+            return;
+        }
+        printer().println(AsciiTable.getTable(AsciiTable.NO_BORDERS, rows, Arrays.asList(
+                new Column().header("PID").headerAlign(HorizontalAlign.CENTER).with(r -> r.pid),
+                new Column().header("NAME").dataAlign(HorizontalAlign.LEFT).maxWidth(30, OverflowBehaviour.ELLIPSIS_RIGHT)
+                        .with(r -> r.name),
+                new Column().header("GROUP").dataAlign(HorizontalAlign.LEFT)
+                        .maxWidth(20, OverflowBehaviour.ELLIPSIS_RIGHT)
+                        .with(this::getGroup),
+                new Column().header("ROUTES").dataAlign(HorizontalAlign.RIGHT).headerAlign(HorizontalAlign.CENTER)
+                        .with(r -> "" + r.size),
+                new Column().header("STATUS").dataAlign(HorizontalAlign.LEFT).headerAlign(HorizontalAlign.CENTER)
+                        .with(r -> r.state),
+                new Column().header("AGE").headerAlign(HorizontalAlign.CENTER).with(r -> r.age),
+                new Column().header("COVER").with(this::getCoverage),
+                new Column().header("MSG/S").with(this::getThroughput),
+                new Column().header("TOTAL").with(this::getTotal),
+                new Column().header("FAIL").with(this::getFailed),
+                new Column().header("INFLIGHT").with(this::getInflight),
+                new Column().header("MEAN").with(r -> r.mean),
+                new Column().header("MIN").with(r -> r.min),
+                new Column().header("MAX").with(r -> r.max),
+                new Column().header("LAST").with(r -> r.last),
+                new Column().header("DELTA").with(this::getDelta),
+                new Column().header("SINCE-LAST").with(this::getSinceLast))));
+    }
+
+    /**
+     * A row in JSON mode.
+     */
+    protected JsonObject toJson(Row r) {
+        JsonObject jo = new JsonObject();
+        jo.put("pid", JsonValues.pid(r.pid));
+        jo.put("name", r.name);
+        jo.put("group", getGroup(r));
+        jo.put("routes", r.size);
+        jo.put("status", r.state);
+        jo.put("age", r.age);
+        jo.put("uptime", r.uptime);
+        jo.put("coverage", JsonValues.text(getCoverage(r)));
+        jo.put("throughput", JsonValues.decimal(r.throughput));
+        jo.put("total", JsonValues.number(r.total));
+        jo.put("failed", JsonValues.number(r.failed));
+        jo.put("inflight", JsonValues.number(r.inflight));
+        // processing times in millis
+        jo.put("mean", JsonValues.number(r.mean));
+        jo.put("min", JsonValues.number(r.min));
+        jo.put("max", JsonValues.number(r.max));
+        jo.put("last", JsonValues.number(r.last));
+        jo.put("delta", JsonValues.number(r.delta));
+        jo.put("sinceLastStarted", JsonValues.text(r.sinceLastStarted));
+        jo.put("sinceLastCompleted", JsonValues.text(r.sinceLastCompleted));
+        jo.put("sinceLastFailed", JsonValues.text(r.sinceLastFailed));
+        return jo;
+    }
+
+    /**
+     * The order of the rows by the --sort option.
+     */
+    protected Comparator<Row> order() {
+        return ORDER.comparator(sort);
+    }
+
+    protected String getSinceLast(Row r) {
+        return ListingFormat.sinceLast(r.sinceLastStarted, r.sinceLastCompleted, r.sinceLastFailed);
+    }
+
+    protected String getThroughput(Row r) {
+        String s = r.throughput;
+        if (s == null || s.isEmpty()) {
+            s = "";
+        }
+        return s;
+    }
+
+    protected String getCoverage(Row r) {
+        String s = r.coverage;
+        if (s == null || s.isEmpty()) {
+            s = "";
+        }
+        return s;
+    }
+
+    protected String getGroup(Row r) {
+        return r.group;
+    }
+
+    protected String getDelta(Row r) {
+        return ListingFormat.delta(r.delta);
+    }
+
+    protected String getTotal(Row r) {
+        return r.total;
+    }
+
+    protected String getFailed(Row r) {
+        return r.failed;
+    }
+
+    protected String getInflight(Row r) {
+        return r.inflight;
+    }
+
+    static class Row {
+        String pid;
+        String name;
+        long uptime;
+        String group;
+        int size;
+        List<String> routeIds;
+        String state;
+        String age;
+        String coverage;
+        String throughput;
+        String total;
+        String failed;
+        String inflight;
+        String mean;
+        String max;
+        String min;
+        String last;
+        String delta;
+        String sinceLastStarted;
+        String sinceLastCompleted;
+        String sinceLastFailed;
+        String load01;
+        String load05;
+        String load15;
+    }
+
+}

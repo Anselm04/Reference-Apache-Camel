@@ -1,0 +1,363 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.camel.component.olingo4;
+
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.Iterator;
+import java.util.Map;
+import java.util.Set;
+
+import org.apache.camel.Category;
+import org.apache.camel.Consumer;
+import org.apache.camel.Processor;
+import org.apache.camel.Producer;
+import org.apache.camel.component.olingo4.internal.Olingo4ApiCollection;
+import org.apache.camel.component.olingo4.internal.Olingo4ApiName;
+import org.apache.camel.component.olingo4.internal.Olingo4Constants;
+import org.apache.camel.component.olingo4.internal.Olingo4PropertiesHelper;
+import org.apache.camel.spi.BodyType;
+import org.apache.camel.spi.BodyType.Carrier;
+import org.apache.camel.spi.BodyTypes;
+import org.apache.camel.spi.EndpointServiceLocation;
+import org.apache.camel.spi.ExtendedPropertyConfigurerGetter;
+import org.apache.camel.spi.PropertyConfigurer;
+import org.apache.camel.spi.UriEndpoint;
+import org.apache.camel.spi.UriParam;
+import org.apache.camel.support.PluginHelper;
+import org.apache.camel.support.PropertyBindingSupport;
+import org.apache.camel.support.component.AbstractApiEndpoint;
+import org.apache.camel.support.component.ApiMethod;
+import org.apache.camel.support.component.ApiMethodPropertiesHelper;
+import org.apache.camel.util.CaseInsensitiveMap;
+
+/**
+ * Communicate with OData 4.0 services using Apache Olingo OData API.
+ */
+@UriEndpoint(firstVersion = "2.19.0", scheme = "olingo4", title = "Olingo4", syntax = "olingo4:apiName/methodName",
+             apiSyntax = "apiName/methodName",
+             category = { Category.CLOUD }, headersClass = Olingo4Constants.class)
+@BodyTypes(consumerOut = @BodyType(value = { Carrier.POJO, Carrier.VALUE },
+                                   byOption = {
+                                           @BodyType.When(option = "methodName", value = "uread",
+                                                          carriers = Carrier.STREAM) },
+                                   description = "The result of read for the resourcePath, as in the producer: an entity"
+                                                 + " set is split into one message per ClientEntity and a collection"
+                                                 + " property into one message per ClientValue; with splitResult=false the"
+                                                 + " ClientEntitySet or the ClientCollectionValue comes in one message. With"
+                                                 + " filterAlreadySeen only the entities or values not read before come. uread"
+                                                 + " gives the response unparsed as a stream"),
+           producerIn = @BodyType(value = { Carrier.POJO, Carrier.TEXT }, dependsOn = "inBody",
+                                  byOption = {
+                                          @BodyType.When(option = "methodName", value = "read", carriers = Carrier.ANY),
+                                          @BodyType.When(option = "methodName", value = "uread", carriers = Carrier.ANY),
+                                          @BodyType.When(option = "methodName", value = "delete", carriers = Carrier.ANY),
+                                          @BodyType.When(option = "methodName", value = "action",
+                                                         carriers = { Carrier.POJO, Carrier.TEXT, Carrier.NULL }),
+                                          @BodyType.When(option = "methodName", value = "batch",
+                                                         carriers = Carrier.LIST) },
+                                  description = "create, update, patch, merge and action send the body as their data,"
+                                                + " passed as it is without type conversion: a ClientEntity, or the entity"
+                                                + " as JSON text, which is sent as application/json. A Map, bytes or a"
+                                                + " stream fails: convertBodyTo String for JSON in bytes or a stream. An action may have no body,"
+                                                + " and batch takes a List of Olingo4BatchRequest. read, uread and delete"
+                                                + " do not use the body"),
+           producerOut = @BodyType(value = { Carrier.POJO, Carrier.VALUE },
+                                   byOption = {
+                                           @BodyType.When(option = "methodName", value = "uread",
+                                                          carriers = Carrier.STREAM),
+                                           @BodyType.When(option = "methodName", value = "delete",
+                                                          carriers = Carrier.VALUE),
+                                           @BodyType.When(option = "methodName", value = "batch",
+                                                          carriers = Carrier.LIST),
+                                           @BodyType.When(option = "filterAlreadySeen", value = "true",
+                                                          carriers = { Carrier.POJO, Carrier.VALUE, Carrier.NULL }) },
+                                   description = "read gives the Olingo client object of the resource: a ClientEntitySet,"
+                                                 + " a ClientEntity, the Edm of $metadata or the ClientServiceDocument; a"
+                                                 + " ClientPrimitiveValue, ClientComplexValue or ClientCollectionValue for a"
+                                                 + " property or $value, and a Long for $count. uread gives the response as"
+                                                 + " a stream. create, update, patch, merge and action give the ClientEntity"
+                                                 + " of the response, or the HttpStatusCode when it has no content, as delete"
+                                                 + " does; batch gives a List of Olingo4BatchResponse. With"
+                                                 + " filterAlreadySeen, a result read before is null, and an entity set or"
+                                                 + " a collection value keeps only the entities or values not read before"))
+@Deprecated(since = "4.18")
+public class Olingo4Endpoint extends AbstractApiEndpoint<Olingo4ApiName, Olingo4Configuration>
+        implements EndpointServiceLocation {
+
+    protected static final String RESOURCE_PATH_PROPERTY = "resourcePath";
+    protected static final String RESPONSE_HANDLER_PROPERTY = "responseHandler";
+    protected static final String SERVICE_URI_PROPERTY = "serviceUri";
+    protected static final String FILTER_ALREADY_SEEN = "filterAlreadySeen";
+
+    private static final String KEY_PREDICATE_PROPERTY = "keyPredicate";
+    private static final String QUERY_PARAMS_PROPERTY = "queryParams";
+    private static final String ENDPOINT_HTTP_HEADERS_PROPERTY = "endpointHttpHeaders";
+
+    private static final String READ_METHOD = "read";
+    private static final String EDM_PROPERTY = "edm";
+    private static final String DATA_PROPERTY = "data";
+    private static final String DELETE_METHOD = "delete";
+
+    // unparsed variants
+    private static final String UREAD_METHOD = "uread";
+
+    private Set<String> olingo4endpointPropertyNames;
+
+    @UriParam
+    private Olingo4Configuration configuration;
+
+    private Olingo4AppWrapper apiProxy;
+
+    public Olingo4Endpoint(String uri, Olingo4Component component, Olingo4ApiName apiName, String methodName,
+                           Olingo4Configuration endpointConfiguration) {
+        super(uri, component, apiName, methodName, Olingo4ApiCollection.getCollection().getHelper(apiName),
+              endpointConfiguration);
+        this.configuration = endpointConfiguration;
+    }
+
+    @Override
+    public String getServiceUrl() {
+        return configuration.getServiceUri();
+    }
+
+    @Override
+    public String getServiceProtocol() {
+        return "odata";
+    }
+
+    @Override
+    public Producer createProducer() throws Exception {
+        return new Olingo4Producer(this);
+    }
+
+    @Override
+    public Consumer createConsumer(Processor processor) throws Exception {
+        // make sure inBody is not set for consumers
+        if (inBody != null) {
+            throw new IllegalArgumentException("Option inBody is not supported for consumer endpoint");
+        }
+        // only read method is supported
+        if (!READ_METHOD.equals(methodName) && !UREAD_METHOD.equals(methodName)) {
+            throw new IllegalArgumentException("Only read method is supported for consumer endpoints");
+        }
+        final Olingo4Consumer consumer = new Olingo4Consumer(this, processor);
+        consumer.setSplitResult(configuration.isSplitResult());
+        configureConsumer(consumer);
+        return consumer;
+    }
+
+    @Override
+    protected ApiMethodPropertiesHelper<Olingo4Configuration> getPropertiesHelper() {
+        return Olingo4PropertiesHelper.getHelper(getCamelContext());
+    }
+
+    @Override
+    protected String getThreadProfileName() {
+        return Olingo4Constants.THREAD_PROFILE_NAME;
+    }
+
+    @Override
+    public void configureProperties(Map<String, Object> options) {
+        // filter out options that are with $ as they are for query
+        Map<String, Object> query = new CaseInsensitiveMap();
+        Map<String, Object> known = new CaseInsensitiveMap();
+        options.forEach((k, v) -> {
+            if (k.startsWith("$")) {
+                query.put(k, v);
+            } else {
+                known.put(k, v);
+            }
+        });
+        options.keySet().removeIf(known::containsKey);
+
+        // configure endpoint first (from the known options) and then specialized configuration class afterwards
+        PropertyConfigurer configurer = getComponent().getEndpointPropertyConfigurer();
+        if (configurer instanceof ExtendedPropertyConfigurerGetter) {
+            ExtendedPropertyConfigurerGetter getter = (ExtendedPropertyConfigurerGetter) configurer;
+            for (String name : getter.getAllOptions(this).keySet()) {
+                if (known.containsKey(name)) {
+                    Object value = known.get(name);
+                    boolean hit = configurer.configure(getCamelContext(), this, name, value, true);
+                    if (hit) {
+                        known.remove(name);
+                    }
+                }
+            }
+        }
+        // configure on configuration first to be reflection free
+        configurer = PluginHelper.getConfigurerResolver(getCamelContext())
+                .resolvePropertyConfigurer(configuration.getClass().getName(), getCamelContext());
+        if (configurer != null) {
+            PropertyBindingSupport.build()
+                    .withConfigurer(configurer)
+                    .withIgnoreCase(true)
+                    .withTarget(configuration)
+                    .withCamelContext(getCamelContext())
+                    .withProperties(known)
+                    .withRemoveParameters(true)
+                    .bind();
+        }
+        super.configureProperties(known);
+        if (!known.isEmpty()) {
+            // handle individual query params
+            query.putAll(known);
+        }
+        // and remove from original options as it was used by query
+        options.keySet().removeIf(query::containsKey);
+        // this will parse query and expand these $ keys into the actual query keys
+        parseQueryParams(query);
+        // and restore back to options
+        options.putAll(query);
+    }
+
+    @Override
+    protected void afterConfigureProperties() {
+        olingo4endpointPropertyNames
+                = new HashSet<>(getPropertiesHelper().getValidEndpointProperties(getCamelContext(), configuration));
+        olingo4endpointPropertyNames.add(EDM_PROPERTY);
+        olingo4endpointPropertyNames.add(ENDPOINT_HTTP_HEADERS_PROPERTY);
+        olingo4endpointPropertyNames.add(SERVICE_URI_PROPERTY);
+        olingo4endpointPropertyNames.add(FILTER_ALREADY_SEEN);
+
+        // set default inBody
+        if (!(READ_METHOD.equals(methodName) || DELETE_METHOD.equals(methodName) || UREAD_METHOD.equals(methodName))
+                && inBody == null) {
+            inBody = DATA_PROPERTY;
+        }
+        createProxy();
+    }
+
+    @Override
+    public Object getApiProxy(ApiMethod method, Map<String, Object> args) {
+        lock.lock();
+        try {
+            return apiProxy.getOlingo4App();
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    @Override
+    public Olingo4Component getComponent() {
+        return (Olingo4Component) super.getComponent();
+    }
+
+    @Override
+    protected void doStart() throws Exception {
+        if (apiProxy == null) {
+            createProxy();
+        }
+    }
+
+    @Override
+    protected void doStop() throws Exception {
+        if (apiProxy != null) {
+            // close the apiProxy
+            getComponent().closeApiProxy(apiProxy);
+            apiProxy = null;
+        }
+    }
+
+    @Override
+    public void interceptPropertyNames(Set<String> propertyNames) {
+        // add edm, and responseHandler property names
+        // edm is computed on first call to getApiProxy(), and responseHandler
+        // is provided by consumer and producer
+        if (!DELETE_METHOD.equals(methodName)) {
+            propertyNames.add(EDM_PROPERTY);
+        }
+        propertyNames.add(RESPONSE_HANDLER_PROPERTY);
+    }
+
+    @Override
+    public void interceptProperties(Map<String, Object> properties) {
+        Map<String, String> endpointHttpHeaders = (Map<String, String>) properties.get(ENDPOINT_HTTP_HEADERS_PROPERTY);
+
+        // read Edm if not set yet
+        properties.put(EDM_PROPERTY, apiProxy.getEdm(endpointHttpHeaders));
+
+        // handle filterAlreadySeen property
+        properties.put(FILTER_ALREADY_SEEN, configuration.isFilterAlreadySeen());
+
+        // handle keyPredicate
+        final String keyPredicate = (String) properties.get(KEY_PREDICATE_PROPERTY);
+        if (keyPredicate != null) {
+
+            // make sure a resource path is provided
+            properties.compute(RESOURCE_PATH_PROPERTY, (key, resourcePath) -> {
+                if (resourcePath == null) {
+                    throw new IllegalArgumentException(
+                            "Resource path must be provided in endpoint URI, or URI parameter '" + RESOURCE_PATH_PROPERTY
+                                                       + "', or exchange header '"
+                                                       + Olingo4Constants.PROPERTY_PREFIX + RESOURCE_PATH_PROPERTY + "'");
+                }
+
+                // append keyPredicate to dynamically create resource path
+                return resourcePath + "(" + keyPredicate + ")";
+            });
+        }
+
+        // handle individual queryParams
+        parseQueryParams(properties);
+    }
+
+    private void createProxy() {
+        apiProxy = getComponent().createApiProxy(getConfiguration());
+    }
+
+    private void parseQueryParams(Map<String, Object> options) {
+        // extract non-endpoint properties as query params
+        final Map<String, String> queryParams = new HashMap<>();
+        for (Iterator<Map.Entry<String, Object>> it = options.entrySet().iterator(); it.hasNext();) {
+
+            final Map.Entry<String, Object> entry = it.next();
+            final String paramName = entry.getKey();
+
+            // Avoid swallowing consumer scheduler properties, which get processed in configureProperties()
+            if (paramName.startsWith("consumer.")) {
+                continue;
+            }
+
+            if (!olingo4endpointPropertyNames.contains(paramName)) {
+
+                // add to query params
+                final Object value = entry.getValue();
+                if (value == null) {
+                    throw new IllegalArgumentException("Null value for query parameter " + paramName);
+                }
+                queryParams.put(paramName, value.toString());
+
+                // remove entry from supplied options
+                it.remove();
+            }
+        }
+        if (!queryParams.isEmpty()) {
+
+            @SuppressWarnings("unchecked")
+            final Map<String, String> oldParams = (Map<String, String>) options.get(QUERY_PARAMS_PROPERTY);
+            if (oldParams == null) {
+                // set queryParams property
+                options.put(QUERY_PARAMS_PROPERTY, queryParams);
+            } else {
+                // overwrite old params in supplied map
+                oldParams.putAll(queryParams);
+            }
+
+        }
+    }
+}

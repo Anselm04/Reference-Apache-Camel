@@ -1,0 +1,541 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.camel.processor.keyvalue.jpa;
+
+import java.time.Duration;
+import java.util.Iterator;
+import java.util.List;
+import java.util.Set;
+
+import jakarta.persistence.EntityManager;
+import jakarta.persistence.EntityManagerFactory;
+import jakarta.persistence.PersistenceException;
+import jakarta.persistence.Query;
+
+import org.apache.camel.api.management.ManagedAttribute;
+import org.apache.camel.api.management.ManagedOperation;
+import org.apache.camel.api.management.ManagedResource;
+import org.apache.camel.component.jpa.DefaultTransactionStrategy;
+import org.apache.camel.component.jpa.JpaHelper;
+import org.apache.camel.component.jpa.TransactionStrategy;
+import org.apache.camel.spi.Configurer;
+import org.apache.camel.spi.KeyValueRepository;
+import org.apache.camel.spi.Metadata;
+import org.apache.camel.support.KeyValueRepositoryHelper;
+import org.apache.camel.support.service.ServiceSupport;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import static org.apache.camel.component.jpa.JpaHelper.getTargetEntityManager;
+import static org.apache.camel.component.jpa.JpaHelper.isConstraintViolation;
+
+/**
+ * A JPA-based {@link KeyValueRepository} that stores entries as {@link KeyValueEntry} entities.
+ * <p/>
+ * Values are serialized to byte arrays using Java Object Serialization and stored in a {@code CAMEL_KEYVALUE} table.
+ * Expired entries are cleaned up lazily on access.
+ * <p/>
+ * This implementation follows the same transaction and entity-manager patterns used by
+ * {@link org.apache.camel.processor.idempotent.jpa.JpaMessageIdRepository}.
+ *
+ * @since 4.23
+ */
+@Metadata(label = "bean",
+          description = "A JPA-based KeyValueRepository that stores entries using JPA entities.",
+          annotations = { "interfaceName=org.apache.camel.spi.KeyValueRepository" })
+@Configurer(metadataOnly = true)
+@ManagedResource(description = "JPA based key-value repository")
+public class JpaKeyValueRepository extends ServiceSupport implements KeyValueRepository {
+
+    private static final String QUERY_BY_KEY
+            = "select e from " + KeyValueEntry.class.getName() + " e where e.itemKey = ?1";
+    private static final String QUERY_ALL_KEYS
+            = "select e.itemKey from " + KeyValueEntry.class.getName() + " e where e.expiresAt = 0 or e.expiresAt > ?1";
+    private static final String QUERY_ALL
+            = "select e from " + KeyValueEntry.class.getName() + " e";
+    private static final String QUERY_COUNT_VALID
+            = "select count(e) from " + KeyValueEntry.class.getName() + " e where e.expiresAt = 0 or e.expiresAt > ?1";
+    private static final String DELETE_IF_EXPIRED
+            = "delete from " + KeyValueEntry.class.getName()
+              + " e where e.itemKey = ?1 and e.expiresAt > 0 and e.expiresAt <= ?2";
+
+    // how many transactions putIfAbsent may use when concurrent inserts of the same key keep failing
+    private static final int PUT_IF_ABSENT_ATTEMPTS = 3;
+
+    private static final String SOMETHING_WENT_WRONG
+            = "Something went wrong in JpaKeyValueRepository: %s";
+
+    private static final Logger LOG = LoggerFactory.getLogger(JpaKeyValueRepository.class);
+
+    @Metadata(description = "The JPA EntityManagerFactory to use", required = true)
+    private EntityManagerFactory entityManagerFactory;
+    @Metadata(description = "The TransactionStrategy to use for transactional operations")
+    private TransactionStrategy transactionStrategy;
+    @Metadata(description = "Whether to join an existing transaction", defaultValue = "true")
+    private boolean joinTransaction = true;
+    @Metadata(description = "Whether to use a shared EntityManager", defaultValue = "false")
+    private boolean sharedEntityManager;
+    @Metadata(label = "advanced,security",
+              description = "Sets an ObjectInputFilter pattern (jdk.serialFilter syntax) applied when deserializing"
+                            + " values read back from the repository. When not set, the JVM-wide jdk.serialFilter is"
+                            + " used if present; otherwise a conservative default filter denying java.net.* and"
+                            + " otherwise allowing java.*, javax.* and org.apache.camel.* packages is applied. Widen"
+                            + " this pattern when storing instances of your own classes in the repository.")
+    private String deserializationFilter;
+
+    /**
+     * Creates a new JPA key-value repository. The {@link #setEntityManagerFactory(EntityManagerFactory)} must be called
+     * before starting.
+     */
+    public JpaKeyValueRepository() {
+    }
+
+    /**
+     * Creates a new JPA key-value repository with the given entity manager factory.
+     *
+     * @param entityManagerFactory the JPA entity manager factory to use
+     */
+    public JpaKeyValueRepository(EntityManagerFactory entityManagerFactory) {
+        this.entityManagerFactory = entityManagerFactory;
+    }
+
+    // ---- KeyValueRepository implementation ----
+
+    @Override
+    @ManagedOperation(description = "Get value by key")
+    public Object get(String key) {
+        final Object[] rc = new Object[1];
+        final EntityManager entityManager
+                = getTargetEntityManager(null, entityManagerFactory, false, sharedEntityManager, true);
+
+        transactionStrategy.executeInTransaction(() -> {
+            if (joinTransaction) {
+                entityManager.joinTransaction();
+            }
+            try {
+                KeyValueEntry entry = findByKey(entityManager, key);
+                if (entry == null) {
+                    rc[0] = null;
+                } else if (entry.isExpired()) {
+                    deleteIfExpired(entityManager, key);
+                    rc[0] = null;
+                } else {
+                    rc[0] = KeyValueRepositoryHelper.deserialize(entry.getItemValue(), deserializationFilter);
+                }
+            } catch (Exception ex) {
+                String contextInfo = String.format(SOMETHING_WENT_WRONG, ex.getMessage());
+                throw new PersistenceException(contextInfo, ex);
+            } finally {
+                closeEntityManager(entityManager);
+            }
+        });
+
+        LOG.debug("get {} -> {}", key, rc[0] != null ? "found" : "null");
+        return rc[0];
+    }
+
+    @Override
+    @ManagedOperation(description = "Put a key-value pair with optional TTL")
+    public Object put(String key, Object value, Duration ttl) {
+        final Object[] rc = new Object[1];
+        final EntityManager entityManager
+                = getTargetEntityManager(null, entityManagerFactory, false, sharedEntityManager, true);
+
+        transactionStrategy.executeInTransaction(() -> {
+            if (joinTransaction) {
+                entityManager.joinTransaction();
+            }
+            try {
+                long expiresAt = toExpiresAt(ttl);
+                byte[] serializedValue = KeyValueRepositoryHelper.serialize(value);
+
+                KeyValueEntry entry = findByKey(entityManager, key);
+                if (entry != null) {
+                    if (!entry.isExpired()) {
+                        rc[0] = KeyValueRepositoryHelper.deserialize(entry.getItemValue(), deserializationFilter);
+                    }
+                    entry.setItemValue(serializedValue);
+                    entry.setExpiresAt(expiresAt);
+                    entityManager.merge(entry);
+                } else {
+                    entry = new KeyValueEntry(key, serializedValue, expiresAt);
+                    entityManager.persist(entry);
+                }
+                entityManager.flush();
+            } catch (Exception ex) {
+                String contextInfo = String.format(SOMETHING_WENT_WRONG, ex.getMessage());
+                throw new PersistenceException(contextInfo, ex);
+            } finally {
+                closeEntityManager(entityManager);
+            }
+        });
+
+        LOG.debug("put {} -> previous={}", key, rc[0] != null ? "found" : "null");
+        return rc[0];
+    }
+
+    @Override
+    @ManagedOperation(description = "Delete a key")
+    public Object delete(String key) {
+        final Object[] rc = new Object[1];
+        final EntityManager entityManager
+                = getTargetEntityManager(null, entityManagerFactory, false, sharedEntityManager, true);
+
+        transactionStrategy.executeInTransaction(() -> {
+            if (joinTransaction) {
+                entityManager.joinTransaction();
+            }
+            try {
+                KeyValueEntry entry = findByKey(entityManager, key);
+                if (entry == null) {
+                    rc[0] = null;
+                } else if (entry.isExpired()) {
+                    deleteIfExpired(entityManager, key);
+                    rc[0] = null;
+                } else {
+                    rc[0] = KeyValueRepositoryHelper.deserialize(entry.getItemValue(), deserializationFilter);
+                    entityManager.remove(entry);
+                    entityManager.flush();
+                }
+            } catch (Exception ex) {
+                String contextInfo = String.format(SOMETHING_WENT_WRONG, ex.getMessage());
+                throw new PersistenceException(contextInfo, ex);
+            } finally {
+                closeEntityManager(entityManager);
+            }
+        });
+
+        LOG.debug("delete {} -> {}", key, rc[0] != null ? "found" : "null");
+        return rc[0];
+    }
+
+    @Override
+    @ManagedOperation(description = "Check if key exists")
+    public boolean contains(String key) {
+        final Boolean[] rc = new Boolean[1];
+        final EntityManager entityManager
+                = getTargetEntityManager(null, entityManagerFactory, false, sharedEntityManager, true);
+
+        transactionStrategy.executeInTransaction(() -> {
+            if (joinTransaction) {
+                entityManager.joinTransaction();
+            }
+            try {
+                KeyValueEntry entry = findByKey(entityManager, key);
+                if (entry == null) {
+                    rc[0] = Boolean.FALSE;
+                } else if (entry.isExpired()) {
+                    deleteIfExpired(entityManager, key);
+                    rc[0] = Boolean.FALSE;
+                } else {
+                    rc[0] = Boolean.TRUE;
+                }
+            } catch (Exception ex) {
+                String contextInfo = String.format(SOMETHING_WENT_WRONG, ex.getMessage());
+                throw new PersistenceException(contextInfo, ex);
+            } finally {
+                closeEntityManager(entityManager);
+            }
+        });
+
+        LOG.debug("contains {} -> {}", key, rc[0]);
+        return rc[0];
+    }
+
+    @Override
+    public Set<String> keys() {
+        final Set<?>[] rc = new Set<?>[1];
+        final EntityManager entityManager
+                = getTargetEntityManager(null, entityManagerFactory, false, sharedEntityManager, true);
+
+        transactionStrategy.executeInTransaction(() -> {
+            if (joinTransaction) {
+                entityManager.joinTransaction();
+            }
+            try {
+                Query query = entityManager.createQuery(QUERY_ALL_KEYS);
+                query.setParameter(1, System.currentTimeMillis());
+                @SuppressWarnings("unchecked")
+                List<String> resultList = query.getResultList();
+                rc[0] = Set.copyOf(resultList);
+            } catch (Exception ex) {
+                String contextInfo = String.format(SOMETHING_WENT_WRONG, ex.getMessage());
+                throw new PersistenceException(contextInfo, ex);
+            } finally {
+                closeEntityManager(entityManager);
+            }
+        });
+
+        LOG.debug("keys -> {} entries", rc[0] != null ? rc[0].size() : 0);
+        @SuppressWarnings("unchecked")
+        Set<String> result = (Set<String>) rc[0];
+        return result;
+    }
+
+    @Override
+    @ManagedOperation(description = "Clear all entries")
+    public void clear() {
+        final EntityManager entityManager
+                = getTargetEntityManager(null, entityManagerFactory, false, sharedEntityManager, true);
+
+        transactionStrategy.executeInTransaction(() -> {
+            if (joinTransaction) {
+                entityManager.joinTransaction();
+            }
+            try {
+                List<?> list = entityManager.createQuery(QUERY_ALL).getResultList();
+                if (!list.isEmpty()) {
+                    Iterator<?> it = list.iterator();
+                    while (it.hasNext()) {
+                        Object item = it.next();
+                        entityManager.remove(item);
+                    }
+                    entityManager.flush();
+                }
+            } catch (Exception ex) {
+                String contextInfo = String.format(SOMETHING_WENT_WRONG, ex.getMessage());
+                throw new PersistenceException(contextInfo, ex);
+            } finally {
+                closeEntityManager(entityManager);
+            }
+        });
+
+        LOG.debug("clear the store {}", KeyValueEntry.class.getName());
+    }
+
+    /**
+     * Stores the value only if no non-expired entry exists for the key. The primary key of the table decides between
+     * concurrent callers: when the insert fails with a constraint violation, the transaction is rolled back and the key
+     * is read again in a new transaction, which returns the value stored by the other caller, or inserts again if that
+     * entry has been deleted meanwhile. In a transaction of the caller, the failed insert marks that transaction for
+     * rollback.
+     *
+     * @throws PersistenceException if the insert failed in all attempts
+     */
+    @Override
+    public Object putIfAbsent(String key, Object value, Duration ttl) {
+        final byte[] serializedValue = KeyValueRepositoryHelper.serialize(value);
+        for (int attempt = 1;; attempt++) {
+            try {
+                Object answer = doPutIfAbsent(key, serializedValue, ttl);
+                LOG.debug("putIfAbsent {} -> {}", key, answer != null ? "existing" : "inserted");
+                return answer;
+            } catch (PersistenceException e) {
+                // another thread/node inserted the key: read it again in a new transaction, as the failed one may
+                // not see that entry (REPEATABLE READ) or the entry may be deleted meanwhile
+                if (attempt >= PUT_IF_ABSENT_ATTEMPTS || !isConstraintViolation(e)) {
+                    throw e;
+                }
+                LOG.debug("Concurrent insert of key '{}' -- reading it again in a new transaction", key);
+            }
+        }
+    }
+
+    private Object doPutIfAbsent(String key, byte[] serializedValue, Duration ttl) {
+        final Object[] rc = new Object[1];
+        final EntityManager entityManager
+                = getTargetEntityManager(null, entityManagerFactory, false, sharedEntityManager, true);
+
+        transactionStrategy.executeInTransaction(() -> {
+            if (joinTransaction) {
+                entityManager.joinTransaction();
+            }
+            try {
+                KeyValueEntry entry = findByKey(entityManager, key);
+                if (entry != null && !entry.isExpired()) {
+                    // key exists and is valid -- return existing value
+                    rc[0] = KeyValueRepositoryHelper.deserialize(entry.getItemValue(), deserializationFilter);
+                } else {
+                    if (entry != null) {
+                        // key exists but expired -- delete it, unless it has been stored again meanwhile, in which
+                        // case the insert below fails
+                        deleteIfExpired(entityManager, key);
+                        entityManager.detach(entry);
+                    }
+                    entityManager.persist(new KeyValueEntry(key, serializedValue, toExpiresAt(ttl)));
+                    entityManager.flush();
+                    rc[0] = null;
+                }
+            } catch (Exception ex) {
+                String contextInfo = String.format(SOMETHING_WENT_WRONG, ex.getMessage());
+                throw new PersistenceException(contextInfo, ex);
+            } finally {
+                closeEntityManager(entityManager);
+            }
+        });
+
+        return rc[0];
+    }
+
+    @Override
+    @ManagedAttribute(description = "The number of non-expired entries in the repository")
+    public int size() {
+        final int[] rc = new int[1];
+        final EntityManager entityManager
+                = getTargetEntityManager(null, entityManagerFactory, false, sharedEntityManager, true);
+
+        transactionStrategy.executeInTransaction(() -> {
+            if (joinTransaction) {
+                entityManager.joinTransaction();
+            }
+            try {
+                Query query = entityManager.createQuery(QUERY_COUNT_VALID);
+                query.setParameter(1, System.currentTimeMillis());
+                Long count = (Long) query.getSingleResult();
+                rc[0] = count.intValue();
+            } catch (Exception ex) {
+                String contextInfo = String.format(SOMETHING_WENT_WRONG, ex.getMessage());
+                throw new PersistenceException(contextInfo, ex);
+            } finally {
+                closeEntityManager(entityManager);
+            }
+        });
+
+        LOG.debug("size -> {}", rc[0]);
+        return rc[0];
+    }
+
+    // ---- Configuration properties ----
+
+    public EntityManagerFactory getEntityManagerFactory() {
+        return entityManagerFactory;
+    }
+
+    /**
+     * Sets the JPA EntityManagerFactory to use.
+     *
+     * @param entityManagerFactory the entity manager factory
+     */
+    public void setEntityManagerFactory(EntityManagerFactory entityManagerFactory) {
+        this.entityManagerFactory = entityManagerFactory;
+    }
+
+    public TransactionStrategy getTransactionStrategy() {
+        return transactionStrategy;
+    }
+
+    /**
+     * Sets the transaction strategy to use. If not set, a {@link DefaultTransactionStrategy} will be created
+     * automatically.
+     *
+     * @param transactionStrategy the transaction strategy
+     */
+    public void setTransactionStrategy(TransactionStrategy transactionStrategy) {
+        this.transactionStrategy = transactionStrategy;
+    }
+
+    @ManagedAttribute(description = "Whether to join existing transaction")
+    public boolean isJoinTransaction() {
+        return joinTransaction;
+    }
+
+    /**
+     * Sets whether to join an existing transaction. Default is {@code true}.
+     *
+     * @param joinTransaction whether to join existing transactions
+     */
+    public void setJoinTransaction(boolean joinTransaction) {
+        this.joinTransaction = joinTransaction;
+    }
+
+    @ManagedAttribute(description = "Whether to use shared EntityManager")
+    public boolean isSharedEntityManager() {
+        return sharedEntityManager;
+    }
+
+    /**
+     * Sets whether to use a shared EntityManager. Default is {@code false}.
+     *
+     * @param sharedEntityManager whether to use a shared EntityManager
+     */
+    public void setSharedEntityManager(boolean sharedEntityManager) {
+        this.sharedEntityManager = sharedEntityManager;
+    }
+
+    public String getDeserializationFilter() {
+        return deserializationFilter;
+    }
+
+    /**
+     * Sets an {@link java.io.ObjectInputFilter} pattern (same syntax as {@code jdk.serialFilter}) applied when
+     * deserializing values read back from the repository. When not set, the JVM-wide {@code jdk.serialFilter} is used
+     * if present, otherwise a conservative default filter is applied. Widen this pattern when storing instances of your
+     * own classes in the repository.
+     */
+    public void setDeserializationFilter(String deserializationFilter) {
+        this.deserializationFilter = deserializationFilter;
+    }
+
+    // ---- Lifecycle ----
+
+    @Override
+    protected void doInit() throws Exception {
+        if (transactionStrategy == null) {
+            transactionStrategy = JpaHelper.resolveTransactionStrategy(null, entityManagerFactory, false);
+        }
+    }
+
+    @Override
+    protected void doStart() throws Exception {
+        // noop
+    }
+
+    @Override
+    protected void doStop() throws Exception {
+        // noop
+    }
+
+    // ---- Private helpers ----
+
+    private KeyValueEntry findByKey(EntityManager entityManager, String key) {
+        Query query = entityManager.createQuery(QUERY_BY_KEY);
+        query.setParameter(1, key);
+        List<?> list = query.getResultList();
+        if (list.isEmpty()) {
+            return null;
+        }
+        return (KeyValueEntry) list.get(0);
+    }
+
+    /**
+     * Deletes the entry of the key only if it is still expired: another transaction may have stored the key again since
+     * it was read, and that entry must be kept.
+     */
+    private static void deleteIfExpired(EntityManager entityManager, String key) {
+        Query query = entityManager.createQuery(DELETE_IF_EXPIRED);
+        query.setParameter(1, key);
+        query.setParameter(2, System.currentTimeMillis());
+        query.executeUpdate();
+    }
+
+    private static long toExpiresAt(Duration ttl) {
+        if (ttl == null || ttl.isZero() || ttl.isNegative()) {
+            return 0;
+        }
+        return KeyValueRepositoryHelper.expiresAt(ttl);
+    }
+
+    private static void closeEntityManager(EntityManager entityManager) {
+        try {
+            if (entityManager.isOpen()) {
+                entityManager.close();
+            }
+        } catch (Exception e) {
+            // ignore
+        }
+    }
+}

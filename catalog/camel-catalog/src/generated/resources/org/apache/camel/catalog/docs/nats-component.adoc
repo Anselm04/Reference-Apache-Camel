@@ -1,0 +1,340 @@
+= Nats Component
+:doctitle: Nats
+:shortname: nats
+:artifactid: camel-nats
+:description: Send and receive messages from NATS messaging system.
+:since: 2.17
+:supportlevel: Stable
+:tabs-sync-option:
+:component-header: Both producer and consumer are supported
+
+*Since Camel {since}*
+
+*{component-header}*
+
+http://nats.io/[NATS] is a fast and reliable messaging platform.
+
+Maven users will need to add the following dependency to
+their `pom.xml` for this component.
+
+[source,xml]
+----
+<dependency>
+    <groupId>org.apache.camel</groupId>
+    <artifactId>camel-nats</artifactId>
+    <!-- use the same version as your Camel core version -->
+    <version>x.y.z</version>
+</dependency>
+----
+
+== URI format
+
+----
+nats:topic[?options]
+----
+
+Where *topic* is the topic name
+
+// component options: START
+include::partial$component-configure-options.adoc[]
+include::partial$component-endpoint-options.adoc[]
+include::partial$component-endpoint-headers.adoc[]
+// component options: END
+
+
+== Usage
+
+=== Configuring servers
+
+You configure the NATS servers on either the component or the endpoint.
+
+For example, to configure this once on the component, you can do:
+
+._Java-only: configuring NATS servers on the component_
+[source,java]
+----
+NatsComponent nats = context.getComponent("nats", NatsComponent.class);
+nats.setServers("someserver:4222,someotherserver:42222");
+----
+
+Notice how you can specify multiple servers separated by comma.
+
+Or you can specify the servers in the endpoint URI
+
+[tabs]
+====
+Java::
++
+[source,java]
+----
+from("direct:send").to("nats:test?servers=localhost:4222");
+----
+
+XML::
++
+[source,xml]
+----
+<route>
+  <from uri="direct:send"/>
+  <to uri="nats:test?servers=localhost:4222"/>
+</route>
+----
+
+YAML::
++
+[source,yaml]
+----
+- route:
+    from:
+      uri: direct:send
+      steps:
+        - to:
+            uri: nats:test
+            parameters:
+              servers: localhost:4222
+----
+====
+
+The endpoint configuration will override any server configuration on the component level.
+
+=== Configuring username and password or token
+
+You can specify username and password for the servers in the server URLs,
+where its `username:password@url`, or `token@url` etc:
+
+._Java-only: configuring NATS servers with credentials_
+[source,java]
+----
+NatsComponent nats = context.getComponent("nats", NatsComponent.class);
+nats.setServers("scott:tiger@someserver:4222,superman:123@someotherserver:42222");
+----
+
+If you are using Camel Main or Spring Boot, you can configure the server urls in the `application.properties` file
+[source,properties]
+----
+camel.component.nats.servers=scott:tiger@someserver:4222,superman:123@someotherserver:42222
+----
+
+=== Request/Reply support
+The producer supports request/reply: when the exchange pattern is InOut, it waits for the reply message, up to
+`requestTimeout`, and the payload of the reply becomes the message body, as a byte array.
+
+The consumer sends back the message body as the reply message, when routing the message is complete, if the message has a
+reply subject and the consumer has `exchangePattern=InOut`. The body must convert to a byte array: text, bytes, a stream or a
+file. A body that does not, such as a Map, sends no reply.
+
+A consumer replies when its `exchangePattern` is `InOut`, the message has a reply subject, `replyToDisabled` is `false`,
+and the exchange did not fail (NATS has no error reply, so a failed exchange is not answered and the requester times out).
+The body the route ends with is converted to a byte array and published to the reply subject:
+
+* A route that ends with no body sends an empty reply (0 bytes), so the requester gets an answer.
+* A body that does not convert to a byte array, such as a `Map` or a POJO, is not sent. No reply is published,
+  and the error goes to the exception handler of the consumer, which logs it at WARN level by default.
+  Convert the body in the route, for example to JSON or a `String`, before the route ends.
+
+Replies are for core NATS only. The reply subject of a JetStream message is its ack subject, so a consumer with
+`jetstreamEnabled=true` never replies to a JetStream message, even when `exchangePattern` is `InOut`.
+The consumer logs a WARN when it starts with this combination.
+
+== Examples
+
+=== Producer example
+
+[tabs]
+====
+Java::
++
+[source,java]
+----
+from("direct:send")
+  .to("nats:mytopic");
+----
+
+XML::
++
+[source,xml]
+----
+<route>
+  <from uri="direct:send"/>
+  <to uri="nats:mytopic"/>
+</route>
+----
+
+YAML::
++
+[source,yaml]
+----
+- route:
+    from:
+      uri: direct:send
+      steps:
+        - to:
+            uri: nats:mytopic
+----
+====
+
+In case of using authorization, you can directly specify your credentials in the server URL
+
+[tabs]
+====
+Java::
++
+[source,java]
+----
+from("direct:send")
+  .to("nats:mytopic?servers=username:password@localhost:4222");
+----
+
+XML::
++
+[source,xml]
+----
+<route>
+  <from uri="direct:send"/>
+  <to uri="nats:mytopic?servers=username:password@localhost:4222"/>
+</route>
+----
+
+YAML::
++
+[source,yaml]
+----
+- route:
+    from:
+      uri: direct:send
+      steps:
+        - to:
+            uri: nats:mytopic
+            parameters:
+              servers: "username:password@localhost:4222"
+----
+====
+
+or your token
+
+[tabs]
+====
+Java::
++
+[source,java]
+----
+from("direct:send")
+  .to("nats:mytopic?servers=token@localhost:4222");
+----
+
+XML::
++
+[source,xml]
+----
+<route>
+  <from uri="direct:send"/>
+  <to uri="nats:mytopic?servers=token@localhost:4222"/>
+</route>
+----
+
+YAML::
++
+[source,yaml]
+----
+- route:
+    from:
+      uri: direct:send
+      steps:
+        - to:
+            uri: nats:mytopic
+            parameters:
+              servers: "token@localhost:4222"
+----
+====
+
+=== Consumer example
+
+[tabs]
+====
+Java::
++
+[source,java]
+----
+from("nats:mytopic?maxMessages=5&queueName=myqueue")
+  .to("mock:result");
+----
+
+XML::
++
+[source,xml]
+----
+<route>
+  <from uri="nats:mytopic?maxMessages=5&amp;queueName=myqueue"/>
+  <to uri="mock:result"/>
+</route>
+----
+
+YAML::
++
+[source,yaml]
+----
+- route:
+    from:
+      uri: nats:mytopic
+      parameters:
+        maxMessages: 5
+        queueName: myqueue
+      steps:
+        - to:
+            uri: mock:result
+----
+====
+
+=== Manual Acknowledgment (JetStream)
+
+When consuming from JetStream, by default messages are automatically acknowledged
+after successful route processing, or negatively acknowledged (redelivered) on failure.
+
+To take full control of acknowledgment, set `manualAck=true` on the consumer endpoint.
+This disables automatic acknowledgment and exposes a `NatsManualAck` object as the
+`CamelNatsManualAck` message header.
+
+._Java-only: manual acknowledgment with NatsManualAck in a processor_
+[source,java]
+----
+from("nats:mytopic?jetstreamEnabled=true&jetstreamName=mystream&durableName=myconsumer&pullSubscription=false&manualAck=true")
+    .process(exchange -> {
+        // do work ...
+
+        NatsManualAck manualAck = exchange.getIn().getHeader("CamelNatsManualAck", NatsManualAck.class);
+        manualAck.ack();
+    });
+----
+
+If the route completes without calling any NatsManualAck method, the message remains unacknowledged
+and NATS will redeliver it after `ackWait` expires (default 30 seconds).
+
+=== JetStream push consumer whose consumer was deleted
+
+With `jetstreamEnabled=true` and `pullSubscription=false`, the server deletes an ephemeral
+JetStream consumer (no `durableName`, and no durable name in the `consumerConfiguration`)
+after about 5 seconds without a subscriber, for example while the client is disconnected, and
+loses it on a restart. After every reconnect the Camel consumer asks the server for its
+consumer, and subscribes again when its ephemeral consumer is gone:
+
+* The new consumer starts at the first message the route did not acknowledge, so the route can
+see again the messages after that one (with `ackPolicy=None`, after the last message
+delivered). A message that was not acknowledged and was already delivered `maxDeliver` times
+does not count, as the server does not deliver it again.
+* When nothing was delivered yet, a consumer with the deliver policy `New` (or `Last`) starts
+after (or at) the last message of the stream at the subscribe.
+* On a stream with `WorkQueue` retention, and on a stream that was created again since the
+route subscribed, the new consumer uses the consumer configuration as it is (from the first
+message of the new stream for `New` and `Last`).
+* When the consumer cannot be checked or created again (for example JetStream is not ready yet
+after a server restart, or the stream is gone until it is created again), the Camel consumer
+keeps trying while the route runs, a few times a second apart and then up to every 30 seconds,
+and logs a WARN after the first attempts.
+
+A durable consumer is not created again: when it is gone (deleted by an administrator, or
+after its `inactiveThreshold`), the Camel consumer logs a WARN and keeps its subscription, and
+messages arrive again when the durable is created again with the same deliver subject.
+
+The consumer is checked only after a reconnect. A consumer that is deleted while the
+connection stays up (for example with `nats consumer rm`) is not detected, and the route
+receives nothing more until it is restarted.

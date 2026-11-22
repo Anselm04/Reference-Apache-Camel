@@ -1,0 +1,1348 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.camel.dsl.jbang.core.commands.ai;
+
+import java.util.List;
+
+import org.apache.camel.catalog.CamelCatalog;
+import org.apache.camel.catalog.DefaultCamelCatalog;
+import org.junit.jupiter.api.BeforeAll;
+import org.junit.jupiter.api.Test;
+
+import static org.assertj.core.api.Assertions.assertThat;
+
+class SourceValidatorEndpointTest {
+
+    private static CamelCatalog catalog;
+
+    @BeforeAll
+    static void loadCatalog() {
+        catalog = new DefaultCamelCatalog();
+    }
+
+    @Test
+    void validExpandedFormNoErrors() {
+        String yaml = """
+                - from:
+                    uri: timer:tick
+                    parameters:
+                      period: 1000
+                      fixedRate: true
+                  steps:
+                    - log: "${body}"
+                """;
+        List<String> errors = SourceValidator.validateYamlEndpoints(yaml, catalog);
+        assertThat(errors).isEmpty();
+    }
+
+    @Test
+    void queryOptionsInTheUriAndAParametersBlock() {
+        // CAMEL-24842: the runtime refuses options in both places; the schema does not see it
+        String yaml = """
+                - route:
+                    from:
+                      uri: timer:tick
+                      steps:
+                        - to:
+                            uri: file://inbox?fileExist=Override
+                            parameters:
+                              fileName: invoice-2001.json
+                """;
+        List<String> errors = SourceValidator.validateYamlEndpoints(yaml, catalog);
+        assertThat(errors).hasSize(1);
+        assertThat(errors.get(0)).startsWith("Line 6: ")
+                .contains("query options (fileExist=Override)")
+                .contains("parameters: (fileExist: Override)")
+                .contains("Uri should not contains query parameters");
+    }
+
+    @Test
+    void queryOptionsInTheUriAndAParametersBlockOnFrom() {
+        String yaml = """
+                - from:
+                    uri: "timer:t?period=1000"
+                    parameters:
+                      repeatCount: 1
+                    steps:
+                      - log: "hello"
+                """;
+        List<String> errors = SourceValidator.validateYamlEndpoints(yaml, catalog);
+        assertThat(errors).hasSize(1);
+        assertThat(errors.get(0)).startsWith("Line 2: ").contains("(period: 1000)");
+    }
+
+    @Test
+    void expandedFormUnknownOption() {
+        String yaml = """
+                - from:
+                    uri: timer:tick
+                    parameters:
+                      period: 1000
+                      badOption: xyz
+                  steps:
+                    - log: "${body}"
+                """;
+        List<String> errors = SourceValidator.validateYamlEndpoints(yaml, catalog);
+        assertThat(errors).isNotEmpty();
+        assertThat(errors.get(0)).contains("timer:");
+        assertThat(errors.get(0)).containsIgnoringCase("unknown");
+    }
+
+    @Test
+    void aCommentedOutOptionIsNotAnOption() {
+        // CAMEL-26960: was the unknown option '# idempotentRepository'
+        String yaml = """
+                - from:
+                    uri: file
+                    parameters:
+                      directoryName: orders
+                      noop: true
+                      # or
+                      # idempotentRepository: "#redisRepo"
+                    steps:
+                      - log: "${body}"
+                """;
+        assertThat(SourceValidator.validateYamlEndpoints(yaml, catalog)).isEmpty();
+    }
+
+    @Test
+    void aJdbcUrlWrittenAsTheEndpointSaysWhatJdbcTakes() {
+        // CAMEL-26960: a benchmark answer wrote the JDBC url of the database as the uri of the jdbc component
+        String yaml = """
+                - from:
+                    uri: timer:tick
+                    steps:
+                      - to: jdbc:mysql://localhost/orders?user=app&password=secret
+                """;
+        List<String> errors = SourceValidator.validateYamlEndpoints(yaml, catalog);
+        assertThat(errors).hasSize(2);
+        assertThat(errors.get(0)).startsWith("Line 4: jdbc: Unknown option 'user'")
+                .contains("jdbc: takes the name of a DataSource bean, jdbc:myDataSource");
+        assertThat(errors.get(1)).startsWith("Line 4: jdbc: Unknown option 'password'");
+    }
+
+    @Test
+    void expandedFormInvalidBoolean() {
+        String yaml = """
+                - from:
+                    uri: timer:tick
+                    parameters:
+                      fixedRate: notABoolean
+                  steps:
+                    - log: "${body}"
+                """;
+        List<String> errors = SourceValidator.validateYamlEndpoints(yaml, catalog);
+        assertThat(errors).isNotEmpty();
+        assertThat(errors.get(0)).contains("timer:");
+    }
+
+    @Test
+    void inlineUriNoErrors() {
+        String yaml = """
+                - from: timer:tick?period=1000
+                  steps:
+                    - to: log:myLogger
+                """;
+        List<String> errors = SourceValidator.validateYamlEndpoints(yaml, catalog);
+        assertThat(errors).isEmpty();
+    }
+
+    @Test
+    void inlineUriUnknownOption() {
+        String yaml = """
+                - from: timer:tick?badOption=xyz
+                  steps:
+                    - log: "${body}"
+                """;
+        List<String> errors = SourceValidator.validateYamlEndpoints(yaml, catalog);
+        assertThat(errors).isNotEmpty();
+        assertThat(errors.get(0)).contains("timer:");
+        assertThat(errors.get(0)).containsIgnoringCase("unknown");
+    }
+
+    @Test
+    void expandedUriWithQueryParamsNoErrors() {
+        String yaml = """
+                - from:
+                    uri: timer:tick?period=1000
+                  steps:
+                    - log: "${body}"
+                """;
+        List<String> errors = SourceValidator.validateYamlEndpoints(yaml, catalog);
+        assertThat(errors).isEmpty();
+    }
+
+    @Test
+    void expandedUriWithQueryParamsAndParametersBlock() {
+        // the options are valid, but the runtime refuses them in both places (CAMEL-24842)
+        String yaml = """
+                - from:
+                    uri: timer:tick?period=1000
+                    parameters:
+                      fixedRate: true
+                  steps:
+                    - log: "${body}"
+                """;
+        List<String> errors = SourceValidator.validateYamlEndpoints(yaml, catalog);
+        assertThat(errors).hasSize(1);
+        assertThat(errors.get(0)).startsWith("Line 2: ").contains("query options (period=1000)");
+    }
+
+    @Test
+    void expandedUriWithQueryParamsAndBadParameter() {
+        String yaml = """
+                - from:
+                    uri: timer:tick?period=1000
+                    parameters:
+                      badOption: xyz
+                  steps:
+                    - log: "${body}"
+                """;
+        List<String> errors = SourceValidator.validateYamlEndpoints(yaml, catalog);
+        // the mix is reported, and the unknown option still is
+        assertThat(errors).hasSize(2);
+        assertThat(errors.get(0)).contains("query options (period=1000)");
+        assertThat(errors.get(1)).contains("timer:").containsIgnoringCase("unknown");
+    }
+
+    @Test
+    void multipleEndpointsValidatedIndependently() {
+        String yaml = """
+                - from:
+                    uri: timer:tick
+                    parameters:
+                      period: 1000
+                  steps:
+                    - to:
+                        uri: log:myLogger
+                        parameters:
+                          badOption: xyz
+                """;
+        List<String> errors = SourceValidator.validateYamlEndpoints(yaml, catalog);
+        assertThat(errors).isNotEmpty();
+        assertThat(errors).allSatisfy(e -> assertThat(e).contains("log:"));
+        assertThat(errors).noneSatisfy(e -> assertThat(e).contains("timer:"));
+    }
+
+    @Test
+    void placeholderUriSkipped() {
+        String yaml = """
+                - from: "{{myUri}}"
+                  steps:
+                    - log: "${body}"
+                """;
+        List<String> errors = SourceValidator.validateYamlEndpoints(yaml, catalog);
+        assertThat(errors).isEmpty();
+    }
+
+    @Test
+    void placeholderValueSkipped() {
+        String yaml = """
+                - from:
+                    uri: timer:tick
+                    parameters:
+                      period: "{{myPeriod}}"
+                  steps:
+                    - log: "${body}"
+                """;
+        List<String> errors = SourceValidator.validateYamlEndpoints(yaml, catalog);
+        assertThat(errors).isEmpty();
+    }
+
+    @Test
+    void quotedParameterValues() {
+        String yaml = """
+                - from:
+                    uri: timer:tick
+                    parameters:
+                      period: "1000"
+                      fixedRate: 'true'
+                  steps:
+                    - log: "${body}"
+                """;
+        List<String> errors = SourceValidator.validateYamlEndpoints(yaml, catalog);
+        assertThat(errors).isEmpty();
+    }
+
+    @Test
+    void inlineToWithDash() {
+        String yaml = """
+                - from: timer:tick?period=1000
+                  steps:
+                    - to: seda:myQueue?badOption=xyz
+                """;
+        List<String> errors = SourceValidator.validateYamlEndpoints(yaml, catalog);
+        assertThat(errors).hasSize(1);
+        assertThat(errors.get(0)).contains("seda:");
+    }
+
+    @Test
+    void validRouteNoEndpointErrors() {
+        String yaml = """
+                - from:
+                    uri: timer:tick
+                    parameters:
+                      period: 5000
+                      repeatCount: 1
+                  steps:
+                    - setBody:
+                        simple: "Hello World"
+                    - to:
+                        uri: seda:result
+                """;
+        List<String> errors = SourceValidator.validateYamlEndpoints(yaml, catalog);
+        assertThat(errors).isEmpty();
+    }
+
+    @Test
+    void schemeOnlyUriWithParameters() {
+        String yaml = """
+                - route:
+                    id: timer-log
+                    from:
+                      uri: timer
+                      parameters:
+                        timerName: tick
+                        period: 1000
+                        bridgeErrorHandler2: 123
+                      steps:
+                        - log:
+                            message: "${body}"
+                """;
+        List<String> errors = SourceValidator.validateYamlEndpoints(yaml, catalog);
+        assertThat(errors).isNotEmpty();
+        assertThat(errors).anyMatch(e -> e.contains("timer:") && e.contains("bridgeErrorHandler2"));
+    }
+
+    @Test
+    void schemeOnlyUriValidOptions() {
+        String yaml = """
+                - route:
+                    id: timer-log
+                    from:
+                      uri: timer
+                      parameters:
+                        timerName: tick
+                        period: 1000
+                        fixedRate: true
+                      steps:
+                        - log:
+                            message: "${body}"
+                """;
+        List<String> errors = SourceValidator.validateYamlEndpoints(yaml, catalog);
+        assertThat(errors).isEmpty();
+    }
+
+    @Test
+    void commentsIgnored() {
+        String yaml = """
+                # from: timer:tick?badOption=xyz
+                - from:
+                    uri: timer:tick
+                    parameters:
+                      period: 1000
+                  steps:
+                    - log: "${body}"
+                """;
+        List<String> errors = SourceValidator.validateYamlEndpoints(yaml, catalog);
+        assertThat(errors).isEmpty();
+    }
+
+    @org.junit.jupiter.api.Test
+    void consumerOptionOnAToSaysHowToReadInsteadOfWrite() {
+        String yaml = """
+                - from:
+                    uri: timer:tick
+                    steps:
+                      - to:
+                          uri: "file:data?fileName=input.xml&noop=true"
+                """;
+        java.util.List<String> msgs
+                = SourceValidator.validateYamlEndpoints(yaml, new org.apache.camel.catalog.DefaultCamelCatalog());
+        org.assertj.core.api.Assertions.assertThat(msgs).hasSize(1);
+        org.assertj.core.api.Assertions.assertThat(msgs.get(0))
+                .contains("not applicable in producer only mode")
+                .contains("it writes the body")
+                .contains("poll EIP")
+                // a data file the route needs is read, not consumed
+                .contains("to read a data file the route needs, such as a lookup table: setVariable with constant:"
+                          + " resource:file:<path>");
+
+        // another component does not get the file's hint
+        String kafka = """
+                - from:
+                    uri: timer:tick
+                    steps:
+                      - to:
+                          uri: "kafka:orders?groupId=orders"
+                """;
+        org.assertj.core.api.Assertions
+                .assertThat(SourceValidator.validateYamlEndpoints(kafka, new org.apache.camel.catalog.DefaultCamelCatalog()))
+                .singleElement().asString().contains("poll EIP").doesNotContain("resource:file");
+    }
+
+    @org.junit.jupiter.api.Test
+    void componentDocSaysWhereItGoes() {
+        org.apache.camel.catalog.CamelCatalog catalog = new org.apache.camel.catalog.DefaultCamelCatalog();
+        org.assertj.core.api.Assertions.assertThat(CatalogDocs.usage(catalog.componentModel("file"))).contains("from: consumes")
+                .contains("poll EIP").contains("setVariable with constant: resource:file:stock.json");
+        org.assertj.core.api.Assertions.assertThat(CatalogDocs.usage(catalog.componentModel("jms"))).contains("poll EIP")
+                .doesNotContain("resource:file");
+        org.assertj.core.api.Assertions.assertThat(CatalogDocs.usage(catalog.componentModel("timer")))
+                .startsWith("consumer only");
+        org.assertj.core.api.Assertions.assertThat(CatalogDocs.usage(catalog.componentModel("log")))
+                .startsWith("producer only");
+    }
+
+    @Test
+    void anInventedOptionSaysWhatTheComponentDoesInstead() {
+        List<String> msgs = SourceValidator.validateYamlEndpoints("""
+                - from:
+                    uri: timer:tick?interval=1000&body=hello
+                    steps:
+                      - to:
+                          uri: file:output?fileName=report.xml&mkdir=true&body=hello
+                """, catalog);
+        assertThat(msgs).hasSize(4);
+        assertThat(msgs.get(3)).contains("Unknown option 'body'").contains("setBody step before the to: file: step");
+        assertThat(msgs.get(0)).contains("Unknown option 'interval'").contains("write period=<millis>");
+        assertThat(msgs.get(1)).contains("Unknown option 'body'").contains("setBody step");
+        assertThat(msgs.get(2)).contains("Unknown option 'mkdir'").contains("autoCreate=true");
+    }
+
+    @Test
+    void anOptionNamedAfterTheComponentSaysWhatTheEndpointTakes() {
+        // the closest name was cronService, and the quick fix renamed cron= to that
+        List<String> msgs = SourceValidator.validateYamlEndpoints("""
+                - from:
+                    uri: cron:cron?cron=0/10 * * * * ?
+                    steps:
+                      - log:
+                          message: "x"
+                """, catalog);
+        assertThat(msgs).singleElement().satisfies(m -> assertThat(m)
+                .contains("Unknown option 'cron'")
+                .contains("no option is named after the component: write cron:name?schedule=...")
+                .doesNotContain("Did you mean"));
+        assertThat(QuickFixes.fixFor(msgs.get(0), "    uri: cron:cron?cron=0/10 * * * * ?")).isNull();
+    }
+
+    /**
+     * r27n-5 connect-service-jms-request-reply step 2: told to keep the message with variableReceive, the model put it
+     * under parameters: of the to:, and pattern before it. Both are keys of the to:, next to uri:.
+     */
+    @Test
+    void anOptionOfTheEipUnderParametersSaysItIsAKeyOfTheEip() {
+        List<String> msgs = SourceValidator.validateYamlEndpoints("""
+                - route:
+                    id: reserve-order
+                    from:
+                      uri: jms
+                      parameters:
+                        destinationType: queue
+                        destinationName: orders
+                        variableReceive: order
+                      steps:
+                        - to:
+                            uri: jms
+                            parameters:
+                              destinationType: queue
+                              destinationName: stock
+                              exchangePattern: InOut
+                              variableReceive: stockReply
+                        - to:
+                            uri: jms
+                            parameters:
+                              destinationName: stock
+                              pattern: InOut
+                        - to: "jms:queue:stock?variableReceive=stockReply"
+                """, catalog);
+        assertThat(msgs).hasSize(4);
+        assertThat(msgs.get(0)).isEqualTo("Line 8: jms: Unknown option 'variableReceive' (variableReceive is a key of the"
+                                          + " from:, next to uri:, not an option of the jms endpoint: from: {uri: jms,"
+                                          + " parameters: {...}, variableReceive: order})");
+        assertThat(msgs.get(1)).isEqualTo("Line 16: jms: Unknown option 'variableReceive' (variableReceive is a key of"
+                                          + " the to:, next to uri:, not an option of the jms endpoint: to: {uri: jms,"
+                                          + " parameters: {...}, variableReceive: stockReply})");
+        assertThat(msgs.get(2)).isEqualTo("Line 21: jms: Unknown option 'pattern' (pattern is a key of the to:, next to"
+                                          + " uri:, not an option of the jms endpoint: to: {uri: jms, parameters: {...},"
+                                          + " pattern: InOut})");
+        assertThat(msgs.get(3)).isEqualTo("Line 22: jms: Unknown option 'variableReceive' (variableReceive is a key of"
+                                          + " the to:, next to uri:, not an option of the jms endpoint: to: {uri:"
+                                          + " \"jms:queue:stock\", variableReceive: stockReply})");
+        // the keys where they go, and an option that is neither the endpoint's nor the EIP's
+        assertThat(SourceValidator.validateYamlEndpoints("""
+                - from:
+                    uri: timer:tick
+                    steps:
+                      - to:
+                          uri: jms
+                          parameters:
+                            destinationName: stock
+                          pattern: InOut
+                          variableReceive: stockReply
+                      - to:
+                          uri: jms
+                          parameters:
+                            destinatonName: stock
+                """, catalog)).anySatisfy(m -> assertThat(m).contains("Unknown option 'destinatonName'. Did you mean"))
+                .noneMatch(m -> m.contains("is a key of"));
+        // the Java and XML DSLs write the options in the uri
+        assertThat(EndpointChecks.optionOfTheEip(catalog, "to", "variableReceive", "jms",
+                "jms:queue:stock?variableReceive=stockReply", true, false))
+                .isEqualTo("variableReceive is an option of the to, not of the jms endpoint: set it on the to, not in the uri");
+    }
+
+    @Test
+    void aWildcardInTheFileIncludeOptionIsNamedAsNotARegex() {
+        List<String> msgs = SourceValidator.validateYamlEndpoints("""
+                - from:
+                    uri: file:input?include=*.txt&noop=true
+                    steps:
+                      - log: "${body}"
+                - from:
+                    uri: file:other?include=.*\\.txt
+                    steps:
+                      - log: "${body}"
+                """, catalog);
+        assertThat(msgs).hasSize(1);
+        assertThat(msgs.get(0)).contains("include=*.txt is not a regular expression")
+                .contains("write include=.*\\.txt").contains("antInclude=*.txt");
+    }
+
+    @Test
+    void aSimpleMistakeInAFileNameOptionIsReportedAtWriteTime() {
+        // r26 connect-sftp-transfer step 3, a receipt named like the batch: the write was accepted, and the route then
+        // failed to reload on "Unknown file language syntax: noext"
+        String yaml = """
+                - route:
+                    from:
+                      uri: timer:tick
+                      steps:
+                        - to:
+                            uri: sftp:localhost:2222/receipts
+                            parameters:
+                              username: admin
+                              fileName: "${file:noext}.txt"
+                        - to:
+                            uri: "file:receipts?fileName=${file:name:noext}.txt"
+                """;
+        List<String> msgs = SourceValidator.validateYamlEndpoints(yaml, catalog);
+        assertThat(msgs).hasSize(2);
+        assertThat(msgs.get(0)).startsWith("Line 9: sftp: fileName=${file:noext}.txt has a Simple syntax error: Unknown"
+                                           + " file language syntax: noext (did you mean ${file:name.noext}, the file"
+                                           + " name without its extension?");
+        assertThat(msgs.get(1)).startsWith("Line 11: file: fileName=${file:name:noext}.txt has a Simple syntax error:"
+                                           + " Unknown file language syntax: name:noext (did you mean"
+                                           + " ${file:name.noext}?");
+        // the functions as written in the file component's doc, with a date, a header and a property placeholder
+        String right = yaml.replace("${file:noext}.txt", "{{receipt.prefix}}${file:name.noext}-${date:now:yyyyMMdd}.txt")
+                .replace("${file:name:noext}.txt", "${header.CamelFileName}.done&tempFileName=${file:onlyname}.tmp");
+        assertThat(SourceValidator.validateYamlEndpoints(right, catalog)).isEmpty();
+    }
+
+    @Test
+    void aFileOptionTheRuntimeAcceptsIsNotRefused() {
+        // review of #29147: the check of the file language options refused routes that run fine: a placeholder as an
+        // operand of ||, a RAW value with & in it (in the uri and under parameters:), a single-quoted value with '' in
+        // it, and + for a space in a uri
+        String yaml = """
+                - route:
+                    from:
+                      uri: file
+                      parameters:
+                        directoryName: inbox
+                        filterFile: "${file:size} > 1000 || {{extra.filter}}"
+                      steps:
+                        - log: "${file:name}"
+                - route:
+                    from:
+                      uri: "file:archive?filterFile=RAW(${file:name} contains 'R&D')"
+                      steps:
+                        - log: "${file:name}"
+                - route:
+                    from:
+                      uri: file
+                      parameters:
+                        directoryName: research
+                        filterFile: "RAW(${file:onlyname} contains 'R&D')"
+                      steps:
+                        - log: "${file:name}"
+                - route:
+                    from:
+                      uri: file
+                      parameters:
+                        directoryName: plans
+                        filterFile: '${file:name} contains ''plan'''
+                      steps:
+                        - log: "${file:name}"
+                - route:
+                    from:
+                      uri: "file:big?filterFile=${file:size}+>+1000"
+                      steps:
+                        - log: "${file:name}"
+                """;
+        assertThat(SourceValidator.validateYamlEndpoints(yaml, catalog)).isEmpty();
+        // a mistake is still reported, in RAW and in single quotes
+        String wrong = yaml.replace("RAW(${file:name} contains 'R&D')", "RAW(${file:noext} contains 'R&D')")
+                .replace("'${file:name} contains ''plan'''", "'${file:name:noext} contains ''plan'''");
+        assertThat(SourceValidator.validateYamlEndpoints(wrong, catalog)).satisfiesExactly(
+                m -> assertThat(m).startsWith("Line 11: file: filterFile=${file:noext} contains 'R&D' has a Simple syntax"
+                                              + " error: Unknown file language syntax: noext"),
+                m -> assertThat(m).startsWith("Line 27: file: filterFile=${file:name:noext} contains 'plan' has a Simple"
+                                              + " syntax error: Unknown file language syntax: name:noext"));
+    }
+
+    @Test
+    void anAmpersandInAParameterValueIsAccepted() {
+        // CAMEL-26594: the YAML DSL keeps a value with an & whole (in RAW), so filterFile: "${file:name} contains 'R&D'"
+        // runs, where the & cut the value before (CAMEL-26591). So does a secret option, and a path option, where an & is
+        // a character like any other
+        String yaml = """
+                - route:
+                    from:
+                      uri: file:inbox
+                      parameters:
+                        filterFile: "${file:name} contains 'R&D'"
+                        noop: true
+                      steps:
+                        - log: "${file:name}"
+                - route:
+                    from:
+                      uri: file
+                      parameters:
+                        directoryName: R&D
+                        filterFile: "${file:size} > 1000 && ${file:name} ends with '.csv'"
+                      steps:
+                        - log: "${file:name}"
+                - route:
+                    from:
+                      uri: sftp:localhost:2222/inbox
+                      parameters:
+                        username: admin
+                        password: "s3cr&t"
+                      steps:
+                        - log: "${file:name}"
+                - route:
+                    from:
+                      uri: timer:tick
+                      steps:
+                        - to:
+                            uri: log:audit
+                            parameters:
+                              marker: "f(x)&g(y)"
+                """;
+        assertThat(SourceValidator.validateYamlEndpoints(yaml, catalog)).isEmpty();
+        // the value is checked whole, as the runtime reads it: a mistake in it is reported with the whole value
+        String wrong = yaml.replace("${file:name} contains 'R&D'", "${file:noext} contains 'R&D'");
+        assertThat(SourceValidator.validateYamlEndpoints(wrong, catalog)).satisfiesExactly(
+                m -> assertThat(m).startsWith("Line 5: file: filterFile=${file:noext} contains 'R&D' has a Simple syntax"
+                                              + " error: Unknown file language syntax: noext"));
+    }
+
+    @Test
+    void anAmpersandIsReportedWhereTheYamlDslStillCutsTheValue() {
+        // CAMEL-26594: the YAML DSL adds a value of a map option, a value that starts with # and a value that no RAW form
+        // can keep whole to the uri as they are, so there the & still cuts the value. A secret option is put in RAW(...)
+        // only, which ends at )&
+        String yaml = """
+                - route:
+                    from:
+                      uri: once
+                      parameters:
+                        name: hello
+                        headers:
+                          dept: "R&D"
+                      steps:
+                        - log: "${body}"
+                - route:
+                    from:
+                      uri: file:inbox
+                      parameters:
+                        filter: "#my&Filter"
+                      steps:
+                        - log: "${file:name}"
+                - route:
+                    from:
+                      uri: timer:tick
+                      steps:
+                        - to:
+                            uri: log:audit
+                            parameters:
+                              marker: "f(x)&g{y}&z"
+                        - to:
+                            uri: log:audit2
+                            parameters:
+                              marker: "{x})&y"
+                - route:
+                    from:
+                      uri: sftp:localhost:2222/inbox
+                      parameters:
+                        username: admin
+                        password: "s3c)&t"
+                      steps:
+                        - log: "${file:name}"
+                """;
+        String noRawForm = " No RAW form can keep this value whole: RAW(...) ends at a ) followed by &, and RAW{...} ends"
+                           + " at a } followed by & (and RAW{{ is the start of a property placeholder). So the YAML DSL"
+                           + " adds the value to the uri as it is.";
+        List<String> msgs = SourceValidator.validateYamlEndpoints(yaml, catalog);
+        assertThat(msgs).hasSize(5);
+        assertThat(msgs.get(0)).isEqualTo("Line 7: once: dept of headers has an & in its value. The YAML DSL adds the"
+                                          + " values of a map option to the uri as they are. An & starts a new option, so"
+                                          + " Camel reads dept=R and takes the rest as another option. Write the value in"
+                                          + " RAW(...), which Camel keeps as it is: dept: \"RAW(R&D)\"");
+        assertThat(msgs.get(1)).isEqualTo("Line 14: file: filter has an & in its value. The YAML DSL keeps a value with"
+                                          + " an & whole, but it adds a value that starts with # (a reference) to the uri"
+                                          + " as it is. An & starts a new option, so Camel reads filter=#my and takes the"
+                                          + " rest as another option. Write the value in RAW(...), which Camel keeps as it"
+                                          + " is, and the reference still works: filter: \"RAW(#my&Filter)\"");
+        assertThat(msgs.get(2)).isEqualTo("Line 24: log: marker has an & in its value." + noRawForm
+                                          + " An & starts a new option, so Camel reads marker=f(x) and takes the rest as"
+                                          + " another option. Put the value in a property and refer to it with #property:"
+                                          + " marker: \"#property:marker\", with marker=f(x)&g{y}&z in"
+                                          + " application.properties");
+        assertThat(msgs.get(3)).isEqualTo("Line 28: log: marker has an & in its value." + noRawForm
+                                          + " An & starts a new option, so Camel reads marker={x}) and takes the rest as"
+                                          + " another option. Put the value in a property and refer to it with #property:"
+                                          + " marker: \"#property:marker\", with marker={x})&y in application.properties");
+        assertThat(msgs.get(4)).isEqualTo("Line 34: sftp: password has an & in its value. The YAML DSL puts a secret"
+                                          + " option in RAW(...), and RAW(...) ends at a ) followed by &. An & starts a new"
+                                          + " option, so Camel reads password=s3c and takes the rest as another option. Put"
+                                          + " the value in a property and refer to it with #property: password:"
+                                          + " \"#property:password\", and set password in application.properties");
+
+        // the fixes the messages give are accepted
+        String fixed = yaml.replace("dept: \"R&D\"", "dept: \"RAW(R&D)\"")
+                .replace("\"#my&Filter\"", "\"RAW(#my&Filter)\"")
+                .replace("\"f(x)&g{y}&z\"", "\"#property:marker\"")
+                .replace("\"{x})&y\"", "\"#property:marker\"")
+                .replace("\"s3c)&t\"", "\"#property:password\"");
+        assertThat(SourceValidator.validateYamlEndpoints(fixed, catalog)).isEmpty();
+    }
+
+    @Test
+    void severalEndpointsInOneToAreNamed() {
+        List<String> msgs = SourceValidator.validateYamlEndpoints("""
+                - from:
+                    uri: timer:tick
+                    steps:
+                      - to:
+                          uri: direct:processA,direct:processB
+                      - to:
+                          uri: "log:a?showAll=true"
+                """, catalog);
+        assertThat(msgs).hasSize(1);
+        assertThat(msgs.get(0)).contains("a to: takes one endpoint").contains("multicast: {to: [...]}")
+                .contains("recipientList");
+    }
+
+    @Test
+    void aHeaderNoComponentSetsIsNamedWithTheClosest() {
+        List<String> msgs = SourceValidator.validateKnownHeaders("""
+                - from:
+                    uri: "file:in?noop=true"
+                    steps:
+                      - log: "${header.CamelFileNam} ${header.CamelFileName} ${header.MyOwn}"
+                      - setHeader:
+                          name: CamelFilePathX
+                          simple: "x"
+                """, catalog);
+        assertThat(msgs).hasSize(2);
+        assertThat(msgs.get(0)).contains("header CamelFileNam is not set by file").contains("did you mean CamelFileName")
+                .contains("The file headers are");
+        assertThat(msgs.get(1)).contains("header CamelFilePathX is not set by file");
+    }
+
+    @Test
+    void aTimerExchangePropertyIsSetOnlyWithIncludeMetadata() {
+        // TimerConsumer sets the counter, name, period and time as exchange properties, and only with includeMetadata
+        List<String> msgs = SourceValidator.validateKnownHeaders("""
+                - from:
+                    uri: "timer:tick?period=1000"
+                    steps:
+                      - log: "${header.CamelTimerCounter} ${header.CamelTimerFiredTime} ${exchangeProperty.CamelTimerName}"
+                """, catalog);
+        assertThat(msgs).hasSize(2);
+        assertThat(msgs.get(0)).startsWith("Line 4:")
+                .contains("timer sets CamelTimerCounter only with includeMetadata=true")
+                .contains("${exchangeProperty.CamelTimerCounter}");
+        assertThat(msgs.get(1)).startsWith("Line 4:").contains("timer sets CamelTimerName only with includeMetadata=true");
+    }
+
+    /** CAMEL-25744: the counter is 1 on the first fire, so a comparison with 0 never picks it. */
+    @Test
+    void aTimerCounterComparisonThatCanNeverBeTrueIsReported() {
+        List<String> msgs = SourceValidator.validateKnownHeaders("""
+                - from:
+                    uri: "timer:tick?repeatCount=2&includeMetadata=true"
+                    steps:
+                      - setBody:
+                          simple: "resource:file:${exchangeProperty.CamelTimerCounter == 0 ? 'a.json' : 'b.json'}"
+                      - choice:
+                          when:
+                            - simple: "${header.CamelTimerCounter} != 0"
+                              steps:
+                                - log: "${body}"
+                      - filter:
+                          groovy: "exchange.getProperty('CamelTimerCounter', Integer) < 1"
+                """, catalog);
+        assertThat(msgs).hasSize(3);
+        assertThat(msgs.get(0)).startsWith("Line 5:").contains("counts the fires from 1").contains("== 0 is never true")
+                .contains("compare with 1");
+        assertThat(msgs.get(1)).startsWith("Line 8:").contains("!= 0 is always true");
+        assertThat(msgs.get(2)).startsWith("Line 12:").contains("< 1 is never true");
+    }
+
+    @Test
+    void aTimerCounterComparisonThatIsAlwaysTrueIsReported() {
+        List<String> msgs = SourceValidator.validateKnownHeaders("""
+                - from:
+                    uri: "timer:tick?repeatCount=2&includeMetadata=true"
+                    steps:
+                      - filter:
+                          simple: "${exchangeProperty.CamelTimerCounter} > 0"
+                      - filter:
+                          groovy: "exchange.getProperty('CamelTimerCounter', Integer) >= 1"
+                      - filter:
+                          simple: "${exchangeProperty.CamelTimerCounter} >= 0"
+                """, catalog);
+        assertThat(msgs).hasSize(3);
+        assertThat(msgs.get(0)).startsWith("Line 5:").contains("> 0 is always true");
+        assertThat(msgs.get(1)).startsWith("Line 7:").contains(">= 1 is always true");
+        assertThat(msgs.get(2)).startsWith("Line 9:").contains(">= 0 is always true");
+    }
+
+    @Test
+    void aTimerCounterComparedWithOneIsFine() {
+        List<String> msgs = SourceValidator.validateKnownHeaders("""
+                - from:
+                    uri: "timer:tick?repeatCount=2&includeMetadata=true"
+                    steps:
+                      - setBody:
+                          simple: "resource:file:${exchangeProperty.CamelTimerCounter == 1 ? 'a.json' : 'b.json'}"
+                      - filter:
+                          simple: "${exchangeProperty.CamelTimerCounter} > 1"
+                      - filter:
+                          simple: "${exchangeProperty.CamelTimerCounter} >= 2"
+                """, catalog);
+        assertThat(msgs).isEmpty();
+    }
+
+    /** The routes of a REST DSL use direct, which has no header metadata: a wrong status header is still reported. */
+    @Test
+    void aWrongHttpStatusHeaderIsReportedInADirectRoute() {
+        List<String> msgs = SourceValidator.validateKnownHeaders("""
+                - rest:
+                    get:
+                      - path: /orders/{id}
+                        to: direct:get-order
+                - route:
+                    from:
+                      uri: direct:get-order
+                      steps:
+                        - setHeader:
+                            name: CamelHttpStatusCode
+                            constant: 404
+                        - setHeader:
+                            name: Exchange.HTTP_STATUS
+                            constant: 404
+                        - log: "${header.CamelHttpStatusCode}"
+                """, catalog);
+        assertThat(msgs).hasSize(2);
+        assertThat(msgs.get(0)).startsWith("Line 10:").contains("Camel has no header CamelHttpStatusCode")
+                .contains("the header CamelHttpResponseCode (Exchange.HTTP_RESPONSE_CODE)");
+        assertThat(msgs.get(1)).startsWith("Line 13:").contains("Exchange has no constant HTTP_STATUS")
+                .contains("the route fails to start").contains("the header CamelHttpResponseCode");
+    }
+
+    @Test
+    void aConstantOfExchangeIsTheNameCamelLooksUp() {
+        // Camel looks the constant up when it creates the route (DefaultCamelContextExtension.resolvePropertyPlaceholders)
+        List<String> msgs = SourceValidator.validateKnownHeaders("""
+                - from:
+                    uri: direct:get-order
+                    steps:
+                      - setHeader:
+                          name: Exchange.HTTP_RESPONSE_CODE
+                          constant: 404
+                      - setHeader:
+                          name: CamelHttpResponseCode
+                          constant: 404
+                      - setProperty:
+                          name: Exchange.HTTP_STATUS
+                          constant: 404
+                      - setHeader:
+                          name: Exchange.FILE_NAM
+                          constant: out.json
+                """, catalog);
+        // the name of a setProperty is looked up as well
+        assertThat(msgs).hasSize(2);
+        assertThat(msgs.get(0)).startsWith("Line 11:").contains("Exchange has no constant HTTP_STATUS");
+        assertThat(msgs.get(1)).startsWith("Line 14:").contains("Exchange has no constant FILE_NAM")
+                .contains("did you mean Exchange.FILE_NAME");
+    }
+
+    /** "did you mean JMSReplyTo?" led to replies set by hand: Camel does request-reply with pattern InOut (r20). */
+    @Test
+    void aReplyHeaderGetsTheRequestReplyHint() {
+        List<String> msgs = SourceValidator.validateKnownHeaders("""
+                - from:
+                    uri: jms:queue:orders
+                    steps:
+                      - setHeader:
+                          name: CamelJmsReplyTo
+                          constant: stock-reply
+                      - to:
+                          uri: jms:queue:stock
+                """, catalog);
+        assertThat(msgs).singleElement().satisfies(m -> assertThat(m)
+                .contains("header CamelJmsReplyTo is not set by jms")
+                .contains("send with pattern: InOut on the to: and Camel sets JMSReplyTo and waits for the reply")
+                .contains("you do not need to set JMSReplyTo or replyTo yourself")
+                .doesNotContain("did you mean"));
+    }
+
+    /** CAMEL-26018: the smtp producer reads the alternative body of an HTML mail from CamelMailAlternativeBody. */
+    @Test
+    void aHeaderTheProducerReadsIsKnown() {
+        List<String> msgs = SourceValidator.validateKnownHeaders("""
+                - from:
+                    uri: timer:tick
+                    steps:
+                      - setHeader:
+                          name: CamelMailAlternativeBody
+                          constant: Hello plain text
+                      - setBody:
+                          constant: <p>Hello HTML</p>
+                      - to:
+                          uri: smtp://localhost?to=info@acme.com&contentType=text/html
+                """, catalog);
+        assertThat(msgs).isEmpty();
+    }
+
+    /**
+     * A reply header set by hand in a route that sends nothing InOut gets a note, in any case of its name (r21 of the
+     * local-model benchmark: the service route set JMSReplyTo and the request went one way). The endpoints are written
+     * as the scheme alone with parameters, as well as in a URI.
+     */
+    @Test
+    void aJmsReplyHeaderSetByHandGetsANote() {
+        String route = """
+                - route:
+                    id: reserve-order
+                    from:
+                      uri: jms
+                      parameters:
+                        destinationType: queue
+                        destinationName: orders
+                      steps:
+                        - toD:
+                            uri: "jms:queue:stock"
+                        - log:
+                            message: "Stock service answered: ${header.camelJmsReplyTo}"
+                - route:
+                    id: stock-service
+                    from:
+                      uri: jms
+                      parameters:
+                        destinationName: stock
+                      steps:
+                        - setHeader:
+                            name: JMSReplyTo
+                            expression:
+                              simple: "jms:queue:orders"
+                        - setBody:
+                            constant: reserved
+                """;
+        assertThat(HeaderChecks.replyHeaderNotes(route)).containsExactly(
+                "Line 12: camelJmsReplyTo is read, and no message is sent with pattern: InOut. "
+                                                                         + HeaderChecks.JMS_REQUEST_REPLY_HINT,
+                "Line 21: JMSReplyTo is set by hand, and no message is sent with pattern: InOut. "
+                                                                                                                + HeaderChecks.JMS_REQUEST_REPLY_HINT);
+        // with the request sent InOut, the reply is Camel's: no note
+        assertThat(HeaderChecks.replyHeaderNotes(route.replace("uri: \"jms:queue:stock\"",
+                "uri: \"jms:queue:stock\"\n            pattern: InOut"))).isEmpty();
+        // not a JMS route: no note
+        assertThat(HeaderChecks.replyHeaderNotes(route.replace("uri: jms", "uri: seda").replace("jms:queue:", "seda:")))
+                .isEmpty();
+    }
+
+    /** The headers of an endpoint written as the scheme alone (uri: jms, with parameters:) are checked too. */
+    @Test
+    void theHeadersOfAnEndpointWrittenAsTheSchemeAloneAreChecked() {
+        List<String> msgs = SourceValidator.validateKnownHeaders("""
+                - route:
+                    from:
+                      uri: jms
+                      parameters:
+                        destinationName: orders
+                      steps:
+                        - log:
+                            message: "${header.CamelJmsDestinationNam}"
+                """, catalog);
+        assertThat(msgs).singleElement().satisfies(m -> assertThat(m)
+                .contains("header CamelJmsDestinationNam is not set by jms")
+                .contains("did you mean CamelJmsDestination, CamelJmsDestinationName?"));
+    }
+
+    /** The JMS request-reply hint is for JMS only: the reply headers of other components keep their "did you mean". */
+    @Test
+    void aReplyHeaderOfAnotherComponentGetsDidYouMean() {
+        List<String> msgs = SourceValidator.validateKnownHeaders("""
+                - from:
+                    uri: ftp:localhost/inbox
+                    steps:
+                      - log:
+                          message: "${header.CamelFtpReplycode}"
+                """, catalog);
+        assertThat(msgs).singleElement().satisfies(m -> assertThat(m)
+                .contains("header CamelFtpReplycode is not set by ftp")
+                .contains("did you mean CamelFtpReplyCode")
+                .doesNotContain("request-reply over JMS"));
+    }
+
+    /** CAMEL-26039: the short form of a to: names the component as well as to: {uri: ...} does. */
+    @Test
+    void aHeaderOfAComponentInTheShortFormOfAToIsKnown() {
+        List<String> msgs = SourceValidator.validateKnownHeaders("""
+                - route:
+                    from:
+                      uri: timer:tick
+                      steps:
+                        - setHeader:
+                            name: CamelAwsSecretsManagerSecretId
+                            constant: my-secret
+                        - to: aws-secrets-manager:sm?operation=getSecret
+                """, catalog);
+        assertThat(msgs).isEmpty();
+    }
+
+    @Test
+    void theShortFormsOfTheEndpointStepsNameTheirComponents() {
+        List<String> msgs = SourceValidator.validateKnownHeaders("""
+                - interceptSendToEndpoint: "kafka:audit"
+                - route:
+                    from:
+                      uri: timer:tick
+                      steps:
+                        - setHeader:
+                            name: CamelSqlQuery
+                            constant: select 1
+                        - setHeader:
+                            name: CamelKafkaKey
+                            constant: k
+                        - setHeader:
+                            name: CamelFtpReplyCode
+                            constant: 200
+                        - toD: 'sql:select 1'
+                        - poll: "ftp:localhost/inbox"
+                """, catalog);
+        assertThat(msgs).isEmpty();
+    }
+
+    @Test
+    void aKeyAfterAnEndpointStepIsNotAComponent() {
+        // the long form of a to: has the uri on the next line; an option such as replyTo is not a to:
+        List<String> msgs = SourceValidator.validateKnownHeaders("""
+                - route:
+                    from:
+                      uri: timer:tick
+                      steps:
+                        - to:
+                            uri: jms:queue:orders
+                            parameters:
+                              replyTo: "queue:stock"
+                        - to:
+                            steps: x
+                        - log: "${header.CamelInventedOne}"
+                """, catalog);
+        assertThat(msgs).singleElement().asString().contains("header CamelInventedOne is not set by timer, jms ");
+    }
+
+    @Test
+    void withIncludeMetadataAHeaderLookupFindsTheExchangeProperty() {
+        // Simple's ${header.x} falls back to the exchange properties, so it reads the counter
+        List<String> msgs = SourceValidator.validateKnownHeaders("""
+                - from:
+                    uri: "timer:tick?period=1000&includeMetadata=true"
+                    steps:
+                      - log: "${header.CamelTimerCounter} ${exchangeProperty.CamelTimerName}"
+                """, catalog);
+        assertThat(msgs).isEmpty();
+    }
+
+    /** r27l-4 transform-groovy step 3: resource:file:order-${body[CamelTimerCounter]}.json loaded order-.json. */
+    @Test
+    void aTimerExchangePropertyReadOnTheBodyIsReported() {
+        List<String> msgs = SourceValidator.validateKnownHeaders("""
+                - from:
+                    uri: timer:orders?repeatCount=2&includeMetadata=true
+                    steps:
+                      - setBody:
+                          simple: "resource:file:order-${body[CamelTimerCounter]}.json"
+                      - log: "${body.CamelTimerName} ${body[CamelTimerCounter]}"
+                """, catalog);
+        assertThat(msgs).hasSize(2);
+        assertThat(msgs.get(0)).isEqualTo("Line 5: ${body[CamelTimerCounter]} reads a field of the body, and the body has"
+                                          + " no field CamelTimerCounter: CamelTimerCounter is an exchange property of the"
+                                          + " timer, write ${exchangeProperty.CamelTimerCounter}");
+        assertThat(msgs.get(1)).startsWith("Line 6: ${body.CamelTimerName} reads a field of the body");
+        // without includeMetadata the timer does not set it, which the message says too
+        assertThat(SourceValidator.validateKnownHeaders("""
+                - from:
+                    uri: timer:orders?repeatCount=2
+                    steps:
+                      - setBody:
+                          simple: "resource:file:order-${body.CamelTimerCounter}.json"
+                """, catalog)).singleElement().asString()
+                .endsWith("write ${exchangeProperty.CamelTimerCounter} (the timer sets it only with includeMetadata=true"
+                          + " on the endpoint)");
+        // a field of the body with a name of Camel that no component of the route sets as an exchange property
+        assertThat(SourceValidator.validateKnownHeaders("""
+                - from:
+                    uri: file:orders
+                    steps:
+                      - log: "${body[CamelTimerCounter]}"
+                """, catalog)).isEmpty();
+    }
+
+    @Test
+    void withIncludeMetadataTheHeadersMapStillHasNoSuchHeader() {
+        List<String> msgs = SourceValidator.validateKnownHeaders("""
+                - from:
+                    uri: timer:tick
+                    parameters:
+                      includeMetadata: true
+                    steps:
+                      - log: "${headers.CamelTimerCounter}"
+                """, catalog);
+        assertThat(msgs).singleElement().asString()
+                .contains("CamelTimerCounter is an exchange property set by timer, not a header")
+                .contains("${exchangeProperty.CamelTimerCounter}");
+    }
+
+    @Test
+    void anInventedHeaderForTheSourceEndpointGetsTheExpressionThatAnswersIt() {
+        // a timer-triggered route has no message source to name, so a beginner or a model invents CamelFromEndpoint for
+        // "which endpoint did this come from"; nothing is close, so the message must say what does answer it and what
+        // the timer sets
+        List<String> msgs = SourceValidator.validateKnownHeaders("""
+                - from:
+                    uri: "timer:tick?period=1000"
+                    steps:
+                      - log: "Endpoint: ${header.CamelFromEndpoint} size: ${body.length()}"
+                """, catalog);
+        assertThat(msgs).hasSize(1);
+        assertThat(msgs.get(0)).contains("header CamelFromEndpoint is not set by timer").doesNotContain("did you mean")
+                .contains("${exchange.fromEndpoint}").contains("${routeId}").contains("${header.CamelToEndpoint}")
+                .contains("The timer headers are CamelTimerFiredTime")
+                .contains(
+                        "timer sets the exchange properties CamelTimerCounter, CamelTimerName, CamelTimerPeriod, CamelTimerTime")
+                .contains("${exchangeProperty.CamelTimerCounter}")
+                .contains("stays null unless a setHeader step sets it earlier in the route");
+    }
+
+    @Test
+    void anInventedHeaderWithTwoComponentsListsTheTriggersHeaders() {
+        // the first component in the file is the trigger; its headers are listed even when nothing is close
+        List<String> msgs = SourceValidator.validateKnownHeaders("""
+                - from:
+                    uri: "file:in?noop=true"
+                    steps:
+                      - log: "${header.CamelEndpointUri} ${header.CamelFileName}"
+                      - to:
+                          uri: "timer:ignored"
+                """, catalog);
+        assertThat(msgs).hasSize(1);
+        assertThat(msgs.get(0)).contains("header CamelEndpointUri is not set by file, timer")
+                .contains("${exchange.fromEndpoint}").contains("The file headers are").contains("CamelFileName");
+    }
+
+    @Test
+    void anInventedSizeHeaderNamesTheBodyFunctions() {
+        List<String> msgs = SourceValidator.validateKnownHeaders("""
+                - from:
+                    uri: "timer:tick?period=1000"
+                    steps:
+                      - log: "${header.CamelPayloadSize}"
+                """, catalog);
+        assertThat(msgs).hasSize(1);
+        assertThat(msgs.get(0)).contains("${body.length()}").contains("${headers.size()}");
+    }
+
+    @Test
+    void aPropertyOrBeanNameIsNotAHeader() {
+        // CAMEL-24710: name: counts as a header only under setHeader/removeHeader; a dotted name is looked up as is,
+        // by the prefix the component documents (CamelSolrField.), and as the head of an OGNL path
+        List<String> msgs = SourceValidator.validateKnownHeaders("""
+                - beans:
+                    - name: CamelMyBean
+                      type: "#class:com.example.MyBean"
+                - from:
+                    uri: "file:in?noop=true"
+                    steps:
+                      - setProperty:
+                          name: CamelAwsSqsDeleteFiltered
+                          constant: "true"
+                      - setHeader:
+                          name: CamelSolrField.id
+                          simple: "${body}"
+                      - log: "${header.CamelFileName.length()} ${header.CamelFileNam.length()}"
+                      - to:
+                          uri: solr:localhost:8983/mycollection
+                """, catalog);
+        assertThat(msgs).hasSize(1);
+        assertThat(msgs.get(0)).contains("header CamelFileNam.length is not set by").contains("did you mean CamelFileLength");
+    }
+
+    @Test
+    void aCommentABlockScalarAndANestedMapInTheParametersAreRead() {
+        // CAMEL-24710: a comment after a value is not the value; the body of a block scalar is not options; the keys
+        // under a Map option are its entries
+        List<String> msgs = SourceValidator.validateYamlEndpoints("""
+                - from:
+                    uri: ai-tool:createOrder
+                    parameters:
+                      description: "Create an order"
+                      argSchema: |
+                        {
+                          "type": "object",
+                          "properties": { "id": { "type": "string" } }
+                        }
+                    steps:
+                      - to:
+                          uri: log:out
+                          parameters:
+                            groupSize: 30000          # the default is none
+                            showAll: true
+                      - to:
+                          uri: once
+                          parameters:
+                            name: hello
+                            headers:
+                              foo: foolish
+                              bar: 456
+                            unknownOne: x
+                """, catalog);
+        assertThat(msgs).hasSize(1);
+        assertThat(msgs.get(0)).contains("Unknown option 'unknownOne'");
+    }
+
+    @Test
+    void aProducerOnlyComponentInFromIsNamed() {
+        List<String> msgs = SourceValidator.validateYamlEndpoints("""
+                - from:
+                    uri: mock:result
+                    steps:
+                      - log: "${body}"
+                - from:
+                    uri: direct:ok
+                    steps:
+                      - to: mock:out
+                """, catalog);
+        assertThat(msgs).hasSize(1);
+        assertThat(msgs.get(0)).contains("mock is a producer-only component: it cannot be a from:").contains("direct:name");
+    }
+
+    /** CAMEL-24852: the directory of a file endpoint on a to: cannot be dynamic; toD: evaluates the uri first. */
+    @Test
+    void aDynamicDirectoryOnAFileEndpointSaysToUseFileNameOrToD() {
+        String yaml = """
+                - route:
+                    from:
+                      uri: timer:tick
+                      steps:
+                        - to:
+                            uri: "file://archived/${header.monthDir}?fileName=${header.CamelFileName}"
+                """;
+        List<String> errors = SourceValidator.validateYamlEndpoints(yaml, catalog);
+        assertThat(errors)
+                .anyMatch(e -> e.startsWith("Line 6: file: the directory archived/${header.monthDir} cannot be dynamic")
+                        && e.contains("fileName (file:archived?fileName=${...})") && e.contains("use toD:"));
+
+        List<String> dynamic = SourceValidator.validateYamlEndpoints(yaml.replace("- to:", "- toD:"), catalog);
+        assertThat(dynamic).noneMatch(e -> e.contains("cannot be dynamic"));
+
+        // a from: with a dynamic directory fails at startup the same way
+        String fromYaml = """
+                - route:
+                    from:
+                      uri: "file://archived/${header.monthDir}"
+                      steps:
+                        - to:
+                            uri: log:done
+                """;
+        assertThat(SourceValidator.validateYamlEndpoints(fromYaml, catalog))
+                .anyMatch(e -> e.startsWith("Line 3: file: the directory archived/${header.monthDir} cannot be dynamic"));
+    }
+
+    /**
+     * CAMEL-25374: quotes escaped with a backslash in a plain YAML value are text, so they are part of the regex. The
+     * hint gives the line to write, without echoing the stray quotes back.
+     */
+    @Test
+    void quoteCharactersInAnIncludeRegexAreReported() {
+        String yaml = """
+                - route:
+                    from:
+                      uri: file:inbox
+                      parameters:
+                        include: \\".*\\\\.json\\"
+                      steps:
+                        - to:
+                            uri: log:done
+                """;
+        List<String> errors = SourceValidator.validateYamlEndpoints(yaml, catalog);
+        assertThat(errors).anyMatch(e -> e.startsWith("Line 5: file: include has quote characters in its value")
+                && e.contains("Write the line as include: '.*\\.json'"));
+        assertThat(errors).noneMatch(e -> e.contains("matches a literal backslash"));
+        assertThat(EndpointChecks.withoutQuoteCharacters("'.*\\.json'")).isEqualTo(".*\\.json");
+        assertThat(EndpointChecks.withoutQuoteCharacters(".*\\.json")).isEqualTo(".*\\.json");
+    }
+
+    /** CAMEL-24854: a doubled backslash in an include regex (kept as is inside single quotes) matches no file. */
+    @Test
+    void aDoubledBackslashInAnIncludeRegexIsReported() {
+        String yaml = """
+                - route:
+                    from:
+                      uri: file:orders
+                      parameters:
+                        include: '.*\\\\.json$'
+                      steps:
+                        - to:
+                            uri: log:done
+                """;
+        List<String> errors = SourceValidator.validateYamlEndpoints(yaml, catalog);
+        assertThat(errors)
+                .anyMatch(e -> e.startsWith("Line 5: file: include=.*\\\\.json$ matches a literal backslash in the file name")
+                        && e.endsWith("write include='.*\\.json$'"));
+
+        List<String> ok = SourceValidator.validateYamlEndpoints(yaml.replace("\\\\.json", "\\.json"), catalog);
+        assertThat(ok).noneMatch(e -> e.contains("backslash"));
+
+        // in double quotes YAML reads \\ as one backslash: ".*\\.json$" is the regex .*\.json$, nothing to report
+        List<String> doubleQuoted
+                = SourceValidator.validateYamlEndpoints(yaml.replace("'.*\\\\.json$'", "\".*\\\\.json$\""), catalog);
+        assertThat(doubleQuoted).noneMatch(e -> e.contains("backslash"));
+
+        // \\myfile is a backslash on purpose: \myfile is not a regex escape, so there is nothing else it can mean
+        List<String> literal = SourceValidator.validateYamlEndpoints(yaml.replace(".*\\\\.json$", ".*\\\\myfile.*"), catalog);
+        assertThat(literal).noneMatch(e -> e.contains("backslash"));
+    }
+}

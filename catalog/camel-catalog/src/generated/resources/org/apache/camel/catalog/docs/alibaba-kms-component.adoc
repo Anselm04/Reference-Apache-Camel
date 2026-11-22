@@ -1,0 +1,103 @@
+= Alibaba Key Management Service (KMS) Component
+:doctitle: Alibaba Key Management Service (KMS)
+:shortname: alibaba-kms
+:artifactid: camel-alibaba-kms
+:description: Encrypt and decrypt data using Alibaba Cloud Key Management Service (KMS).
+:since: 4.23
+:supportlevel: Preview
+:tabs-sync-option:
+:component-header: Only producer is supported
+//Manually maintained attributes
+:group: Alibaba Cloud
+
+*Since Camel {since}*
+
+*{component-header}*
+
+The Alibaba Cloud KMS component allows you to encrypt, decrypt and generate data keys using Alibaba Cloud KMS.
+
+Maven users will need to add the following dependency to their `pom.xml`
+for this component:
+
+[source,xml]
+----
+<dependency>
+    <groupId>org.apache.camel</groupId>
+    <artifactId>camel-alibaba-kms</artifactId>
+    <version>x.x.x</version>
+    <!-- use the same version as your Camel core version -->
+</dependency>
+----
+
+== URI format
+
+[source]
+----
+alibaba-kms:operation[?options]
+----
+
+// component options: START
+include::partial$component-configure-options.adoc[]
+include::partial$component-endpoint-options.adoc[]
+include::partial$component-endpoint-headers.adoc[]
+// component options: END
+
+== Usage
+
+=== Operations
+
+The component supports the following operations:
+
+* `encrypt` - encrypt plaintext using a KMS key (producer)
+* `decrypt` - decrypt a ciphertext blob (producer)
+* `generateDataKey` - generate a data key (producer)
+
+=== Plaintext of encrypt
+
+`encrypt` encrypts the `plaintext` option or the `CamelAlibabaKmsPlaintext` header when one is set, else the message
+body. A `String` is encrypted in UTF-8, and a `byte[]`, an `InputStream` or a file as its bytes, so binary data is
+kept. The component sends these bytes to KMS in Base64, so the `plaintext` that `decrypt` returns for them is Base64:
+decode it to get the original bytes back. A `Map` or a POJO fails instead of being encrypted as its `toString()`: in
+the body with an `InvalidPayloadException`, and in the header or in the exchange property of the same name with an
+`IllegalArgumentException`. Marshal such a value first, for example with `marshal().json()`. A value whose text is
+its `toString()`, such as a `UUID`, a `URI` or a `java.time` value, is encrypted as that text. A message without a
+body fails with an `IllegalArgumentException`.
+
+=== Producer example
+
+[tabs]
+====
+Java::
++
+[source,java]
+----
+from("direct:start")
+    .setBody(constant("secret-value"))
+    .to("alibaba-kms:encrypt?keyId=alias/my-key&region=cn-hangzhou&accessKey=RAW(accessKey)&secretKey=RAW(secretKey)");
+----
+
+YAML::
++
+[source,yaml]
+----
+- route:
+    from:
+      uri: direct:start
+      steps:
+        - setBody:
+            expression:
+              constant:
+                expression: secret-value
+        - to:
+            uri: alibaba-kms:encrypt
+            parameters:
+              keyId: alias/my-key
+              region: cn-hangzhou
+              accessKey: "{{alibaba.access-key}}"
+              secretKey: "{{alibaba.secret-key}}"
+----
+====
+
+== Examples
+
+For more examples, see the unit tests in the `camel-alibaba-kms` module.

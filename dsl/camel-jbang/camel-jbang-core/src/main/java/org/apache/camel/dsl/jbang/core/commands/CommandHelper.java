@@ -1,0 +1,147 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.camel.dsl.jbang.core.commands;
+
+import java.io.InputStream;
+import java.util.Scanner;
+import java.util.concurrent.atomic.AtomicBoolean;
+
+import org.apache.camel.dsl.jbang.core.common.EnvironmentHelper;
+import org.apache.camel.dsl.jbang.run.common.ExportHelper;
+import org.apache.camel.dsl.jbang.run.common.Printer;
+import org.jline.terminal.Terminal;
+
+public final class CommandHelper {
+
+    private static final ThreadLocal<Printer> printerAssociation = new ThreadLocal<>();
+
+    private CommandHelper() {
+    }
+
+    public static Printer getPrinter() {
+        return printerAssociation.get();
+    }
+
+    public static void setPrinter(Printer out) {
+        printerAssociation.set(out);
+    }
+
+    public static void cleanExportDir(String dir) {
+        ExportHelper.cleanExportDir(dir);
+    }
+
+    public static void cleanExportDir(String dir, boolean keepHidden) {
+        ExportHelper.cleanExportDir(dir, keepHidden);
+    }
+
+    /**
+     * Prompts the user for confirmation before performing a destructive operation. Returns true if the operation should
+     * proceed, false otherwise.
+     *
+     * <p>
+     * The confirmation is automatically granted (returns true) when:
+     * <ul>
+     * <li>The {@code yes} parameter is true (user passed --yes/-y)</li>
+     * <li>Running in a CI environment</li>
+     * <li>No interactive console is available</li>
+     * </ul>
+     *
+     * @param  message the confirmation prompt message to display
+     * @param  yes     whether the user explicitly confirmed via --yes/-y flag
+     * @return         true if the operation should proceed
+     */
+    public static boolean confirmOperation(String message, boolean yes) {
+        if (yes || EnvironmentHelper.isCIEnvironment() || !EnvironmentHelper.isInteractiveTerminal()) {
+            return true;
+        }
+        System.out.print(message + " [y/N] ");
+        System.out.flush();
+        try {
+            Terminal terminal = EnvironmentHelper.getActiveTerminal();
+            InputStream input = terminal != null ? terminal.input() : System.in;
+            // Do not use try-with-resources here: closing the Scanner would close the input stream
+            Scanner scanner = new Scanner(input);
+            String answer = scanner.nextLine().trim().toLowerCase();
+            return "y".equals(answer) || "yes".equals(answer);
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
+    /**
+     * A background task that reads from console, and can be used to signal when user has entered or pressed ctrl + c /
+     * ctrl + d
+     */
+    public static class ReadConsoleTask implements Runnable {
+
+        private final Runnable listener;
+
+        public ReadConsoleTask(Runnable listener) {
+            this.listener = listener;
+        }
+
+        @Override
+        public void run() {
+            // a line (Enter), or the end of the input, stops the command
+            EnvironmentHelper.readLine();
+            listener.run();
+        }
+    }
+
+    /**
+     * Tells a command that watches or follows whether to keep going: until the user presses Enter in an interactive
+     * terminal, or until the duration has passed.
+     */
+    public static final class RunUntil {
+
+        private final AtomicBoolean running = new AtomicBoolean(true);
+        private final long deadline;
+
+        private RunUntil(long duration) {
+            this.deadline = duration > 0 ? System.currentTimeMillis() + duration : 0;
+        }
+
+        /**
+         * Starts watching for Enter (in an interactive terminal only).
+         *
+         * @param duration how long to keep going, in millis, or 0 to keep going until Enter is pressed
+         */
+        public static RunUntil start(long duration) {
+            RunUntil answer = new RunUntil(duration);
+            if (EnvironmentHelper.isInteractiveTerminal()) {
+                Thread t = new Thread(new ReadConsoleTask(answer::stop), "WaitForUser");
+                t.setDaemon(true);
+                t.start();
+            }
+            return answer;
+        }
+
+        /**
+         * Whether to keep going.
+         */
+        public boolean isRunning() {
+            return running.get() && (deadline == 0 || System.currentTimeMillis() < deadline);
+        }
+
+        /**
+         * Stops the command.
+         */
+        public void stop() {
+            running.set(false);
+        }
+    }
+}

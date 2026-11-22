@@ -1,0 +1,141 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.camel.dsl.jbang.core.commands.update;
+
+import java.io.BufferedReader;
+import java.io.IOException;
+import java.io.InputStreamReader;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.concurrent.TimeUnit;
+
+import org.aesh.command.CommandDefinition;
+import org.aesh.command.option.Mixin;
+import org.apache.camel.dsl.jbang.core.commands.CamelCommand;
+import org.apache.camel.dsl.jbang.core.common.CliException;
+import org.apache.camel.dsl.jbang.core.common.CliExitCode;
+import org.apache.camel.dsl.jbang.run.common.RuntimeType;
+import org.apache.camel.main.download.DownloadException;
+import org.apache.camel.main.download.MavenDependencyDownloader;
+
+/**
+ * Command to update a Camel project to a specified version. This command supports updating projects for different
+ * runtimes such as Camel Main, Spring Boot, and Quarkus. It uses Maven and OpenRewrite to apply the necessary updates.
+ */
+@CommandDefinition(name = "run", description = "Update Camel project", generateHelp = true, sortOptions = true,
+                   footer = {
+                           "Examples:",
+                           "  camel update run" })
+public class UpdateRun extends CamelCommand {
+
+    @Mixin
+    CamelUpdateMixin updateMixin;
+
+    // the directory of the Maven project to update
+    Path projectDir = Path.of(".");
+
+    /**
+     * Executes the update command for a Camel project. This method determines the appropriate Maven command based on
+     * the runtime type (Camel Main, Spring Boot, or Quarkus) and executes it to update the project to the specified
+     * version.
+     *
+     * @return           the exit code of the update process (0 for success, -1 for failure)
+     * @throws Exception if an error occurs during the update process
+     */
+    @Override
+    public Integer doCall() throws Exception {
+        if (!Files.isRegularFile(projectDir.resolve("pom.xml"))) {
+            printer().printErr("No Maven project found in the current directory: run camel update run in the directory "
+                               + "with the pom.xml of the project to update");
+            return CliExitCode.FILE_NOT_FOUND;
+        }
+
+        List<String> command = new ArrayList<>();
+        try (MavenDependencyDownloader downloader = createDownloader()) {
+            downloader.setRepositories(updateMixin.mavenResolver.repos());
+            downloader.start();
+
+            Update update = null;
+            try {
+                if (updateMixin.runtime == RuntimeType.quarkus) {
+                    update = new CamelQuarkusUpdate(updateMixin, downloader);
+
+                    command = update.command();
+                } else {
+                    update = new CamelUpdate(updateMixin, downloader);
+
+                    command = update.command();
+                }
+            } catch (CamelUpdateException ex) {
+                printer().printErr(ex.getMessage());
+
+                return CliExitCode.FAILURE;
+            } catch (DownloadException e) {
+                printer().printErr("Cannot download what the update to Camel " + updateMixin.version + " needs: "
+                                   + e.getMessage());
+
+                return CliExitCode.FAILURE;
+            }
+        }
+
+        return executeCommand(command);
+    }
+
+    /**
+     * The downloader of the upgrade recipes and versions.
+     */
+    protected MavenDependencyDownloader createDownloader() {
+        return new MavenDependencyDownloader();
+    }
+
+    /**
+     * Executes a shell command and prints its output.
+     *
+     * @param  command              the command to execute
+     * @return                      the exit code of the command execution
+     * @throws IOException          if an I/O error occurs
+     * @throws InterruptedException if the command execution is interrupted
+     */
+    protected int executeCommand(List<String> command) throws IOException, InterruptedException {
+        ProcessBuilder pb = new ProcessBuilder(command).directory(projectDir.toFile());
+        Process p = pb.redirectErrorStream(true)
+                .start();
+
+        // print the output while the command runs, so the timeout applies to the command
+        Thread reader = new Thread(() -> {
+            try (BufferedReader stdInput = new BufferedReader(new InputStreamReader(p.getInputStream()))) {
+                String line;
+                while ((line = stdInput.readLine()) != null) {
+                    printer().println(line);
+                }
+            } catch (IOException e) {
+                // the command was destroyed
+            }
+        }, "camel-update-output");
+        reader.setDaemon(true);
+        reader.start();
+
+        if (!p.waitFor(updateMixin.upgradeTimeout, TimeUnit.SECONDS)) {
+            p.destroyForcibly();
+            throw CliException.timeout("Update did not finish within " + updateMixin.upgradeTimeout + " seconds");
+        }
+        reader.join(TimeUnit.SECONDS.toMillis(5));
+        return p.exitValue();
+    }
+}

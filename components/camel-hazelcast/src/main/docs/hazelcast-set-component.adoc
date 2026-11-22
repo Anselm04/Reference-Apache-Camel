@@ -1,0 +1,82 @@
+= Hazelcast Set Component
+:doctitle: Hazelcast Set
+:shortname: hazelcast-set
+:artifactid: camel-hazelcast
+:description: Perform operations on Hazelcast distributed set.
+:since: 2.7
+:supportlevel: Stable
+:tabs-sync-option:
+:component-header: Both producer and consumer are supported
+//Manually maintained attributes
+:group: Hazelcast
+
+*Since Camel {since}*
+
+*{component-header}*
+
+The http://www.hazelcast.com/[Hazelcast] Set component is one of Camel Hazelcast Components which allows you to access a Hazelcast distributed set.
+
+
+// component options: START
+include::partial$component-configure-options.adoc[]
+include::partial$component-endpoint-options.adoc[]
+include::partial$component-endpoint-headers.adoc[]
+// component options: END
+
+== set cache producer
+
+The set producer provides seven operations:
+
+* add
+* removeValue
+* clear
+* addAll
+* removeAll
+* retainAll
+* getAll
+
+The operation comes from the `CamelHazelcastOperationType` header, or from the `defaultOperation` option when the
+header is not set. `add` and `removeValue` take the item from the message body, and `addAll`, `removeAll` and
+`retainAll` take a collection. `getAll` sets a copy of the items of the set as the message body:
+
+[source,yaml]
+----
+- route:
+    from:
+      uri: direct:addTag
+      steps:
+        - to:
+            uri: hazelcast-set:tags
+            parameters:
+              defaultOperation: add
+- route:
+    from:
+      uri: direct:allTags
+      steps:
+        - setHeader:
+            name: CamelHazelcastOperationType
+            expression:
+              constant:
+                expression: getAll
+        - to:
+            uri: hazelcast-set:tags
+        - log:
+            message: "Number of tags: ${body.size()}"
+----
+
+== set cache consumer
+
+The consumer receives an event when an item is added to or removed from the set.
+The message body is the Hazelcast `ItemEvent`, so the item is `${body.item}`, and the `CamelHazelcastListenerAction`
+header is `added` or `removed`:
+
+[source,yaml]
+----
+- route:
+    from:
+      uri: hazelcast-set:tags
+      steps:
+        - log:
+            message: "${header.CamelHazelcastListenerAction}: ${body.item}"
+----
+

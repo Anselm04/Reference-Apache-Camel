@@ -1,0 +1,547 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.camel.dsl.jbang.core.commands.action;
+
+import java.awt.image.BufferedImage;
+import java.io.File;
+import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.time.Instant;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.LinkedHashSet;
+import java.util.List;
+import java.util.Locale;
+import java.util.Set;
+import java.util.stream.Stream;
+
+import javax.imageio.ImageIO;
+
+import org.aesh.command.CommandDefinition;
+import org.aesh.command.option.Arguments;
+import org.aesh.command.option.Mixin;
+import org.aesh.command.option.Option;
+import org.apache.camel.diagram.RouteDiagramAsciiRenderer;
+import org.apache.camel.diagram.RouteDiagramHelper;
+import org.apache.camel.diagram.RouteDiagramLayoutEngine;
+import org.apache.camel.diagram.RouteDiagramLayoutEngine.LayoutRoute;
+import org.apache.camel.diagram.RouteDiagramLayoutEngine.NodeLabelMode;
+import org.apache.camel.diagram.RouteDiagramLayoutEngine.RouteInfo;
+import org.apache.camel.diagram.RouteDiagramRenderer;
+import org.apache.camel.diagram.RouteDiagramRenderer.DiagramColors;
+import org.apache.camel.diagram.RouteErrorFrame;
+import org.apache.camel.diagram.TopologyErrorFrame;
+import org.apache.camel.diagram.TopologyHelper;
+import org.apache.camel.diagram.TopologyLayoutEngine.TopologyEdgeInfo;
+import org.apache.camel.dsl.jbang.core.common.ActionClient;
+import org.apache.camel.dsl.jbang.core.common.ActionClient.ActionResult;
+import org.apache.camel.dsl.jbang.core.common.CliException;
+import org.apache.camel.dsl.jbang.core.common.CliExitCode;
+import org.apache.camel.dsl.jbang.core.common.ProcessFinder;
+import org.apache.camel.dsl.jbang.core.common.ProcessFinder.CamelProcess;
+import org.apache.camel.dsl.jbang.run.common.PathUtils;
+import org.apache.camel.support.PatternHelper;
+import org.apache.camel.util.StopWatch;
+import org.apache.camel.util.json.JsonObject;
+import org.apache.camel.util.json.Jsoner;
+import org.jline.reader.LineReader;
+import org.jline.reader.LineReaderBuilder;
+import org.jline.terminal.Terminal;
+import org.jline.terminal.TerminalBuilder;
+import org.jline.terminal.impl.TerminalGraphics;
+import org.jline.terminal.impl.TerminalGraphicsManager;
+import org.jline.utils.InfoCmp;
+
+@CommandDefinition(name = "route-diagram", description = "Display Camel route diagram in the terminal", generateHelp = true,
+                   footer = {
+                           "Examples:",
+                           "  camel cmd route-diagram",
+                           "  camel cmd route-diagram hello.yaml",
+                           "  camel cmd route-diagram hello.yaml bye.yaml" })
+public class CamelRouteDiagramAction extends ActionWatchCommand {
+
+    private static final long DUMP_COMPLETION_TIMEOUT_MILLIS = 10000;
+
+    @Arguments(description = "Source file name(s) (shell-expanded wildcards), or name/pid of a running "
+                             + "Camel integration",
+               paramLabel = "files")
+    List<String> files = new ArrayList<>();
+
+    @Option(name = "filter", description = "Filter route by filename or route id")
+    String filter;
+
+    @Option(name = "width", description = "Image width in pixels (0 = auto)", defaultValue = "0")
+    int width;
+
+    @Option(name = "output", description = "Save diagram to a file (PNG for image themes, text for ascii theme)")
+    String output;
+
+    @Option(name = "theme", description = "Color theme preset (dark, light, transparent, ascii, unicode) or custom colors "
+                                          + "(e.g. bg=#1e1e1e:from=#2e7d32:to=#1565c0). Values can be #hex or "
+                                          + "ANSI color names (e.g. from=seagreen:to=steelblue). "
+                                          + "Use bg= for transparent. Use ascii/unicode for plain text output. "
+                                          + "Can also be set via DIAGRAM_COLORS env var. "
+                                          + "Default: unicode in the terminal, and light when --output is a .png file.")
+    String theme;
+
+    @Option(name = "font-size", description = "Font size in logical pixels for node text", defaultValue = "12")
+    int fontSize;
+
+    @Option(name = "box-width", description = "Node box width in logical pixels", defaultValue = "180")
+    int boxWidth;
+
+    @Option(name = "node-label", description = "What text to display in diagram nodes: code, description, or both (default)",
+            defaultValue = "both")
+    String nodeLabel;
+
+    @Option(name = "metric", hasValue = false,
+            description = "Whether to include live metrics (only possible for running Camel application)",
+            defaultValue = "true")
+    boolean metric;
+
+    @Option(name = "body-types", hasValue = false,
+            description = "Whether to show the body types each step has been reached with, on the arrow into"
+                          + " the step, in an image (only for a running Camel application whose message"
+                          + " history recorded them, such as in the dev profile)",
+            defaultValue = "true")
+    boolean bodyTypes;
+
+    @Option(name = "problems", hasValue = false,
+            description = "Whether to mark the steps that the checks of camel validate find a problem with, and"
+                          + " say what it is beside the route, in an image of source files",
+            defaultValue = "true")
+    boolean problems;
+
+    @Option(name = "highlight", description = "Comma-separated node IDs to highlight in the diagram")
+    String highlight;
+
+    @Option(name = "highlight-style", description = "Highlight style: success (green) or fail (red)", defaultValue = "success")
+    String highlightStyle;
+
+    @Option(name = "ignore-loading-error", hasValue = false,
+            description = "Whether to ignore route loading and compilation errors (use this with care!)",
+            defaultValue = "false")
+    boolean ignoreLoadingError;
+
+    @Option(name = "compile", hasValue = false,
+            description = "Whether to compile Java source files and load their routes. By default Java "
+                          + "routes are read by the Java DSL parser, without compiling them",
+            defaultValue = "false")
+    boolean compile;
+
+    @Option(name = "errors", hasValue = false,
+            description = "Draw the error handling of each route in a frame below its steps: its onException clauses,"
+                          + " where its failures go and where it is reached on error from. Without it only the steps"
+                          + " of the route are drawn")
+    boolean errors;
+
+    @Mixin
+    ActionTimeoutMixin timeoutOption;
+
+    /**
+     * The error paths of the topology, for the lines of the error frames (Camel 4.23 or newer). Package visible for
+     * testing.
+     */
+    List<TopologyErrorFrame.ErrorPath> errorPaths = List.of();
+
+    private long pid;
+
+    private DiagramColors colors;
+    private Terminal terminal;
+    private TerminalGraphics terminalGraphics;
+    private LineReader lineReader;
+
+    @Override
+    public Integer doCall() throws Exception {
+        System.setProperty("java.awt.headless", "true");
+
+        resolveTheme();
+        boolean textMode = isTextTheme();
+        if (!textMode) {
+            String colorSpec = System.getenv("DIAGRAM_COLORS");
+            colors = DiagramColors.parse(colorSpec != null ? colorSpec : theme);
+        }
+
+        // if output in terminal then set up terminal
+        if (output == null) {
+            terminal = TerminalBuilder.builder().system(true).build();
+            lineReader = LineReaderBuilder.builder().terminal(terminal).build();
+            if (!textMode) {
+                terminalGraphics = TerminalGraphicsManager.getBestProtocol(terminal).orElse(null);
+                if (terminalGraphics == null) {
+                    printer().printErr("Terminal does not support graphics protocols (Kitty, iTerm2, or Sixel).");
+                    printer().printErr(
+                            "Try running in a supported terminal: Kitty, iTerm2, WezTerm, Ghostty, or VS Code.");
+                    printer().printErr("Or use --theme=ascii or --theme=unicode for plain text output.");
+                    return CliExitCode.USAGE;
+                }
+            }
+        }
+
+        try {
+            return super.doCall();
+        } finally {
+            if (terminal != null) {
+                terminal.close();
+            }
+        }
+    }
+
+    @Override
+    protected Integer doWatchCall() throws Exception {
+        resolveTheme();
+        // only attempt to resolve a running integration when a single token is given (or none, defaulting to "*"):
+        // multiple tokens can only be a set of source files
+        String nameOrPid = files.isEmpty() ? "*" : files.get(0);
+        List<CamelProcess> processes = files.size() <= 1 ? ProcessFinder.find(nameOrPid) : List.of();
+
+        boolean sourceMode = processes.isEmpty() && !files.isEmpty();
+
+        List<RouteInfo> routes;
+        if (processes.isEmpty()) {
+            if (files.isEmpty()) {
+                throw CliException.notFound("No running Camel integration found");
+            }
+            routes = doCallSource(files);
+            if (routes == null) {
+                return 1;
+            }
+            if (problems && !isTextTheme()) {
+                RouteDiagramProblems.attach(routes, files);
+            }
+        } else {
+            // more than one match is an error that says which integrations match
+            CamelProcess process = processes.size() > 1 ? ProcessFinder.requireOne(nameOrPid) : processes.get(0);
+            this.pid = process.pid();
+            JsonObject jo = executeAction(process, "route-structure", root -> {
+                root.put("filter", "*");
+                root.put("brief", false);
+                root.put("metric", metric);
+            });
+            routes = parseRoutes(jo);
+            if (errors) {
+                errorPaths = requestErrorPaths(process);
+            }
+        }
+
+        if (routes.isEmpty()) {
+            if (sourceMode) {
+                throw CliException.failure("No routes found in: " + files
+                                           + " (if this is unexpected, the source may have failed to fully load within"
+                                           + " the timeout; try --ignore-loading-error or check the logs)");
+            }
+            throw CliException.failure("No routes found");
+        }
+
+        if (filter != null) {
+            routes = routes.stream()
+                    .filter(r -> (r.routeId != null && PatternHelper.matchPattern(r.routeId, filter))
+                            || (r.source != null && PatternHelper.matchPattern(r.source, filter)))
+                    .toList();
+        }
+
+        if (routes.isEmpty()) {
+            throw CliException.notFound("No route matching: " + filter);
+        }
+
+        // parse highlight info: the routes are drawn with the nodes highlighted
+        Set<String> highlightedNodeIds = null;
+        RouteDiagramHelper.HighlightStyle hlStyle = null;
+        if (highlight != null && !highlight.isBlank()) {
+            highlightedNodeIds = new LinkedHashSet<>(Arrays.asList(highlight.split(",")));
+            hlStyle = "fail".equalsIgnoreCase(highlightStyle)
+                    ? RouteDiagramHelper.HighlightStyle.FAIL
+                    : RouteDiagramHelper.HighlightStyle.SUCCESS;
+            Set<String> ids = highlightedNodeIds;
+            if (routes.stream().flatMap(r -> r.nodes.stream()).noneMatch(n -> n.id != null && ids.contains(n.id))) {
+                throw CliException.notFound("No route has the nodes to highlight: " + highlight);
+            }
+        }
+
+        NodeLabelMode labelMode = parseNodeLabelMode(nodeLabel);
+        RouteDiagramLayoutEngine engine = new RouteDiagramLayoutEngine(boxWidth, fontSize, labelMode);
+        // an image draws the steps as cards: a title and its detail beside an icon
+        engine.setCardStyle(!isTextTheme());
+        engine.setBodyTypes(bodyTypes && !isTextTheme());
+        // the problems are those of the source files, checked without running them
+        engine.setProblems(problems && sourceMode && !isTextTheme());
+
+        List<LayoutRoute> layoutRoutes = new ArrayList<>();
+        int currentY = RouteDiagramLayoutEngine.PADDING;
+        int rowHeight = isTextTheme() ? RouteDiagramAsciiRenderer.ROW_HEIGHT : RouteDiagramRenderer.rowHeight(fontSize);
+        TopologyErrorFrame.LineStyle lineStyle = isUnicodeTheme() ? TopologyErrorFrame.LineStyle.UNICODE
+                : isTextTheme() ? TopologyErrorFrame.LineStyle.ASCII : TopologyErrorFrame.LineStyle.TEXT;
+        for (RouteInfo route : routes) {
+            // the steps of the route; its error handling in a frame below them with --errors, or when the highlighted
+            // path steps into one of its onException clauses
+            LayoutRoute lr = RouteErrorFrame.layout(
+                    engine, route, currentY, errors, highlightedNodeIds, errorPaths, lineStyle, rowHeight);
+            layoutRoutes.add(lr);
+            currentY = lr.maxY + RouteDiagramLayoutEngine.V_GAP;
+        }
+
+        if (isTextTheme()) {
+            RouteDiagramAsciiRenderer asciiRenderer
+                    = new RouteDiagramAsciiRenderer(engine.getNodeWidth(), isUnicodeTheme(), pid > 0 && metric);
+            String ascii = asciiRenderer.renderDiagramAnsi(layoutRoutes, currentY, highlightedNodeIds, hlStyle);
+
+            if (output != null) {
+                String fileName = output.endsWith(".png")
+                        ? output.substring(0, output.length() - 4) + ".txt" : output;
+                File file = new File(fileName);
+                File parentDir = file.getParentFile();
+                if (parentDir != null) {
+                    parentDir.mkdirs();
+                }
+                Files.writeString(file.toPath(), ascii);
+                printer().println("Diagram saved to: " + file.getAbsolutePath());
+            } else {
+                if (watch) {
+                    clearScreen();
+                }
+                printer().println(ascii);
+            }
+        } else {
+            RouteDiagramRenderer renderer = new RouteDiagramRenderer(
+                    engine.getNodeWidth(), fontSize * RouteDiagramLayoutEngine.SCALE, pid > 0 && metric);
+
+            BufferedImage image;
+            try {
+                image = renderer.renderDiagram(layoutRoutes, currentY, colors, highlightedNodeIds, hlStyle);
+            } catch (IllegalStateException e) {
+                printer().printErr(e.getMessage());
+                return CliExitCode.FAILURE;
+            }
+
+            if (output != null) {
+                File file = new File(output);
+                File parentDir = file.getParentFile();
+                if (parentDir != null) {
+                    parentDir.mkdirs();
+                }
+                ImageIO.write(image, "PNG", file);
+                printer().println("Diagram saved to: " + file.getAbsolutePath());
+            } else {
+                if (watch) {
+                    clearScreen();
+                }
+                doDisplayDiagram(image);
+            }
+        }
+
+        return 0;
+    }
+
+    @Override
+    protected boolean watchWait(StopWatch watch) {
+        return watch.taken() < 5000;
+    }
+
+    @Override
+    protected void clearScreen() {
+        if (terminal != null) {
+            terminal.puts(InfoCmp.Capability.clear_screen);
+            terminal.flush();
+        }
+    }
+
+    @Override
+    protected Runnable waitForUserEnter() {
+        return () -> {
+            if (lineReader != null) {
+                try {
+                    lineReader.readLine();
+                } catch (Exception e) {
+                    // ignore
+                }
+            }
+            running.set(false);
+        };
+    }
+
+    private void doDisplayDiagram(BufferedImage image) throws IOException {
+        TerminalGraphics.ImageOptions opts = new TerminalGraphics.ImageOptions()
+                .preserveAspectRatio(true);
+        if (width > 0) {
+            opts.width(width);
+        }
+        terminalGraphics.displayImage(terminal, image, opts);
+        terminal.writer().println();
+        terminal.flush();
+    }
+
+    /**
+     * Loads the given source files (see {@link #dumpRoutesFromSource(List, String, boolean, boolean)}) and returns the
+     * merged route structure across all of them, or {@code null} if a file does not exist or loading failed (an error
+     * is already printed to the user in that case). Package visible for testing.
+     */
+    List<RouteInfo> doCallSource(List<String> sourceFiles) throws Exception {
+        SourceDump dump = dumpRoutesFromSource(sourceFiles, "route-diagram-source-", ignoreLoadingError, compile);
+        if (dump == null) {
+            return null;
+        }
+
+        try {
+            return readRoutesFromFolder(dump.workDir(), dump.bootStart());
+        } finally {
+            PathUtils.deleteDirectory(dump.workDir());
+        }
+    }
+
+    /**
+     * Reads every per-resource route-structure JSON file dumped into the given folder (one file per source file, named
+     * after it; {@code route-topology.json} is skipped) and merges their routes. Waits (up to 10 seconds) for
+     * {@code route-topology.json} to appear with a timestamp at or after {@code notBefore}, since the dump happens
+     * asynchronously as part of the transient Camel boot: that file is always written last by
+     * {@code DefaultDumpRoutesStrategy}, once every route-structure file for this batch has already landed, so its
+     * fresh appearance (rather than "any file exists") is what actually signals the whole batch is complete and safe to
+     * merge, instead of a partial batch mid-write. Returns {@code null}, without merging whatever partial files exist,
+     * if the marker never becomes fresh within {@code maxWaitMillis}. Package visible for testing.
+     */
+    List<RouteInfo> readRoutesFromFolder(Path folder, Instant notBefore) throws Exception {
+        return readRoutesFromFolder(folder, notBefore, DUMP_COMPLETION_TIMEOUT_MILLIS);
+    }
+
+    List<RouteInfo> readRoutesFromFolder(Path folder, Instant notBefore, long maxWaitMillis) throws Exception {
+        Path topologyMarker = folder.resolve("route-topology.json");
+        StopWatch watch = new StopWatch();
+        while (watch.taken() < maxWaitMillis && !isFreshFile(topologyMarker, notBefore)) {
+            Thread.sleep(100);
+        }
+        if (!isFreshFile(topologyMarker, notBefore)) {
+            printer().printErr("Dump did not complete within " + maxWaitMillis + " ms: " + topologyMarker
+                               + " was never (freshly) written; the source may have failed to fully load "
+                               + "within the timeout, try --ignore-loading-error or check the logs");
+            return null;
+        }
+
+        List<Path> jsonFiles = List.of();
+        if (Files.isDirectory(folder)) {
+            try (Stream<Path> stream = Files.list(folder)) {
+                jsonFiles = stream
+                        .filter(p -> p.getFileName().toString().endsWith(".json"))
+                        .filter(p -> !"route-topology.json".equals(p.getFileName().toString()))
+                        .sorted()
+                        .toList();
+            }
+        }
+
+        List<RouteInfo> all = new ArrayList<>();
+        for (Path p : jsonFiles) {
+            JsonObject jo = (JsonObject) Jsoner.deserialize(Files.readString(p));
+            all.addAll(parseRoutes(jo));
+        }
+        if (errors) {
+            // the error paths come from the topology of the same dump
+            errorPaths = errorPaths((JsonObject) Jsoner.deserialize(Files.readString(topologyMarker)));
+        }
+        return all;
+    }
+
+    /** Asks the running integration for its topology, for the error paths; none when it does not answer. */
+    private List<TopologyErrorFrame.ErrorPath> requestErrorPaths(CamelProcess process) {
+        ActionResult result = ActionClient.execute(process, "route-topology", null, timeout());
+        return result.isOk() && result.reply() != null ? errorPaths(result.reply()) : List.of();
+    }
+
+    private static List<TopologyErrorFrame.ErrorPath> errorPaths(JsonObject topology) {
+        return TopologyErrorFrame.paths(
+                TopologyHelper.parseEdges(topology, true).stream().filter(TopologyEdgeInfo::isErrorPath).toList());
+    }
+
+    private static boolean isFreshFile(Path file, Instant notBefore) throws IOException {
+        // small tolerance for filesystem mtime granularity / clock skew between capturing notBefore and the write
+        return Files.exists(file) && !Files.getLastModifiedTime(file).toInstant().isBefore(notBefore.minusSeconds(1));
+    }
+
+    List<RouteInfo> parseRoutes(JsonObject jo) {
+        return RouteDiagramHelper.parseRoutes(jo);
+    }
+
+    /**
+     * The theme when none is given: a diagram in the terminal is text (an image needs a terminal with a graphics
+     * protocol), and a diagram saved as a .png file is an image in the light theme.
+     */
+    private void resolveTheme() {
+        if (theme == null || theme.isBlank()) {
+            theme = output != null && output.toLowerCase(Locale.ROOT).endsWith(".png") ? "light" : "unicode";
+        }
+    }
+
+    private boolean isTextTheme() {
+        return "ascii".equalsIgnoreCase(theme) || "unicode".equalsIgnoreCase(theme);
+    }
+
+    private boolean isUnicodeTheme() {
+        return "unicode".equalsIgnoreCase(theme);
+    }
+
+    static NodeLabelMode parseNodeLabelMode(String value) {
+        if (value == null || value.isBlank() || "code".equalsIgnoreCase(value)) {
+            return NodeLabelMode.CODE;
+        } else if ("description".equalsIgnoreCase(value)) {
+            return NodeLabelMode.DESCRIPTION;
+        } else if ("both".equalsIgnoreCase(value)) {
+            return NodeLabelMode.BOTH;
+        }
+        return NodeLabelMode.CODE;
+    }
+
+    /**
+     * Used BY MCP tools
+     *
+     * Renders the routes contained in the given source file as a PNG diagram saved to {@code outputFile}. Convenience
+     * entry point for programmatic invocation (e.g. from MCP tools) that always targets a source file rather than a
+     * named/PID diagram theme option. Note: this still goes through the normal single-token dispatch in
+     * {@link #doWatchCall()}, which first checks {@code sourceFile} against running Camel integrations; a source file
+     * whose name (without extension) happens to match a running integration's name would render that integration
+     * instead. In practice this is unlikely since {@code sourceFile} is expected to include a file extension.
+     *
+     * @param  sourceFile         path to the route source file (YAML, XML, Java, ...)
+     * @param  outputFile         path to the PNG file to write
+     * @param  theme              color theme spec (e.g. "dark", "light", "transparent" or custom)
+     * @param  filter             optional route filter (route id or filename pattern)
+     * @param  width              image width in pixels (0 = auto)
+     * @param  ignoreLoadingError whether to ignore route loading and compilation errors
+     * @return                    exit code; 0 on success, non-zero otherwise
+     * @throws Exception          if the source cannot be read or the diagram cannot be rendered
+     */
+    public Integer renderSourceToFile(
+            String sourceFile, String outputFile, String theme, String filter,
+            int width, boolean ignoreLoadingError,
+            int fontSize, int boxWidth, String nodeLabel)
+            throws Exception {
+        this.files = List.of(sourceFile);
+        this.output = outputFile;
+        if (theme != null && !theme.isBlank()) {
+            this.theme = theme;
+        }
+        this.filter = filter;
+        this.width = width;
+        this.ignoreLoadingError = ignoreLoadingError;
+        this.fontSize = fontSize;
+        this.boxWidth = boxWidth;
+        if (nodeLabel != null && !nodeLabel.isBlank()) {
+            this.nodeLabel = nodeLabel;
+        }
+        this.metric = false;
+        this.problems = true;
+        return doCall();
+    }
+
+}

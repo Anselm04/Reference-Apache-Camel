@@ -1,0 +1,414 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.camel.component.google.sheets.transform;
+
+import java.math.BigDecimal;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.List;
+import java.util.ListIterator;
+import java.util.Map;
+import java.util.Objects;
+import java.util.Optional;
+
+import com.google.api.services.sheets.v4.model.ValueRange;
+import org.apache.camel.CamelExecutionException;
+import org.apache.camel.InvalidPayloadException;
+import org.apache.camel.Message;
+import org.apache.camel.component.google.sheets.internal.GoogleSheetsConstants;
+import org.apache.camel.component.google.sheets.stream.GoogleSheetsStreamConstants;
+import org.apache.camel.spi.BodyType;
+import org.apache.camel.spi.BodyType.Carrier;
+import org.apache.camel.spi.BodyTypes;
+import org.apache.camel.spi.DataType;
+import org.apache.camel.spi.DataTypeTransformer;
+import org.apache.camel.spi.Transformer;
+import org.apache.camel.support.MessageHelper;
+import org.apache.camel.util.ObjectHelper;
+import org.apache.camel.util.StringHelper;
+import org.apache.camel.util.json.DeserializationException;
+import org.apache.camel.util.json.JsonObject;
+import org.apache.camel.util.json.Jsoner;
+
+/**
+ * Data type supports generic JsonNode representation of Google Sheets row and column values. Transforms generic
+ * JsonNode struct to/from a Google Sheets ValueRange object. Supports both inbound and outbound transformation
+ * depending on the given message body content. When Google Sheets ValueRange object is given as message body (e.g. as a
+ * result of a get values operation) the transformer will transform into generic Json struct. When generic Json struct
+ * is given as a message body transformer will transform into a proper ValueRange object that is ready to be used in an
+ * update/append values operation. The Implementation also supports splitResults setting where a set of values is split
+ * into its individual items. The Json struct of a row or column read from a spreadsheet has the id of the spreadsheet
+ * in its spreadsheetId field; when Json struct is transformed into a ValueRange this field is ignored, and the
+ * spreadsheet to write to is the one of the CamelGoogleSheets.spreadsheetId header or of the endpoint.
+ */
+@DataTypeTransformer(name = "google-sheets:application-x-struct",
+                     description = "Transforms to/from JSon data and Google Sheets ValueRange object")
+@BodyTypes(transformerIn = @BodyType(value = Carrier.ANY,
+                                     description = "A ValueRange or the JSON of one, or JSON rows: a JSON object or array, or a List of JSON objects"),
+           transformerOut = @BodyType(value = { Carrier.LIST, Carrier.TEXT, Carrier.POJO },
+                                      description = "A ValueRange, or the JSON of one, becomes a List of JSON Strings, one per row or column; "
+                                                    + "another body becomes one JSON String with the header CamelGoogleSheets.splitResults=true, "
+                                                    + "or else a ValueRange"))
+public class GoogleSheetsJsonStructDataTypeTransformer extends Transformer {
+
+    private static final String ROW_PREFIX = "#";
+
+    @Override
+    public void transform(Message message, DataType fromType, DataType toType) {
+        final Optional<ValueRange> valueRange = getValueRangeBody(message);
+
+        String range = message.getHeader(GoogleSheetsConstants.PROPERTY_PREFIX + "range", "A:A").toString();
+        String majorDimension = message
+                .getHeader(GoogleSheetsConstants.PROPERTY_PREFIX + "majorDimension", RangeCoordinate.DIMENSION_ROWS).toString();
+        String spreadsheetId = message.getHeader(GoogleSheetsConstants.PROPERTY_PREFIX + "spreadsheetId", "").toString();
+        String[] columnNames
+                = message.getHeader(GoogleSheetsConstants.PROPERTY_PREFIX + "columnNames", "A").toString().split(",");
+
+        boolean splitResults = Boolean
+                .parseBoolean(message.getHeader(GoogleSheetsConstants.PROPERTY_PREFIX + "splitResults", "false").toString());
+
+        if (valueRange.isPresent()) {
+            message.setBody(
+                    transformFromValueRangeModel(message, valueRange.get(), spreadsheetId, range, majorDimension, columnNames));
+        } else if (splitResults) {
+            message.setBody(transformFromSplitValuesModel(message, spreadsheetId, range, majorDimension, columnNames));
+        } else {
+            String valueInputOption
+                    = message.getHeader(GoogleSheetsConstants.PROPERTY_PREFIX + "valueInputOption", "USER_ENTERED").toString();
+            message.setBody(
+                    transformToValueRangeModel(message, spreadsheetId, range, majorDimension, valueInputOption, columnNames));
+        }
+    }
+
+    /**
+     * Constructs proper ValueRange object from given generic Json struct. The spreadsheet is the one of the
+     * CamelGoogleSheets.spreadsheetId header, or else the one of the endpoint; a spreadsheetId field of a row is left
+     * out of the values.
+     */
+    private ValueRange transformToValueRangeModel(
+            Message message, String spreadsheetId, String range, String majorDimension, String valueInputOption,
+            String[] columnNames) {
+        try {
+            List<String> jsonBeans = bodyAsJsonBeans(message);
+
+            ValueRange valueRange = new ValueRange();
+            List<List<Object>> values = new ArrayList<>();
+
+            if (ObjectHelper.isNotEmpty(jsonBeans)) {
+                final ArrayList<String> properties = createCoordinateNameSpec(range, majorDimension, columnNames);
+
+                for (String json : jsonBeans) {
+                    // a spreadsheetId field, which the rows read by this transformer have, is not a value, and does not
+                    // choose the spreadsheet: that is the CamelGoogleSheets.spreadsheetId header or the endpoint option
+                    Map<String, Object> dataShape = readJsonObject(json);
+
+                    List<Object> rangeValues = new ArrayList<>();
+                    properties
+                            .stream()
+                            .filter(specEntry -> !Objects.equals("spreadsheetId", specEntry))
+                            .forEach(specEntry -> rangeValues.add(dataShape.getOrDefault(specEntry, null)));
+
+                    values.add(rangeValues);
+                }
+            }
+
+            valueRange.setMajorDimension(majorDimension);
+            valueRange.setValues(values);
+
+            if (ObjectHelper.isNotEmpty(spreadsheetId)) {
+                message.setHeader(GoogleSheetsStreamConstants.SPREADSHEET_ID, spreadsheetId);
+                message.setHeader(GoogleSheetsConstants.PROPERTY_PREFIX + "spreadsheetId", spreadsheetId);
+            }
+            message.setHeader(GoogleSheetsStreamConstants.RANGE, range);
+            message.setHeader(GoogleSheetsConstants.PROPERTY_PREFIX + "range", range);
+            message.setHeader(GoogleSheetsStreamConstants.MAJOR_DIMENSION, majorDimension);
+            message.setHeader(GoogleSheetsConstants.PROPERTY_PREFIX + "majorDimension", majorDimension);
+            message.setHeader(GoogleSheetsConstants.PROPERTY_PREFIX + "valueInputOption", valueInputOption);
+            message.setHeader(GoogleSheetsConstants.PROPERTY_PREFIX + "values", valueRange);
+
+            return valueRange;
+        } catch (InvalidPayloadException | DeserializationException e) {
+            throw new CamelExecutionException(
+                    "Failed to apply Google Sheets Json struct data type on exchange",
+                    message.getExchange(), e);
+        }
+    }
+
+    /**
+     * Construct generic Json struct from given ValueRange object. Json struct represents the row and column values
+     * only.
+     */
+    private List<String> transformFromValueRangeModel(
+            Message message, ValueRange valueRange, String spreadsheetId, String range, String majorDimension,
+            String[] columnNames) {
+        final List<String> jsonBeans = new ArrayList<>();
+        if (valueRange != null) {
+            if (ObjectHelper.isNotEmpty(valueRange.getRange())) {
+                range = valueRange.getRange();
+            }
+            RangeCoordinate rangeCoordinate = RangeCoordinate.fromRange(range);
+
+            if (ObjectHelper.isNotEmpty(valueRange.getMajorDimension())) {
+                majorDimension = valueRange.getMajorDimension();
+            }
+
+            if (ObjectHelper.equal(RangeCoordinate.DIMENSION_ROWS, majorDimension)) {
+                for (List<Object> values : valueRange.getValues()) {
+                    final Map<String, Object> model = new HashMap<>();
+                    model.put("spreadsheetId", spreadsheetId);
+                    int columnIndex = rangeCoordinate.getColumnStartIndex();
+                    for (Object value : values) {
+                        model.put(CellCoordinate.getColumnName(columnIndex, rangeCoordinate.getColumnStartIndex(),
+                                columnNames), value);
+                        columnIndex++;
+                    }
+                    jsonBeans.add(Jsoner.serialize(model));
+                }
+            } else if (ObjectHelper.equal(RangeCoordinate.DIMENSION_COLUMNS, majorDimension)) {
+                for (List<Object> values : valueRange.getValues()) {
+                    final Map<String, Object> model = new HashMap<>();
+                    model.put("spreadsheetId", spreadsheetId);
+                    int rowIndex = rangeCoordinate.getRowStartIndex() + 1;
+                    for (Object value : values) {
+                        model.put(ROW_PREFIX + rowIndex, value);
+                        rowIndex++;
+                    }
+                    jsonBeans.add(Jsoner.serialize(model));
+                }
+            }
+        }
+        return jsonBeans;
+    }
+
+    /**
+     * Construct generic Json struct from given split values model. Json struct represents the row and column values
+     * only. In split mode one single row/column is handled as an individual result.
+     */
+    private String transformFromSplitValuesModel(
+            Message message, String spreadsheetId, String range, String majorDimension, String[] columnNames) {
+        try {
+            final List<?> values = bodyAsJsonBeans(message);
+
+            final Map<String, Object> model = new HashMap<>();
+            model.put("spreadsheetId", spreadsheetId);
+
+            if (values != null) {
+                if (ObjectHelper.isNotEmpty(message.getHeader(GoogleSheetsStreamConstants.RANGE))) {
+                    range = message.getHeader(GoogleSheetsStreamConstants.RANGE).toString();
+                }
+                RangeCoordinate rangeCoordinate = RangeCoordinate.fromRange(range);
+
+                if (ObjectHelper.isNotEmpty(message.getHeader(GoogleSheetsStreamConstants.MAJOR_DIMENSION))) {
+                    majorDimension = message.getHeader(GoogleSheetsStreamConstants.MAJOR_DIMENSION).toString();
+                }
+
+                if (ObjectHelper.equal(RangeCoordinate.DIMENSION_ROWS, majorDimension)) {
+                    int columnIndex = rangeCoordinate.getColumnStartIndex();
+                    for (Object value : values) {
+                        model.put(CellCoordinate.getColumnName(columnIndex, rangeCoordinate.getColumnStartIndex(), columnNames),
+                                value);
+                        columnIndex++;
+                    }
+                } else if (ObjectHelper.equal(RangeCoordinate.DIMENSION_COLUMNS, majorDimension)) {
+                    int rowIndex = rangeCoordinate.getRowStartIndex() + 1;
+                    for (Object value : values) {
+                        model.put(ROW_PREFIX + rowIndex, value);
+                        rowIndex++;
+                    }
+                }
+            }
+
+            return Jsoner.serialize(model);
+        } catch (InvalidPayloadException | DeserializationException e) {
+            throw new CamelExecutionException(
+                    "Failed to apply Google Sheets Json struct data type on exchange",
+                    message.getExchange(), e);
+        }
+    }
+
+    /**
+     * Try to convert message body to a ValueRange object if possible. Returns empty optional when message body
+     * conversion is not applicable.
+     */
+    private static Optional<ValueRange> getValueRangeBody(Message message) {
+        if (message.getBody() instanceof ValueRange) {
+            return Optional.of(message.getBody(ValueRange.class));
+        }
+
+        String jsonBody = MessageHelper.extractBodyAsString(message);
+        if (jsonBody != null) {
+            try {
+                return valueRangeOf(Jsoner.deserialize(jsonBody));
+            } catch (DeserializationException e) {
+                return Optional.empty();
+            }
+        }
+
+        return Optional.empty();
+    }
+
+    /**
+     * A JSON object whose values property is an array of arrays is a ValueRange.
+     */
+    @SuppressWarnings("unchecked")
+    private static Optional<ValueRange> valueRangeOf(Object json) {
+        if (json instanceof JsonObject object && object.get("values") instanceof List<?> rows
+                && rows.stream().allMatch(row -> row instanceof List)) {
+            ValueRange valueRange = new ValueRange();
+            valueRange.setValues((List<List<Object>>) normalize(rows));
+            if (object.get("range") instanceof String range) {
+                valueRange.setRange(range);
+            }
+            if (object.get("majorDimension") instanceof String majorDimension) {
+                valueRange.setMajorDimension(majorDimension);
+            }
+            return Optional.of(valueRange);
+        }
+        return Optional.empty();
+    }
+
+    @SuppressWarnings("unchecked")
+    private static Map<String, Object> readJsonObject(String json) throws DeserializationException {
+        Object parsed = normalize(Jsoner.deserialize(json));
+        if (parsed instanceof Map) {
+            return (Map<String, Object>) parsed;
+        }
+        throw new IllegalArgumentException("Expected a JSON object: " + json);
+    }
+
+    /**
+     * Gives the numbers of a parsed JSON value the types Jackson gives them: an integral literal is an Integer, Long or
+     * BigInteger, any other number a Double.
+     */
+    @SuppressWarnings("unchecked")
+    private static Object normalize(Object value) {
+        if (value instanceof BigDecimal number) {
+            return toJavaNumber(number);
+        }
+        if (value instanceof Map<?, ?> map) {
+            for (Map.Entry<String, Object> entry : ((Map<String, Object>) map).entrySet()) {
+                entry.setValue(normalize(entry.getValue()));
+            }
+        } else if (value instanceof List<?> list) {
+            for (ListIterator<Object> it = ((List<Object>) list).listIterator(); it.hasNext();) {
+                it.set(normalize(it.next()));
+            }
+        }
+        return value;
+    }
+
+    private static Number toJavaNumber(BigDecimal number) {
+        if (number.scale() != 0) {
+            return number.doubleValue();
+        }
+        try {
+            return number.intValueExact();
+        } catch (ArithmeticException e) {
+            // too large for an int
+        }
+        try {
+            return number.longValueExact();
+        } catch (ArithmeticException e) {
+            return number.toBigInteger();
+        }
+    }
+
+    private static boolean isJsonObject(String value) {
+        String trimmed = value.trim();
+        return !trimmed.isEmpty() && trimmed.charAt(0) == '{' && trimmed.charAt(trimmed.length() - 1) == '}';
+    }
+
+    private static boolean isJsonArray(String value) {
+        String trimmed = value.trim();
+        return !trimmed.isEmpty() && trimmed.charAt(0) == '[' && trimmed.charAt(trimmed.length() - 1) == ']';
+    }
+
+    /**
+     * The elements of a JSON array as JSON Strings; a String element is taken as is.
+     */
+    private static List<String> arrayToJsonBeans(List<?> array) {
+        List<String> jsonBeans = new ArrayList<>();
+        for (Object item : array) {
+            jsonBeans.add(
+                    item instanceof String text ? StringHelper.removeLeadingAndEndingQuotes(text) : Jsoner.serialize(item));
+        }
+        return jsonBeans;
+    }
+
+    /**
+     * Converts message body to list of Json objects. Supports different message body types such as List, String,
+     * InputStream.
+     */
+    private static List<String> bodyAsJsonBeans(Message message) throws InvalidPayloadException, DeserializationException {
+        if (message.getBody() == null) {
+            return Collections.emptyList();
+        }
+
+        if (message.getBody() instanceof List) {
+            return message.getBody(List.class);
+        }
+
+        String body = message.getMandatoryBody(String.class);
+        if (isJsonArray(body)) {
+            return arrayToJsonBeans((List<?>) Jsoner.deserialize(body));
+        } else if (isJsonObject(body)) {
+            return Collections.singletonList(body);
+        }
+
+        return Collections.emptyList();
+    }
+
+    /**
+     * Construct row and column coordinate names for given range. Supports mapping of custom column names to proper
+     * row/column coordinates.
+     */
+    public static ArrayList<String> createCoordinateNameSpec(String range, String majorDimension, String... columnNames) {
+        ArrayList<String> names = new ArrayList<>();
+
+        RangeCoordinate coordinate = RangeCoordinate.fromRange(range);
+        if (ObjectHelper.equal(RangeCoordinate.DIMENSION_ROWS, majorDimension)) {
+            createSchemaFromRowDimension(names, coordinate, columnNames);
+        } else if (ObjectHelper.equal(RangeCoordinate.DIMENSION_COLUMNS, majorDimension)) {
+            createSchemaFromColumnDimension(names, coordinate);
+        }
+
+        return names;
+    }
+
+    /**
+     * Create dynamic json schema from row dimension. If split only a single object "ROW" holding 1-n column values is
+     * created. Otherwise, each row results in a separate object with 1-n column values as property.
+     */
+    private static void createSchemaFromRowDimension(
+            ArrayList<String> properties, RangeCoordinate coordinate, String... columnNames) {
+        for (int i = coordinate.getColumnStartIndex(); i < coordinate.getColumnEndIndex(); i++) {
+            properties.add(CellCoordinate.getColumnName(i, coordinate.getColumnStartIndex(), columnNames));
+        }
+    }
+
+    /**
+     * Create dynamic json schema from column dimension. If split only a single object "COLUMN" holding 1-n row values
+     * is created. Otherwise, each column results in a separate object with 1-n row values as property.
+     */
+    private static void createSchemaFromColumnDimension(ArrayList<String> properties, RangeCoordinate coordinate) {
+        for (int i = coordinate.getRowStartIndex() + 1; i <= coordinate.getRowEndIndex(); i++) {
+            properties.add("#" + i);
+        }
+    }
+}

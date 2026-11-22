@@ -1,0 +1,157 @@
+= PLC4X Component
+:doctitle: PLC4X
+:shortname: plc4x
+:artifactid: camel-plc4x
+:description: Read and write to PLC devices
+:since: 3.20
+:supportlevel: Stable
+:tabs-sync-option:
+:component-header: Both producer and consumer are supported
+
+*Since Camel {since}*
+
+*{component-header}*
+
+The Camel Component for PLC4X allows you to create routes using the PLC4X API to read from a Programmable Logic Controllers (PLC) device or write to it.
+
+== URI Format
+
+------------------------------
+plc4x://driver[?options]
+------------------------------
+
+You can append query options to the URI in the following format: `?options=value&option2=value&...`.
+
+
+// component options: START
+include::partial$component-configure-options.adoc[]
+include::partial$component-endpoint-options.adoc[]
+include::partial$component-endpoint-headers.adoc[]
+// component options: END
+
+
+== Dependencies
+
+Maven users will need to add the following dependency to their `pom.xml`.
+
+*pom.xml*
+
+[source,xml]
+---------------------------------------
+<dependency>
+    <groupId>org.apache.camel</groupId>
+    <artifactId>camel-plc4x</artifactId>
+    <version>${camel-version}</version>
+</dependency>
+---------------------------------------
+
+where `$\{camel-version}` must be replaced by the actual version of Camel.
+
+== Usage
+
+The Camel PLC4X component supports various protocols by adding the driver dependencies:
+
+* Allen Bradley ETH
+* Automation Device Specification (ADS)
+* CANopen
+* EtherNet/IP
+* Firmata
+* KNXnet/IP
+* Modbus (TCP/UDP/Serial)
+* Open Platform Communications Unified Architecture (OPC UA)
+* Step7 (S7)
+
+The list of supported protocols is growing in https://plc4x.apache.org[PLC4X].
+There are good chances that they will work out of the box just by adding the driver dependency.
+You can check https://plc4x.apache.org/users/protocols/index.html[here].
+
+=== Consumer
+
+The consumer supports one-time reading or Triggered Reading. To read from
+the PLC, use a  `Map<String,String>` containing the Alias and Queries for the Data you want (tags).
+
+You can configure the _tags_ using `tag.key=value` in the URI, and you can repeat this for multiple tags.
+
+The Body created by the Consumer will be a `Map<String,Object>` containing the Aliases and their associated value
+read from the PLC.
+
+The following route reads two tags once. It uses the simulated driver of PLC4X (`plc4j-driver-simulated`), so it needs
+no PLC. With a real PLC, the driver in the URI and the addresses of the tags follow the protocol of the PLC:
+
+[source,yaml]
+----
+- route:
+    from:
+      uri: plc4x:simulated://plant
+      parameters:
+        tag.temperature: "RANDOM/temperature:DINT"
+        tag.pressure: "RANDOM/pressure:DINT"
+      steps:
+        - log:
+            message: "Tags read: ${body}"
+----
+
+With the `trigger` option, the consumer reads the tags each time a boolean trigger tag rises. It polls the trigger tag
+every `period` milliseconds on the connection of the endpoint, starting when the route starts; `period` is required
+with `trigger` and must be positive. On a rising edge of the trigger, from `false` (or from no value read yet) to
+`true`, the consumer delivers one exchange whose body is a `Map<String,Object>` of the tags, read in the same request
+as the trigger. The trigger tag is not part of the body; it is read under the reserved name `TRIGGER_VAR`, which no tag
+may use. While the trigger stays `true`, no further exchange is delivered.
+
+A poll that fails, for example because a tag cannot be read, the PLC cannot be reached or does not answer within five
+seconds, or the trigger reads as a value that is not a boolean (such as a number or an array), is reported to the
+exception handler of the consumer (or to the error handler of the route with `bridgeErrorHandler=true`), and polling
+continues. The default exception handler logs the first failed poll of a run at WARN with the stack trace and the
+following ones at DEBUG without it; the first successful poll after a run of failed polls is logged at INFO.
+The trigger value read before the failure is forgotten, so a trigger that is `true` at the first successful poll after
+a failure counts as a rising edge. Automatic recovery after a lost connection needs `autoReconnect=true`: a poll then
+replaces a lost connection with a new one. With the default `autoReconnect=false`, the endpoint stops on each lost
+connection, and the consumer fails that poll and stops polling until the route is restarted. Likewise, a connection
+that cannot be set up when the route starts is retried by the polls with `autoReconnect=true`, and fails the start of
+the route without it.
+
+The following route reads a register of a Modbus TCP device each time coil 1 goes from `false` to `true`, checking the
+coil every 100 milliseconds:
+
+[source,yaml]
+----
+- route:
+    from:
+      uri: plc4x:modbus-tcp://192.168.0.10:502
+      parameters:
+        trigger: "coil:1"
+        period: 100
+        autoReconnect: true
+        tag.counter: "holding-register:2:INT"
+      steps:
+        - log:
+            message: "Counter read on trigger: ${body}"
+----
+
+=== Polling Consumer
+
+The polling consumer supports consecutive reading. The input and output are the same as for the regular consumer.
+A read that fails, for example because the PLC does not have one of the tags, fails the exchange that it returns.
+
+=== Producer
+
+To write data to the PLC, the body of the message must be a `Map<String,Map<String,Object>>`. Its keys are the names of
+the tags, and the value of each tag is a `Map` of one entry: the address of the tag and the value to write to it.
+To write several addresses, use one tag for each. A body that is not a `Map`, or a tag whose value is not a `Map` of
+exactly one address, fails the exchange with a `PlcInvalidTagException`, and nothing is written.
+
+The following route writes `21` to the address `%DB1:DINT` under the tag name `temperature`:
+
+[source,yaml]
+----
+- route:
+    from:
+      uri: direct:write
+      steps:
+        - setBody:
+            expression:
+              groovy:
+                expression: "[temperature: ['%DB1:DINT': 21]]"
+        - to:
+            uri: plc4x:s7://192.168.0.10
+----

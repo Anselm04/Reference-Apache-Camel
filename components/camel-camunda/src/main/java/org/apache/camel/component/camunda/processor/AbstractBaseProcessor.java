@@ -1,0 +1,82 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.camel.component.camunda.processor;
+
+import org.apache.camel.CamelExchangeException;
+import org.apache.camel.Exchange;
+import org.apache.camel.component.camunda.CamundaConstants;
+import org.apache.camel.component.camunda.CamundaEndpoint;
+import org.apache.camel.component.camunda.model.AbstractCamundaResponse;
+import org.apache.camel.component.camunda.model.CamundaMessage;
+import org.apache.camel.support.service.BaseService;
+import tools.jackson.core.JacksonException;
+import tools.jackson.databind.ObjectMapper;
+import tools.jackson.databind.json.JsonMapper;
+
+public abstract class AbstractBaseProcessor extends BaseService implements CamundaProcessor {
+    protected final CamundaEndpoint endpoint;
+    static final ObjectMapper objectMapper = JsonMapper.builderWithJackson2Defaults().build();
+
+    public AbstractBaseProcessor(CamundaEndpoint endpoint) {
+        this.endpoint = endpoint;
+    }
+
+    protected void setBody(Exchange exchange, CamundaMessage message) {
+        if (endpoint.isFormatJSON()) {
+            try {
+                exchange.getMessage().setBody(objectMapper.writeValueAsString(message));
+            } catch (JacksonException e) {
+                throw new IllegalArgumentException("Cannot convert result", e);
+            }
+        } else {
+            exchange.getMessage().setBody(message);
+        }
+    }
+
+    /**
+     * Reads the body as JSON. The body is a String, or is converted to one, such as a byte[] or an InputStream.
+     *
+     * @return                          the request, or null if the body cannot be converted to a String
+     * @throws IllegalArgumentException if the body cannot be deserialized as {@code type}
+     */
+    protected <T> T readJson(Exchange exchange, Class<T> type, String errorMessage) {
+        String json = exchange.getMessage().getBody(String.class);
+        if (json == null) {
+            return null;
+        }
+        try {
+            return objectMapper.readValue(json, type);
+        } catch (JacksonException e) {
+            throw new IllegalArgumentException(errorMessage, e);
+        }
+    }
+
+    /**
+     * Fails the exchange when the operation failed. The response stays in the body.
+     */
+    protected void failIfNotSuccess(Exchange exchange, AbstractCamundaResponse response) throws CamelExchangeException {
+        if (!response.isSuccess()) {
+            throw new CamelExchangeException(
+                    "Camunda operation " + endpoint.getOperationName().value() + " failed: " + response.getErrorMessage(),
+                    exchange);
+        }
+    }
+
+    protected void removeHeaders(Exchange exchange) {
+        exchange.getMessage().removeHeaders(CamundaConstants.HEADER_PREFIX + ".*");
+    }
+}

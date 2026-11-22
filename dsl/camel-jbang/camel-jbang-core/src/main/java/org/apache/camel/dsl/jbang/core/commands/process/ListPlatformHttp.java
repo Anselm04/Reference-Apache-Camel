@@ -1,0 +1,175 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.camel.dsl.jbang.core.commands.process;
+
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.List;
+import java.util.StringJoiner;
+import java.util.stream.Collectors;
+
+import com.github.freva.asciitable.AsciiTable;
+import com.github.freva.asciitable.Column;
+import com.github.freva.asciitable.HorizontalAlign;
+import com.github.freva.asciitable.OverflowBehaviour;
+import org.aesh.command.CommandDefinition;
+import org.aesh.command.option.Argument;
+import org.aesh.command.option.Option;
+import org.apache.camel.dsl.jbang.core.common.CopyableRow;
+import org.apache.camel.dsl.jbang.core.common.PidNameAgeCompletionCandidates;
+import org.apache.camel.dsl.jbang.core.common.ProcessHelper;
+import org.apache.camel.dsl.jbang.core.common.RowSort;
+import org.apache.camel.util.TimeUtils;
+import org.apache.camel.util.json.JsonArray;
+import org.apache.camel.util.json.JsonObject;
+import org.apache.camel.util.json.Jsoner;
+
+@CommandDefinition(name = "platform-http", description = "Get embedded HTTP services of Camel integrations",
+                   generateHelp = true,
+                   footer = {
+                           "Examples:",
+                           "  camel get platform-http",
+                           "  camel get platform-http --all" })
+public class ListPlatformHttp extends ProcessWatchCommand {
+
+    private static final RowSort<Row> ORDER = RowSort.<Row> integration(r -> r.pid, r -> r.name, r -> r.uptime);
+
+    @Argument(description = "Name or pid of running Camel integration")
+    String name = "*";
+
+    @Option(name = "sort", description = "Sort by pid, name or age", defaultValue = "pid",
+            completer = PidNameAgeCompletionCandidates.class)
+    String sort;
+
+    @Option(name = "all", hasValue = false, description = "Include management endpoints")
+    boolean all;
+
+    @Override
+    public Integer doProcessWatchCall() throws Exception {
+        List<Row> rows = new ArrayList<>();
+
+        forEachIntegration(name, (ph, root) -> {
+            // there must be a status file for the running Camel integration
+            Row row = new Row();
+            JsonObject context = (JsonObject) root.get("context");
+            if (context == null) {
+                return;
+            }
+            row.name = context.getString("name");
+            if ("CamelJBang".equals(row.name)) {
+                row.name = ProcessHelper.extractName(root, ph);
+            }
+            row.pid = Long.toString(ph.pid());
+            row.uptime = extractSince(ph);
+            row.age = TimeUtils.printSince(row.uptime);
+
+            JsonObject jph = (JsonObject) root.get("platform-http");
+            if (jph != null) {
+                String server = jph.getString("server");
+                JsonArray arr = (JsonArray) jph.get("endpoints");
+                if (arr != null) {
+                    for (int i = 0; i < arr.size(); i++) {
+                        row = row.copy();
+                        JsonObject jo = (JsonObject) arr.get(i);
+                        row.server = server;
+                        row.url = jo.getString("url");
+                        row.path = jo.getString("path");
+                        row.verbs = jo.getString("verbs");
+                        row.consumes = jo.getString("consumes");
+                        row.produces = jo.getString("produces");
+                        rows.add(row);
+                    }
+                }
+                if (all) {
+                    arr = (JsonArray) jph.get("managementEndpoints");
+                    if (arr != null) {
+                        for (int i = 0; i < arr.size(); i++) {
+                            row = row.copy();
+                            JsonObject jo = (JsonObject) arr.get(i);
+                            row.server = server;
+                            row.url = jo.getString("url");
+                            row.path = jo.getString("path");
+                            row.verbs = jo.getString("verbs");
+                            row.consumes = jo.getString("consumes");
+                            row.produces = jo.getString("produces");
+                            rows.add(row);
+                        }
+                    }
+                }
+            }
+        });
+
+        // sort rows
+        rows.sort(ORDER.comparator(sort));
+
+        if (!rows.isEmpty() || jsonOutput) {
+            if (jsonOutput) {
+                printer().println(Jsoner.serialize(rows.stream().map(r -> {
+                    JsonObject jo = new JsonObject();
+                    jo.put("pid", JsonValues.pid(r.pid));
+                    jo.put("name", r.name);
+                    jo.put("url", r.url);
+                    jo.put("method", r.verbs);
+                    jo.put("consumes", r.consumes);
+                    jo.put("produces", r.produces);
+                    return jo;
+                }).collect(Collectors.toList())));
+            } else {
+                printer().println(AsciiTable.getTable(AsciiTable.NO_BORDERS, rows, Arrays.asList(
+                        new Column().header("PID").headerAlign(HorizontalAlign.CENTER).with(r -> r.pid),
+                        new Column().header("NAME").dataAlign(HorizontalAlign.LEFT)
+                                .maxWidth(30, OverflowBehaviour.ELLIPSIS_RIGHT)
+                                .with(r -> r.name),
+                        new Column().header("URL").dataAlign(HorizontalAlign.LEFT).with(r -> r.url),
+                        new Column().header("METHOD").dataAlign(HorizontalAlign.LEFT).with(r -> r.verbs),
+                        new Column().header("CONTENT-TYPE").dataAlign(HorizontalAlign.LEFT).with(this::getContent))));
+            }
+        }
+
+        return 0;
+    }
+
+    private String getContent(Row r) {
+        StringJoiner sj = new StringJoiner("   ");
+        if (r.consumes != null || r.produces != null) {
+            if (r.consumes != null) {
+                sj.add("accept: " + r.consumes);
+            }
+            if (r.produces != null) {
+                sj.add("produces: " + r.produces);
+            }
+        }
+        if (sj.length() > 0) {
+            return sj.toString();
+        }
+        return "";
+    }
+
+    private static class Row extends CopyableRow<Row> {
+        String pid;
+        String name;
+        String age;
+        long uptime;
+        String server;
+        String url;
+        String path;
+        String verbs;
+        String consumes;
+        String produces;
+    }
+
+}

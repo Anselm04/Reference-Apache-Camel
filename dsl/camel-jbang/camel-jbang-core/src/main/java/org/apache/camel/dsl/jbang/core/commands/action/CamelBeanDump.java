@@ -1,0 +1,318 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.camel.dsl.jbang.core.commands.action;
+
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.HashMap;
+import java.util.Iterator;
+import java.util.List;
+import java.util.Map;
+
+import com.github.freva.asciitable.AsciiTable;
+import com.github.freva.asciitable.Column;
+import com.github.freva.asciitable.HorizontalAlign;
+import com.github.freva.asciitable.OverflowBehaviour;
+import org.aesh.command.CommandDefinition;
+import org.aesh.command.option.Argument;
+import org.aesh.command.option.Mixin;
+import org.aesh.command.option.Option;
+import org.apache.camel.dsl.jbang.core.common.CliException;
+import org.apache.camel.dsl.jbang.core.common.CompletionCandidates;
+import org.apache.camel.dsl.jbang.core.common.JsonOutput;
+import org.apache.camel.dsl.jbang.core.common.ProcessFinder.CamelProcess;
+import org.apache.camel.dsl.jbang.core.common.RowSort;
+import org.apache.camel.dsl.jbang.core.common.TerminalWidthHelper;
+import org.apache.camel.util.json.JsonArray;
+import org.apache.camel.util.json.JsonObject;
+
+@CommandDefinition(name = "bean", description = "List beans in a running Camel integration", generateHelp = true,
+                   footer = {
+                           "Examples:",
+                           "  camel get bean",
+                           "  camel get bean --filter=myBean",
+                           "  camel get bean --scope=user",
+                           "  camel get bean --json" })
+public class CamelBeanDump extends ActionBaseCommand {
+
+    private static final List<String> SCOPES = List.of("all", "user", "camel", "spring", "quarkus");
+
+    private static final RowSort<Row> ORDER = new RowSort<Row>()
+            .text("name", r -> r.name)
+            .text("type", r -> r.type);
+
+    public static class NameTypeCompletionCandidates extends CompletionCandidates {
+
+        public NameTypeCompletionCandidates() {
+        }
+
+        @Override
+        public Iterator<String> iterator() {
+            return List.of("name", "type").iterator();
+        }
+
+    }
+
+    public static class ScopeCompletionCandidates extends CompletionCandidates {
+
+        public ScopeCompletionCandidates() {
+        }
+
+        @Override
+        public Iterator<String> iterator() {
+            return SCOPES.iterator();
+        }
+
+    }
+
+    @Argument(description = "Name or pid of running Camel integration")
+    String name = "*";
+
+    @Option(name = "sort", description = "Sort by name or type", defaultValue = "name",
+            completer = NameTypeCompletionCandidates.class)
+    String sort = "name";
+
+    @Option(name = "filter", description = "Filter beans names (use all to include all beans)", defaultValue = "all")
+    String filter = "all";
+
+    @Option(name = "properties", hasValue = false, description = "Show bean properties", defaultValue = "true")
+    boolean properties;
+
+    @Option(name = "nulls", hasValue = false, description = "Include null values", defaultValue = "true")
+    boolean nulls;
+
+    @Option(name = "scope",
+            description = "Filter beans by scope: all, user (excludes Camel/Spring/Quarkus/JDK), camel, spring, quarkus",
+            defaultValue = "all", completer = ScopeCompletionCandidates.class)
+    String scope = "all";
+
+    @Option(name = "internal", hasValue = false, description = "Include internal Camel beans", defaultValue = "false")
+    boolean internal;
+
+    @Option(name = "dsl", hasValue = false, description = "Include only beans from YAML or XML DSL", defaultValue = "false")
+    boolean dsl;
+
+    @Option(name = "json", hasValue = false, description = "Output in JSON Format")
+    boolean jsonOutput;
+
+    @Mixin
+    ActionTimeoutMixin timeoutOption;
+
+    private volatile long pid;
+
+    @Override
+    public Integer doCall() throws Exception {
+        List<Row> rows = new ArrayList<>();
+
+        if (!SCOPES.contains(scope)) {
+            throw CliException.usage("--scope must be one of " + String.join(", ", SCOPES) + ", was: " + scope);
+        }
+
+        CamelProcess process = findOne(name);
+        this.pid = process.pid();
+
+        JsonObject jo = executeAction(process, "bean", root -> {
+            if (!"all".equals(filter)) {
+                root.put("filter", filter);
+            }
+            root.put("properties", properties);
+            root.put("nulls", nulls);
+            root.put("internal", !"all".equals(scope) || internal);
+        });
+
+        JsonObject beans;
+        if (dsl) {
+            beans = (JsonObject) jo.get("bean-models");
+        } else {
+            beans = (JsonObject) jo.get("beans");
+        }
+        if (beans == null) {
+            throw CliException.failure("Bean data not available from the running integration");
+        }
+        for (String name : beans.keySet()) {
+            JsonObject jt = (JsonObject) beans.get(name);
+            Row row = new Row();
+            row.name = jt.getString("name");
+            row.type = jt.getString("type");
+            JsonArray arr = jt.getCollection("properties");
+            // the configuration of the properties in the DSL, by name: the two lists can differ without --nulls
+            Map<String, String> configValues = new HashMap<>();
+            JsonArray arr2 = jt.getCollection("modelProperties");
+            if (arr2 != null) {
+                for (Object o : arr2) {
+                    JsonObject p2 = (JsonObject) o;
+                    configValues.put(p2.getString("name"), p2.getString("value"));
+                }
+            }
+            if (arr != null) {
+                row.properties = new ArrayList<>();
+                for (int i = 0; i < arr.size(); i++) {
+                    PropertyRow pr = new PropertyRow();
+                    row.properties.add(pr);
+                    JsonObject p = (JsonObject) arr.get(i);
+                    pr.name = p.getString("name");
+                    pr.type = p.getString("type");
+                    pr.value = p.get("value");
+                    pr.configValue = configValues.get(pr.name);
+                }
+            }
+            rows.add(row);
+        }
+
+        // filter by scope
+        if (!"all".equals(scope)) {
+            rows.removeIf(r -> !matchesScope(r, scope));
+        }
+
+        // sort rows
+        rows.sort(ORDER.comparator(sort));
+        if (jsonOutput) {
+            JsonOutput.printList(printer(), rows.stream().map(this::toJson).toList());
+        } else if (properties) {
+            for (Row row : rows) {
+                String line = "BEAN: " + row.name + " (" + row.type + "):";
+                printer().println(line);
+                printer().println("-".repeat(line.length()));
+                if (row.properties != null) {
+                    propertiesTable(row.properties);
+                }
+                printer().println();
+            }
+        } else {
+            singleTable(rows);
+        }
+
+        return 0;
+    }
+
+    private JsonObject toJson(Row r) {
+        JsonObject jo = new JsonObject();
+        jo.put("name", r.name);
+        jo.put("type", r.type);
+        if (r.properties != null) {
+            jo.put("properties", r.properties.stream().map(pr -> {
+                JsonObject p = new JsonObject();
+                p.put("name", pr.name);
+                p.put("type", pr.type);
+                p.put("value", pr.value);
+                if (pr.configValue != null) {
+                    p.put("configValue", pr.configValue);
+                }
+                return p;
+            }).toList());
+        }
+        return jo;
+    }
+
+    protected void singleTable(List<Row> rows) {
+        int tw = terminalWidth();
+        int borderOverhead = TerminalWidthHelper.noBorderOverhead(2);
+        int nameWidth = TerminalWidthHelper.flexWidth(tw, 100, borderOverhead, 20, 60);
+        int typeWidth = TerminalWidthHelper.flexWidth(tw, nameWidth, borderOverhead, 20, 100);
+
+        printer().println(AsciiTable.getTable(AsciiTable.NO_BORDERS, rows, Arrays.asList(
+                new Column().header("NAME").dataAlign(HorizontalAlign.LEFT)
+                        .maxWidth(nameWidth, OverflowBehaviour.ELLIPSIS_RIGHT)
+                        .with(r -> r.name),
+                new Column().header("TYPE").dataAlign(HorizontalAlign.LEFT).maxWidth(typeWidth, OverflowBehaviour.CLIP_LEFT)
+                        .with(r -> r.type))));
+    }
+
+    protected void propertiesTable(List<PropertyRow> rows) {
+        int tw = terminalWidth();
+        int colCount = dsl ? 4 : 3;
+        int borderOverhead = TerminalWidthHelper.noBorderOverhead(colCount);
+        int propWidth = TerminalWidthHelper.flexWidth(tw, 40 + 80 + (dsl ? 80 : 0), borderOverhead, 15, 40);
+        int propTypeWidth = TerminalWidthHelper.flexWidth(tw, propWidth + 80 + (dsl ? 80 : 0), borderOverhead, 15, 40);
+        int valueWidth = TerminalWidthHelper.flexWidth(tw, propWidth + propTypeWidth + (dsl ? 80 : 0), borderOverhead, 20, 80);
+        int configWidth = dsl
+                ? TerminalWidthHelper.flexWidth(tw, propWidth + propTypeWidth + valueWidth, borderOverhead, 20, 80)
+                : 80;
+
+        printer().println(AsciiTable.getTable(AsciiTable.NO_BORDERS, rows, Arrays.asList(
+                new Column().header("PROPERTY").dataAlign(HorizontalAlign.LEFT)
+                        .maxWidth(propWidth, OverflowBehaviour.ELLIPSIS_RIGHT)
+                        .with(r -> r.name),
+                new Column().header("TYPE").dataAlign(HorizontalAlign.LEFT)
+                        .maxWidth(propTypeWidth, OverflowBehaviour.ELLIPSIS_RIGHT)
+                        .with(r -> r.type),
+                new Column().header("CONFIGURATION").visible(dsl).dataAlign(HorizontalAlign.LEFT)
+                        .maxWidth(configWidth, OverflowBehaviour.NEWLINE)
+                        .with(r -> r.configValue),
+                new Column().header("VALUE").dataAlign(HorizontalAlign.LEFT).maxWidth(valueWidth, OverflowBehaviour.NEWLINE)
+                        .with(this::getValue))));
+    }
+
+    private String getValue(PropertyRow r) {
+        if (r.value != null) {
+            return r.value.toString();
+        }
+        return "null";
+    }
+
+    private static boolean matchesScope(Row r, String scope) {
+        return switch (scope) {
+            case "user" -> !isFrameworkBean(r);
+            case "camel" -> isCamelBean(r);
+            case "spring" -> isSpringBean(r);
+            case "quarkus" -> isQuarkusBean(r);
+            default -> true;
+        };
+    }
+
+    private static boolean isFrameworkBean(Row r) {
+        if (isCamelBean(r) || isSpringBean(r) || isQuarkusBean(r)) {
+            return true;
+        }
+        return r.type != null && r.type.startsWith("java.");
+    }
+
+    private static boolean isCamelBean(Row r) {
+        if (r.name != null && (r.name.startsWith("camel-") || r.name.startsWith("org.apache.camel"))) {
+            return true;
+        }
+        return r.type != null && r.type.startsWith("org.apache.camel");
+    }
+
+    private static boolean isSpringBean(Row r) {
+        if (r.name != null && r.name.startsWith("org.springframework")) {
+            return true;
+        }
+        return r.type != null && r.type.startsWith("org.springframework");
+    }
+
+    private static boolean isQuarkusBean(Row r) {
+        if (r.name != null && r.name.startsWith("io.quarkus")) {
+            return true;
+        }
+        return r.type != null && r.type.startsWith("io.quarkus");
+    }
+
+    private static class Row {
+        String name;
+        String type;
+        List<PropertyRow> properties;
+    }
+
+    private static class PropertyRow {
+        String name;
+        String type;
+        Object value;
+        String configValue;
+    }
+
+}

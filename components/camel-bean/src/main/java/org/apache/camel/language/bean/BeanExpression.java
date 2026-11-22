@@ -1,0 +1,842 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.camel.language.bean;
+
+import java.io.File;
+import java.io.InputStream;
+import java.util.Collection;
+import java.util.List;
+import java.util.Map;
+import java.util.regex.Pattern;
+import java.util.stream.Collectors;
+
+import org.apache.camel.BeanScope;
+import org.apache.camel.CamelContext;
+import org.apache.camel.Exchange;
+import org.apache.camel.ExchangePattern;
+import org.apache.camel.Expression;
+import org.apache.camel.ExpressionIllegalSyntaxException;
+import org.apache.camel.NoSuchBeanException;
+import org.apache.camel.Predicate;
+import org.apache.camel.RuntimeCamelException;
+import org.apache.camel.StreamCache;
+import org.apache.camel.TypeConverter;
+import org.apache.camel.WrappedFile;
+import org.apache.camel.component.bean.BeanComponent;
+import org.apache.camel.component.bean.BeanConstants;
+import org.apache.camel.component.bean.BeanExpressionProcessor;
+import org.apache.camel.component.bean.BeanHolder;
+import org.apache.camel.component.bean.BeanInfo;
+import org.apache.camel.component.bean.ConstantBeanHolder;
+import org.apache.camel.component.bean.ConstantTypeBeanHolder;
+import org.apache.camel.component.bean.MethodNotFoundException;
+import org.apache.camel.component.bean.ParameterMappingStrategy;
+import org.apache.camel.component.bean.ParameterMappingStrategyHelper;
+import org.apache.camel.component.bean.RegistryBean;
+import org.apache.camel.component.bean.RequestBeanHolder;
+import org.apache.camel.spi.Language;
+import org.apache.camel.support.BodyFacts;
+import org.apache.camel.support.ExchangeHelper;
+import org.apache.camel.support.LanguageSupport;
+import org.apache.camel.util.KeyValueHolder;
+import org.apache.camel.util.ObjectHelper;
+import org.apache.camel.util.OgnlHelper;
+import org.apache.camel.util.StringHelper;
+
+import static org.apache.camel.util.ObjectHelper.hasDefaultPublicNoArgConstructor;
+
+/**
+ * Evaluates an expression using a bean method invocation
+ */
+public class BeanExpression implements Expression, Predicate {
+
+    private ParameterMappingStrategy parameterMappingStrategy;
+    private BeanComponent beanComponent;
+    private Language simple;
+    private Class<?> resultType;
+    private final Object bean;
+    private String beanName;
+    private Class<?> type;
+    private final String method;
+    private BeanHolder beanHolder;
+    private boolean ognlMethod;
+    private BeanScope scope = BeanScope.Singleton;
+    private boolean validate = true;
+
+    public BeanExpression(Object bean, String method) {
+        this.bean = bean;
+        this.method = method;
+        this.beanName = null;
+        this.type = null;
+    }
+
+    public BeanExpression(String beanName, String method) {
+        this.beanName = beanName;
+        this.method = method;
+        this.bean = null;
+        this.type = null;
+    }
+
+    public BeanExpression(Class<?> type, String method) {
+        this.type = type;
+        this.method = method;
+        this.bean = null;
+        this.beanName = null;
+    }
+
+    public Object getBean() {
+        return bean;
+    }
+
+    public String getBeanName() {
+        return beanName;
+    }
+
+    public Class<?> getType() {
+        return type;
+    }
+
+    public String getMethod() {
+        return method;
+    }
+
+    public BeanScope getScope() {
+        return scope;
+    }
+
+    public void setScope(BeanScope scope) {
+        this.scope = scope;
+    }
+
+    public boolean isValidate() {
+        return validate;
+    }
+
+    public void setValidate(boolean validate) {
+        this.validate = validate;
+    }
+
+    public ParameterMappingStrategy getParameterMappingStrategy() {
+        return parameterMappingStrategy;
+    }
+
+    public void setParameterMappingStrategy(ParameterMappingStrategy parameterMappingStrategy) {
+        this.parameterMappingStrategy = parameterMappingStrategy;
+    }
+
+    public BeanComponent getBeanComponent() {
+        return beanComponent;
+    }
+
+    public void setBeanComponent(BeanComponent beanComponent) {
+        this.beanComponent = beanComponent;
+    }
+
+    public Language getSimple() {
+        return simple;
+    }
+
+    public void setSimple(Language simple) {
+        this.simple = simple;
+    }
+
+    public Class<?> getResultType() {
+        return resultType;
+    }
+
+    public void setResultType(Class<?> resultType) {
+        this.resultType = resultType;
+    }
+
+    @Override
+    public void init(CamelContext context) {
+        if (parameterMappingStrategy == null) {
+            parameterMappingStrategy = ParameterMappingStrategyHelper.createParameterMappingStrategy(context);
+        }
+        if (beanComponent == null) {
+            beanComponent = context.getComponent("bean", BeanComponent.class);
+        }
+        if (beanName != null && beanName.startsWith("type:")) {
+            // its a reference to a fqn class so load the class and use type instead
+            String fqn = beanName.substring(5);
+            try {
+                type = context.getClassResolver().resolveMandatoryClass(fqn);
+                beanName = null;
+            } catch (ClassNotFoundException e) {
+                throw new NoSuchBeanException(beanName, e);
+            }
+        }
+        if (beanHolder == null) {
+            beanHolder = createBeanHolder(context, parameterMappingStrategy, beanComponent);
+        }
+
+        // lets see if we can do additional validation that the bean has valid method during creation of the expression
+        Object target = beanHolder.getBean(null);
+        if (method != null) {
+            if (validate) {
+                validateHasMethod(context, target, type, method);
+                // validate OGNL if its invalid syntax
+                if (OgnlHelper.isInvalidValidOgnlExpression(method)) {
+                    throw new ExpressionIllegalSyntaxException(method);
+                }
+            }
+            ognlMethod = OgnlHelper.isValidOgnlExpression(method);
+        }
+    }
+
+    @Override
+    public String toString() {
+        StringBuilder sb = new StringBuilder(256);
+
+        sb.append("BeanExpression[");
+        if (bean != null) {
+            sb.append(bean);
+        } else if (beanName != null) {
+            sb.append(beanName);
+        } else if (type != null) {
+            sb.append(ObjectHelper.className(type));
+        }
+        if (method != null) {
+            sb.append(" method:").append(method);
+        }
+        sb.append("]");
+        return sb.toString();
+    }
+
+    public Object evaluate(Exchange exchange) {
+        if (beanHolder == null) {
+            throw new IllegalStateException("The expression must be initialized first");
+        }
+        try {
+            if (ognlMethod) {
+                // okay the method is an ognl expression
+                return invokeOgnlMethod(beanHolder, beanName, method, exchange);
+            } else {
+                // regular non ognl invocation
+                return invokeBean(beanHolder, beanName, method, exchange);
+            }
+        } catch (RuntimeBeanExpressionException e) {
+            throw e;
+        } catch (Exception e) {
+            throw new RuntimeBeanExpressionException(exchange, getBeanName(exchange, beanName, beanHolder), method, e);
+        }
+    }
+
+    @Override
+    public <T> T evaluate(Exchange exchange, Class<T> type) {
+        Object result = evaluate(exchange);
+        if (Object.class == type) {
+            // do not use type converter if type is Object (optimize)
+            return (T) (resultType == null
+                    ? result : exchange.getContext().getTypeConverter().convertTo(resultType, exchange, result));
+        } else {
+            return exchange.getContext().getTypeConverter().convertTo(type, exchange, result);
+        }
+    }
+
+    @Override
+    public boolean matches(Exchange exchange) {
+        Object value = evaluate(exchange);
+        return ObjectHelper.evaluateValuePredicate(value);
+    }
+
+    /**
+     * Validates the given bean has the method.
+     * <p/>
+     * This implementation will skip trying to validate OGNL method name expressions.
+     *
+     * @param  context                                camel context
+     * @param  bean                                   the bean instance
+     * @param  type                                   the bean type
+     * @param  method                                 the method, can be <tt>null</tt> if no method name provided
+     * @throws org.apache.camel.RuntimeCamelException is thrown if bean does not have the method
+     */
+    protected void validateHasMethod(CamelContext context, Object bean, Class<?> type, String method) {
+        if (method == null) {
+            return;
+        }
+
+        if (bean == null && type == null) {
+            throw new IllegalArgumentException("Either bean or type should be provided on " + this);
+        }
+
+        // do not try to validate ognl methods
+        if (OgnlHelper.isValidOgnlExpression(method)) {
+            return;
+        }
+
+        if (bean == null && hasDefaultPublicNoArgConstructor(type)) {
+            bean = context.getInjector().newInstance(type);
+        }
+
+        // if invalid OGNL then fail
+        if (OgnlHelper.isInvalidValidOgnlExpression(method)) {
+            ExpressionIllegalSyntaxException cause = new ExpressionIllegalSyntaxException(method);
+            throw RuntimeCamelException
+                    .wrapRuntimeCamelException(new MethodNotFoundException(bean != null ? bean : type, method, cause));
+        }
+
+        if (bean != null) {
+            BeanInfo info = new BeanInfo(context, bean.getClass(), parameterMappingStrategy, beanComponent);
+            if (!info.hasMethod(method)) {
+                throw RuntimeCamelException.wrapRuntimeCamelException(new MethodNotFoundException(null, bean, method));
+            }
+        } else {
+            BeanInfo info = new BeanInfo(context, type, parameterMappingStrategy, beanComponent);
+            // must be a static method as we do not have a bean instance to invoke
+            if (!info.hasStaticMethod(method)) {
+                throw RuntimeCamelException.wrapRuntimeCamelException(new MethodNotFoundException(null, type, method, true));
+            }
+        }
+    }
+
+    private BeanHolder createBeanHolder(
+            CamelContext context, ParameterMappingStrategy parameterMappingStrategy, BeanComponent beanComponent) {
+        // either use registry lookup or a constant bean
+        BeanHolder holder = null;
+        if (bean != null) {
+            holder = new ConstantBeanHolder(bean, context, parameterMappingStrategy, beanComponent);
+        } else if (beanName != null) {
+            RegistryBean rb = new RegistryBean(context, beanName, parameterMappingStrategy, beanComponent);
+            if (scope == BeanScope.Singleton) {
+                // cache holder as its singleton
+                holder = rb.createCacheHolder();
+            } else if (scope == BeanScope.Request) {
+                // wrap in registry scoped
+                holder = new RequestBeanHolder(rb);
+            } else {
+                // prototype scope will lookup bean on each access
+                holder = rb;
+            }
+        } else if (type != null) {
+            ConstantTypeBeanHolder th = new ConstantTypeBeanHolder(type, context, parameterMappingStrategy, beanComponent);
+            if (scope == BeanScope.Singleton && ObjectHelper.hasDefaultPublicNoArgConstructor(type)) {
+                // we can only cache if we can create an instance of the bean, and for that we need a public constructor
+                holder = th.createCacheHolder();
+            } else if (scope == BeanScope.Request) {
+                // wrap in registry scoped
+                holder = new RequestBeanHolder(th);
+            } else {
+                holder = th;
+            }
+        } else {
+            throw new IllegalArgumentException("Either bean, beanName or type should be set on " + this);
+        }
+        return holder;
+    }
+
+    private static String getBeanName(Exchange exchange, String beanName, BeanHolder beanHolder) {
+        String name = beanName;
+        if (name == null && beanHolder != null && beanHolder.getBean(exchange) != null) {
+            name = beanHolder.getBean(exchange).getClass().getCanonicalName();
+        }
+        if (name == null && beanHolder != null && beanHolder.getBeanInfo() != null
+                && beanHolder.getBeanInfo().getType() != null) {
+            name = beanHolder.getBeanInfo().getType().getCanonicalName();
+        }
+        return name;
+    }
+
+    /**
+     * Invokes the bean and returns the result. If an exception was thrown while invoking the bean, then the exception
+     * is set on the exchange.
+     */
+    private static Object invokeBean(BeanHolder beanHolder, String beanName, String methodName, Exchange exchange) {
+        Object result;
+
+        try {
+            // do not close BeanExpressionProcessor as beanHolder should not be closed
+            @SuppressWarnings("resource")
+            BeanExpressionProcessor processor = new BeanExpressionProcessor(beanHolder); // NOSONAR
+
+            if (methodName != null) {
+                processor.setMethod(methodName);
+                // enable OGNL like invocation
+                processor.setShorthandMethod(true);
+            }
+            // copy the original exchange to avoid side effects on it
+            Exchange resultExchange = ExchangeHelper.createCopy(exchange, true);
+            // remove any existing exception in case we do OGNL on the exception
+            resultExchange.setException(null);
+
+            // force to use InOut to retrieve the result on the OUT message
+            resultExchange.setPattern(ExchangePattern.InOut);
+            processor.process(resultExchange);
+            // the response is always stored in OUT
+            result = resultExchange.hasOut() ? resultExchange.getOut().getBody() : null;
+
+            // propagate properties and headers from result
+            if (resultExchange.hasProperties()) {
+                exchange.getProperties().putAll(resultExchange.getProperties());
+            }
+            if (resultExchange.hasOut() && resultExchange.getOut().hasHeaders()) {
+                exchange.getIn().getHeaders().putAll(resultExchange.getOut().getHeaders());
+            }
+
+            // propagate exceptions
+            if (resultExchange.getException() != null) {
+                exchange.setException(resultExchange.getException());
+            }
+        } catch (Exception e) {
+            throw new RuntimeBeanExpressionException(
+                    exchange, describeBean(beanHolder, beanName, exchange), methodHint(methodName, e), e);
+        }
+
+        return result;
+    }
+
+    /**
+     * ${body.toUpperCase} without parentheses binds the body as the parameter of the one argument overload, which fails
+     * on the conversion; say that a method call needs parentheses.
+     */
+    private static String methodHint(String methodName, Throwable e) {
+        if (methodName != null && !methodName.contains("(") && !methodName.contains("[")) {
+            for (Throwable t = e; t != null; t = t.getCause()) {
+                String n = t.getClass().getSimpleName();
+                if (n.equals("NoTypeConversionAvailableException") || n.equals("InvalidPayloadException")) {
+                    return methodName + " (a method call needs parentheses: " + methodName + "())";
+                }
+            }
+        }
+        return methodName;
+    }
+
+    /**
+     * Why ${body.equals('x')}, ${body.hashCode()} and the other methods Camel does not call on a bean fail: the body is
+     * not the reason, so the hint says what to write instead of what the body is (CAMEL-26041). Null for another
+     * method.
+     */
+    private static String excludedMethodHint(String methodName) {
+        String name = methodName != null ? StringHelper.before(methodName, "(", methodName).trim() : null;
+        // getClass is excluded from the bean binding, but BeanInfo invokes it on its own
+        if (name == null || "getClass".equals(name) || !BeanInfo.isExcludedMethodName(name)) {
+            return null;
+        }
+        if ("equals".equals(name)) {
+            return " (Camel does not call equals on a bean: compare with an operator instead, such as ${body} == 'value'"
+                   + " in simple)";
+        }
+        return " (Camel does not call " + name + " on a bean)";
+    }
+
+    /**
+     * The bean name, or for an OGNL on the message body (${body.foo()}) what the body is, so the message does not say
+     * "on null".
+     */
+    private static String describeBean(BeanHolder beanHolder, String beanName, Exchange exchange) {
+        if (beanName != null) {
+            return beanName;
+        }
+        try {
+            Object bean = beanHolder != null ? beanHolder.getBean(exchange) : null;
+            if (bean != null) {
+                return "the message body of type " + ObjectHelper.className(bean);
+            }
+        } catch (Exception e) {
+            // ignore
+        }
+        return "the message body";
+    }
+
+    /**
+     * To invoke a bean using a OGNL notation which denotes the chain of methods to invoke.
+     * <p/>
+     * For more advanced OGNL you may have to look for a real framework such as OGNL, Mvel or dynamic programming
+     * language such as Groovy.
+     */
+    private Object invokeOgnlMethod(BeanHolder beanHolder, String beanName, String ognl, Exchange exchange) {
+
+        // we must start with having bean as the result
+        Object result = beanHolder.getBean(exchange);
+
+        // copy the original exchange to avoid side effects on it
+        Exchange resultExchange = ExchangeHelper.createCopy(exchange, true);
+        // remove any existing exception in case we do OGNL on the exception
+        resultExchange.setException(null);
+        // force to use InOut to retrieve the result on the OUT message
+        resultExchange.setPattern(ExchangePattern.InOut);
+        // do not propagate any method name when using OGNL, as with OGNL we
+        // compute and provide the method name to explicit to invoke
+        resultExchange.removeProperty(BeanConstants.BEAN_METHOD_NAME);
+
+        // current ognl path as we go along
+        String ognlPath = "";
+
+        // loop and invoke each method
+        Object beanToCall = beanHolder.getBean(exchange);
+        Class<?> beanType = beanHolder.getBeanInfo().getType();
+
+        // there must be a bean to call with, we currently does not support OGNL expressions on using purely static methods
+        if (beanToCall == null && beanType == null) {
+            throw new IllegalArgumentException(
+                    "Bean instance and bean type is null. OGNL bean expressions requires to have either a bean instance of the class name of the bean to use.");
+        }
+
+        if (ognl != null) {
+            // must be a valid method name according to java identifier ruling
+            OgnlHelper.validateMethodName(ognl);
+        }
+
+        // Split ognl except when this is not a Map, Array
+        // and we would like to keep the dots within the key name
+        List<String> methods = OgnlHelper.splitOgnl(ognl);
+
+        for (String methodName : methods) {
+            BeanHolder holder = createBeanHolder(beanToCall, beanType, exchange);
+            boolean nullSafe = OgnlHelper.isNullSafeOperator(methodName);
+
+            validateHolder(holder, exchange, beanHolder, ognl, methodName);
+
+            ognlPath += methodName;
+            methodName = OgnlHelper.removeLeadingOperators(methodName);
+
+            KeyValueHolder<String, String> index = OgnlHelper.isOgnlIndex(methodName);
+            String key = null;
+            if (index != null) {
+                methodName = index.getKey();
+                key = index.getValue();
+            }
+
+            result = invokeMethodIfPresent(holder, beanName, methodName, exchange, resultExchange, result);
+            result = lookupByKeyIfPresent(key, result, resultExchange, exchange, nullSafe, ognlPath, holder);
+
+            if (result == null && nullSafe) {
+                return null;
+            }
+
+            beanToCall = result;
+            beanType = null;
+        }
+
+        return result;
+    }
+
+    private BeanHolder createBeanHolder(Object beanToCall, Class<?> beanType, Exchange exchange) {
+        if (beanToCall != null) {
+            return new ConstantBeanHolder(beanToCall, exchange.getContext(), parameterMappingStrategy, beanComponent);
+        }
+        if (beanType != null) {
+            return new ConstantTypeBeanHolder(beanType, exchange.getContext(), parameterMappingStrategy, beanComponent);
+        }
+        return null;
+    }
+
+    private void validateHolder(
+            BeanHolder holder, Exchange exchange, BeanHolder originalHolder, String ognl, String methodName) {
+        if (holder == null) {
+            String name = getBeanName(exchange, null, originalHolder);
+            throw new RuntimeBeanExpressionException(
+                    exchange, name, ognl, "last method returned null and therefore cannot continue to invoke method "
+                                          + methodName + " on a null instance");
+        }
+    }
+
+    private Object invokeMethodIfPresent(
+            BeanHolder holder, String beanName, String methodName,
+            Exchange exchange, Exchange resultExchange, Object currentResult) {
+        if (methodName == null) {
+            return currentResult;
+        }
+        Object newResult = invokeBean(holder, beanName, methodName, resultExchange);
+        if (resultExchange.getException() != null) {
+            // ${body.sku} on a Map with no method of that name: read the key, the only thing it can mean
+            // (CAMEL-24916)
+            Object value = mapValue(holder, exchange, methodName, resultExchange.getException());
+            if (value != NO_SUCH_KEY) {
+                resultExchange.setException(null);
+                return value;
+            }
+            String method = methodHint(methodName, resultExchange.getException());
+            String excluded = excludedMethodHint(methodName);
+            if (excluded != null) {
+                // ${body.equals('x')}: no bean binding calls it, whatever the body is (CAMEL-26041)
+                throw new RuntimeBeanExpressionException(
+                        exchange, describeBean(holder, beanName, exchange), method + excluded,
+                        resultExchange.getException());
+            }
+            Object bean = beanOf(holder, exchange);
+            String body = bodyHint(exchange, bean);
+            String list = body == null ? listHint(bean, methodName) : null;
+            // ${variable.customer.name} on a variable that holds the file as read
+            String file = body == null && (bean instanceof WrappedFile<?> || bean instanceof File)
+                    ? noKeysHint(bean, methodName) : null;
+            throw new RuntimeBeanExpressionException(
+                    exchange, describeBean(holder, beanName, exchange),
+                    body != null
+                            ? method + " (" + body + ")"
+                            : list != null ? method + list
+                            : file != null ? method + file : keyHint(holder, exchange, methodName, method),
+                    resultExchange.getException());
+        }
+        return newResult;
+    }
+
+    /**
+     * ${body.orderId}, or a method a model makes up such as ${body.find(...)}, on a List: neither is there, so say how
+     * to get to an element: by its index, by a field with jsonpath, or one at a time with split. The way
+     * {@link #noKeysHint} does for ${body[orderId]}; null for any other bean.
+     */
+    static String listHint(Object bean, String methodName) {
+        if (!(bean instanceof Collection<?>) && !(bean instanceof Object[])) {
+            return null;
+        }
+        String type = bean instanceof List ? "a List" : bean instanceof Object[] ? "an array" : "a Collection";
+        boolean field = methodName != null && FIELD_NAME.matcher(methodName).matches();
+        String name = field ? methodName : "field";
+        return " (" + type + " has no " + (field ? "method or key " + methodName : "such method") + ": "
+               + pickElementHint(name, "[0]." + name) + ")";
+    }
+
+    /**
+     * How to pick an element of a list by a field, and then the first element: given [0] first, models wrote
+     * ${body[0].orderId} and took the first element.
+     */
+    private static String pickElementHint(String name, String first) {
+        return "to pick the element whose " + name + " has a given value, use jsonpath: \"$[?(@." + name + " == '${header."
+               + name + "}')]\" with resultType java.util.Map (the element, or null when none or several match); " + first
+               + " reads the first element; or split it";
+    }
+
+    private static final Pattern FIELD_NAME = Pattern.compile("[A-Za-z_][A-Za-z0-9_]*");
+
+    /** Says that the bean is not a Map with that key, as null is a value a key can hold. */
+    private static final Object NO_SUCH_KEY = new Object();
+
+    /**
+     * The value of the key on a Map bean when the method of that name does not exist, so that ${body.sku} reads the sku
+     * of a map the way ${body[sku]} does - what a map means in jq, JavaScript and Groovy too (CAMEL-24916).
+     * <p/>
+     * A method still wins: ${body.size} on a Map calls size() as before. A name that is not a key still fails, so a
+     * misspelled field is still reported.
+     *
+     * @param  holder     the bean the OGNL step is called on; null when there is none
+     * @param  exchange   the exchange the bean is resolved against
+     * @param  methodName the name that failed as a method call, and is tried as a key
+     * @param  cause      the failure of that call, so that only a missing method is read as a key
+     * @return            the value of the key, or {@link #NO_SUCH_KEY} when this is not that case
+     */
+    private static Object mapValue(BeanHolder holder, Exchange exchange, String methodName, Exception cause) {
+        if (methodName == null || methodName.contains("(") || methodName.contains("[")) {
+            return NO_SUCH_KEY;
+        }
+        boolean noSuchMethod = false;
+        for (Throwable t = cause; t != null && !noSuchMethod; t = t.getCause()) {
+            noSuchMethod = t instanceof MethodNotFoundException;
+        }
+        if (!noSuchMethod) {
+            return NO_SUCH_KEY; // the method is there and it failed: that is a real error
+        }
+        try {
+            Object bean = holder != null ? holder.getBean(exchange) : null;
+            if (bean instanceof Map<?, ?> map && map.containsKey(methodName)) {
+                return map.get(methodName);
+            }
+        } catch (Exception e) {
+            // ignore and let the original failure stand
+        }
+        return NO_SUCH_KEY;
+    }
+
+    /** At most this many keys are listed when a Map has no key of the name asked for. */
+    private static final int MAX_KEYS_LISTED = 20;
+
+    /**
+     * ${body.type} on a Map body reads the key type (CAMEL-24916), so getting here means the Map has no such key: say
+     * that and list its keys, since the usual cause is a body that is not the Map one thinks (inside a split over an
+     * order's lines the body is a line, not the order) (CAMEL-25322).
+     */
+    private static String keyHint(BeanHolder holder, Exchange exchange, String methodName, String hint) {
+        if (methodName == null || methodName.contains("(") || methodName.contains("[")) {
+            return hint;
+        }
+        try {
+            Object bean = holder != null ? holder.getBean(exchange) : null;
+            if (bean instanceof Map<?, ?> && bean == exchange.getMessage().getBody()) {
+                // the body: which step made it this Map, as a split over an order's lines does (CAMEL-25749)
+                return hint + " (the Map has no key " + methodName + "; " + BodyFacts.describe(exchange) + ": "
+                       + BodyFacts.hint(exchange, BodyFacts.Need.DATA) + ")";
+            }
+            if (bean instanceof Map<?, ?> map) {
+                String keys = map.keySet().stream().limit(MAX_KEYS_LISTED).map(String::valueOf)
+                        .collect(Collectors.joining(", "));
+                String more = map.size() > MAX_KEYS_LISTED ? ", ... (" + map.size() + " keys)" : "";
+                return hint + " (the Map has no key " + methodName
+                       + (map.isEmpty() ? "; it is empty)" : "; its keys are: " + keys + more + ")");
+            }
+        } catch (Exception e) {
+            // ignore
+        }
+        return hint;
+    }
+
+    private Object lookupByKeyIfPresent(
+            String key, Object result, Exchange resultExchange, Exchange exchange,
+            boolean nullSafe, String ognlPath, BeanHolder holder) {
+        if (key == null) {
+            return result;
+        }
+        if (LanguageSupport.hasSimpleFunction(key)) {
+            Expression exp = simple.createExpression(key);
+            exp.init(exchange.getContext());
+            key = exp.evaluate(exchange, String.class);
+        }
+        if (key != null) {
+            Object bean = holder.getBean(exchange);
+            // the payload of the message body is told by bodyHint below, from what the message history knows
+            Object value = result != null ? result : bean;
+            boolean payloadBody = bean != null && bean == exchange.getMessage().getBody() && value == bean
+                    && isPayload(value);
+            try {
+                return lookupResult(resultExchange, key, result, nullSafe, ognlPath, bean, !payloadBody);
+            } catch (IndexOutOfBoundsException e) {
+                // ${body[status]} on the file as read, or on a stream: the same exception, saying what the body is
+                // and the step that parses it (CAMEL-25749)
+                String body = bodyHint(exchange, bean);
+                if (body == null) {
+                    throw e;
+                }
+                throw new IndexOutOfBoundsException(e.getMessage() + " (" + body + ")");
+            }
+        }
+        return result;
+    }
+
+    /**
+     * What the body is and what to write, when an OGNL read on the message body failed because of its type: the payload
+     * as text, bytes, a stream or the file as read, which an unmarshal turns into data, or an iterator, which has no
+     * size (CAMEL-25749). Null for a Map, whose keys {@link #keyHint} lists, and for a List or an object, where the
+     * name read is wrong rather than the body.
+     */
+    private static String bodyHint(Exchange exchange, Object bean) {
+        if (bean == null || bean instanceof Map || bean != exchange.getMessage().getBody()) {
+            return null;
+        }
+        String hint = BodyFacts.hint(exchange, BodyFacts.Need.DATA);
+        return hint != null ? BodyFacts.describe(exchange) + ": " + hint : null;
+    }
+
+    /** The bean an OGNL step is called on, or null when it cannot be resolved. */
+    private static Object beanOf(BeanHolder holder, Exchange exchange) {
+        try {
+            return holder != null ? holder.getBean(exchange) : null;
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    /** Text, bytes, a stream or the file as read: what an unmarshal turns into data. */
+    private static boolean isPayload(Object value) {
+        return value instanceof WrappedFile<?> || value instanceof File || value instanceof StreamCache
+                || value instanceof InputStream || value instanceof byte[] || value instanceof String;
+    }
+
+    private static Object lookupResult(
+            Exchange exchange, String key, Object result, boolean nullSafe, String ognlPath, Object bean,
+            boolean hint) {
+        StringHelper.notEmpty(key, "key", "in Simple language ognl path: " + ognlPath);
+
+        final TypeConverter typeConverter = exchange.getContext().getTypeConverter();
+
+        // trim key
+        key = key.trim();
+
+        // remove any enclosing quotes
+        key = StringHelper.removeLeadingAndEndingQuotes(key);
+
+        // try map first
+        Map<?, ?> map = typeConverter.convertTo(Map.class, result);
+        if (map != null) {
+            return map.get(key);
+        }
+
+        // special for list is last keyword
+        Integer num = typeConverter.tryConvertTo(Integer.class, key);
+        boolean checkList = key.startsWith("last") || num != null;
+
+        if (checkList) {
+            List<?> list = typeConverter.convertTo(List.class, result);
+            if (list != null) {
+                if (key.startsWith("last")) {
+                    num = list.size() - 1;
+
+                    // maybe its an expression to subtract a number after last
+                    String after = StringHelper.after(key, "-");
+                    if (after != null) {
+                        Integer redux = typeConverter.tryConvertTo(Integer.class, after.trim());
+                        if (redux != null) {
+                            num -= redux;
+                        } else {
+                            throw new ExpressionIllegalSyntaxException(key);
+                        }
+                    }
+                }
+                if (num != null && num >= 0 && !list.isEmpty() && list.size() > num) {
+                    return list.get(num);
+                }
+                if (!nullSafe) {
+                    // not null safe then its mandatory so thrown out of bounds exception
+                    throw new IndexOutOfBoundsException(
+                            "Index: " + num + ", Size: " + list.size()
+                                                        + " out of bounds with List from bean: " + bean + "using OGNL path ["
+                                                        + ognlPath + "]");
+                }
+            }
+        }
+
+        if (!nullSafe) {
+            throw new IndexOutOfBoundsException(
+                    "Key: " + key + " not found in bean: " + bean + " of type: "
+                                                + ObjectHelper.classCanonicalName(bean) + " using OGNL path [" + ognlPath
+                                                + "]" + (hint ? noKeysHint(result != null ? result : bean, key) : ""));
+        } else {
+            // null safe so we can return null
+            return null;
+        }
+    }
+
+    /**
+     * What to do when a key is read from a value that has no keys (CAMEL-25746): the file as read (a variable set from
+     * the body of a file consumer or of pollEnrich), the message body as a stream or bytes (a request body before it is
+     * unmarshalled, or a variable set from it), JSON text, or a List, array or other Collection, where [0] picks an
+     * element.
+     */
+    static String noKeysHint(Object value, String key) {
+        if (value instanceof WrappedFile<?> || value instanceof File) {
+            // a variable set from the body of a file consumer or of pollEnrich holds the file, not its data
+            String type = value instanceof WrappedFile<?> ? value.getClass().getSimpleName() : "File";
+            return " (the value is the file as read (a " + type + "), not its data: unmarshal it first, for example with"
+                   + " json, then read the key; a variable is unmarshalled in place with variableSend and variableReceive"
+                   + " set to its name, such as unmarshal: {json: {}, variableSend: customer, variableReceive: customer})";
+        }
+        if (value instanceof StreamCache || value instanceof InputStream || value instanceof byte[]) {
+            return " (the value is the message body as a stream, not a Map: unmarshal it first, for example with json,"
+                   + " then read the key; a variable keeps the value it had when it was set)";
+        }
+        if (value instanceof CharSequence text) {
+            String trimmed = text.toString().strip();
+            if (trimmed.startsWith("{") || trimmed.startsWith("[")) {
+                return " (the value is JSON text, not a Map: unmarshal it first, for example with json, then read the key)";
+            }
+        }
+        if (value instanceof Collection || value instanceof Object[]) {
+            String type = value instanceof List ? "a List" : value instanceof Object[] ? "an array" : "a Collection";
+            String name = FIELD_NAME.matcher(key).matches() ? key : "field";
+            return " (" + type + " has no keys: " + pickElementHint(name, "[0][" + key + "]") + ")";
+        }
+        return "";
+    }
+}

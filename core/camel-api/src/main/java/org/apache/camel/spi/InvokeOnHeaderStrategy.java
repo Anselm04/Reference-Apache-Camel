@@ -1,0 +1,60 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.camel.spi;
+
+import org.apache.camel.AsyncCallback;
+import org.apache.camel.Exchange;
+import org.jspecify.annotations.Nullable;
+
+/**
+ * Pluggable strategy for invoking {@link InvokeOnHeader}.
+ * <p>
+ * Camel provides source code generated strategies via the camel maven tooling.
+ *
+ * @see   InvokeOnHeader
+ * @since 3.8
+ */
+public interface InvokeOnHeaderStrategy {
+
+    /**
+     * Returned by {@link #invoke(Object, String, Exchange, AsyncCallback)} when there is no method for the key, so the
+     * caller can tell an unknown key from a void method, which returns <code>null</code>.
+     *
+     * @since 4.24
+     */
+    Object NO_METHOD = new Object() {
+        @Override
+        public String toString() {
+            return "NO_METHOD";
+        }
+    };
+
+    /**
+     * Invoke the method based on the header key
+     *
+     * @param  target    the target such as a producer extending HeaderSelectorProducer
+     * @param  key       the header key
+     * @param  exchange  the exchange
+     * @param  callback  the async callback
+     * @return           optional response from invoking the method, or <code>null</code> if the method is void. If a
+     *                   value is returned, then this value is stored as result on the message body. {@link #NO_METHOD}
+     *                   when there is no method for the key.
+     * @throws Exception is thrown if error invoking the method.
+     */
+    @Nullable
+    Object invoke(Object target, String key, Exchange exchange, AsyncCallback callback) throws Exception;
+}

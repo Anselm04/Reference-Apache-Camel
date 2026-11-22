@@ -1,0 +1,145 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.camel.component.undertow.handlers;
+
+import java.util.HashMap;
+import java.util.Map;
+import java.util.concurrent.locks.Lock;
+import java.util.concurrent.locks.ReentrantLock;
+
+import io.undertow.server.HttpHandler;
+import io.undertow.server.handlers.PathHandler;
+import io.undertow.util.URLUtils;
+
+/**
+ * Extended PathHandler to monitor add/remove handlers.
+ */
+public class CamelPathHandler extends PathHandler {
+    private final Lock lock = new ReentrantLock();
+    // the exact and the prefix paths are kept apart, as a base path can have both: a static path, and the path
+    // templates under it (a prefix path)
+    private final Map<String, HttpHandler> exactHandlers = new HashMap<>();
+    private final Map<String, HttpHandler> prefixHandlers = new HashMap<>();
+    private final HttpHandler defaultHandler;
+    private String handlerString;
+
+    public CamelPathHandler(HttpHandler defaultHandler) {
+        super(defaultHandler);
+        this.defaultHandler = defaultHandler;
+    }
+
+    @Override
+    public PathHandler addPrefixPath(final String path, final HttpHandler handler) {
+        lock.lock();
+        try {
+            super.addPrefixPath(path, handler);
+            prefixHandlers.put(path, handler);
+            handlerString = null;
+            return this;
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    @Override
+    public PathHandler addExactPath(final String path, final HttpHandler handler) {
+        lock.lock();
+        try {
+            super.addExactPath(path, handler);
+            exactHandlers.put(path, handler);
+            handlerString = null;
+            return this;
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    @Override
+    public PathHandler removePrefixPath(final String path) {
+        lock.lock();
+        try {
+            super.removePrefixPath(path);
+            if ("/".equals(URLUtils.normalizeSlashes(path))) {
+                // Undertow keeps a prefix handler of / as its default handler, and removing it leaves none, so that
+                // every request that no other path matches would fail: use the default handler again
+                super.addPrefixPath("/", defaultHandler);
+            }
+            prefixHandlers.remove(path);
+            handlerString = null;
+            return this;
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    @Override
+    public PathHandler removeExactPath(final String path) {
+        lock.lock();
+        try {
+            super.removeExactPath(path);
+            exactHandlers.remove(path);
+            handlerString = null;
+            return this;
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    /**
+     * The handler of the path: its prefix handler (such as the handler of the path templates under it), or else its
+     * exact handler.
+     */
+    public HttpHandler getHandler(String path) {
+        lock.lock();
+        try {
+            HttpHandler handler = prefixHandlers.get(path);
+            return handler != null ? handler : exactHandlers.get(path);
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    /**
+     * The exact handler of the path, also when the path has a prefix handler too.
+     */
+    public HttpHandler getExactHandler(String path) {
+        lock.lock();
+        try {
+            return exactHandlers.get(path);
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    public boolean isEmpty() {
+        lock.lock();
+        try {
+            return exactHandlers.isEmpty() && prefixHandlers.isEmpty();
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    @Override
+    public String toString() {
+        if (handlerString == null) {
+            handlerString = "CamelPathHandler[exact=" + exactHandlers + ", prefix=" + prefixHandlers + "]";
+        }
+        return handlerString;
+    }
+
+}

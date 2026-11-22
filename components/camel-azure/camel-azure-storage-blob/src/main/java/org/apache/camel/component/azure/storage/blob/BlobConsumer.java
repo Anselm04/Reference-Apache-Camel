@@ -1,0 +1,526 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.camel.component.azure.storage.blob;
+
+import java.io.Closeable;
+import java.io.IOException;
+import java.time.Duration;
+import java.util.Iterator;
+import java.util.LinkedHashMap;
+import java.util.LinkedList;
+import java.util.Map;
+import java.util.Queue;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
+
+import com.azure.core.http.rest.PagedResponse;
+import com.azure.core.util.polling.LongRunningOperationStatus;
+import com.azure.core.util.polling.PollResponse;
+import com.azure.storage.blob.BlobClient;
+import com.azure.storage.blob.BlobContainerClient;
+import com.azure.storage.blob.models.BlobCopyInfo;
+import com.azure.storage.blob.models.BlobItem;
+import com.azure.storage.blob.models.BlobStorageException;
+import org.apache.camel.AsyncCallback;
+import org.apache.camel.Exchange;
+import org.apache.camel.ExchangePropertyKey;
+import org.apache.camel.Processor;
+import org.apache.camel.component.azure.storage.blob.client.BlobClientWrapper;
+import org.apache.camel.component.azure.storage.blob.client.BlobContainerClientWrapper;
+import org.apache.camel.component.azure.storage.blob.operations.BlobContainerOperations;
+import org.apache.camel.component.azure.storage.blob.operations.BlobOperationResponse;
+import org.apache.camel.component.azure.storage.blob.operations.BlobOperations;
+import org.apache.camel.spi.Synchronization;
+import org.apache.camel.support.ScheduledBatchPollingConsumer;
+import org.apache.camel.util.CastUtils;
+import org.apache.camel.util.IOHelper;
+import org.apache.camel.util.ObjectHelper;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+public class BlobConsumer extends ScheduledBatchPollingConsumer {
+
+    private static final Logger LOG = LoggerFactory.getLogger(BlobConsumer.class);
+
+    // blobs whose exchanges are being processed, which a later poll must not consume again
+    private final Set<String> inProgress = ConcurrentHashMap.newKeySet();
+
+    // Remaining names from the current Azure listing page. Keeping these across polls
+    // prevents a limited consumer from repeatedly starting with the first page.
+    private final Queue<BlobItem> pendingListedBlobs = new LinkedList<>();
+
+    // Continuation state for the next Azure listing page.
+    private String listingContinuationToken;
+    private boolean listingComplete;
+
+    public BlobConsumer(final BlobEndpoint endpoint, final Processor processor) {
+        super(endpoint, processor);
+    }
+
+    @Override
+    protected void doStart() throws Exception {
+        super.doStart();
+
+        // A restarted route must start a fresh listing pass. The container contents
+        // may have changed while the route was stopped.
+        pendingListedBlobs.clear();
+        listingContinuationToken = null;
+        listingComplete = false;
+
+        if (getEndpoint().getConfiguration().isMoveAfterRead()) {
+            String destContainer = getEndpoint().getConfiguration().getDestinationContainer();
+            if (ObjectHelper.isEmpty(destContainer)) {
+                throw new IllegalArgumentException(
+                        "destinationContainer must be set when moveAfterRead is enabled");
+            }
+        }
+    }
+
+    @Override
+    protected int poll() throws Exception {
+        final String containerName = getEndpoint().getConfiguration().getContainerName();
+        final String blobName = getEndpoint().getConfiguration().getBlobName();
+        final BlobContainerClient blobContainerClient
+                = getEndpoint().getBlobServiceClient().getBlobContainerClient(containerName);
+
+        Queue<Exchange> exchanges;
+
+        try {
+            if (ObjectHelper.isNotEmpty(blobName)) {
+                // here we have a blob which means we just download a single blob
+                exchanges = new LinkedList<>();
+                addExchange(blobName, blobContainerClient, exchanges, false);
+            } else {
+                // download multiple blobs since we only have no blobName set
+                exchanges = createBatchExchangesFromContainer(blobContainerClient);
+            }
+            return processBatch(CastUtils.cast(exchanges));
+        } catch (BlobStorageException ex) {
+            if (404 == ex.getStatusCode()) {
+                return 0;
+            } else {
+                throw ex;
+            }
+        }
+    }
+
+    private Exchange createExchangeFromBlob(final String blobName, final BlobContainerClient blobContainerClient)
+            throws IOException {
+        final BlobClientWrapper clientWrapper
+                = new BlobClientWrapper(blobContainerClient.getBlobClient(blobName));
+        final BlobOperations operations = new BlobOperations(getEndpoint().getConfiguration(), clientWrapper);
+        final Exchange exchange = createExchange(true);
+
+        BlobOperationResponse response;
+        if (!ObjectHelper.isEmpty(getEndpoint().getConfiguration().getFileDir())) {
+            // if we have a fileDir set, we download our content
+            response = operations.downloadBlobToFile(exchange);
+        } else {
+            // otherwise, we rely on the outputstream/inputstream
+            response = operations.getBlob(exchange);
+        }
+
+        getEndpoint().setResponseOnExchange(response, exchange);
+
+        exchange.getIn().setHeader(BlobConstants.BLOB_NAME, blobName);
+        return exchange;
+    }
+
+    private Queue<Exchange> createBatchExchangesFromContainer(final BlobContainerClient blobContainerClient)
+            throws IOException {
+        final BlobContainerClientWrapper containerClientWrapper = new BlobContainerClientWrapper(blobContainerClient);
+        final BlobContainerOperations containerOperations
+                = new BlobContainerOperations(getEndpoint().getConfiguration(), containerClientWrapper);
+
+        // Start a new pass only after the previous listing and its pending page are exhausted.
+        if (pendingListedBlobs.isEmpty() && listingComplete) {
+            listingContinuationToken = null;
+            listingComplete = false;
+        }
+
+        // A poll that starts in the middle of a listing must not fail merely because
+        // the remaining tail contains only blobs that cannot be retrieved.
+        final boolean fromStartOfListing = pendingListedBlobs.isEmpty()
+                && ObjectHelper.isEmpty(listingContinuationToken);
+
+        // Prepare the complete poll batch before processBatch routes its first exchange.
+        // This deliberately preserves Camel's exact batch size/index/complete contract.
+        // maxMessagesPerPoll limits successful gets (0 means unlimited); this is bounded
+        // prefetch when a limit is set, not strict just-in-time retrieval before each route.
+        final Queue<Exchange> exchanges = new LinkedList<>();
+        final Map<String, Exception> failures = new LinkedHashMap<>();
+        final int maxMessagesPerPoll = getMaxMessagesPerPoll();
+
+        try {
+            // The limit counts successful gets, not names returned by Azure.
+            // In-progress blobs, deleted blobs (404), and failed gets do not use the limit.
+            while (maxMessagesPerPoll <= 0 || exchanges.size() < maxMessagesPerPoll) {
+                final BlobItem blobItem = nextListedBlob(containerOperations, maxMessagesPerPoll);
+                if (blobItem == null) {
+                    break;
+                }
+
+                try {
+                    addExchange(blobItem.getName(), blobContainerClient, exchanges, true);
+                } catch (Exception e) {
+                    failures.put(blobItem.getName(), e);
+                }
+            }
+        } catch (RuntimeException e) {
+            // A listing failure after some blobs were opened must not leak their streams
+            // or leave them marked in progress. Restart listing on the next poll.
+            releaseNotProcessed(exchanges);
+            pendingListedBlobs.clear();
+            listingContinuationToken = null;
+            listingComplete = false;
+            throw e;
+        }
+
+        if (!failures.isEmpty()) {
+            if (exchanges.isEmpty() && fromStartOfListing) {
+                // None of the listed blobs could be got, so this is not about one blob
+                // (expired credentials, no permission, no connection): fail the poll.
+                releaseNotProcessed(exchanges);
+                final Map.Entry<String, Exception> first = failures.entrySet().iterator().next();
+                LOG.warn("None of the listed blobs of container {} could be got ({} failed, the first is {}): the poll fails",
+                        getEndpoint().getConfiguration().getContainerName(), failures.size(), first.getKey());
+                rethrow(first.getValue());
+            }
+
+            for (Map.Entry<String, Exception> failure : failures.entrySet()) {
+                getExceptionHandler().handleException("Error getting blob " + failure.getKey() + " from container "
+                                                      + getEndpoint().getConfiguration().getContainerName()
+                                                      + ". The blob is skipped for this poll.",
+                        failure.getValue());
+            }
+        }
+
+        return exchanges;
+    }
+
+    /**
+     * Returns the next matching blob, fetching only one Azure page when necessary. The unconsumed names in a page
+     * remain queued for the next poll.
+     */
+    private BlobItem nextListedBlob(
+            final BlobContainerOperations containerOperations, final int maxMessagesPerPoll) {
+        while (pendingListedBlobs.isEmpty() && !listingComplete) {
+            final Iterator<PagedResponse<BlobItem>> pages = containerOperations
+                    .listBlobsPaged(null, listingContinuationToken, maxMessagesPerPoll)
+                    .iterableByPage().iterator();
+
+            if (!pages.hasNext()) {
+                listingComplete = true;
+                forceConsumerAsReady();
+                return null;
+            }
+
+            final PagedResponse<BlobItem> page = pages.next();
+            final String regex = getEndpoint().getConfiguration().getRegex();
+
+            for (BlobItem item : page.getValue()) {
+                if (ObjectHelper.isEmpty(regex) || item.getName().matches(regex)) {
+                    pendingListedBlobs.add(item);
+                }
+            }
+
+            listingContinuationToken = page.getContinuationToken();
+            listingComplete = ObjectHelper.isEmpty(listingContinuationToken);
+            forceConsumerAsReady();
+        }
+
+        return pendingListedBlobs.poll();
+    }
+
+    private static void rethrow(final Exception e) throws IOException {
+        if (e instanceof IOException ioe) {
+            throw ioe;
+        }
+        if (e instanceof RuntimeException re) {
+            throw re;
+        }
+        throw new IOException(e);
+    }
+
+    /**
+     * Gets a blob and adds its exchange.
+     *
+     * @return true if the blob was got and its exchange added, false if it is skipped (an exchange of a previous poll
+     *         is still processing it, or it no longer exists)
+     */
+    private boolean addExchange(
+            final String blobName, final BlobContainerClient blobContainerClient, final Queue<Exchange> exchanges,
+            final boolean listed)
+            throws IOException {
+        // skip the blob if an exchange of a previous poll is still processing it
+        if (!inProgress.add(blobName)) {
+            LOG.trace("Skipping blob {} as it is already in progress", blobName);
+            return false;
+        }
+        try {
+            exchanges.add(createExchangeFromBlob(blobName, blobContainerClient));
+            return true;
+        } catch (Exception e) {
+            inProgress.remove(blobName);
+            if (listed && e instanceof BlobStorageException bse && bse.getStatusCode() == 404) {
+                // deleted (for example by another consumer) after it was listed
+                LOG.debug("Skipping blob {} as it no longer exists", blobName);
+                return false;
+            }
+            throw e;
+        }
+    }
+
+    /**
+     * Releases the exchanges that are not routed: their blobs are no longer in progress, so a later poll consumes them
+     * again, and their blob input streams are closed, as no on completion does it.
+     */
+    private void releaseNotProcessed(final Queue<?> exchanges) {
+        for (Object o : exchanges) {
+            final Exchange exchange = (Exchange) o;
+            final String name = exchange.getIn().getHeader(BlobConstants.BLOB_NAME, String.class);
+            if (name != null) {
+                inProgress.remove(name);
+            }
+            if (exchange.getIn().getBody() instanceof Closeable body) {
+                IOHelper.close(body);
+            }
+            releaseExchange(exchange, true);
+        }
+        exchanges.clear();
+    }
+
+    @Override
+    public BlobEndpoint getEndpoint() {
+        return (BlobEndpoint) super.getEndpoint();
+    }
+
+    @Override
+    public int processBatch(Queue<Object> exchanges) {
+        final int total = exchanges.size();
+
+        for (int index = 0; index < total && isBatchAllowed(); index++) {
+            // only loop if we are started (allowed to run)
+            final Exchange exchange = ObjectHelper.cast(Exchange.class, exchanges.poll());
+
+            // add current index and total as properties
+            exchange.setProperty(ExchangePropertyKey.BATCH_INDEX, index);
+            exchange.setProperty(ExchangePropertyKey.BATCH_SIZE, total);
+            exchange.setProperty(ExchangePropertyKey.BATCH_COMPLETE, index == total - 1);
+
+            // update pending number of exchanges
+            pendingExchanges = total - index - 1;
+
+            // the blob to delete or move once the exchange is done. It is taken now, as the route may change or remove
+            // the blob name header before it ends (the producer takes the name of the blob to upload from it)
+            final String blobName = exchange.getIn().getHeader(BlobConstants.BLOB_NAME, String.class);
+            // add on completion to handle after work when the exchange is done
+            exchange.getExchangeExtension().addOnCompletion(new Synchronization() {
+                @Override
+                public void onComplete(Exchange exchange) {
+                    try {
+                        processCommit(exchange, blobName);
+                    } finally {
+                        releaseInProgress(blobName);
+                    }
+                }
+
+                @Override
+                public void onFailure(Exchange exchange) {
+                    try {
+                        processRollback(exchange);
+                    } finally {
+                        releaseInProgress(blobName);
+                    }
+                }
+            });
+
+            // use default consumer callback
+            AsyncCallback cb = defaultConsumerCallback(exchange, true);
+            getAsyncProcessor().process(exchange, cb);
+        }
+        // the remaining exchanges are not processed as the consumer is stopping
+        releaseNotProcessed(exchanges);
+        return total;
+    }
+
+    private void releaseInProgress(final String blobName) {
+        if (blobName != null) {
+            inProgress.remove(blobName);
+        }
+    }
+
+    /**
+     * Strategy when processing the exchange failed.
+     *
+     * @param exchange the exchange
+     */
+    protected void processRollback(Exchange exchange) {
+        final Exception cause = exchange.getException();
+        if (cause != null) {
+            getExceptionHandler().handleException(
+                    "Error during processing exchange. Will attempt to process the message on next poll.", exchange, cause);
+        }
+    }
+
+    /**
+     * Strategy to move/delete the blob after being processed, the blob named by the {@link BlobConstants#BLOB_NAME}
+     * header.
+     *
+     * @param      exchange the exchange
+     * @deprecated          use {@link #processCommit(Exchange, String)}, which the consumer calls instead
+     */
+    @Deprecated(since = "4.24.0")
+    protected void processCommit(Exchange exchange) {
+        processCommit(exchange, exchange.getIn().getHeader(BlobConstants.BLOB_NAME, String.class));
+    }
+
+    /**
+     * Strategy to move/delete the blob after being processed.
+     *
+     * @param exchange the exchange
+     * @param blobName the name of the blob the exchange was created from, in the container of the endpoint
+     */
+    protected void processCommit(Exchange exchange, String blobName) {
+        try {
+            final String containerName = getEndpoint().getConfiguration().getContainerName();
+
+            if (blobName == null) {
+                LOG.warn("Cannot perform move/delete after read because the consumed blob has no name");
+                return;
+            }
+
+            if (getEndpoint().getConfiguration().isMoveAfterRead()) {
+                final String destinationContainer = getEndpoint().getConfiguration().getDestinationContainer();
+                LOG.trace("Moving blob {} from container {} to container {}...", blobName, containerName, destinationContainer);
+
+                // Build destination blob name with optional prefix/suffix
+                final String destinationBlobName = buildDestinationBlobName(blobName);
+
+                // Copy to destination
+                final PollResponse<BlobCopyInfo> copy
+                        = copyBlobToDestination(containerName, blobName, destinationContainer, destinationBlobName);
+                if (copy.getStatus() != LongRunningOperationStatus.SUCCESSFULLY_COMPLETED) {
+                    // the copy failed, was aborted, or its status could not be read: keep the source blob, it is
+                    // consumed again on the next poll
+                    final String error = copy.getValue() != null ? copy.getValue().getError() : null;
+                    getExceptionHandler().handleException(
+                            "Error occurred during moving blob. The blob is not deleted and will be consumed again.",
+                            exchange,
+                            new IllegalStateException(
+                                    "Copy of blob " + blobName + " to container " + destinationContainer
+                                                      + " ended with status " + copy.getStatus()
+                                                      + (error != null ? ": " + error : "")));
+                    return;
+                }
+
+                // Delete source blob after successful copy (move = copy + delete)
+                deleteBlob(containerName, blobName);
+
+                LOG.trace("Moved blob {} from container {} to blob {} in container {}",
+                        blobName, containerName, destinationBlobName, destinationContainer);
+            } else if (getEndpoint().getConfiguration().isDeleteAfterRead()) {
+                // Only delete if not moving (move already handles deletion)
+                LOG.trace("Deleting blob {} from container {}...", blobName, containerName);
+
+                deleteBlob(containerName, blobName);
+
+                LOG.trace("Deleted blob {} from container {}", blobName, containerName);
+            }
+        } catch (BlobStorageException e) {
+            getExceptionHandler().handleException(
+                    "Error occurred during moving or deleting blob. This exception is ignored.", exchange, e);
+        }
+    }
+
+    /**
+     * Builds the destination blob name with optional prefix/suffix and prefix removal.
+     *
+     * @param  blobName the source blob name
+     * @return          the destination blob name
+     */
+    private String buildDestinationBlobName(String blobName) {
+        StringBuilder builder = new StringBuilder();
+
+        String blobNameToUse = blobName;
+
+        // Remove prefix if configured
+        if (getEndpoint().getConfiguration().isRemovePrefixOnMove()) {
+            String prefix = getEndpoint().getConfiguration().getPrefix();
+            if (prefix != null && blobNameToUse.startsWith(prefix)) {
+                blobNameToUse = blobNameToUse.substring(prefix.length());
+            }
+        }
+
+        // Add destination prefix
+        if (ObjectHelper.isNotEmpty(getEndpoint().getConfiguration().getDestinationBlobPrefix())) {
+            builder.append(getEndpoint().getConfiguration().getDestinationBlobPrefix());
+        }
+
+        builder.append(blobNameToUse);
+
+        // Add destination suffix
+        if (ObjectHelper.isNotEmpty(getEndpoint().getConfiguration().getDestinationBlobSuffix())) {
+            builder.append(getEndpoint().getConfiguration().getDestinationBlobSuffix());
+        }
+
+        return builder.toString();
+    }
+
+    /**
+     * Copies a blob from source container to destination container within the same storage account.
+     *
+     * @param  sourceContainer      the source container name
+     * @param  sourceBlobName       the source blob name
+     * @param  destinationContainer the destination container name
+     * @param  destinationBlobName  the destination blob name
+     * @return                      the last response of the copy: the copy is asynchronous on the service, and the
+     *                              poller returns normally also when the copy failed or was aborted
+     */
+    private PollResponse<BlobCopyInfo> copyBlobToDestination(
+            String sourceContainer, String sourceBlobName,
+            String destinationContainer, String destinationBlobName) {
+        BlobContainerClient sourceContainerClient
+                = getEndpoint().getBlobServiceClient().getBlobContainerClient(sourceContainer);
+        BlobClient sourceBlobClient = sourceContainerClient.getBlobClient(sourceBlobName);
+
+        BlobContainerClient destContainerClient
+                = getEndpoint().getBlobServiceClient().getBlobContainerClient(destinationContainer);
+        BlobClient destBlobClient = destContainerClient.getBlobClient(destinationBlobName);
+
+        // Use beginCopy which supports same-account authorization via shared key/Azure AD
+        Duration timeout = getEndpoint().getConfiguration().getTimeout();
+        if (timeout == null) {
+            timeout = Duration.ofMinutes(5);
+        }
+        return destBlobClient.beginCopy(sourceBlobClient.getBlobUrl(), Duration.ofSeconds(2))
+                .waitForCompletion(timeout);
+    }
+
+    /**
+     * Deletes a blob from the specified container.
+     *
+     * @param containerName the container name
+     * @param blobName      the blob name
+     */
+    private void deleteBlob(String containerName, String blobName) {
+        BlobContainerClient containerClient
+                = getEndpoint().getBlobServiceClient().getBlobContainerClient(containerName);
+        BlobClient blobClient = containerClient.getBlobClient(blobName);
+        blobClient.delete();
+    }
+}

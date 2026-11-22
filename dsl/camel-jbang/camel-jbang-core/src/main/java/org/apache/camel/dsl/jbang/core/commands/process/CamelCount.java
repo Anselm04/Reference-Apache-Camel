@@ -1,0 +1,151 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.camel.dsl.jbang.core.commands.process;
+
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.List;
+import java.util.Map;
+import java.util.stream.Collectors;
+
+import com.github.freva.asciitable.AsciiTable;
+import com.github.freva.asciitable.Column;
+import com.github.freva.asciitable.HorizontalAlign;
+import com.github.freva.asciitable.OverflowBehaviour;
+import org.aesh.command.CommandDefinition;
+import org.aesh.command.option.Argument;
+import org.aesh.command.option.Option;
+import org.apache.camel.dsl.jbang.core.common.PidNameAgeCompletionCandidates;
+import org.apache.camel.dsl.jbang.core.common.ProcessHelper;
+import org.apache.camel.dsl.jbang.core.common.RowSort;
+import org.apache.camel.util.TimeUtils;
+import org.apache.camel.util.json.JsonObject;
+import org.apache.camel.util.json.Jsoner;
+
+@CommandDefinition(name = "count", description = "Get total and failed exchanges", generateHelp = true,
+                   footer = {
+                           "Examples:",
+                           "  camel get count",
+                           "  camel get count --watch" })
+public class CamelCount extends ProcessWatchCommand {
+
+    private static final RowSort<Row> ORDER = RowSort.<Row> integration(r -> r.pid, r -> r.name, r -> r.uptime);
+
+    @Argument(description = "Name or pid of running Camel integration")
+    String name = "*";
+
+    @Option(name = "sort", description = "Sort by pid, name or age", defaultValue = "pid",
+            completer = PidNameAgeCompletionCandidates.class)
+    String sort;
+
+    @Option(name = "total", hasValue = false, description = "Get the total exchanges from a running integration")
+    boolean total;
+
+    @Option(name = "fail", hasValue = false, description = "Get the failed exchanges from a running integration")
+    boolean fail;
+
+    @Override
+    public Integer doProcessWatchCall() throws Exception {
+        List<Row> rows = new ArrayList<>();
+
+        forEachIntegration(name, (ph, root) -> {
+            // there must be a status file for the running Camel integration
+            Row row = new Row();
+            JsonObject context = (JsonObject) root.get("context");
+            if (context == null) {
+                return;
+            }
+            row.name = context.getString("name");
+            if ("CamelJBang".equals(row.name)) {
+                row.name = ProcessHelper.extractName(root, ph);
+            }
+            row.pid = Long.toString(ph.pid());
+            row.uptime = extractSince(ph);
+            row.age = TimeUtils.printSince(row.uptime);
+            Map<String, ?> stats = context.getMap("statistics");
+            if (stats != null) {
+                row.total = stats.get("exchangesTotal").toString();
+                row.failed = stats.get("exchangesFailed").toString();
+            }
+            rows.add(row);
+        });
+
+        // sort rows
+        rows.sort(ORDER.comparator(sort));
+
+        if (jsonOutput) {
+            // also with --total or --fail, as the rows have both counters
+            printer().println(Jsoner.serialize(rows.stream().map(r -> {
+                JsonObject jo = new JsonObject();
+                jo.put("pid", JsonValues.pid(r.pid));
+                jo.put("name", r.name);
+                jo.put("age", r.age);
+                jo.put("uptime", r.uptime);
+                jo.put("total", JsonValues.number(r.total));
+                jo.put("failed", JsonValues.number(r.failed));
+                return jo;
+            }).collect(Collectors.toList())));
+        } else if (!total && !fail) {
+            if (!rows.isEmpty()) {
+                printer().println(AsciiTable.getTable(AsciiTable.NO_BORDERS, rows, Arrays.asList(
+                        new Column().header("PID").headerAlign(HorizontalAlign.CENTER).with(r -> r.pid),
+                        new Column().header("NAME").dataAlign(HorizontalAlign.LEFT)
+                                .maxWidth(30, OverflowBehaviour.ELLIPSIS_RIGHT)
+                                .with(r -> r.name),
+                        new Column().header("AGE").headerAlign(HorizontalAlign.CENTER).with(r -> r.age),
+                        new Column().header("TOTAL").with(r -> r.total),
+                        new Column().header("FAIL").with(r -> r.failed))));
+            }
+        } else {
+            StringBuilder builder = new StringBuilder();
+            if (!rows.isEmpty()) {
+                int index = 0;
+                for (Row r : rows) {
+                    if (rows.size() > 1) {
+                        builder.append(r.name).append(",");
+                    }
+                    if (total) {
+                        builder.append(r.total);
+                    }
+                    if (fail) {
+                        if (total) {
+                            builder.append(",");
+                        }
+                        builder.append(r.failed);
+                    }
+                    if (index < rows.size() - 1) {
+                        builder.append(System.getProperty("line.separator"));
+                    }
+                    index++;
+                }
+            }
+            printer().println(String.valueOf(builder));
+        }
+
+        return 0;
+    }
+
+    private static class Row {
+        String pid;
+        String name;
+        String age;
+        long uptime;
+        String total;
+        String failed;
+    }
+
+}

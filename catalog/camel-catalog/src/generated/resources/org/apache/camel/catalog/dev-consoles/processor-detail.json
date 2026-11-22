@@ -1,0 +1,160 @@
+{
+  "console": {
+    "kind": "console",
+    "group": "camel",
+    "name": "processor-detail",
+    "title": "Processor Detail",
+    "description": "Show configured options for all processors in a route",
+    "deprecated": false,
+    "readOnly": true,
+    "javaType": "org.apache.camel.impl.console.ProcessorDetailDevConsole",
+    "groupId": "org.apache.camel",
+    "artifactId": "camel-console",
+    "version": "4.24.0-SNAPSHOT"
+  },
+  "options": {
+    "routeId": {
+      "index": 0,
+      "kind": "option",
+      "displayName": "Route Id",
+      "group": "query",
+      "label": "query",
+      "required": false,
+      "type": "string",
+      "javaType": "java.lang.String",
+      "deprecated": false,
+      "autowired": false,
+      "secret": false,
+      "description": "The route id to get processor details for (use * for all routes)"
+    }
+  },
+  "response": {
+    "type": "object",
+    "properties": {
+      "routeId": {
+        "type": "string",
+        "description": "The route ID (only present when a specific route was requested)"
+      },
+      "processors": {
+        "type": "array",
+        "items": {
+          "type": "object",
+          "properties": {
+            "id": {
+              "type": "string",
+              "description": "The processor ID (the id of the from for the route input, as in the trace and message history)"
+            },
+            "type": {
+              "type": "string",
+              "description": "The processor type (the XML element name, or 'from' for the route input)"
+            },
+            "endpointUri": {
+              "type": "string",
+              "description": "The endpoint URI (only present for the route input entry)"
+            },
+            "line": {
+              "type": "integer",
+              "description": "The source line number (only present when known)"
+            },
+            "options": {
+              "type": "object",
+              "additionalProperties": {
+                "type": "string"
+              },
+              "description": "The processor's configured options, as attribute\/child-element name to string value"
+            },
+            "state": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "name": {
+                    "type": "string",
+                    "description": "The option that holds the state, such as idempotentRepository"
+                  },
+                  "type": {
+                    "type": "string",
+                    "description": "The class name of the repository"
+                  },
+                  "inMemory": {
+                    "type": "boolean",
+                    "description": "True when the repository keeps the state only in memory, so it is lost when the integration stops (only present when true)"
+                  }
+                }
+              },
+              "description": "Where the processor or route input keeps its state, such as the repository of an idempotent consumer, an aggregator, or a file consumer with noop=true (only present when it keeps state)"
+            }
+          }
+        },
+        "description": "The route's processors (only present when a specific route was requested)"
+      },
+      "routes": {
+        "type": "array",
+        "items": {
+          "type": "object",
+          "properties": {
+            "routeId": {
+              "type": "string",
+              "description": "The route ID"
+            },
+            "processors": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "id": {
+                    "type": "string",
+                    "description": "The processor ID (the id of the from for the route input, as in the trace and message history)"
+                  },
+                  "type": {
+                    "type": "string",
+                    "description": "The processor type (the XML element name, or 'from' for the route input)"
+                  },
+                  "endpointUri": {
+                    "type": "string",
+                    "description": "The endpoint URI (only present for the route input entry)"
+                  },
+                  "line": {
+                    "type": "integer",
+                    "description": "The source line number (only present when known)"
+                  },
+                  "options": {
+                    "type": "object",
+                    "additionalProperties": {
+                      "type": "string"
+                    },
+                    "description": "The processor's configured options, as attribute\/child-element name to string value"
+                  },
+                  "state": {
+                    "type": "array",
+                    "items": {
+                      "type": "object",
+                      "properties": {
+                        "name": {
+                          "type": "string",
+                          "description": "The option that holds the state, such as idempotentRepository"
+                        },
+                        "type": {
+                          "type": "string",
+                          "description": "The class name of the repository"
+                        },
+                        "inMemory": {
+                          "type": "boolean",
+                          "description": "True when the repository keeps the state only in memory, so it is lost when the integration stops (only present when true)"
+                        }
+                      }
+                    },
+                    "description": "Where the processor or route input keeps its state, such as the repository of an idempotent consumer, an aggregator, or a file consumer with noop=true (only present when it keeps state)"
+                  }
+                }
+              },
+              "description": "The route's processors, starting with the route input"
+            }
+          }
+        },
+        "description": "The route details for all routes (only present when routeId is * or omitted)"
+      }
+    }
+  }
+}
+

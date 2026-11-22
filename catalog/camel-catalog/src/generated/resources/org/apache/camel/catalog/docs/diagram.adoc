@@ -1,0 +1,620 @@
+= Diagram Component
+:doctitle: Diagram
+:shortname: diagram
+:artifactid: camel-diagram
+:description: Camel Route Diagram rendering
+:since: 4.21
+:supportlevel: Stable
+:tabs-sync-option:
+
+*Since Camel {since}*
+
+The Diagram module provides route diagram rendering capabilities for Apache Camel routes.
+It can generate visual route diagrams as PNG images or plain ASCII art text representations from route structure data.
+
+== Features
+
+* Render route diagrams as PNG images with colored nodes and scope boxes
+* Render route diagrams as plain ASCII art text for terminal output
+* Support for all Camel EIPs: choice, doTry/doCatch, filter, split, loop, multicast, and more
+* Scope boxes visually group branching and scoping EIPs
+* Multiple color themes: dark, light, transparent, or custom (PNG only)
+* Highlight specific paths through routes (e.g., error paths or message traces) with colored arrows
+
+== Usage
+
+=== As a library
+
+Add the `camel-diagram` dependency to your project:
+
+[source,xml]
+----
+<dependency>
+    <groupId>org.apache.camel</groupId>
+    <artifactId>camel-diagram</artifactId>
+</dependency>
+----
+
+==== Using Camel Java API
+
+You can use the diagram renderer with the Camel API to render as PNG images:
+
+._Java-only: using RouteDiagramDumper to render as PNG image_
+[source,java]
+----
+RouteDiagramDumper dumper = PluginHelper.getRouteDiagramDumper(context);
+BufferedImage image = dumper.dumpRoutesAsImage("*", RouteDiagramDumper.Theme.DARK);
+----
+
+Or render as ASCII art text:
+
+._Java-only: using RouteDiagramDumper to render as ASCII art_
+[source,java]
+----
+RouteDiagramDumper dumper = PluginHelper.getRouteDiagramDumper(context);
+String ascii = dumper.dumpRoutesAsAsciiArt("*");
+----
+
+==== Using standalone Java API
+
+Then use the API to render diagrams:
+
+._Java-only: standalone rendering to PNG image_
+[source,java]
+----
+import org.apache.camel.diagram.*;
+import org.apache.camel.diagram.RouteDiagramLayoutEngine.*;
+import org.apache.camel.diagram.RouteDiagramRenderer.*;
+
+// Parse route structure from JSON
+List<RouteInfo> routes = RouteDiagramHelper.parseRoutes(jsonObject);
+
+// Layout and render
+RouteDiagramLayoutEngine engine = new RouteDiagramLayoutEngine();
+// the renderer draws the steps as cards, so lay them out as cards
+engine.setCardStyle(true);
+RouteDiagramRenderer renderer = new RouteDiagramRenderer();
+
+LayoutRoute lr = engine.layoutRoute(routes.get(0), RouteDiagramLayoutEngine.PADDING);
+DiagramColors colors = DiagramColors.parse("dark");
+BufferedImage image = renderer.renderDiagram(List.of(lr), lr.maxY + RouteDiagramLayoutEngine.V_GAP, colors);
+
+// Save to file
+ImageIO.write(image, "PNG", new File("diagram.png"));
+----
+
+To render as ASCII art instead:
+
+._Java-only: standalone rendering to ASCII art_
+[source,java]
+----
+import org.apache.camel.diagram.*;
+import org.apache.camel.diagram.RouteDiagramLayoutEngine.*;
+
+// Parse route structure from JSON
+List<RouteInfo> routes = RouteDiagramHelper.parseRoutes(jsonObject);
+
+// Layout and render as ASCII
+RouteDiagramLayoutEngine engine = new RouteDiagramLayoutEngine();
+LayoutRoute lr = engine.layoutRoute(routes.get(0), RouteDiagramLayoutEngine.PADDING);
+
+RouteDiagramAsciiRenderer renderer = new RouteDiagramAsciiRenderer(engine.getNodeWidth());
+String ascii = renderer.renderDiagram(List.of(lr), lr.maxY + RouteDiagramLayoutEngine.V_GAP);
+System.out.println(ascii);
+----
+
+=== With Camel CLI
+
+The diagram rendering is used by the `camel cmd route-diagram` command in Camel CLI:
+
+[source,bash]
+----
+camel cmd route-diagram MyRoute.java
+----
+
+=== Developer console
+
+When the developer console is enabled (for example with `camel run --console`), the `route-diagram`
+console provides two diagram modes:
+
+* **Route mode** (default): Renders individual route diagrams using the `<camel-route-diagram>` web component,
+  fed by the `route-structure` console. Shows the step-by-step flow within each route.
+* **Topology mode**: Renders inter-route topology using the `<camel-topology-diagram>` web component,
+  fed by the `route-topology` console. Shows how routes connect through shared endpoints.
+
+Access topology mode with `?mode=topology`. For both modes, request `?format=png` to get the legacy
+inline PNG image instead, or use the `ascii` / `unicode` themes for plain-text output.
+
+Add `?errors=true` to draw the error handling as well: in route mode the `onException` clauses of each route in a
+frame below its steps, and in topology mode the routes reached only on error in a frame below the others. See
+<<_error_handling_in_a_route_diagram,Error Handling in a Route Diagram>> and
+<<_error_handling_in_the_topology,Error Handling in the Topology>>.
+
+== Color Themes
+
+The following built-in themes are available:
+
+* `dark` - dark background, dark cards (default)
+* `light` - light background, white cards
+* `transparent` - transparent background, white cards
+
+Custom colors can be specified using the format:
+
+[source,properties]
+----
+bg=#1e1e1e:from=#2e7d32:to=#1565c0:eip=#8957e5:choice=#d29922
+----
+
+A custom spec is on top of the `dark` theme. The colors of the cards are set with `card` (the background of a card),
+`cardBorder`, `cardText` (the kind of step) and `cardDetail` (its detail):
+
+[source,properties]
+----
+bg=#ffffff:card=#fafafa:cardBorder=#d0d7de:cardText=#1f2328:cardDetail=#59636e
+----
+
+Color values can be `#hex` codes or ANSI color names (e.g., `seagreen`, `steelblue`).
+
+To use dark theme
+
+[source,bash]
+----
+camel cmd route-diagram MyRoute.java --theme=dark
+----
+
+=== Steps as Cards
+
+An image of a route draws each step as a card: an icon for the kind of step, in a circle of the color of its kind,
+the kind in bold (such as `setBody`), and its detail below (such as `groovy: body.items`, from the code
+`setBody[groovy{body.items}]`). A step without detail, such as `choice`, shows only its kind.
+
+[source,bash]
+----
+camel cmd route-diagram orders.camel.yaml --output=orders.png
+----
+
+`camel cmd route-diagram` saves a `.png` file in the `light` theme when no `--theme` is given (in the terminal it shows
+the `unicode` text diagram), and so does the `camel_render_route_diagram` MCP tool.
+
+image::ROOT:route-diagram-card.png[A route diagram: a file read, a groovy mapping, an http call and a JMS send as white cards]
+
+With `--node-label=both` (the default of `camel cmd route-diagram`) a step with a description shows the description
+and then the detail below its kind.
+
+The icons are from https://lucide.dev[Lucide] (ISC License), the same as the embeddable web components.
+
+=== Body Types on the Arrows
+
+The diagram of a running Camel application shows on each arrow the body types the step after it has been reached
+with, when the message history recorded them (such as in the dev profile): their simple class names, such as
+`GenericFile` or `LinkedHashMap`. A step reached with bodies of more than one kind (payload, data, collection or null)
+has a yellow warning label with the kinds, as such a step needs attention: a step that writes or sends fails for the
+data, and a step that reads fields fails for the payload.
+
+image::ROOT:route-diagram-body-types.png[The orders route of a running application: GenericFile on the arrow into setBody, a warning label LinkedHashMap | String (data and payload) on the arrow into the http call, and InputStream on the last two arrows]
+
+The arrows are longer to hold the labels, so a route with body types takes more room. Turn them off with
+`--body-types=false`:
+
+[source,bash]
+----
+camel cmd route-diagram myapp --output=myapp.png --body-types=false
+----
+
+A diagram of a source file has no body types, as its routes have not run.
+
+=== Problems of the Steps
+
+A diagram of source files marks the steps that the checks of `camel validate` find a problem with: the card has a
+yellow border and a badge, and the problem is in a callout beside the route, at the height of the step. For example a
+Groovy step that reads fields of the file as it was read, before it is unmarshalled:
+
+image::ROOT:route-diagram-problems.png[The orders route: the setBody step reads body.items of the file as it was read, and a callout beside it says to unmarshal it first]
+
+In a route with branches (`choice`, `multicast`, `doTry`, ...) a callout beside the route would cross the steps of
+another branch, so the badge has a number, and the problems are a numbered list below the route.
+
+A YAML route is checked as `camel validate` does: the YAML DSL schema, the endpoints and expressions against the
+catalog, and the body flow. A Java or XML route is checked with the checks that read the source without compiling it,
+as the route diagram reads Java routes without compiling them. Turn the problems off with `--problems=false`.
+
+== ASCII Art Rendering
+
+The ASCII art renderer produces plain text diagrams using box-drawing characters.
+This is useful for terminal output where images cannot be displayed.
+
+Nodes are drawn as boxes using `+`, `-`, and `|` characters, with arrows using `|` and `v`.
+Branching EIPs (choice, multicast, etc.) produce L-shaped arrows with horizontal connector lines.
+Long labels are automatically wrapped to fit within the box width.
+
+Example output for a simple route:
+
+[source,text]
+----
+route1
+    +----------------------+
+    |      timer:tick      |
+    +----------------------+
+                |
+                |
+                |
+                v
+    +----------------------+
+    |        log:a         |
+    +----------------------+
+----
+
+Example output for a branching route with choice:
+
+[source,text]
+----
+route1
+                  +----------------------+
+                  |      timer:tick      |
+                  +----------------------+
+                              |
+                              v
+                  +----------------------+
+                  |       choice()       |
+                  +----------------------+
+                              |
+              +---------------+---------------+
+              v                               v
+  +----------------------+        +----------------------+
+  |      when(...)       |        |     otherwise()      |
+  +----------------------+        +----------------------+
+              |                               |
+              v                               v
+  +----------------------+        +----------------------+
+  |        log:a         |        |        log:b         |
+  +----------------------+        +----------------------+
+----
+
+Scope boxes (for filter, split, doTry, etc.) are rendered with dashed borders using `:` for vertical
+and `- - -` for horizontal lines.
+
+Use `--theme=ascii` for plain ASCII art:
+
+[source,bash]
+----
+camel cmd route-diagram MyRoute.java --theme=ascii
+----
+
+== Unicode Rendering
+
+The `unicode` theme uses Unicode box-drawing characters for a cleaner look.
+Node boxes use `┌──┐ │ └──┘`, arrows use `│` and `▼`, and branch junctions use `┴`.
+Scope boxes use `╌` (dashed horizontal) and `╎` (dashed vertical) with no corners.
+
+[source,bash]
+----
+camel cmd route-diagram MyRoute.java --theme=unicode
+----
+
+Example output:
+
+[source,text]
+----
+route1
+┌──────────────────────┐
+│      timer:tick      │
+└──────────────────────┘
+           │
+           │
+           ▼
+┌──────────────────────┐
+│        log:a         │
+└──────────────────────┘
+----
+
+== Error Handling in the Topology
+
+A topology diagram draws the happy path: how routes call each other. The error handling, the routes reached only
+while a failure is handled (such as the target of a dead letter channel or an `onException`), can be drawn in a
+frame of its own below the routes, with where the failures of each come from and how they are handled. There are no
+arrows into the frame: with a global error handler every route would have one. The camel-jbang monitor draws the
+same frame with `x`.
+
+[source,bash]
+----
+camel cmd route-topology error-handling.camel.yaml --theme=unicode --errors
+----
+
+[source,text]
+----
+╭┄ Error handling ┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄╮
+┆                                                                 ┆
+┆   ┌──────────────────────┐                                      ┆
+┆   │        parked        │                                      ┆
+┆   │   (direct:parked)    │                                      ┆
+┆   └──────────────────────┘                                      ┆
+┆   ◂ checkout: onException, handled · dead letter, handled       ┆
+┆   ⚠ own failures: onException, handled · dead letter, handled   ┆
+┆                                                                 ┆
+╰┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄╯
+----
+
+_handled_ means the message ends there, _continued_ that the route goes on, and _not handled_ that the failure
+goes on to the caller. _own failures_ says the route uses the error handling that sends to it, so a failure in it
+comes back to it. The error paths come from Camel 4.23 or newer.
+
+With `--external`, an external system that only the routes in the frame use, such as the folder or the queue where
+the failed messages end up, is drawn in the frame too, below its route, with the arrow from it.
+
+._Java-only: a topology with its error handling in a frame_
+[source,java]
+----
+List<TopologyNodeInfo> nodes = TopologyHelper.parseNodes(topologyJson);
+List<TopologyEdgeInfo> calls = TopologyHelper.parseEdges(topologyJson);
+List<TopologyEdgeInfo> errors = TopologyHelper.parseEdges(topologyJson, true).stream()
+        .filter(TopologyEdgeInfo::isErrorPath).toList();
+
+TopologyLayoutEngine engine = new TopologyLayoutEngine();
+TopologyErrorFrame.Placed placed
+        = TopologyErrorFrame.layout(engine, nodes, calls, errors, TopologyAsciiRenderer.ROW_HEIGHT);
+String text = new TopologyAsciiRenderer(engine.getNodeWidth(), true)
+        .renderDiagram(placed.layout(), placed.frame());
+----
+
+For a PNG image, lay out with `TopologyImageRenderer.rowHeight(fontSize)` and pass the frame to
+`TopologyImageRenderer.renderImage`.
+
+== Error Handling in a Route Diagram
+
+A route diagram draws the steps of a route. Its `onException` clauses (a global one is copied into every route) are
+not steps: with `--errors` they are drawn in a frame of their own below the route, with where the failures of the
+route go and where it is reached on error from. Without it only the steps of the route are drawn. A highlighted path
+(see <<_path_highlighting,Path Highlighting>>) that steps into an `onException` clause draws the frame too, so the clause it took shows.
+The developer console takes `?errors=true`, and the web component the `errors` attribute.
+
+[source,bash]
+----
+camel cmd route-diagram error-handling.camel.yaml --theme=unicode --errors --filter=parked
+----
+
+The frame below the steps of the `parked` route:
+
+[source,text]
+----
+╭╌ Error handling ╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╮
+╎ ⚠ own failures: onException, handled · dead letter, handled                               ╎
+╎ ◂ reached when checkout handles a failure: onException, handled · dead letter, handled    ╎
+╎                                                                                           ╎
+╎                                                                                           ╎
+╎ ┌──────────────────────┐                                                                  ╎
+╎ │  onException[[java.  │                                                                  ╎
+╎ │        lang.         │                                                                  ╎
+╎ │ IllegalStateExcep... │                                                                  ╎
+╎ └──────────────────────┘                                                                  ╎
+╎             │                                                                             ╎
+╎             │                                                                             ╎
+╎             │                                                                             ╎
+╎             ▼                                                                             ╎
+╎ ┌──────────────────────┐                                                                  ╎
+╎ │   log[Payment for    │                                                                  ╎
+╎ │   ${body[orderId]}   │                                                                  ╎
+╎ │ declined:${except... │                                                                  ╎
+╎ └──────────────────────┘                                                                  ╎
+╎             │                                                                             ╎
+╎             │                                                                             ╎
+╎             │                                                                             ╎
+╎             │                                                                             ╎
+╎             ▼                                                                             ╎
+╎ ┌──────────────────────┐                                                                  ╎
+╎ │  to[direct:parked]   │                                                                  ╎
+╎ └──────────────────────┘                                                                  ╎
+╎                                                                                           ╎
+╎                                                                                           ╎
+╰╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╯
+----
+
+`▸ on failure to` names where the failures of the route go (the line in `checkout` reads
+`▸ on failure to parked`), `◂ reached when` the route whose failure handling sends to it, and
+`⚠ own failures` that the route uses the error handling that sends to it, so a failure in it comes back to it.
+
+._Java-only: a route with its error handling in a frame_
+[source,java]
+----
+RouteErrorFrame.Split split = RouteErrorFrame.split(route);
+LayoutRoute lr = engine.layoutRoute(split.happy(), RouteDiagramLayoutEngine.PADDING);
+RouteErrorFrame.add(engine, lr, split.blocks(),
+        RouteErrorFrame.lines(route.routeId, errorPaths, TopologyErrorFrame.LineStyle.UNICODE),
+        RouteDiagramAsciiRenderer.ROW_HEIGHT);
+----
+
+The error paths come from the topology (`TopologyErrorFrame.paths`); without them the frame holds the
+`onException` clauses only. The renderers draw the frame of each `LayoutRoute` that has one; for a PNG image, lay
+out with `RouteDiagramRenderer.rowHeight(fontSize)`.
+
+== Path Highlighting
+
+You can highlight specific paths through routes by specifying node IDs.
+The arrows and lines between consecutive highlighted nodes are rendered in color,
+making it easy to visualize message flow, error paths, or trace results.
+
+Two highlight styles are available:
+
+* `success` - Green arrows (default). Useful for visualizing successful message paths or trace results.
+* `fail` - Red arrows. Useful for visualizing error paths or failure routes.
+
+Only the arrows between highlighted nodes are colored — the node boxes remain unchanged.
+When highlighting is active, only routes that contain highlighted nodes are rendered.
+
+=== With Camel CLI
+
+Use the `--highlight` and `--highlight-style` options:
+
+[source,bash]
+----
+camel cmd route-diagram MyRoute.yaml --theme=unicode --highlight "from1,setBody1,log1" --highlight-style success
+----
+
+To highlight an error path in red:
+
+[source,bash]
+----
+camel cmd route-diagram MyRoute.yaml --theme=unicode --highlight "from1,filter1,throwException1" --highlight-style fail
+----
+
+The node IDs (e.g., `from1`, `setBody1`, `log1`) correspond to the IDs assigned in the route structure.
+You can discover them by inspecting the route structure JSON from a running Camel application,
+or they typically follow the pattern `<eipName><index>`.
+
+=== With Java API
+
+._Java-only: path highlighting with ASCII and PNG renderers_
+[source,java]
+----
+import org.apache.camel.diagram.*;
+import org.apache.camel.diagram.RouteDiagramLayoutEngine.*;
+
+Set<String> highlightedNodes = Set.of("from1", "setBody1", "log1");
+RouteDiagramHelper.HighlightStyle style = RouteDiagramHelper.HighlightStyle.SUCCESS;
+
+// For ASCII/Unicode rendering
+RouteDiagramAsciiRenderer renderer = new RouteDiagramAsciiRenderer(engine.getNodeWidth(), true);
+String diagram = renderer.renderDiagramAnsi(layoutRoutes, totalHeight, highlightedNodes, style);
+
+// For PNG rendering
+RouteDiagramRenderer pngRenderer = new RouteDiagramRenderer(
+        engine.getNodeWidth(), fontSize * RouteDiagramLayoutEngine.SCALE, false);
+BufferedImage image = pngRenderer.renderDiagram(layoutRoutes, totalHeight, colors, highlightedNodes, style);
+----
+
+== Embeddable Web Components
+
+`camel-diagram` ships two lightweight web components that render interactive diagrams
+as SVG directly in the browser. Any application with `camel-diagram` on the classpath
+automatically serves the components as static resources — no extra server configuration needed.
+
+=== Route Diagram Component
+
+The `<camel-route-diagram>` web component renders individual route diagrams showing
+the step-by-step flow within a single route, including EIP patterns, processors, and endpoints.
+
+=== Topology Diagram Component
+
+The `<camel-topology-diagram>` web component renders inter-route topology diagrams showing
+how multiple routes connect to each other through shared endpoints, providing a high-level
+view of message flow across the entire application.
+
+=== Route Diagram Usage
+
+Include the bundled script served from `META-INF/resources/camel/diagram/camel-route-diagram.js`
+(automatically exposed by Servlet 3 containers and Quarkus/Spring Boot static-resource mechanisms):
+
+[source,html]
+----
+<script type="module" src="/camel/diagram/camel-route-diagram.js"></script>
+
+<camel-route-diagram
+  src="/q/dev/route-structure"
+  refresh="5000"
+  filter="my-route">
+</camel-route-diagram>
+----
+
+The `src` attribute must point to an endpoint returning the `route-structure` dev console JSON
+(for example the Quarkus Dev UI endpoint `/q/dev/route-structure`).
+The component automatically appends `?metric=true` so that per-processor exchange statistics
+are included in the diagram.
+
+=== Topology Diagram Usage
+
+Include the bundled script served from `META-INF/resources/camel/diagram/camel-topology-diagram.js`:
+
+[source,html]
+----
+<script type="module" src="/camel/diagram/camel-topology-diagram.js"></script>
+
+<camel-topology-diagram
+  src="/q/dev/route-topology"
+  refresh="5000"
+  external="true"
+  interlink="true"
+  metric="true">
+</camel-topology-diagram>
+----
+
+The `src` attribute must point to an endpoint returning the `route-topology` dev console JSON
+(for example the Quarkus Dev UI endpoint `/q/dev/route-topology`).
+This provides a high-level view showing how routes connect through shared endpoints.
+
+=== Route Diagram Attributes
+
+[width="100%",cols="2,5,2",options="header"]
+|===
+| Attribute | Description | Default
+| `src` | URL to fetch the route-structure JSON from (required) | —
+| `refresh` | Polling interval in milliseconds; `0` disables polling | `0`
+| `filter` | Route ID filter, forwarded as `?filter=` query parameter | (all routes)
+| `errors` | `true` draws the `onException` clauses of each route in a frame below its steps; otherwise only the steps of the route are drawn | `false`
+| `topology` | URL to fetch the route-topology JSON from: with `errors`, the frame says where the failures of the route go and where it is reached on error from | —
+|===
+
+=== Topology Diagram Attributes
+
+[width="100%",cols="2,5,2",options="header"]
+|===
+| Attribute | Description | Default
+| `src` | URL to fetch the route-topology JSON from (required) | —
+| `refresh` | Polling interval in milliseconds; `0` disables polling | `0`
+| `external` | Include external endpoints as boundary nodes | `false`
+| `interlink` | Collapse shared endpoints into intermediate nodes | `false`
+| `metric` | Include exchange counters from route metrics | `false`
+| `errors` | `true` draws the routes reached only on error in a frame below the others, with where their failures come from and the external systems only they use | `false`
+|===
+
+=== Theming
+
+Both components are theme-agnostic.
+They respect `prefers-color-scheme` automatically for dark/light mode,
+and expose CSS custom properties so the host application can override every visual aspect.
+
+==== Route Diagram Theming
+
+[source,css]
+----
+camel-route-diagram {
+  --crd-bg:                   #ffffff;   /* canvas background */
+  --crd-node-bg:              #ffffff;   /* node fill colour (defaults to --crd-bg) */
+  --crd-fg:                   #1e293b;   /* text colour */
+  --crd-edge:                 #94a3b8;   /* edge/arrow colour */
+  --crd-stat:                 #64748b;   /* metric overlay text */
+  --crd-font:                 system-ui; /* font family */
+  --crd-font-size:            12px;      /* base font size */
+  --crd-color-route:          #6366f1;   /* "route" node */
+  --crd-color-from:           #0ea5e9;   /* "from" node */
+  --crd-color-to:             #0ea5e9;   /* "to" node */
+  --crd-color-log:            #64748b;   /* "log" node */
+  --crd-color-choice:         #f59e0b;   /* "choice" node */
+  --crd-color-when:           #fbbf24;   /* "when" branch */
+  --crd-color-otherwise:      #fbbf24;   /* "otherwise" branch */
+  --crd-color-doTry:          #f59e0b;   /* "doTry" scope */
+  --crd-color-doCatch:        #fbbf24;   /* "doCatch" clause */
+  --crd-color-doFinally:      #fbbf24;   /* "doFinally" clause */
+  --crd-color-multicast:      #8b5cf6;   /* "multicast" node */
+  --crd-color-circuitBreaker: #ef4444;   /* "circuitBreaker" node */
+  --crd-color-default:        #6366f1;   /* all other EIP nodes */
+}
+----
+
+==== Topology Diagram Theming
+
+[source,css]
+----
+camel-topology-diagram {
+  --ctd-bg:                   #ffffff;   /* canvas background */
+  --ctd-node-bg:              #ffffff;   /* node fill colour (defaults to --ctd-bg) */
+  --ctd-fg:                   #1e293b;   /* text colour */
+  --ctd-edge:                 #94a3b8;   /* edge/arrow colour */
+  --ctd-stat:                 #64748b;   /* metric overlay text */
+  --ctd-font:                 system-ui; /* font family */
+  --ctd-font-size:            12px;      /* base font size */
+  --ctd-color-route:          #6366f1;   /* route nodes */
+  --ctd-color-trigger:        #f59e0b;   /* trigger/timer routes */
+  --ctd-color-external-in:    #6b7280;   /* external input endpoints */
+  --ctd-color-external-out:   #6b7280;   /* external output endpoints */
+  --ctd-color-external-shared: #8b5cf6;  /* shared external endpoints */
+}
+----

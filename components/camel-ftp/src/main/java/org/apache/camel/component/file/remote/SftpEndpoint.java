@@ -1,0 +1,164 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.camel.component.file.remote;
+
+import java.util.List;
+
+import com.jcraft.jsch.Proxy;
+import org.apache.camel.Category;
+import org.apache.camel.Processor;
+import org.apache.camel.component.file.GenericFileConfiguration;
+import org.apache.camel.component.file.GenericFileProcessStrategy;
+import org.apache.camel.component.file.GenericFileProducer;
+import org.apache.camel.component.file.remote.strategy.SftpProcessStrategyFactory;
+import org.apache.camel.component.file.strategy.FileMoveExistingStrategy;
+import org.apache.camel.spi.BodyType;
+import org.apache.camel.spi.BodyType.Carrier;
+import org.apache.camel.spi.BodyTypes;
+import org.apache.camel.spi.Metadata;
+import org.apache.camel.spi.UriEndpoint;
+import org.apache.camel.spi.UriParam;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+/**
+ * Upload and download files to/from SFTP servers.
+ */
+@UriEndpoint(firstVersion = "1.1.0", scheme = "sftp", extendsScheme = "file", title = "SFTP",
+             syntax = "sftp:host:port/directoryName", category = { Category.FILE }, headersClass = FtpConstants.class)
+@Metadata(excludeProperties = "appendChars,bufferSize,siteCommand,"
+                              + "readLockIdempotentReleaseAsync,readLockIdempotentReleaseAsyncPoolSize,"
+                              + "readLockIdempotentReleaseDelay,readLockIdempotentReleaseExecutorService,"
+                              + "readLockDeleteOrphanLockFiles,readLockRemoveOnCommit,readLockRemoveOnRollback,"
+                              + "directoryMustExist,extendedAttributes,probeContentType,startingDirectoryMustExist,"
+                              + "startingDirectoryMustHaveAccess,forceWrites,copyAndDeleteOnRenameFail,"
+                              + "renameUsingCopy,synchronous")
+@BodyTypes(consumerOut = @BodyType(value = Carrier.FILE, dependsOn = "preMove",
+                                   byOption = {
+                                           @BodyType.When(option = "streamDownload", value = "true", carriers = Carrier.STREAM),
+                                           @BodyType.When(option = "download", value = "false", carriers = Carrier.NULL) },
+                                   description = "The file as read: a RemoteFile, which converts to text, bytes or a stream; a"
+                                                 + " stream with streamDownload; with preMove its content, a byte array"),
+           producerIn = @BodyType(value = { Carrier.TEXT, Carrier.BYTES, Carrier.STREAM, Carrier.FILE },
+                                  byOption = @BodyType.When(option = "allowNullBody", value = "true",
+                                                            carriers = {
+                                                                    Carrier.NULL, Carrier.TEXT, Carrier.BYTES,
+                                                                    Carrier.STREAM, Carrier.FILE }),
+                                  description = "What converts to an InputStream: text, bytes, a stream or a file. A Map or"
+                                                + " a List fails: marshal it first"),
+           producerOut = @BodyType(Carrier.UNCHANGED))
+public class SftpEndpoint extends RemoteFileEndpoint<SftpRemoteFile> {
+
+    private static final Logger LOG = LoggerFactory.getLogger(SftpEndpoint.class);
+
+    @UriParam
+    protected SftpConfiguration configuration;
+    @UriParam(label = "advanced")
+    protected Proxy proxy;
+
+    public SftpEndpoint() {
+    }
+
+    public SftpEndpoint(String uri, SftpComponent component, SftpConfiguration configuration) {
+        super(uri, component, configuration);
+        this.configuration = configuration;
+    }
+
+    @Override
+    public SftpConfiguration getConfiguration() {
+        return this.configuration;
+    }
+
+    @Override
+    public void setConfiguration(GenericFileConfiguration configuration) {
+        if (configuration == null) {
+            throw new IllegalArgumentException("SftpConfiguration expected");
+        }
+        // need to set on both
+        this.configuration = (SftpConfiguration) configuration;
+        super.setConfiguration(configuration);
+    }
+
+    @Override
+    protected void doInit() throws Exception {
+        super.doInit();
+
+        String preferredAuthentications = configuration.getPreferredAuthentications();
+        if (preferredAuthentications != null) {
+            List<String> unknown = SftpOperations.unknownAuthenticationMethods(preferredAuthentications);
+            if (!unknown.isEmpty()) {
+                LOG.warn("The preferredAuthentications option of {} has authentication methods that JSch does not know,"
+                         + " which it skips: {}. The methods are password, keyboard-interactive, publickey and"
+                         + " gssapi-with-mic.",
+                        configuration.remoteServerInformation(), String.join(", ", unknown));
+            }
+        }
+    }
+
+    @Override
+    protected RemoteFileConsumer<SftpRemoteFile> buildConsumer(Processor processor) {
+        return new SftpConsumer(
+                this, processor, createRemoteFileOperations(),
+                processStrategy != null ? processStrategy : createGenericFileStrategy());
+    }
+
+    @Override
+    protected GenericFileProducer<SftpRemoteFile> buildProducer() {
+        if (this.getMoveExistingFileStrategy() == null) {
+            this.setMoveExistingFileStrategy(createDefaultSftpMoveExistingFileStrategy());
+        }
+        return new RemoteFileProducer<>(this, createRemoteFileOperations());
+    }
+
+    /**
+     * Default Existing File Move Strategy
+     *
+     * @return the default implementation for sftp component
+     */
+    private FileMoveExistingStrategy createDefaultSftpMoveExistingFileStrategy() {
+        return new SftpDefaultMoveExistingFileStrategy();
+    }
+
+    @Override
+    protected GenericFileProcessStrategy<SftpRemoteFile> createGenericFileStrategy() {
+        return new SftpProcessStrategyFactory().createGenericFileProcessStrategy(getCamelContext(), getParamsAsMap());
+    }
+
+    @Override
+    public RemoteFileOperations<SftpRemoteFile> createRemoteFileOperations() {
+        SftpOperations operations = new SftpOperations(proxy);
+        operations.setEndpoint(this);
+        return operations;
+    }
+
+    public Proxy getProxy() {
+        return proxy;
+    }
+
+    /**
+     * To use a custom configured com.jcraft.jsch.Proxy. This proxy is used to consume/send messages from the target
+     * SFTP host.
+     */
+    public void setProxy(Proxy proxy) {
+        this.proxy = proxy;
+    }
+
+    @Override
+    public String getScheme() {
+        return "sftp";
+    }
+}

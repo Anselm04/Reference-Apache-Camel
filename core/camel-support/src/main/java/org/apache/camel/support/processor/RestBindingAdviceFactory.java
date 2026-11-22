@@ -1,0 +1,376 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.camel.support.processor;
+
+import java.util.HashMap;
+import java.util.Locale;
+import java.util.Map;
+import java.util.Optional;
+import java.util.Set;
+
+import org.apache.camel.CamelContext;
+import org.apache.camel.spi.BeanIntrospection;
+import org.apache.camel.spi.DataFormat;
+import org.apache.camel.spi.ExtendedPropertyConfigurerGetter;
+import org.apache.camel.spi.PropertyConfigurer;
+import org.apache.camel.spi.RestClientRequestValidator;
+import org.apache.camel.spi.RestClientResponseValidator;
+import org.apache.camel.spi.RestConfiguration;
+import org.apache.camel.support.CamelContextHelper;
+import org.apache.camel.support.EndpointHelper;
+import org.apache.camel.support.PluginHelper;
+import org.apache.camel.support.PropertyBindingSupport;
+import org.apache.camel.support.PropertyConfigurerHelper;
+import org.apache.camel.support.ResolverHelper;
+import org.apache.camel.util.ArtifactUtils;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+/**
+ * Factory to create {@link RestBindingAdvice} from the given configuration.
+ */
+public class RestBindingAdviceFactory {
+
+    private static final Logger LOG = LoggerFactory.getLogger(RestBindingAdviceFactory.class);
+
+    // matched by name: camel-support cannot depend on camel-jackson3, and JSON has no binding factory SPI
+    private static final String JACKSON3_PACKAGE = "org.apache.camel.component.jackson3.";
+    private static final String FAIL_ON_UNKNOWN_PROPERTIES = "FAIL_ON_UNKNOWN_PROPERTIES";
+    // options not taken from the data format configured on the context (lower case, as compared): a mapper may be the
+    // one it created when it started, and the request and response data formats keep mappers of their own; the body
+    // type comes from the type and outType of the verb, not from a header or the options of the data format
+    private static final Set<String> NOT_INHERITED_OPTIONS
+            = Set.of("objectmapper", "xmlmapper", "allowunmarshalltype", "allowjmstype", "unmarshaltype", "uselist",
+                    "collectiontype", "partclass", "allowpartclassfromheader");
+
+    /**
+     * Builds the {@link RestBindingAdvice} from the given configuration
+     *
+     * @param  camelContext the camel context
+     * @param  bc           the binding configuration
+     * @return              the created binding advice
+     */
+    public static RestBindingAdvice build(CamelContext camelContext, RestBindingConfiguration bc) throws Exception {
+        String mode = bc.getBindingMode();
+
+        // setup json data format
+        RestConfiguration config = camelContext.getRestConfiguration();
+        DataFormat json = null;
+        DataFormat outJson = null;
+        String jsonName = null;
+        // include json if we have client request validator as we need a json parser
+        if (mode.contains("json") || "auto".equals(mode) || bc.isClientRequestValidation()) {
+            String name = config.getJsonDataFormat();
+            if (name != null) {
+                // must only be a name, not refer to an existing instance
+                Object instance = lookupByName(camelContext, name);
+                if (instance != null) {
+                    throw new IllegalArgumentException(
+                            "JsonDataFormat name: " + name + " must not be an existing bean instance from the registry");
+                }
+            } else {
+                name = "jackson";
+            }
+            boolean optional = "off".equals(mode) && bc.isClientRequestValidation();
+            // this will create a new instance as the name was not already pre-created
+            if (optional) {
+                try {
+                    json = createDataFormat(camelContext, name);
+                } catch (IllegalArgumentException e) {
+                    // ignore
+                }
+            } else {
+                json = createDataFormat(camelContext, name);
+                outJson = createDataFormat(camelContext, name);
+            }
+            jsonName = name;
+
+            // is json binding required? (fail now, as the xml binding does, rather than on every request)
+            if (mode.contains("json") && json == null) {
+                throw new IllegalArgumentException(
+                        "JSON DataFormat " + name + " not found" + ArtifactUtils.dataFormatHint(name) + ".");
+            }
+
+            if (json != null) {
+                setupJson(camelContext, config,
+                        bc.getType(), bc.getTypeClass(),
+                        bc.getOutType(), bc.getOutTypeClass(),
+                        json, outJson);
+            }
+        }
+
+        // setup xml data format
+        DataFormat xml = null;
+        DataFormat outXml = null;
+        if (mode.contains("xml") || "auto".equals(mode)) {
+            String name = config.getXmlDataFormat();
+            if (name != null) {
+                // must only be a name, not refer to an existing instance
+                Object instance = lookupByName(camelContext, name);
+                if (instance != null) {
+                    throw new IllegalArgumentException(
+                            "XmlDataFormat name: " + name + " must not be an existing bean instance from the registry");
+                }
+            } else {
+                name = "jaxb";
+            }
+            // this will create a new instance as the name was not already pre-created
+            xml = createDataFormat(camelContext, name);
+            outXml = createDataFormat(camelContext, name);
+
+            // is xml binding required?
+            if (mode.contains("xml") && xml == null) {
+                throw new IllegalArgumentException(
+                        "XML DataFormat " + name + " not found" + ArtifactUtils.dataFormatHint(name) + ".");
+            }
+
+            // auto binds the formats it finds, so with neither it binds nothing, which is not what auto is set for
+            if ("auto".equals(mode) && json == null && xml == null) {
+                LOG.warn("Rest DSL bindingMode auto binds no request or response body: neither the JSON data format {}{}"
+                         + " nor the XML data format {}{} is on the classpath. Add one of them, or set bindingMode to off.",
+                        jsonName, artifactNote(jsonName), name, artifactNote(name));
+            }
+
+            if (xml != null) {
+                if ("jacksonXml".equalsIgnoreCase(name)) {
+                    // to setup jackson we need to use camel-jacksonxml
+                    PluginHelper.getRestBindingJacksonXmlDataFormatFactory(camelContext).setupJacksonXml(camelContext, config,
+                            bc.getType(), bc.getTypeClass(),
+                            bc.getOutType(), bc.getOutTypeClass(),
+                            xml, outXml);
+                } else {
+                    // to setup JAXB we need to use camel-jaxb
+                    PluginHelper.getRestBindingJaxbDataFormatFactory(camelContext).setupJaxb(camelContext, config,
+                            bc.getType(), bc.getTypeClass(),
+                            bc.getOutType(), bc.getOutTypeClass(),
+                            xml, outXml);
+                }
+            }
+        }
+
+        RestClientRequestValidator requestValidator = null;
+        if (bc.isClientRequestValidation()) {
+            requestValidator = lookupRestClientRequestValidator(camelContext);
+        }
+        RestClientResponseValidator responseValidator = null;
+        if (bc.isClientResponseValidation()) {
+            responseValidator = lookupRestClientResponseValidator(camelContext);
+        }
+
+        RestBindingAdvice advice = new RestBindingAdvice(
+                camelContext, json, xml, outJson, outXml,
+                bc.getConsumes(), bc.getProduces(), mode, bc.isSkipBindingOnErrorCode(), bc.isClientRequestValidation(),
+                bc.isClientResponseValidation(), bc.isEnableCORS(), bc.isEnableNoContentResponse(), bc.getCorsHeaders(),
+                bc.getQueryDefaultValues(), bc.getQueryAllowedValues(), bc.isRequiredBody(), bc.getRequiredQueryParameters(),
+                bc.getRequiredHeaders(), bc.getResponseCodes(), bc.getResponseHeaders(), requestValidator, responseValidator);
+        advice.setResponseCodeHeaders(bc.getResponseCodeHeaders());
+        return advice;
+    }
+
+    /**
+     * Creates a new data format, with the options of the data format of the same name that is configured on the context
+     * (such as with camel.dataformat.jackson.* in Camel Main), as data formats in routes do. The rest configuration's
+     * data format properties are applied afterwards, so they take precedence.
+     */
+    private static DataFormat createDataFormat(CamelContext camelContext, String name) {
+        DataFormat answer = camelContext.createDataFormat(name);
+        if (answer != null && camelContext.getDataFormatNames().contains(name)) {
+            DataFormat configured = camelContext.resolveDataFormat(name);
+            if (configured != null && configured.getClass() == answer.getClass()) {
+                copyOptions(camelContext, name, configured, answer);
+            }
+        }
+        return answer;
+    }
+
+    private static void copyOptions(CamelContext camelContext, String name, DataFormat source, DataFormat target) {
+        PropertyConfigurer configurer
+                = PropertyConfigurerHelper.resolvePropertyConfigurerByName(camelContext, name + "-dataformat", source);
+        if (configurer == null) {
+            configurer = PropertyConfigurerHelper.resolvePropertyConfigurer(camelContext, source);
+        }
+        if (configurer instanceof ExtendedPropertyConfigurerGetter getter) {
+            for (String option : getter.getAllOptions(source).keySet()) {
+                if (!NOT_INHERITED_OPTIONS.contains(option.toLowerCase(Locale.ROOT))) {
+                    Object value = getter.getOptionValue(source, option, true);
+                    if (value != null) {
+                        configurer.configure(camelContext, target, option, value, true);
+                    }
+                }
+            }
+        }
+    }
+
+    protected static void setupJson(
+            CamelContext camelContext,
+            RestConfiguration config, String type, Class<?> typeClass, String outType, Class<?> outTypeClass, DataFormat json,
+            DataFormat outJson)
+            throws Exception {
+
+        Class<?> clazz = null;
+        boolean useList = false;
+        if (typeClass != null) {
+            useList = typeClass.isArray();
+            clazz = useList ? typeClass.getComponentType() : typeClass;
+        } else if (type != null) {
+            useList = type.endsWith("[]");
+            String typeName = useList ? type.substring(0, type.length() - 2) : type;
+            clazz = camelContext.getClassResolver().resolveMandatoryClass(typeName);
+        }
+        final BeanIntrospection beanIntrospection = PluginHelper.getBeanIntrospection(camelContext);
+        if (clazz != null) {
+            beanIntrospection.setProperty(camelContext, json,
+                    "unmarshalType", clazz);
+            beanIntrospection.setProperty(camelContext, json, "useList",
+                    useList);
+        }
+        setAdditionalConfiguration(camelContext, config, json, "json.in.");
+        failOnUnknownProperties(camelContext, json);
+
+        if (outJson != null) {
+            Class<?> outClazz = null;
+            boolean outUseList = false;
+            if (outTypeClass != null) {
+                outUseList = outTypeClass.isArray();
+                outClazz = outUseList ? outTypeClass.getComponentType() : outTypeClass;
+            } else if (outType != null) {
+                outUseList = outType.endsWith("[]");
+                String typeName = outUseList ? outType.substring(0, outType.length() - 2) : outType;
+                outClazz = camelContext.getClassResolver().resolveMandatoryClass(typeName);
+            }
+            if (outClazz != null) {
+                beanIntrospection.setProperty(camelContext, outJson,
+                        "unmarshalType", outClazz);
+                beanIntrospection.setProperty(camelContext, outJson, "useList",
+                        outUseList);
+            }
+            setAdditionalConfiguration(camelContext, config, outJson, "json.out.");
+        }
+    }
+
+    protected static RestClientRequestValidator lookupRestClientRequestValidator(CamelContext camelContext) {
+        RestClientRequestValidator answer = CamelContextHelper.findSingleByType(camelContext, RestClientRequestValidator.class);
+        if (answer == null) {
+            // lookup via classpath to find custom factory
+            Optional<RestClientRequestValidator> result = ResolverHelper.resolveService(
+                    camelContext,
+                    camelContext.getCamelContextExtension().getBootstrapFactoryFinder(),
+                    RestClientRequestValidator.FACTORY,
+                    RestClientRequestValidator.class);
+            // else use a default implementation
+            answer = result.orElseGet(DefaultRestClientRequestValidator::new);
+        }
+        return answer;
+    }
+
+    protected static RestClientResponseValidator lookupRestClientResponseValidator(CamelContext camelContext) {
+        RestClientResponseValidator answer
+                = CamelContextHelper.findSingleByType(camelContext, RestClientResponseValidator.class);
+        if (answer == null) {
+            // lookup via classpath to find custom factory
+            Optional<RestClientResponseValidator> result = ResolverHelper.resolveService(
+                    camelContext,
+                    camelContext.getCamelContextExtension().getBootstrapFactoryFinder(),
+                    RestClientResponseValidator.FACTORY,
+                    RestClientResponseValidator.class);
+            // else use a default implementation
+            answer = result.orElseGet(DefaultRestClientResponseValidator::new);
+        }
+        return answer;
+    }
+
+    private static void setAdditionalConfiguration(
+            CamelContext camelContext, RestConfiguration config, DataFormat dataFormat, String prefix) {
+        if (config.getDataFormatProperties() != null && !config.getDataFormatProperties().isEmpty()) {
+            // must use a copy as otherwise the options gets removed during
+            // introspection setProperties
+            Map<String, Object> copy = new HashMap<>();
+
+            // filter keys on prefix
+            // - either its a known prefix and must match the prefix parameter
+            // - or its a common configuration that we should always use
+            for (Map.Entry<String, Object> entry : config.getDataFormatProperties().entrySet()) {
+                String key = entry.getKey();
+                String copyKey;
+                boolean known = isKeyKnownPrefix(key);
+                if (known) {
+                    // remove the prefix from the key to use
+                    copyKey = key.substring(prefix.length());
+                } else {
+                    // use the key as is
+                    copyKey = key;
+                }
+                if (!known || key.startsWith(prefix)) {
+                    copy.put(copyKey, entry.getValue());
+                }
+            }
+
+            PropertyBindingSupport.build().bind(camelContext, dataFormat, copy);
+        }
+    }
+
+    /**
+     * Jackson 3 accepts unknown properties by default, where Jackson 2 rejects them. REST binding keeps rejecting them
+     * in request bodies, as they come from external callers, unless the feature or a mapper of your own is configured.
+     */
+    private static void failOnUnknownProperties(CamelContext camelContext, DataFormat dataFormat) throws Exception {
+        if (!dataFormat.getClass().getName().startsWith(JACKSON3_PACKAGE)) {
+            return;
+        }
+        BeanIntrospection beanIntrospection = PluginHelper.getBeanIntrospection(camelContext);
+        if (beanIntrospection.getOrElseProperty(dataFormat, "objectMapper", null, false) != null) {
+            return;
+        }
+        Object enable = beanIntrospection.getOrElseProperty(dataFormat, "enableFeatures", null, false);
+        Object disable = beanIntrospection.getOrElseProperty(dataFormat, "disableFeatures", null, false);
+        if (namesFailOnUnknownProperties(enable) || namesFailOnUnknownProperties(disable)) {
+            return;
+        }
+        String features = enable != null ? enable + "," + FAIL_ON_UNKNOWN_PROPERTIES : FAIL_ON_UNKNOWN_PROPERTIES;
+        beanIntrospection.setProperty(camelContext, dataFormat, "enableFeatures", features);
+    }
+
+    private static boolean namesFailOnUnknownProperties(Object features) {
+        return features != null && features.toString().contains(FAIL_ON_UNKNOWN_PROPERTIES);
+    }
+
+    private static boolean isKeyKnownPrefix(String key) {
+        return key.startsWith("json.in.") || key.startsWith("json.out.") || key.startsWith("xml.in.")
+                || key.startsWith("xml.out.");
+    }
+
+    /**
+     * The artifact of a Camel data format in parentheses, or what the hint says of a name that is not one.
+     */
+    private static String artifactNote(String name) {
+        String artifact = ArtifactUtils.dataFormatArtifact(name);
+        return artifact != null ? " (" + artifact + ")" : ArtifactUtils.dataFormatHint(name);
+    }
+
+    private static Object lookupByName(CamelContext camelContext, String name) {
+        if (name == null) {
+            return null;
+        }
+
+        if (EndpointHelper.isReferenceParameter(name)) {
+            return EndpointHelper.resolveReferenceParameter(camelContext, name, Object.class, false);
+        } else {
+            return camelContext.getRegistry().lookupByName(name);
+        }
+    }
+
+}

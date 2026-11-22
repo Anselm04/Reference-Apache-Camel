@@ -1,0 +1,79 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.camel.dsl.jbang.core.commands.mcp;
+
+import java.io.IOException;
+import java.util.ArrayList;
+import java.util.List;
+
+import org.aesh.command.CommandDefinition;
+import org.aesh.command.option.Option;
+import org.apache.camel.dsl.jbang.core.commands.CamelCommand;
+import org.apache.camel.dsl.jbang.core.common.CliException;
+import org.apache.camel.dsl.jbang.run.common.VersionHelper;
+
+@CommandDefinition(name = "mcp", description = "MCP server for AI coding assistants", generateHelp = true)
+public class McpCommand extends CamelCommand {
+
+    @Option(name = "http", hasValue = false,
+            description = "Enable HTTP transport (Streamable HTTP and SSE). Default uses STDIO transport.",
+            defaultValue = "false")
+    boolean http;
+
+    @Option(name = "port", description = "HTTP server port (only used with --http)", defaultValue = "8080")
+    int port = 8080;
+
+    @Option(name = "log-level", description = "Log level (ERROR, WARN, INFO, DEBUG, TRACE)", defaultValue = "WARN")
+    String logLevel = "WARN";
+
+    @Option(name = "version", description = "Camel MCP server version to use (default: current Camel version)")
+    String version;
+
+    // the JBang command, which runs the MCP server
+    String jbang = "jbang";
+
+    @Override
+    public Integer doCall() throws Exception {
+        String mcpVersion = version;
+        if (mcpVersion == null || mcpVersion.isBlank()) {
+            mcpVersion = VersionHelper.extractCamelVersion();
+        }
+
+        List<String> cmd = new ArrayList<>();
+        cmd.add(jbang);
+        cmd.add("-Dquarkus.log.level=" + logLevel);
+        if (http) {
+            cmd.add("-Dquarkus.http.host-enabled=true");
+            cmd.add("-Dquarkus.http.port=" + port);
+        }
+        cmd.add("org.apache.camel:camel-jbang-mcp:" + mcpVersion + ":runner");
+
+        ProcessBuilder pb = new ProcessBuilder(cmd);
+        pb.inheritIO();
+        Process process;
+        try {
+            process = pb.start();
+        } catch (IOException e) {
+            // without JBang this was an internal error (exit 70) with a stack trace (CAMEL-26932)
+            throw CliException.failure("camel mcp runs the MCP server with JBang, which is not installed (" + e.getMessage()
+                                       + "). Install JBang (https://www.jbang.dev), or run the server without it: java -jar"
+                                       + " camel-jbang-mcp-" + mcpVersion + "-runner.jar (see the Camel MCP server"
+                                       + " documentation)");
+        }
+        return process.waitFor();
+    }
+}

@@ -1,0 +1,238 @@
+= Atom Component
+:doctitle: Atom
+:shortname: atom
+:artifactid: camel-atom
+:description: Poll Atom RSS feeds.
+:since: 1.2
+:supportlevel: Stable
+:tabs-sync-option:
+:component-header: Only consumer is supported
+
+*Since Camel {since}*
+
+*{component-header}*
+
+The Atom component is used for polling Atom feeds.
+
+Camel will poll the feed every 60 seconds by default. +
+ *Note:* The component currently only supports polling (consuming)
+feeds.
+
+Maven users will need to add the following dependency to their `pom.xml`
+for this component:
+
+[source,xml]
+----
+<dependency>
+    <groupId>org.apache.camel</groupId>
+    <artifactId>camel-atom</artifactId>
+    <version>x.x.x</version>
+    <!-- use the same version as your Camel core version -->
+</dependency>
+----
+
+== URI format
+
+----
+atom://atomUri[?options]
+----
+
+Where *atomUri* is the URI to the Atom feed to poll.
+
+
+// component options: START
+include::partial$component-configure-options.adoc[]
+include::partial$component-endpoint-options.adoc[]
+include::partial$component-endpoint-headers.adoc[]
+// component options: END
+
+
+== Exchange data format
+
+Camel will set the In body on the returned `Exchange` with the entries.
+Depending on the `splitEntries` flag Camel will either return one
+entry (a `com.apptasticsoftware.rssreader.Item`) or a `List<Item>`.
+
+[width="100%",cols="10%,10%,80%",options="header",]
+|=======================================================================
+|Option |Value |Behavior
+|`splitEntries` |`true` |Only a single entry from the currently being processed feed is set:
+`exchange.in.body(Item)`
+
+|`splitEntries` |`false` |The entire list of entries from the feed is set:
+`exchange.in.body(List<Item>)`
+|=======================================================================
+
+Camel sets the `List<Item>` of all the entries of the feed on the `CamelAtomFeed` header (see the `feedHeader`
+option to disable this).
+
+== Usage
+
+=== Avoid reading the same entry more than once (idempotent consumer)
+
+Camel supports Idempotent Consumer
+directly within the component, so it will skip already processed entries.
+This feature is enabled by default, but can be disabled by setting the `idempotent=false` option.
+
+[tabs]
+====
+Java::
++
+[source,java]
+----
+from("atom://http://macstrac.blogspot.com/feeds/posts/default?idempotent=false").to("...");
+----
+
+XML::
++
+[source,xml]
+----
+<route>
+  <from uri="atom://http://macstrac.blogspot.com/feeds/posts/default?idempotent=false"/>
+  <to uri="..."/>
+</route>
+----
+
+YAML::
++
+[source,yaml]
+----
+- route:
+    from:
+      uri: atom://http://macstrac.blogspot.com/feeds/posts/default
+      parameters:
+        idempotent: false
+      steps:
+        - to:
+            uri: "..."
+----
+====
+
+The default Idempotency strategy uses Atom published and updated timestamps to identify already
+read entries, by filtering all entries older that the _last read_ entry.
+So that no entry is skipped, the consumer routes the entries with this strategy from the oldest to the newest updated
+date (the published date for an entry without an updated date), as with `sortEntries=true`. An entry with the same
+date as the _last read_ entry is distinguished by its id (the `atom:id`, else its link).
+
+The idempotency strategy can be changed by setting the `idempotentStrategy` option. The components support two
+strategies _out-of-the-box_, but custom strategies can be used, by referencing a subclass
+of `org.apache.camel.component.atom.AtomIdempotentStrategy`, with Apache Camel's # notation.
+
+[tabs]
+====
+Java::
++
+[source,java]
+----
+from("atom://http://macstrac.blogspot.com/feeds/posts/default?idempotentStrategy=#myIdempotentStrategy").to("...");
+----
+
+XML::
++
+[source,xml]
+----
+<route>
+  <from uri="atom://http://macstrac.blogspot.com/feeds/posts/default?idempotentStrategy=#myIdempotentStrategy"/>
+  <to uri="..."/>
+</route>
+----
+
+YAML::
++
+[source,yaml]
+----
+- route:
+    from:
+      uri: atom://http://macstrac.blogspot.com/feeds/posts/default
+      parameters:
+        idempotentStrategy: "#myIdempotentStrategy"
+      steps:
+        - to:
+            uri: "..."
+----
+====
+
+==== Repository idempotent strategy
+As an alternative to the default idempotent strategy, a repository based strategy can be use:
+
+[tabs]
+====
+Java::
++
+[source,java]
+----
+from("atom://http://macstrac.blogspot.com/feeds/posts/default?idempotentStrategy=repository").to("...");
+----
+
+XML::
++
+[source,xml]
+----
+<route>
+  <from uri="atom://http://macstrac.blogspot.com/feeds/posts/default?idempotentStrategy=repository"/>
+  <to uri="..."/>
+</route>
+----
+
+YAML::
++
+[source,yaml]
+----
+- route:
+    from:
+      uri: atom://http://macstrac.blogspot.com/feeds/posts/default
+      parameters:
+        idempotentStrategy: repository
+      steps:
+        - to:
+            uri: "..."
+----
+====
+
+This strategy checks for idempotency by storing the Atom Entry GUID in an `IdempotentRepository`. The strategy defaults
+a MemoryIdempotentRepository, but the repository can be changes to any subclass of `IdempotentRepository`, using the
+`idempotentRepository` option.
+
+
+== Examples
+
+=== Consumer Example
+
+In this sample, we poll James Strachan's blog.
+
+[tabs]
+====
+Java::
++
+[source,java]
+----
+from("atom://http://macstrac.blogspot.com/feeds/posts/default").to("seda:feeds");
+----
+
+XML::
++
+[source,xml]
+----
+<route>
+  <from uri="atom://http://macstrac.blogspot.com/feeds/posts/default"/>
+  <to uri="seda:feeds"/>
+</route>
+----
+
+YAML::
++
+[source,yaml]
+----
+- route:
+    from:
+      uri: atom://http://macstrac.blogspot.com/feeds/posts/default
+      steps:
+        - to:
+            uri: seda:feeds
+----
+====
+
+In this sample, we want to filter only good blogs we like to a SEDA
+queue.
+The sample also shows how to set up Camel standalone, not running
+in any Container or using Spring.

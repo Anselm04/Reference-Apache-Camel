@@ -1,0 +1,65 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.camel.dsl.jbang.core.commands;
+
+import java.nio.file.Path;
+
+import org.aesh.command.option.Option;
+import org.apache.camel.dsl.jbang.run.common.QuarkusHelper;
+import org.apache.camel.dsl.jbang.run.common.QuarkusPlatform;
+import org.apache.camel.dsl.jbang.run.common.RuntimeType;
+
+/**
+ * Options related to Quarkus Platform Extension Registry.
+ */
+public class QuarkusExtensionRegistryMixin {
+
+    @Option(name = "quarkus-ext-registry",
+            description = "The base URI of Quarkus Extension Registry. The default is "
+                          + RuntimeType.QUARKUS_EXTENSION_REGISTRY_BASE_URL
+                          + " unless camel.jbang.quarkus.platform.url system property is set"
+                          + " (the \"/client/platforms\" suffix is removed if present).")
+    public String quarkusExtensionRegistryBaseUri;
+
+    public static QuarkusExtensionRegistryMixin of(Path localRegistry) {
+        QuarkusExtensionRegistryMixin result = new QuarkusExtensionRegistryMixin();
+        result.quarkusExtensionRegistryBaseUri = localRegistry.toUri().toString();
+        return result;
+    }
+
+    public String quarkusExtensionRegistryBaseUri() {
+        return resolveExtensionRegistryBaseUri(quarkusExtensionRegistryBaseUri);
+    }
+
+    /**
+     * The base URI of the Quarkus Extension Registry: the configured one, else the one of the
+     * camel.jbang.quarkus.platform.url system property (without its "/client/platforms" suffix), else the default
+     * registry; without a trailing slash.
+     */
+    public static String resolveExtensionRegistryBaseUri(String quarkusExtensionRegistryBaseUri) {
+        String result = quarkusExtensionRegistryBaseUri;
+        if (result == null) {
+            result = System.getProperty(QuarkusHelper.QUARKUS_PLATFORM_URL_PROPERTY);
+            final String suffix = "/client/platforms";
+            if (result != null && result.endsWith(suffix)) {
+                result = result.substring(0, result.length() - suffix.length());
+            }
+        }
+        return QuarkusPlatform.extensionRegistryBaseUri(result);
+    }
+
+}

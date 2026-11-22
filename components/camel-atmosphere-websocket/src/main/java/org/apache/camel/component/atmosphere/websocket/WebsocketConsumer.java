@@ -1,0 +1,161 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.camel.component.atmosphere.websocket;
+
+import java.io.IOException;
+import java.net.URLDecoder;
+import java.nio.charset.StandardCharsets;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+
+import jakarta.servlet.ServletConfig;
+import jakarta.servlet.ServletException;
+import jakarta.servlet.http.HttpServletRequest;
+import jakarta.servlet.http.HttpServletResponse;
+
+import org.apache.camel.AsyncCallback;
+import org.apache.camel.Exchange;
+import org.apache.camel.Processor;
+import org.apache.camel.component.servlet.ServletConsumer;
+import org.apache.camel.spi.HeaderFilterStrategy;
+import org.atmosphere.cpr.ApplicationConfig;
+import org.atmosphere.cpr.AtmosphereFramework;
+import org.atmosphere.cpr.AtmosphereFrameworkInitializer;
+import org.atmosphere.cpr.AtmosphereRequestImpl;
+import org.atmosphere.cpr.AtmosphereResponseImpl;
+import org.atmosphere.websocket.WebSocketProtocol;
+
+/**
+ *
+ */
+public class WebsocketConsumer extends ServletConsumer {
+    private boolean enableEventsResending;
+    private AtmosphereFramework framework;
+    private final AtmosphereFrameworkInitializer initializer;
+
+    public WebsocketConsumer(WebsocketEndpoint endpoint, Processor processor) {
+        super(endpoint, processor);
+        initializer = new AtmosphereFrameworkInitializer(false, true);
+    }
+
+    public void configureEventsResending(final boolean enableEventsResending) {
+        this.enableEventsResending = enableEventsResending;
+    }
+
+    public void configureFramework(ServletConfig config) throws ServletException {
+        initializer.configureFramework(config, false, false, AtmosphereFramework.class);
+        this.framework = initializer.framework();
+        this.framework.setUseNativeImplementation(false);
+        this.framework.addInitParameter(ApplicationConfig.JSR356_MAPPING_PATH, this.getEndpoint().getHttpUri().getPath());
+        this.framework.addInitParameter(ApplicationConfig.ANALYTICS, "false");
+        this.framework.addInitParameter(ApplicationConfig.WEBSOCKET_SUPPORT, "true");
+        this.framework.addInitParameter(ApplicationConfig.WEBSOCKET_PROTOCOL,
+                getEndpoint().isUseStreaming() ? WebsocketStreamHandler.class.getName() : WebsocketHandler.class.getName());
+        this.framework.init(config);
+
+        WebSocketProtocol wsp = this.framework.getWebSocketProtocol();
+        if (wsp instanceof WebsocketHandler) {
+            ((WebsocketHandler) wsp).setConsumer(this);
+        } else {
+            throw new IllegalArgumentException("Unexpected WebSocketHandler: " + wsp);
+        }
+    }
+
+    @Override
+    public WebsocketEndpoint getEndpoint() {
+        return (WebsocketEndpoint) super.getEndpoint();
+    }
+
+    void service(HttpServletRequest request, HttpServletResponse response) throws IOException, ServletException {
+        framework.doCometSupport(AtmosphereRequestImpl.wrap(request), AtmosphereResponseImpl.wrap(response));
+    }
+
+    public void sendMessage(final String connectionKey, Object message) {
+        final Exchange exchange = createExchange(true);
+
+        // set header and body
+        exchange.getIn().setHeader(WebsocketConstants.CONNECTION_KEY, connectionKey);
+        exchange.getIn().setBody(message);
+
+        // use default consumer callback
+        AsyncCallback cb = defaultConsumerCallback(exchange, true);
+        getAsyncProcessor().process(exchange, cb);
+    }
+
+    public void sendEventNotification(String connectionKey, int eventType, Map<String, String> queryParameters) {
+        final Exchange exchange = createExchange(true);
+
+        // set header
+        exchange.getIn().setHeader(WebsocketConstants.CONNECTION_KEY, connectionKey);
+        exchange.getIn().setHeader(WebsocketConstants.EVENT_TYPE, eventType);
+
+        HeaderFilterStrategy headerFilterStrategy = getEndpoint().getHeaderFilterStrategy();
+        for (Map.Entry<String, String> param : queryParameters.entrySet()) {
+            if (headerFilterStrategy == null
+                    || !headerFilterStrategy.applyFilterToExternalHeaders(param.getKey(), param.getValue(), exchange)) {
+                exchange.getIn().setHeader(param.getKey(), param.getValue());
+            }
+        }
+
+        // use default consumer callback
+        AsyncCallback cb = defaultConsumerCallback(exchange, true);
+        getAsyncProcessor().process(exchange, cb);
+    }
+
+    public void sendNotDeliveredMessage(List<String> failedConnectionKeys, Object message) {
+        final Exchange exchange = createExchange(true);
+
+        // set header and body
+        exchange.getIn().setHeader(WebsocketConstants.CONNECTION_KEY_LIST, failedConnectionKeys);
+        exchange.getIn().setHeader(WebsocketConstants.ERROR_TYPE, WebsocketConstants.MESSAGE_NOT_SENT_ERROR_TYPE);
+        exchange.getIn().setBody(message);
+
+        // use default consumer callback
+        AsyncCallback cb = defaultConsumerCallback(exchange, true);
+        getAsyncProcessor().process(exchange, cb);
+    }
+
+    public boolean isEnableEventsResending() {
+        return enableEventsResending;
+    }
+
+    static Map<String, String> getQueryMap(String query) {
+        Map<String, String> map = new HashMap<>();
+        if (query != null) {
+            String[] params = query.split("&");
+            for (String param : params) {
+                if (param.isEmpty()) {
+                    continue;
+                }
+                // a parameter without a value (?foo or ?foo=) gets an empty value, and a value may contain =
+                String[] nameval = param.split("=", 2);
+                map.put(decode(nameval[0]), nameval.length > 1 ? decode(nameval[1]) : "");
+            }
+        }
+        return map;
+    }
+
+    private static String decode(String text) {
+        try {
+            return URLDecoder.decode(text, StandardCharsets.UTF_8);
+        } catch (IllegalArgumentException e) {
+            // not valid URL encoding, so keep the text as is
+            return text;
+        }
+    }
+}

@@ -1,0 +1,293 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.camel.dsl.jbang.core.commands.mcp;
+
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collections;
+import java.util.List;
+import java.util.Locale;
+import java.util.Map;
+import java.util.Set;
+
+import jakarta.enterprise.context.ApplicationScoped;
+import jakarta.inject.Inject;
+
+import io.quarkiverse.mcp.server.Tool;
+import io.quarkiverse.mcp.server.ToolArg;
+import io.quarkiverse.mcp.server.ToolCallException;
+import io.quarkiverse.mcp.server.ToolGuardrails;
+import org.apache.camel.catalog.CamelCatalog;
+import org.apache.camel.catalog.ConfigurationPropertiesValidationResult;
+
+/**
+ * MCP Tool for validating Camel configuration properties (e.g. {@code application.properties} for camel-main, Spring
+ * Boot or Quarkus). Wraps {@link CamelCatalog#validateConfigurationProperty(String)} so that misspelled option names,
+ * invalid values and suggested corrections can be surfaced to LLMs.
+ */
+@McpSecured
+@ApplicationScoped
+public class ConfigurationValidateTools {
+
+    @Inject
+    CatalogService catalogService;
+
+    /**
+     * Tool to validate one or more Camel configuration property lines.
+     */
+    @ToolGuardrails(input = McpArgumentGuardrail.class, output = McpArgumentGuardrail.class)
+    @Tool(annotations = @Tool.Annotations(readOnlyHint = true, destructiveHint = false, openWorldHint = false),
+          description = "Validate one or more Camel configuration property lines (e.g. lines from application.properties). "
+                        +
+                        "Detects misspelled option names, invalid values (boolean/integer/number/duration/enum) and "
+                        +
+                        "returns suggestions when available. The input can be a single line or a multi-line string with "
+                        +
+                        "one property per line; blank lines and comments (starting with # or !) are skipped. "
+                        +
+                        "Lines that are not recognised as Camel properties (e.g. server.port, quarkus.* or camel.beans.*) "
+                        +
+                        "are reported with checked=false and are excluded from summary.valid and summary.errors; "
+                        +
+                        "they are counted in summary.unchecked instead. "
+                        +
+                        "For runtime=spring-boot, starter-specific options (e.g. camel.metrics.uriTagEnabled) "
+                        +
+                        "are not present in the camel-main metadata and are also reported as checked=false.")
+    public ConfigurationValidateResult camel_configuration_validate(
+            @ToolArg(description = "Configuration property lines to validate. Can be a single line "
+                                   + "(e.g. \"camel.main.streamCaching=true\") or multiple lines separated by newlines.") String properties,
+            @ToolArg(description = ToolArgDocs.RUNTIME, required = false) String runtime,
+            @ToolArg(description = ToolArgDocs.CAMEL_VERSION, required = false) String camelVersion,
+            @ToolArg(description = ToolArgDocs.PLATFORM_BOM, required = false) String platformBom) {
+
+        if (properties == null || properties.isBlank()) {
+            throw new ToolCallException("properties argument is required", null);
+        }
+
+        try {
+            CamelCatalog catalog = catalogService.loadCatalog(runtime, camelVersion, platformBom);
+
+            List<PropertyValidationInfo> results = new ArrayList<>();
+            int totalErrors = 0;
+            int totalWarnings = 0;
+            int validCount = 0;
+            int uncheckedCount = 0;
+
+            // For spring-boot, starter-specific options (e.g. camel.metrics.uriTagEnabled from
+            // camel-micrometer-starter) are not present in the camel-main metadata that the catalog
+            // uses. The catalog accepts the group (camel.metrics is a valid main-model group) but
+            // then reports "Unknown option" for starter-only properties. Treat such lines as
+            // unchecked (not inspected) rather than invalid, to avoid false positives.
+            boolean isSpringBoot = "spring-boot".equalsIgnoreCase(runtime);
+
+            String[] lines = properties.split("\\r?\\n");
+            for (int i = 0; i < lines.length; i++) {
+                String line = lines[i];
+                String trimmed = line == null ? "" : line.trim();
+                if (trimmed.isEmpty() || trimmed.startsWith("#") || trimmed.startsWith("!")) {
+                    continue;
+                }
+
+                ConfigurationPropertiesValidationResult result = catalog.validateConfigurationProperty(line);
+                PropertyValidationInfo info = toPropertyValidationInfo(i + 1, line, result, isSpringBoot);
+                results.add(info);
+                if (!info.checked()) {
+                    uncheckedCount++;
+                } else {
+                    totalErrors += info.errors();
+                    totalWarnings += info.warnings();
+                    if (info.valid()) {
+                        validCount++;
+                    }
+                }
+            }
+
+            ConfigurationValidateSummary summary
+                    = new ConfigurationValidateSummary(
+                            results.size(), validCount, totalErrors, totalWarnings,
+                            uncheckedCount);
+
+            return new ConfigurationValidateResult(catalog.getCatalogVersion(), summary, results);
+        } catch (ToolCallException e) {
+            throw e;
+        } catch (Throwable e) {
+            throw new ToolCallException(
+                    "Failed to validate configuration properties (" + e.getClass().getName() + "): " + e.getMessage(),
+                    null);
+        }
+    }
+
+    private PropertyValidationInfo toPropertyValidationInfo(
+            int lineNumber, String text, ConfigurationPropertiesValidationResult result, boolean isSpringBoot) {
+        boolean checked = result.isAccepted();
+        // A checked line is valid when the catalog found no errors; an unchecked line
+        // (not recognised as a Camel property) is neither valid nor invalid — it is simply
+        // not inspected by this catalog.
+        boolean valid = checked && result.isSuccess();
+
+        // For Spring Boot, the catalog uses camel-main metadata which does not include
+        // starter-specific options (e.g. camel.metrics.uriTagEnabled from camel-micrometer-starter).
+        // When the only issues are "unknown option" errors AND the key belongs to a group that is
+        // newly accepted by this fix (not one of the original 10 hardcoded prefixes), downgrade to
+        // unchecked to avoid false positives — the starter may legitimately bind options outside the
+        // main schema. Keys under the original 10 groups (component, dataformat, language, main,
+        // resilience4j, faulttolerance, threadpool, health, lra, rest) retain full validation since
+        // the catalog has always covered them.
+        boolean springBootDowngraded = false;
+        if (isSpringBoot && checked && !valid) {
+            String propertyKey = text != null && text.contains("=") ? text.substring(0, text.indexOf('=')).trim() : text;
+            // Normalize to dash-free lowercase so that Spring Boot relaxed-binding forms
+            // (e.g. camel.fault-tolerance.*, camel.thread-pool.*) match the original group
+            // prefixes the same way the catalog normalises them internally.
+            String normKey = propertyKey != null ? propertyKey.replace("-", "").toLowerCase(Locale.ENGLISH) : null;
+            boolean isOriginalGroup = normKey != null && (normKey.startsWith("camel.component.")
+                    || normKey.startsWith("camel.dataformat.")
+                    || normKey.startsWith("camel.language.")
+                    || normKey.startsWith("camel.main.")
+                    || normKey.startsWith("camel.resilience4j.")
+                    || normKey.startsWith("camel.faulttolerance.")
+                    || normKey.startsWith("camel.threadpool.")
+                    || normKey.startsWith("camel.health.")
+                    || normKey.startsWith("camel.lra.")
+                    || normKey.startsWith("camel.rest."));
+            if (!isOriginalGroup) {
+                Set<String> unknownKeys = result.getUnknown() != null ? result.getUnknown() : Collections.emptySet();
+                boolean onlyUnknownOptionErrors = !unknownKeys.isEmpty()
+                        && result.getNumberOfErrors() == unknownKeys.size()
+                        && result.getSyntaxError() == null
+                        && result.getIncapable() == null
+                        && result.getInvalidBoolean() == null
+                        && result.getInvalidEnum() == null
+                        && result.getInvalidInteger() == null
+                        && result.getInvalidNumber() == null
+                        && result.getInvalidDuration() == null;
+                if (onlyUnknownOptionErrors) {
+                    checked = false;
+                    valid = false;
+                    springBootDowngraded = true;
+                }
+            }
+        }
+
+        int errors = checked ? result.getNumberOfErrors() : 0;
+        int warnings = checked ? result.getNumberOfWarnings() : 0;
+
+        // On a Spring Boot downgrade, still surface suggestions so the user can act on them
+        // even though the line is classified as unchecked (the count is excluded from summary.errors).
+        List<PropertyIssue> issues = (checked || springBootDowngraded) ? collectIssues(result) : Collections.emptyList();
+        String summary = checked ? result.summaryErrorMessage(false, true, true) : null;
+
+        return new PropertyValidationInfo(lineNumber, text, checked, valid, errors, warnings, summary, issues);
+    }
+
+    private List<PropertyIssue> collectIssues(ConfigurationPropertiesValidationResult result) {
+        List<PropertyIssue> issues = new ArrayList<>();
+
+        if (result.getSyntaxError() != null) {
+            issues.add(new PropertyIssue(null, "syntax", result.getSyntaxError(), Collections.emptyList()));
+        }
+        if (result.getUnknownComponent() != null) {
+            issues.add(new PropertyIssue(
+                    result.getUnknownComponent(), "unknownComponent",
+                    "Unknown component: " + result.getUnknownComponent(),
+                    Collections.emptyList()));
+        }
+        if (result.getIncapable() != null) {
+            issues.add(new PropertyIssue(null, "incapable", result.getIncapable(), Collections.emptyList()));
+        }
+
+        if (result.getUnknown() != null) {
+            Map<String, String[]> unknownSuggestions = result.getUnknownSuggestions();
+            for (String name : result.getUnknown()) {
+                String[] suggestions = unknownSuggestions != null ? unknownSuggestions.get(name) : null;
+                issues.add(new PropertyIssue(name, "unknown", "Unknown option", asSuggestionList(suggestions)));
+            }
+        }
+        if (result.getRequired() != null) {
+            for (String name : result.getRequired()) {
+                issues.add(new PropertyIssue(name, "required", "Missing required option", Collections.emptyList()));
+            }
+        }
+        if (result.getDeprecated() != null) {
+            for (String name : result.getDeprecated()) {
+                issues.add(new PropertyIssue(name, "deprecated", "Deprecated option", Collections.emptyList()));
+            }
+        }
+
+        addInvalidValueIssues(issues, result.getInvalidEnum(), "invalidEnum", "Invalid enum value",
+                result.getInvalidEnumChoices(), result.getInvalidEnumSuggestions());
+        addInvalidValueIssues(issues, result.getInvalidReference(), "invalidReference", "Invalid reference value", null,
+                null);
+        addInvalidValueIssues(issues, result.getInvalidBoolean(), "invalidBoolean", "Invalid boolean value", null, null);
+        addInvalidValueIssues(issues, result.getInvalidInteger(), "invalidInteger", "Invalid integer value", null, null);
+        addInvalidValueIssues(issues, result.getInvalidNumber(), "invalidNumber", "Invalid number value", null, null);
+        addInvalidValueIssues(issues, result.getInvalidDuration(), "invalidDuration", "Invalid duration value", null,
+                null);
+        addInvalidValueIssues(issues, result.getInvalidMap(), "invalidMap", "Invalid map key/value", null, null);
+        addInvalidValueIssues(issues, result.getInvalidArray(), "invalidArray", "Invalid array index/value", null, null);
+
+        return issues;
+    }
+
+    private void addInvalidValueIssues(
+            List<PropertyIssue> issues, Map<String, String> values, String kind, String baseMessage,
+            Map<String, String[]> choicesMap, Map<String, String[]> suggestionsMap) {
+        if (values == null) {
+            return;
+        }
+        for (Map.Entry<String, String> entry : values.entrySet()) {
+            String name = entry.getKey();
+            String value = entry.getValue();
+            StringBuilder msg = new StringBuilder(baseMessage);
+            if (value != null && !value.isBlank()) {
+                msg.append(": ").append(value);
+            }
+            if (choicesMap != null) {
+                String[] choices = choicesMap.get(name);
+                if (choices != null && choices.length > 0) {
+                    msg.append(". Possible values: ").append(Arrays.asList(choices));
+                }
+            }
+            String[] suggestions = suggestionsMap != null ? suggestionsMap.get(name) : null;
+            issues.add(new PropertyIssue(name, kind, msg.toString(), asSuggestionList(suggestions)));
+        }
+    }
+
+    private static List<String> asSuggestionList(String[] suggestions) {
+        if (suggestions == null || suggestions.length == 0) {
+            return Collections.emptyList();
+        }
+        return new ArrayList<>(Arrays.asList(suggestions));
+    }
+
+    // Result record classes for Jackson serialization
+
+    public record ConfigurationValidateResult(String camelVersion, ConfigurationValidateSummary summary,
+            List<PropertyValidationInfo> properties) {
+    }
+
+    public record ConfigurationValidateSummary(int total, int valid, int errors, int warnings, int unchecked) {
+    }
+
+    public record PropertyValidationInfo(int lineNumber, String text, boolean checked, boolean valid, int errors,
+            int warnings, String summary, List<PropertyIssue> issues) {
+    }
+
+    public record PropertyIssue(String name, String kind, String message, List<String> suggestions) {
+    }
+}

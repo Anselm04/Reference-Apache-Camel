@@ -1,0 +1,113 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.camel.component.caffeine.processor.idempotent;
+
+import com.github.benmanes.caffeine.cache.Cache;
+import com.github.benmanes.caffeine.cache.Caffeine;
+import org.apache.camel.api.management.ManagedAttribute;
+import org.apache.camel.api.management.ManagedOperation;
+import org.apache.camel.api.management.ManagedResource;
+import org.apache.camel.spi.Configurer;
+import org.apache.camel.spi.IdempotentRepository;
+import org.apache.camel.spi.InMemoryStrategy;
+import org.apache.camel.spi.Metadata;
+import org.apache.camel.support.service.ServiceSupport;
+
+@Metadata(label = "bean",
+          description = "Idempotent repository that uses Caffiene cache to store message ids.",
+          annotations = { "interfaceName=org.apache.camel.spi.IdempotentRepository" })
+@Configurer(metadataOnly = true)
+@ManagedResource(description = "Caffeine based message id repository")
+public class CaffeineIdempotentRepository extends ServiceSupport implements IdempotentRepository, InMemoryStrategy {
+
+    private Cache<String, Boolean> cache;
+
+    @Metadata(description = "Name of cache", defaultValue = "CaffeineIdempotentRepository")
+    private String cacheName;
+
+    public CaffeineIdempotentRepository() {
+        this(CaffeineIdempotentRepository.class.getSimpleName());
+    }
+
+    public CaffeineIdempotentRepository(String repositoryName) {
+        this.cacheName = repositoryName;
+    }
+
+    public void setCacheName(String cacheName) {
+        this.cacheName = cacheName;
+    }
+
+    @ManagedAttribute(description = "The processor name")
+    public String getCacheName() {
+        return cacheName;
+    }
+
+    @Override
+    @ManagedAttribute(description = "Whether the keys are kept only in memory (lost when the application stops)")
+    public boolean isInMemory() {
+        // a Caffeine cache lives in the heap of this JVM
+        return true;
+    }
+
+    @Override
+    @ManagedOperation(description = "Adds the key to the store")
+    public boolean add(String key) {
+        // atomic, so when two exchanges with the same key are added at the same time only one of them is added
+        return cache.asMap().putIfAbsent(key, Boolean.TRUE) == null;
+    }
+
+    @Override
+    public boolean confirm(String key) {
+        return cache.asMap().containsKey(key);
+    }
+
+    @Override
+    @ManagedOperation(description = "Does the store contain the given key")
+    public boolean contains(String key) {
+        return cache.asMap().containsKey(key);
+    }
+
+    @Override
+    @ManagedOperation(description = "Remove the key from the store")
+    public boolean remove(String key) {
+        cache.invalidate(key);
+        return true;
+    }
+
+    @Override
+    @ManagedOperation(description = "Clear the store")
+    public void clear() {
+        cache.invalidateAll();
+    }
+
+    @Override
+    protected void doStart() throws Exception {
+        if (cache == null) {
+            Caffeine<Object, Object> builder = Caffeine.newBuilder();
+            cache = builder.build();
+        }
+    }
+
+    @Override
+    protected void doStop() throws Exception {
+        // noop
+    }
+
+    protected Cache getCache() {
+        return this.cache;
+    }
+}

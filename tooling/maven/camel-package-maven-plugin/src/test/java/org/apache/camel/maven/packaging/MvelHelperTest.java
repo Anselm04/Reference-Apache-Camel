@@ -1,0 +1,81 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.camel.maven.packaging;
+
+import java.util.stream.Stream;
+
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.Arguments;
+import org.junit.jupiter.params.provider.MethodSource;
+
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.junit.jupiter.params.provider.Arguments.arguments;
+
+public class MvelHelperTest {
+
+    @Test
+    public void shouldBeRobustAtEscaping() {
+        assertThat(MvelHelper.escape(null)).isNull();
+        assertThat(MvelHelper.escape("")).isEmpty();
+        assertThat(MvelHelper.escape(" ")).isEqualTo(" ");
+    }
+
+    @ParameterizedTest
+    @MethodSource("curlyBracketEscapeCases")
+    public void shouldcurlyBracket(final String given, final String expected) {
+        assertThat(MvelHelper.escape(given)).isEqualTo(expected);
+    }
+
+    @ParameterizedTest
+    @MethodSource("urlEscapeCases")
+    public void shouldUrls(final String given, final String expected) {
+        assertThat(MvelHelper.escape(given)).isEqualTo(expected);
+    }
+
+    // every template calling escape() renders the result inside a table cell, where an unescaped
+    // pipe starts a new cell and shifts or drops the remaining cells of the row; some descriptions
+    // (e.g. the bindy CsvRecord separator javadoc) already escape their pipes, and must be kept as-is
+    @ParameterizedTest
+    @MethodSource("pipeEscapeCases")
+    public void shouldEscapePipes(final String given, final String expected) {
+        assertThat(MvelHelper.escape(given)).isEqualTo(expected);
+    }
+
+    static Stream<Arguments> curlyBracketEscapeCases() {
+        return Stream.of(arguments("some {expression} here", "some \\{expression} here"));
+    }
+
+    static Stream<Arguments> urlEscapeCases() {
+        return Stream.of(arguments("http", "http"),
+                arguments("http://example.com", "\\http://example.com"),
+                arguments("some http://example.com here", "some \\http://example.com here"),
+                arguments("https://example.com", "\\https://example.com"),
+                arguments("ftp://example.com", "\\ftp://example.com"),
+                arguments("ftp", "ftp"),
+                arguments("http", "http"));
+    }
+
+    static Stream<Arguments> pipeEscapeCases() {
+        return Stream.of(
+                arguments("Add error handler (none|log|sink:<endpoint>)", "Add error handler (none\\|log\\|sink:<endpoint>)"),
+                arguments("[source|sink] at http://example.com", "[source\\|sink] at \\http://example.com"),
+                arguments("the '\\|' sign, then you have to mask it, like '\\|'",
+                        "the '\\|' sign, then you have to mask it, like '\\|'"),
+                arguments("none|log and '\\|'", "none\\|log and '\\|'"));
+    }
+}

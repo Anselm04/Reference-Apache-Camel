@@ -1,0 +1,245 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.camel.component.influxdb;
+
+import java.util.Locale;
+import java.util.Set;
+
+import org.apache.camel.Category;
+import org.apache.camel.Consumer;
+import org.apache.camel.Processor;
+import org.apache.camel.Producer;
+import org.apache.camel.spi.BodyType;
+import org.apache.camel.spi.BodyType.Carrier;
+import org.apache.camel.spi.BodyTypes;
+import org.apache.camel.spi.Metadata;
+import org.apache.camel.spi.UriEndpoint;
+import org.apache.camel.spi.UriParam;
+import org.apache.camel.spi.UriPath;
+import org.apache.camel.support.DefaultEndpoint;
+import org.influxdb.InfluxDB;
+import org.influxdb.dto.Query;
+import org.influxdb.dto.QueryResult;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+/**
+ * Interact with <a href="https://influxdata.com/time-series-platform/influxdb/">InfluxDB</a> v1, a time series
+ * database.
+ */
+@UriEndpoint(firstVersion = "2.18.0", scheme = "influxdb", title = "InfluxDB", syntax = "influxdb:connectionBean",
+             category = { Category.DATABASE }, producerOnly = true, headersClass = InfluxDbConstants.class)
+@BodyTypes(producerIn = @BodyType(value = { Carrier.POJO, Carrier.MAP },
+                                  byOption = {
+                                          @BodyType.When(option = "batch", value = "true", carriers = Carrier.POJO,
+                                                         javaType = "org.influxdb.dto.BatchPoints"),
+                                          @BodyType.When(option = "operation", value = "query", carriers = Carrier.ANY),
+                                          @BodyType.When(option = "operation", value = "ping", carriers = Carrier.ANY) },
+                                  description = "The org.influxdb.dto.Point to write, or a Map of the field names and their"
+                                                + " values with the measurement name under the camelInfluxDB.MeasurementName"
+                                                + " key. Text, bytes or a List of Points fail: line protocol is not parsed."
+                                                + " With batch=true the body must be a BatchPoints. The query and ping"
+                                                + " operations do not read the body: the query comes from the"
+                                                + " camelInfluxDB.query header or the query option"),
+           producerOut = @BodyType(value = Carrier.UNCHANGED,
+                                   byOption = {
+                                           @BodyType.When(option = "operation", value = "query", carriers = Carrier.POJO,
+                                                          javaType = "org.influxdb.dto.QueryResult"),
+                                           @BodyType.When(option = "operation", value = "ping", carriers = Carrier.POJO,
+                                                          javaType = "org.influxdb.dto.Pong") },
+                                   description = "An insert leaves the body unchanged. A query gives the QueryResult of"
+                                                 + " InfluxDB; an error the server reports in it (such as an unknown"
+                                                 + " database) fails the exchange instead. Ping gives the Pong with the"
+                                                 + " version of the server"))
+public class InfluxDbEndpoint extends DefaultEndpoint {
+
+    private static final Logger LOG = LoggerFactory.getLogger(InfluxDbEndpoint.class);
+    private static final String CREATE_DATABASE = "CREATE DATABASE ";
+    private static final String SHOW_DATABASES = "SHOW DATABASES";
+    private static final Set<String> OPERATIONS
+            = Set.of(InfluxDbOperations.INSERT, InfluxDbOperations.QUERY, InfluxDbOperations.PING);
+
+    private InfluxDB influxDB;
+
+    @UriPath
+    @Metadata(required = true)
+    private String connectionBean;
+    @UriParam
+    private String databaseName;
+    @UriParam(defaultValue = "default")
+    private String retentionPolicy = "default";
+    @UriParam(defaultValue = "false")
+    private boolean batch;
+    @UriParam(defaultValue = InfluxDbOperations.INSERT, enums = "insert,query,ping")
+    private String operation = InfluxDbOperations.INSERT;
+    @UriParam
+    private String query;
+    @UriParam(defaultValue = "false")
+    private boolean checkDatabaseExistence;
+    @UriParam(defaultValue = "false")
+    private boolean autoCreateDatabase;
+
+    public InfluxDbEndpoint(String uri, InfluxDbComponent component) {
+        super(uri, component);
+    }
+
+    @Override
+    public Producer createProducer() throws Exception {
+        return new InfluxDbProducer(this);
+    }
+
+    @Override
+    public Consumer createConsumer(Processor processor) throws Exception {
+        throw new UnsupportedOperationException("You cannot receive messages from this endpoint");
+    }
+
+    @Override
+    protected void doInit() throws Exception {
+        super.doInit();
+
+        // an operation that is not supported fails the start of the endpoint, instead of its first message
+        if (operation == null || !OPERATIONS.contains(operation.toLowerCase(Locale.ROOT))) {
+            throw new IllegalArgumentException(
+                    "The operation " + operation + " is not supported: use one of insert, query or ping");
+        }
+        if (checkDatabaseExistence) {
+            ensureDatabaseExists();
+        }
+
+    }
+
+    public InfluxDB getInfluxDB() {
+        return influxDB;
+    }
+
+    /**
+     * The Influx DB to use
+     */
+    public void setInfluxDB(InfluxDB influxDB) {
+        this.influxDB = influxDB;
+    }
+
+    public String getDatabaseName() {
+        return databaseName;
+    }
+
+    /**
+     * The name of the database where the time series will be stored
+     */
+    public void setDatabaseName(String databaseName) {
+        this.databaseName = databaseName;
+    }
+
+    public String getRetentionPolicy() {
+        return retentionPolicy;
+    }
+
+    /**
+     * The string that defines the retention policy to the data created by the endpoint
+     */
+    public void setRetentionPolicy(String retentionPolicy) {
+        this.retentionPolicy = retentionPolicy;
+    }
+
+    public String getConnectionBean() {
+        return connectionBean;
+    }
+
+    /**
+     * Connection to the influx database, of class InfluxDB.class
+     */
+    public void setConnectionBean(String connectionBean) {
+        this.connectionBean = connectionBean;
+    }
+
+    public boolean isBatch() {
+        return batch;
+    }
+
+    /**
+     * Define if this operation is a batch operation or not
+     */
+    public void setBatch(boolean batch) {
+        this.batch = batch;
+    }
+
+    public String getOperation() {
+        return operation;
+    }
+
+    /**
+     * Define if this operation is an insert, a query or a ping. The value is not case-sensitive.
+     */
+    public void setOperation(String operation) {
+        this.operation = operation;
+    }
+
+    public String getQuery() {
+        return query;
+    }
+
+    /**
+     * Define the query in case of operation query
+     */
+    public void setQuery(String query) {
+        this.query = query;
+    }
+
+    public boolean isCheckDatabaseExistence() {
+        return checkDatabaseExistence;
+    }
+
+    /**
+     * Define if we want to check the database existence while starting the endpoint
+     */
+    public void setCheckDatabaseExistence(boolean checkDatabaseExistence) {
+        this.checkDatabaseExistence = checkDatabaseExistence;
+    }
+
+    public boolean isAutoCreateDatabase() {
+        return autoCreateDatabase;
+    }
+
+    /**
+     * Define if we want to auto create the database if it's not present
+     */
+    public void setAutoCreateDatabase(boolean autoCreateDatabase) {
+        this.autoCreateDatabase = autoCreateDatabase;
+    }
+
+    private void ensureDatabaseExists() {
+        QueryResult result = getInfluxDB().query(new Query(SHOW_DATABASES));
+
+        //values are located in the first item in series, where list of values is the first item in the Serie's values,
+        //if any object on the 'path' is null, database does not exist
+        boolean exists;
+        try {
+            //NPE could be thrown from objects deep in the structure.
+            //try catch block with NullPointerException is used on purpose
+            exists = result.getResults().get(0).getSeries().get(0).getValues().get(0).contains(databaseName);
+        } catch (NullPointerException e) {
+            exists = false;
+        }
+
+        if (!exists) {
+            if (autoCreateDatabase) {
+                LOG.debug("Database {} doesn't exist. Creating it...", databaseName);
+                getInfluxDB().query(new Query(CREATE_DATABASE + databaseName, ""));
+            }
+        }
+    }
+}

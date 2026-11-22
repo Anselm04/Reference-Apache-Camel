@@ -1,0 +1,188 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.camel.dsl.jbang.core.commands.process;
+
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.List;
+import java.util.stream.Collectors;
+
+import com.github.freva.asciitable.AsciiTable;
+import com.github.freva.asciitable.Column;
+import com.github.freva.asciitable.HorizontalAlign;
+import com.github.freva.asciitable.OverflowBehaviour;
+import org.aesh.command.CommandDefinition;
+import org.aesh.command.option.Argument;
+import org.aesh.command.option.Option;
+import org.apache.camel.dsl.jbang.core.common.CopyableRow;
+import org.apache.camel.dsl.jbang.core.common.PidNameAgeCompletionCandidates;
+import org.apache.camel.dsl.jbang.core.common.ProcessHelper;
+import org.apache.camel.dsl.jbang.core.common.RowSort;
+import org.apache.camel.dsl.jbang.core.common.TerminalWidthHelper;
+import org.apache.camel.util.TimeUtils;
+import org.apache.camel.util.json.JsonArray;
+import org.apache.camel.util.json.JsonObject;
+import org.apache.camel.util.json.Jsoner;
+
+@CommandDefinition(name = "internal-task", description = "List internal tasks of Camel integrations", generateHelp = true,
+                   footer = {
+                           "Examples:",
+                           "  camel get internal-task",
+                           "  camel get internal-task --watch" })
+public class ListInternalTask extends ProcessWatchCommand {
+
+    private static final RowSort<Row> ORDER = RowSort.<Row> integration(r -> r.pid, r -> r.name, r -> r.uptime);
+
+    @Argument(description = "Name or pid of running Camel integration")
+    String name = "*";
+
+    @Option(name = "sort", description = "Sort by pid, name or age", defaultValue = "pid",
+            completer = PidNameAgeCompletionCandidates.class)
+    String sort;
+
+    @Override
+    public Integer doProcessWatchCall() throws Exception {
+        List<Row> rows = new ArrayList<>();
+
+        forEachIntegration(name, (ph, root) -> {
+            // there must be a status file for the running Camel integration
+            Row row = new Row();
+            JsonObject context = (JsonObject) root.get("context");
+            if (context == null) {
+                return;
+            }
+            row.name = context.getString("name");
+            if ("CamelJBang".equals(row.name)) {
+                row.name = ProcessHelper.extractName(root, ph);
+            }
+            row.pid = Long.toString(ph.pid());
+            row.uptime = extractSince(ph);
+            row.age = TimeUtils.printSince(row.uptime);
+
+            JsonObject jo = (JsonObject) root.get("internal-tasks");
+            if (jo != null) {
+                JsonArray arr = (JsonArray) jo.get("tasks");
+                for (int i = 0; i < arr.size(); i++) {
+                    jo = (JsonObject) arr.get(i);
+                    row = row.copy();
+                    row.task = jo.getString("name");
+                    row.status = jo.getString("status");
+                    row.attempts = jo.getLong("attempts");
+                    row.delay = jo.getLong("delay");
+                    row.elapsed = jo.getLong("elapsed");
+                    row.firstTime = jo.getLong("firstTime");
+                    row.lastTime = jo.getLong("lastTime");
+                    row.nextTime = jo.getLong("nextTime");
+                    row.error = jo.getString("error");
+                    rows.add(row);
+                }
+            }
+        });
+
+        // sort rows
+        rows.sort(ORDER.comparator(sort));
+
+        if (!rows.isEmpty() || jsonOutput) {
+            if (jsonOutput) {
+                printer().println(Jsoner.serialize(rows.stream().map(r -> {
+                    JsonObject jo = new JsonObject();
+                    jo.put("pid", JsonValues.pid(r.pid));
+                    jo.put("name", r.name);
+                    jo.put("task", r.task);
+                    jo.put("status", r.status);
+                    jo.put("attempts", r.attempts);
+                    jo.put("delay", r.delay);
+                    jo.put("elapsed", r.elapsed);
+                    jo.put("first", getFirst(r));
+                    jo.put("firstTimestamp", r.firstTime > 0 ? r.firstTime : null);
+                    jo.put("last", getLast(r));
+                    jo.put("lastTimestamp", r.lastTime > 0 ? r.lastTime : null);
+                    jo.put("next", getNext(r));
+                    jo.put("nextTimestamp", r.nextTime > 0 ? r.nextTime : null);
+                    jo.put("failure", r.error);
+                    return jo;
+                }).collect(Collectors.toList())));
+            } else {
+                // Flexible column: FAILURE (140)
+                // Fixed columns: PID(8)+NAME(30)+TASK(10)+STATUS(8)+ATTEMPT(7)+DELAY(5)+ELAPSED(7)+FIRST(8)+LAST(8)+NEXT(8) ~= 99
+                int tw = terminalWidth();
+                int failW = TerminalWidthHelper.flexWidth(tw, 99, TerminalWidthHelper.noBorderOverhead(11), 20, 140);
+                printer().println(AsciiTable.getTable(AsciiTable.NO_BORDERS, rows, Arrays.asList(
+                        new Column().header("PID").headerAlign(HorizontalAlign.CENTER).with(r -> r.pid),
+                        new Column().header("NAME").dataAlign(HorizontalAlign.LEFT)
+                                .maxWidth(30, OverflowBehaviour.ELLIPSIS_RIGHT)
+                                .with(r -> r.name),
+                        new Column().header("TASK").dataAlign(HorizontalAlign.LEFT).with(r -> r.task),
+                        new Column().header("STATUS").dataAlign(HorizontalAlign.LEFT).with(r -> r.status),
+                        new Column().header("ATTEMPT").dataAlign(HorizontalAlign.LEFT).with(r -> "" + r.attempts),
+                        new Column().header("DELAY").dataAlign(HorizontalAlign.LEFT).with(r -> "" + r.delay),
+                        new Column().header("ELAPSED").dataAlign(HorizontalAlign.LEFT).with(this::getElapsed),
+                        new Column().header("FIRST").dataAlign(HorizontalAlign.LEFT).with(this::getFirst),
+                        new Column().header("LAST").dataAlign(HorizontalAlign.LEFT).with(this::getLast),
+                        new Column().header("NEXT").dataAlign(HorizontalAlign.LEFT).with(this::getNext),
+                        new Column().header("FAILURE").dataAlign(HorizontalAlign.LEFT)
+                                .maxWidth(failW, OverflowBehaviour.NEWLINE)
+                                .with(r -> r.error))));
+            }
+        }
+
+        return 0;
+    }
+
+    private String getElapsed(Row r) {
+        return TimeUtils.printAge(r.elapsed);
+    }
+
+    private String getFirst(Row r) {
+        if (r.firstTime > 0) {
+            return TimeUtils.printSince(r.firstTime);
+        }
+        return "";
+    }
+
+    private String getLast(Row r) {
+        if (r.lastTime > 0) {
+            return TimeUtils.printSince(r.lastTime, true);
+        }
+        return "";
+    }
+
+    private String getNext(Row r) {
+        if (r.nextTime > 0) {
+            long age = r.nextTime - System.currentTimeMillis();
+            return TimeUtils.printDuration(age, true);
+        }
+        return "";
+    }
+
+    private static class Row extends CopyableRow<Row> {
+        String pid;
+        String name;
+        long uptime;
+        String age;
+        String task;
+        String status;
+        long attempts;
+        long delay;
+        long elapsed;
+        long firstTime;
+        long lastTime;
+        long nextTime;
+        String error;
+    }
+
+}

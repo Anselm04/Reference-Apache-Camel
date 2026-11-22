@@ -1,0 +1,176 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.camel.language.datasonnet;
+
+import java.io.IOException;
+import java.nio.charset.StandardCharsets;
+import java.util.HashMap;
+import java.util.Map;
+import java.util.Optional;
+import java.util.function.Supplier;
+
+import com.datasonnet.Mapper;
+import com.datasonnet.document.MediaType;
+import io.github.classgraph.ClassGraph;
+import io.github.classgraph.ScanResult;
+import org.apache.camel.Expression;
+import org.apache.camel.Predicate;
+import org.apache.camel.component.dataweave.DataWeaveConversionException;
+import org.apache.camel.component.dataweave.DataWeaveConverter;
+import org.apache.camel.spi.BodyType;
+import org.apache.camel.spi.BodyType.Carrier;
+import org.apache.camel.spi.BodyTypes;
+import org.apache.camel.spi.annotations.Language;
+import org.apache.camel.support.LRUCacheFactory;
+import org.apache.camel.support.SingleInputTypedLanguageSupport;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+@Language("datasonnet")
+@BodyTypes(expressionIn = @BodyType(value = Carrier.ANY, dependsOn = { "bodyMediaType", "source" },
+                                    description = "The body as it is, in the variable body. JSON, XML or CSV text is read in"
+                                                  + " that format only with bodyMediaType or a Content-Type header, and"
+                                                  + " without them a stream is read as text"),
+           expressionOut = @BodyType(value = { Carrier.POJO, Carrier.NULL }, javaType = "com.datasonnet.document.Document",
+                                     dependsOn = "outputMediaType",
+                                     javaTypeOption = "resultType",
+                                     description = "A Document with the result: a Java object, or text in outputMediaType"
+                                                   + " when it is set, and null when the result is null"))
+public class DatasonnetLanguage extends SingleInputTypedLanguageSupport {
+    private static final Logger LOG = LoggerFactory.getLogger(DatasonnetLanguage.class);
+    private final Map<String, String> classpathImports;
+
+    // Cache used to stores the Mappers
+    // See: {@link GroovyLanguage}
+    private final Map<String, Mapper> mapperCache = LRUCacheFactory.newLRUSoftCache(16, 1000, true);
+
+    public DatasonnetLanguage() {
+        this.classpathImports = discoverDataSonnetLibraries();
+    }
+
+    public DatasonnetLanguage(Map<String, String> classpathImports) {
+        this.classpathImports = classpathImports;
+    }
+
+    @Override
+    public Predicate createPredicate(String expression) {
+        return createPredicate(expression, null);
+    }
+
+    @Override
+    public Expression createExpression(String expression) {
+        return createExpression(expression, null);
+    }
+
+    @Override
+    public Predicate createPredicate(String expression, Object[] properties) {
+        return (Predicate) createExpression(expression, properties);
+    }
+
+    @Override
+    public Expression createExpression(String expression, Object[] properties) {
+        if (expression != null) {
+            boolean dwlResource = isDataWeaveResource(expression);
+            if (dwlResource) {
+                expression = loadResource(expression);
+            }
+            if (dwlResource || isDataWeaveContent(expression)) {
+                expression = convertDataWeave(expression);
+            }
+        }
+        return super.createExpression(expression, properties);
+    }
+
+    @Override
+    public Expression createExpression(Expression source, String expression, Object[] properties) {
+        DatasonnetExpression answer = new DatasonnetExpression(expression);
+        answer.setSource(source);
+        answer.setResultType(property(Class.class, properties, 0, null));
+        String mediaType = property(String.class, properties, 2, null);
+        if (mediaType != null) {
+            answer.setBodyMediaType(MediaType.valueOf(mediaType));
+        }
+        mediaType = property(String.class, properties, 3, null);
+        if (mediaType != null) {
+            answer.setOutputMediaType(MediaType.valueOf(mediaType));
+        }
+        if (getCamelContext() != null) {
+            answer.init(getCamelContext());
+        }
+        return answer;
+    }
+
+    Optional<Mapper> lookup(String script) {
+        return Optional.ofNullable(mapperCache.get(script));
+    }
+
+    Mapper computeIfMiss(String script, Supplier<Mapper> mapperSupplier) {
+        return mapperCache.computeIfAbsent(script, k -> mapperSupplier.get());
+    }
+
+    public Map<String, String> getClasspathImports() {
+        return classpathImports;
+    }
+
+    private static boolean isDataWeaveResource(String expression) {
+        return expression != null && expression.endsWith(".dwl");
+    }
+
+    private static boolean isDataWeaveContent(String expression) {
+        return expression != null && expression.stripLeading().startsWith("%dw");
+    }
+
+    private static String convertDataWeave(String expression) {
+        DataWeaveConverter converter = new DataWeaveConverter();
+        converter.setIncludeComments(false);
+        String result;
+        if (expression.contains("%dw") || expression.contains("---")) {
+            result = converter.convert(expression);
+        } else {
+            result = converter.convertExpression(expression);
+        }
+        if (converter.getTodoCount() > 0) {
+            throw new DataWeaveConversionException(
+                    "DataWeave expression contains " + converter.getTodoCount()
+                                                   + " construct(s) that cannot be auto-converted to DataSonnet."
+                                                   + " Rewrite those constructs in DataSonnet directly, or use a .ds script instead."
+                                                   + " Converted expression was: " + result);
+        }
+        LOG.debug("Converted DataWeave to DataSonnet: {} expression(s)", converter.getConvertedCount());
+        return result;
+    }
+
+    private Map<String, String> discoverDataSonnetLibraries() {
+        Map<String, String> imports = new HashMap<>();
+        try (ScanResult scanResult = new ClassGraph().acceptPaths("/").scan()) {
+            try {
+                scanResult.getResourcesWithExtension("libsonnet")
+                        .forEachByteArrayThrowingIOException((resource, bytes) -> {
+                            if (LOG.isDebugEnabled()) {
+                                LOG.debug("Loading DataSonnet library: {}", resource.getPath());
+                            }
+                            imports.put(resource.getPath(), new String(bytes, StandardCharsets.UTF_8));
+                        });
+            } catch (IOException e) {
+                if (LOG.isWarnEnabled()) {
+                    LOG.warn("Failed to load DataSonnet libraries", e);
+                }
+            }
+        }
+        return imports;
+    }
+}

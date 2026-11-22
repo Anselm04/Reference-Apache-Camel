@@ -1,0 +1,204 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.camel.dsl.jbang.core.commands.infra;
+
+import java.io.File;
+import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Map;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.stream.Collectors;
+
+import org.aesh.command.CommandDefinition;
+import org.aesh.command.option.Arguments;
+import org.aesh.command.option.Mixin;
+import org.aesh.command.option.Option;
+import org.apache.camel.dsl.jbang.core.commands.CommandHelper;
+import org.apache.camel.dsl.jbang.core.commands.DurationMixin;
+import org.apache.camel.dsl.jbang.core.common.CliExitCode;
+import org.apache.camel.dsl.jbang.core.common.CommandLineHelper;
+import org.apache.commons.io.input.ReversedLinesFileReader;
+import org.apache.commons.io.input.Tailer;
+import org.apache.commons.io.input.TailerListener;
+
+@CommandDefinition(name = "log", description = "Displays external service logs", generateHelp = true,
+                   footer = {
+                           "Examples:",
+                           "  camel infra log",
+                           "  camel infra log kafka" })
+public class InfraLog extends InfraBaseCommand {
+
+    @Arguments(description = "Service name")
+    List<String> serviceName;
+
+    @Option(name = "lines", description = "The number of lines from the end of the log to use as starting offset",
+            defaultValue = "50")
+    int logLines = 50;
+
+    @Option(name = "follow", hasValue = false,
+            description = "Keep following and outputting new log lines (press enter to exit)."
+                          + " Without an interactive terminal the default is false, unless --duration is given.",
+            defaultValue = "true")
+    boolean follow = true;
+
+    @Mixin
+    DurationMixin durationOption = new DurationMixin();
+
+    private ExecutorService executorService;
+
+    public InfraLog() {
+        executorService = Executors.newFixedThreadPool(10);
+    }
+
+    /**
+     * Tails the log of every running instance, rather than the first log file that happens to match the alias. Two
+     * instances of the same service each have their own log, so both are followed and their lines are prefixed with the
+     * pid to tell them apart.
+     */
+    @Override
+    public Integer doCall() throws Exception {
+        String name = serviceName == null || serviceName.isEmpty() ? null : serviceName.get(0);
+
+        List<RunningService> instances = findRunningServices(name);
+
+        // only carry the pid in the prefix when there is more than one instance of that alias to disambiguate
+        Map<String, Long> instancesPerAlias = instances.stream()
+                .collect(Collectors.groupingBy(RunningService::alias, Collectors.counting()));
+
+        follow = isFollowing(follow, durationOption.getDuration());
+
+        List<Future<?>> futures = new ArrayList<>();
+        int printed = 0;
+        for (RunningService instance : instances) {
+            Path logFile = CommandLineHelper.getCamelDir().resolve(getLogFileName(instance.alias(), instance.pid()));
+            if (!Files.isRegularFile(logFile)) {
+                // the service has not written any log yet
+                continue;
+            }
+            String prefix = instancesPerAlias.get(instance.alias()) > 1
+                    ? instance.alias() + "-" + instance.pid() : instance.alias();
+            if (follow) {
+                createTailer(logFile.toFile(), prefix, futures);
+            } else {
+                // the end of the log
+                for (String line : lastLines(logFile.toFile())) {
+                    printer().println("[" + prefix + "] " + line);
+                }
+                printed++;
+            }
+        }
+        if (!follow && printed > 0) {
+            return 0;
+        }
+
+        if (futures.isEmpty()) {
+            if (name != null) {
+                printer().printErr("Log not found for service " + name);
+            } else {
+                printer().printErr("There are no running services");
+            }
+            return CliExitCode.NOT_FOUND;
+        }
+
+        // until the services have stopped (their log file is gone), Enter is pressed, or the --duration has passed
+        CommandHelper.RunUntil until = CommandHelper.RunUntil.start(durationOption.getDuration());
+        try {
+            while (until.isRunning() && futures.stream().anyMatch(f -> !f.isDone())) {
+                Thread.sleep(100);
+            }
+        } finally {
+            // stop tailing
+            futures.forEach(f -> f.cancel(true));
+        }
+
+        return 0;
+    }
+
+    private List<String> lastLines(File logFile) throws IOException {
+        try (ReversedLinesFileReader fileReader = ReversedLinesFileReader.builder().setFile(logFile).get()) {
+            List<String> lines = new ArrayList<>(logLines);
+            for (int i = 0; i < logLines; i++) {
+                String line = fileReader.readLine();
+                if (line == null) {
+                    break;
+                }
+                lines.add(0, line);
+            }
+            return lines;
+        }
+    }
+
+    private void createTailer(File logFile, String alias, List<Future<?>> futures) {
+        Tailer tailer = Tailer.builder()
+                .setFile(logFile)
+                .setTailFromEnd(true)
+                .setTailerListener(new StdoutTailerListener(alias))
+                // tailed by the executor service below, which tells when it is done
+                .setStartThread(false)
+                .get();
+
+        futures.add(executorService.submit(tailer));
+    }
+
+    class StdoutTailerListener implements TailerListener {
+
+        private final String suffix;
+        private Tailer self;
+
+        public StdoutTailerListener(String suffix) {
+            this.suffix = suffix;
+        }
+
+        @Override
+        public void fileNotFound() {
+        }
+
+        @Override
+        public void fileRotated() {
+        }
+
+        @Override
+        public void handle(Exception ex) {
+            if (!(ex instanceof InterruptedException)) {
+                // the log file is gone (interrupted is when the command stops tailing)
+                printer().println("The service " + suffix + " was stopped");
+            }
+            this.self.close();
+            Thread.currentThread().interrupt();
+        }
+
+        @Override
+        public void handle(String line) {
+            printer().println("[" + suffix + "] " + line);
+        }
+
+        @Override
+        public void init(Tailer tailer) {
+            this.self = tailer;
+            try {
+                lastLines(tailer.getFile()).forEach(this::handle);
+            } catch (IOException e) {
+                printer().printErr("Error initializing logs", e);
+            }
+        }
+    }
+}

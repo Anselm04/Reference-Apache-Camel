@@ -1,0 +1,383 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.camel.dsl.jbang.launcher.selfupdate;
+
+import java.io.ByteArrayInputStream;
+import java.io.IOException;
+import java.net.ProxySelector;
+import java.net.URI;
+import java.net.http.HttpClient;
+import java.net.http.HttpRequest;
+import java.net.http.HttpResponse;
+import java.nio.charset.StandardCharsets;
+import java.time.Duration;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+
+import javax.xml.XMLConstants;
+import javax.xml.parsers.DocumentBuilder;
+import javax.xml.parsers.DocumentBuilderFactory;
+
+import org.w3c.dom.Document;
+import org.w3c.dom.Element;
+import org.w3c.dom.NodeList;
+
+import org.apache.camel.dsl.jbang.run.common.VersionHelper;
+
+/**
+ * Fetches and parses the website-installer manifest ({@code latest.properties}/{@code X.Y.Z.properties}). Mirrors
+ * {@code install.sh}'s {@code parse_manifest} exactly, in Java. Used only for the pre-flight version compare that
+ * neither {@code install.sh} nor {@code install.ps1} perform on their own -- the actual archive download, checksum
+ * verification, and extraction happen inside whichever of those two scripts {@code SelfUpdateCommand} delegates to.
+ * <p>
+ * For the nightly builds (see {@link Nightly}) it reads the {@code maven-metadata.xml} of the Apache snapshot
+ * repository instead, the same files {@code install.sh} resolves them from.
+ */
+public final class ManifestFetcher implements AutoCloseable {
+
+    private static final String DEFAULT_MANIFEST_BASE_URL = "https://camel.apache.org/camel-cli/releases";
+    private static final String DEFAULT_MAVEN_BASE_URL = "https://repo1.maven.org/maven2/org/apache/camel/camel-launcher";
+    private static final String DEFAULT_SNAPSHOT_BASE_URL
+            = "https://repository.apache.org/content/repositories/snapshots/org/apache/camel/camel-launcher";
+    private static final Duration CONNECT_TIMEOUT = Duration.ofSeconds(10);
+
+    public record Manifest(String version, String tarSha256, String zipSha256) {
+    }
+
+    private final String manifestBaseUrl;
+    private final String mavenBaseUrl;
+    private final String snapshotBaseUrl;
+    private final HttpClient httpClient;
+
+    public ManifestFetcher(String manifestBaseUrl, String mavenBaseUrl) {
+        this(manifestBaseUrl, mavenBaseUrl, DEFAULT_SNAPSHOT_BASE_URL);
+    }
+
+    public ManifestFetcher(String manifestBaseUrl, String mavenBaseUrl, String snapshotBaseUrl) {
+        this(manifestBaseUrl, mavenBaseUrl, snapshotBaseUrl,
+             HttpClient.newBuilder().proxy(ProxySelector.getDefault()).build());
+    }
+
+    // Visible for testing: SelfUpdateIntegrationTest injects an HttpClient whose SSLContext trusts the
+    // WebsiteInstallerFixture's self-signed certificate authority, since the platform default trust store
+    // (used by the constructors without an HttpClient) has no way to know about a test-only CA. Production
+    // callers go through fromEnvironment(), which uses the three-arg constructor.
+    public ManifestFetcher(String manifestBaseUrl, String mavenBaseUrl, HttpClient httpClient) {
+        this(manifestBaseUrl, mavenBaseUrl, DEFAULT_SNAPSHOT_BASE_URL, httpClient);
+    }
+
+    public ManifestFetcher(String manifestBaseUrl, String mavenBaseUrl, String snapshotBaseUrl, HttpClient httpClient) {
+        this.manifestBaseUrl = manifestBaseUrl;
+        this.mavenBaseUrl = mavenBaseUrl;
+        this.snapshotBaseUrl = snapshotBaseUrl;
+        this.httpClient = httpClient;
+    }
+
+    /**
+     * Production wiring: {@code CAMEL_SELF_UPDATE_MANIFEST_BASE_URL}/{@code CAMEL_SELF_UPDATE_MAVEN_BASE_URL}/
+     * {@code CAMEL_SELF_UPDATE_SNAPSHOT_BASE_URL} override the defaults, mirroring {@code install.sh}'s
+     * {@code CAMEL_INSTALL_*} test seams under a distinct name so overriding one never accidentally affects the other.
+     * Production installs never set either.
+     */
+    public static ManifestFetcher fromEnvironment() {
+        String manifestBaseUrl = System.getenv().getOrDefault("CAMEL_SELF_UPDATE_MANIFEST_BASE_URL",
+                DEFAULT_MANIFEST_BASE_URL);
+        String mavenBaseUrl = System.getenv().getOrDefault("CAMEL_SELF_UPDATE_MAVEN_BASE_URL",
+                DEFAULT_MAVEN_BASE_URL);
+        String snapshotBaseUrl = System.getenv().getOrDefault("CAMEL_SELF_UPDATE_SNAPSHOT_BASE_URL",
+                DEFAULT_SNAPSHOT_BASE_URL);
+        return new ManifestFetcher(manifestBaseUrl, mavenBaseUrl, snapshotBaseUrl);
+    }
+
+    /**
+     * Closes the HTTP client, whose selector thread would otherwise delay the exit of the JVM by up to 300 ms.
+     */
+    @Override
+    public void close() {
+        httpClient.close();
+    }
+
+    public String manifestBaseUrl() {
+        return manifestBaseUrl;
+    }
+
+    public String mavenBaseUrl() {
+        return mavenBaseUrl;
+    }
+
+    public Manifest fetchLatest() {
+        return fetchManifest(manifestBaseUrl + "/latest.properties");
+    }
+
+    public Manifest fetch(String version) {
+        return fetchManifest(manifestBaseUrl + "/" + version + ".properties");
+    }
+
+    /**
+     * Whether release {@code version} ({@code X.Y.Z}) is published on the website. Any failure to tell (no manifest, no
+     * network) counts as not published: it only decides whether a hint is printed.
+     */
+    public boolean isReleased(String version) {
+        try {
+            return version.equals(fetch(version).version());
+        } catch (SelfUpdateException e) {
+            return false;
+        }
+    }
+
+    /**
+     * Fetches a release alias published next to the per-version manifests: {@code lts} ({@code lts.properties}, the
+     * newest LTS release) or a release line {@code X.Y} ({@code X.Y.properties}, the newest patch of that line). The
+     * caller checks that the returned version belongs to the line it asked for.
+     */
+    public Manifest fetchAlias(String name) {
+        String label;
+        if ("lts".equalsIgnoreCase(name)) {
+            name = "lts";
+            label = "LTS";
+        } else if (name != null && name.matches("[0-9]+\\.[0-9]+")) {
+            label = name;
+        } else {
+            throw new IllegalArgumentException("not a release alias (expected lts or X.Y): " + name);
+        }
+        String url = manifestBaseUrl + "/" + name + ".properties";
+        return parse(get(url, "no manifest for " + label + " at " + url + "; the website may not publish aliases yet"));
+    }
+
+    private Manifest fetchManifest(String url) {
+        return parse(get(url, null));
+    }
+
+    /**
+     * The snapshot version of main: the highest {@code X.Y.Z-SNAPSHOT} in the snapshot repository (the maintenance
+     * branches publish nightly builds too, under lower versions).
+     */
+    public String fetchLatestSnapshotVersion() {
+        return latestSnapshotVersion(fetchSnapshotVersions());
+    }
+
+    /**
+     * The snapshot versions ({@code X.Y.Z-SNAPSHOT}) the snapshot repository publishes nightly builds of: main and the
+     * maintenance branches. The repository removes a snapshot version some time after its release.
+     */
+    public List<String> fetchSnapshotVersions() {
+        String url = snapshotBaseUrl + "/maven-metadata.xml";
+        return parseSnapshotVersions(get(url, "no nightly builds at " + url, "snapshot metadata"));
+    }
+
+    /** The snapshot version of main: the highest of {@code snapshotVersions}. */
+    public static String latestSnapshotVersion(List<String> snapshotVersions) {
+        String latest = null;
+        for (String version : snapshotVersions) {
+            if (latest == null || VersionHelper.compare(base(version), base(latest)) > 0) {
+                latest = version;
+            }
+        }
+        if (latest == null) {
+            throw new SelfUpdateException("the snapshot repository lists no X.Y.Z-SNAPSHOT version");
+        }
+        return latest;
+    }
+
+    /**
+     * The newest nightly build of {@code snapshotVersion} ({@code X.Y.Z-SNAPSHOT}), such as
+     * {@code 4.24.0-20261108.143653-24}.
+     */
+    public String fetchNewestBuild(String snapshotVersion) {
+        if (!Nightly.isSnapshotVersion(snapshotVersion)) {
+            throw new IllegalArgumentException("not a snapshot version (expected X.Y.Z-SNAPSHOT): " + snapshotVersion);
+        }
+        String url = snapshotBaseUrl + "/" + snapshotVersion + "/maven-metadata.xml";
+        return parseNewestBuild(get(url, "no nightly builds of " + snapshotVersion + " at " + url, "snapshot metadata"),
+                snapshotVersion);
+    }
+
+    private byte[] get(String url, String notFoundMessage) {
+        return get(url, notFoundMessage, "manifest");
+    }
+
+    private byte[] get(String url, String notFoundMessage, String what) {
+        try {
+            HttpRequest request = HttpRequest.newBuilder(URI.create(url)).timeout(CONNECT_TIMEOUT).build();
+            HttpResponse<byte[]> response = httpClient.send(request, HttpResponse.BodyHandlers.ofByteArray());
+            if (response.statusCode() == 404 && notFoundMessage != null) {
+                throw new SelfUpdateException(notFoundMessage);
+            }
+            if (response.statusCode() != 200) {
+                throw new SelfUpdateException(
+                        "failed to download " + what + " from " + url + " (HTTP "
+                                              + response.statusCode() + ")");
+            }
+            return response.body();
+        } catch (SelfUpdateException e) {
+            throw e;
+        } catch (IOException e) {
+            throw new SelfUpdateException("failed to download " + what + " from " + url, e);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new SelfUpdateException("failed to download " + what + " from " + url, e);
+        }
+    }
+
+    // Package-visible for direct unit testing without a network round-trip. Mirrors install.sh's parse_manifest:
+    // exactly 4 non-blank key=value lines, no duplicate/unknown keys, format=1, X.Y.Z version, 64-char lowercase
+    // hex hashes. CRLF-tolerant (a trailing '\r' is stripped per line) because install.ps1 may have produced or
+    // re-served the same manifest. '#' comment lines (e.g. the ASF license header WebsiteManifestGenerator
+    // prepends) are skipped and don't count toward the four-line total, matching install.sh/install.ps1 and
+    // WebsiteManifestGenerator's own parseStrictManifest.
+    static Manifest parse(byte[] content) {
+        String text = new String(content, StandardCharsets.UTF_8);
+        String[] rawLines = text.split("\n", -1);
+        int rawLineCount = rawLines.length > 0 && rawLines[rawLines.length - 1].isEmpty()
+                ? rawLines.length - 1
+                : rawLines.length;
+
+        List<String> dataLines = new ArrayList<>();
+        for (int i = 0; i < rawLineCount; i++) {
+            String line = rawLines[i];
+            if (line.endsWith("\r")) {
+                line = line.substring(0, line.length() - 1);
+            }
+            if (line.startsWith("#")) {
+                continue;
+            }
+            dataLines.add(line);
+        }
+        if (dataLines.size() != 4) {
+            throw new SelfUpdateException("manifest must contain exactly four lines");
+        }
+
+        Map<String, String> values = new HashMap<>();
+        for (String line : dataLines) {
+            int eq = line.indexOf('=');
+            if (eq <= 0 || eq == line.length() - 1) {
+                throw new SelfUpdateException("manifest contains a blank line");
+            }
+            String key = line.substring(0, eq);
+            String value = line.substring(eq + 1);
+            if (!Set.of("format", "version", "tar_sha256", "zip_sha256").contains(key)) {
+                throw new SelfUpdateException("manifest has unknown key: " + key);
+            }
+            if (values.containsKey(key)) {
+                throw new SelfUpdateException("manifest has duplicate key: " + key);
+            }
+            values.put(key, value);
+        }
+
+        for (String required : List.of("format", "version", "tar_sha256", "zip_sha256")) {
+            if (!values.containsKey(required)) {
+                throw new SelfUpdateException("manifest is missing a required key");
+            }
+        }
+
+        if (!"1".equals(values.get("format"))) {
+            throw new SelfUpdateException("unsupported manifest format: " + values.get("format"));
+        }
+        String version = values.get("version");
+        if (!version.matches("[0-9]+\\.[0-9]+\\.[0-9]+")) {
+            throw new SelfUpdateException("manifest version is not a valid X.Y.Z value");
+        }
+        validateSha256(values.get("tar_sha256"), "manifest tar_sha256");
+        validateSha256(values.get("zip_sha256"), "manifest zip_sha256");
+
+        return new Manifest(version, values.get("tar_sha256"), values.get("zip_sha256"));
+    }
+
+    // Package-visible for unit testing. The highest X.Y.Z-SNAPSHOT of <versions>; other entries are ignored.
+    static String parseLatestSnapshotVersion(byte[] content) {
+        return latestSnapshotVersion(parseSnapshotVersions(content));
+    }
+
+    // Package-visible for unit testing. The X.Y.Z-SNAPSHOT entries of <versions>, in the order listed; other entries
+    // are ignored.
+    static List<String> parseSnapshotVersions(byte[] content) {
+        List<String> result = new ArrayList<>();
+        NodeList versions = parseXml(content).getElementsByTagName("version");
+        for (int i = 0; i < versions.getLength(); i++) {
+            String version = versions.item(i).getTextContent().strip();
+            if (Nightly.isSnapshotVersion(version) && !result.contains(version)) {
+                result.add(version);
+            }
+        }
+        return result;
+    }
+
+    // Package-visible for unit testing. The <value> of the bin tar.gz <snapshotVersion> (Maven 3 metadata), or else
+    // the <timestamp>-<buildNumber> of the <snapshot> (Maven 2 metadata, which Nexus 2 serves to a client it does not
+    // take for Maven 3, such as the JDK HTTP client), as all the files of one deploy share them. It must be a nightly
+    // build of snapshotVersion: it is used in a directory name and a download URL.
+    static String parseNewestBuild(byte[] content, String snapshotVersion) {
+        Document document = parseXml(content);
+        String build = null;
+        NodeList entries = document.getElementsByTagName("snapshotVersion");
+        for (int i = 0; i < entries.getLength() && build == null; i++) {
+            Element entry = (Element) entries.item(i);
+            if ("bin".equals(childText(entry, "classifier")) && "tar.gz".equals(childText(entry, "extension"))) {
+                build = childText(entry, "value");
+            }
+        }
+        if (build == null) {
+            NodeList snapshots = document.getElementsByTagName("snapshot");
+            if (snapshots.getLength() == 0) {
+                throw new SelfUpdateException("the snapshot metadata of " + snapshotVersion + " has no nightly build");
+            }
+            Element snapshot = (Element) snapshots.item(0);
+            build = base(snapshotVersion) + "-" + childText(snapshot, "timestamp") + "-" + childText(snapshot, "buildNumber");
+        }
+        if (!Nightly.isBuild(build) || !Nightly.snapshotVersionOf(build).equals(snapshotVersion)) {
+            throw new SelfUpdateException(
+                    "the snapshot metadata names an invalid nightly build of " + snapshotVersion + ": " + build);
+        }
+        return build;
+    }
+
+    private static String base(String snapshotVersion) {
+        return snapshotVersion.substring(0, snapshotVersion.length() - "-SNAPSHOT".length());
+    }
+
+    private static String childText(Element parent, String name) {
+        NodeList children = parent.getElementsByTagName(name);
+        return children.getLength() > 0 ? children.item(0).getTextContent().strip() : null;
+    }
+
+    // The metadata comes from the network: no DTD, no external entities or schemas. The JDK's own parser, not
+    // whichever one the class path offers (an old Xerces is on it, which does not know the JAXP 1.5 properties).
+    private static Document parseXml(byte[] content) {
+        try {
+            DocumentBuilderFactory factory = DocumentBuilderFactory.newDefaultInstance();
+            factory.setFeature(XMLConstants.FEATURE_SECURE_PROCESSING, true);
+            factory.setFeature("http://apache.org/xml/features/disallow-doctype-decl", true);
+            factory.setAttribute(XMLConstants.ACCESS_EXTERNAL_DTD, "");
+            factory.setAttribute(XMLConstants.ACCESS_EXTERNAL_SCHEMA, "");
+            factory.setXIncludeAware(false);
+            factory.setExpandEntityReferences(false);
+            DocumentBuilder builder = factory.newDocumentBuilder();
+            return builder.parse(new ByteArrayInputStream(content));
+        } catch (Exception e) {
+            throw new SelfUpdateException("the snapshot metadata is not valid: " + e.getMessage(), e);
+        }
+    }
+
+    private static void validateSha256(String value, String label) {
+        if (!value.matches("[0-9a-f]{64}")) {
+            throw new SelfUpdateException(label + " is not a 64-character lowercase hex value");
+        }
+    }
+}

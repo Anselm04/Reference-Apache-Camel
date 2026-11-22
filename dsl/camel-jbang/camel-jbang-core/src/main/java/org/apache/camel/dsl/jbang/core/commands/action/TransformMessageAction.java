@@ -1,0 +1,333 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.camel.dsl.jbang.core.commands.action;
+
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.text.SimpleDateFormat;
+import java.util.Date;
+import java.util.List;
+
+import org.aesh.command.CommandDefinition;
+import org.aesh.command.option.Mixin;
+import org.aesh.command.option.Option;
+import org.aesh.command.option.OptionList;
+import org.apache.camel.dsl.jbang.core.commands.MavenResolverMixin;
+import org.apache.camel.dsl.jbang.core.commands.Run;
+import org.apache.camel.dsl.jbang.core.common.ActionClient;
+import org.apache.camel.dsl.jbang.core.common.ActionClient.ActionResult;
+import org.apache.camel.dsl.jbang.core.common.CliException;
+import org.apache.camel.dsl.jbang.core.common.CliExitCode;
+import org.apache.camel.dsl.jbang.core.common.CommandLineHelper;
+import org.apache.camel.dsl.jbang.core.common.TimeoutConverter;
+import org.apache.camel.dsl.jbang.run.common.PathUtils;
+import org.apache.camel.dsl.jbang.run.common.VersionHelper;
+import org.apache.camel.util.StringHelper;
+import org.apache.camel.util.TimeUtils;
+import org.apache.camel.util.json.JsonArray;
+import org.apache.camel.util.json.JsonObject;
+import org.apache.camel.util.json.Jsoner;
+import org.jline.jansi.Ansi;
+
+@CommandDefinition(name = "message",
+                   description = "Transform message from one format to another via an existing running Camel integration",
+                   generateHelp = true,
+                   footer = {
+                           "Examples:",
+                           "  camel transform message --body='Hello World' --language=simple --template='Bye ${body}'" })
+public class TransformMessageAction extends ActionWatchCommand {
+
+    @Option(name = "camel-version", description = "To run using a different Camel version than the default version.")
+    String camelVersion;
+
+    @Option(name = "body", description = "Message body to send (prefix with file: to refer to loading message body from file)",
+            required = true)
+    String body;
+
+    @OptionList(name = "header", valueSeparator = OptionList.NO_SEPARATOR, description = "Message header (key=value)")
+    List<String> headers;
+
+    @Option(name = "source",
+            description = "Instead of using external template file then refer to an existing Camel route source with inlined Camel language expression in a route. (use :line-number or :id to refer to the exact location of the EIP to use)")
+    String source;
+
+    @Option(name = "language", description = "The language to use for message transformation")
+    String language;
+
+    @Option(name = "component", description = "The component to use for message transformation")
+    String component;
+
+    @Option(name = "dataformat", description = "The dataformat to use for message transformation")
+    String dataformat;
+
+    @Option(name = "template",
+            description = "The template to use for message transformation (prefix with file: to refer to loading template from file)")
+    String template;
+
+    @OptionList(name = "option", valueSeparator = OptionList.NO_SEPARATOR,
+                description = "Option for additional configuration of the used language, component or dataformat (key=value)")
+    List<String> options;
+
+    @Option(name = "output", description = "File to store output. If none provide then output is printed to console.")
+    String output;
+
+    @Option(name = "show-exchange-properties", hasValue = false,
+            description = "Show exchange properties from the output message", defaultValue = "false")
+    boolean showExchangeProperties;
+
+    @Option(name = "show-headers", hasValue = false, description = "Show message headers from the output message",
+            defaultValue = "true")
+    boolean showHeaders = true;
+
+    @Option(name = "show-body", hasValue = false, description = "Show message body from the output message",
+            defaultValue = "true")
+    boolean showBody = true;
+
+    @Option(name = "show-exception", hasValue = false, description = "Show exception and stacktrace for failed transformation",
+            defaultValue = "true")
+    boolean showException = true;
+
+    @Option(name = "timeout",
+            description = "Timeout waiting for message to be transformed, in millis or as a duration such as 30s",
+            defaultValue = "20000", converter = TimeoutConverter.class)
+    long timeout = 20000;
+
+    @Option(name = "logging-color", hasValue = false, description = "Use colored logging", defaultValue = "true")
+    boolean loggingColor = true;
+
+    @Option(name = "pretty", hasValue = false, description = "Pretty print message body when using JSon or XML format")
+    boolean pretty;
+
+    @Mixin
+    MavenResolverMixin mavenResolver;
+
+    // the Camel this command started
+    volatile long pid;
+
+    private MessageTableHelper tableHelper;
+
+    @Override
+    public Integer doCall() throws Exception {
+        if (dataformat == null) {
+            // either source or language/template is required
+            if (source == null && template == null && language == null && component == null) {
+                printer().printErr("Either source or template and one of language/component must be configured");
+                return CliExitCode.USAGE;
+            }
+            if (source == null && (template == null || language == null && component == null)) {
+                printer().printErr("Both template and one of language/component must be configured");
+                return CliExitCode.USAGE;
+            }
+        }
+
+        // does files exists
+        if (source != null && source.startsWith("file:")) {
+            String s = source.substring(5);
+            s = StringHelper.beforeLast(s, ":", s); // remove line number
+            Path f = Path.of(s);
+            if (!Files.exists(f)) {
+                printer().printErr("Source file does not exist: " + f);
+                return CliExitCode.FILE_NOT_FOUND;
+            }
+        }
+        if (template != null && template.startsWith("file:")) {
+            Path f = Path.of(template.substring(5));
+            if (!Files.exists(f)) {
+                printer().printErr("Template file does not exist: " + f);
+                return CliExitCode.FILE_NOT_FOUND;
+            }
+        }
+
+        Integer exit;
+        try {
+            // start a new empty camel in the background
+            Run run = getMain().command(new Run());
+            // requires camel 4.3 onwards
+            if (camelVersion != null && VersionHelper.isLE(camelVersion, "4.2.0")) {
+                printer().printErr("This requires Camel version 4.3 or newer");
+                return CliExitCode.USAGE;
+            }
+            exit = run.runTransformMessage(camelVersion, mavenResolver);
+            this.pid = run.spawnPid;
+            if (exit == 0) {
+                exit = super.doCall();
+            }
+        } finally {
+            if (pid > 0) {
+                // stop running camel as we are done
+                Path parent = CommandLineHelper.getCamelDir();
+                Path pidFile = parent.resolve(Long.toString(pid));
+                if (Files.exists(pidFile)) {
+                    PathUtils.deleteFile(pidFile);
+                }
+            }
+        }
+
+        return exit;
+    }
+
+    @Override
+    protected Integer doWatchCall() throws Exception {
+        JsonObject root = new JsonObject();
+        root.put("action", "transform");
+        if (source != null) {
+            root.put("source", source);
+        }
+        if (language != null) {
+            root.put("language", language);
+        }
+        if (component != null) {
+            root.put("component", component);
+        }
+        if (dataformat != null) {
+            root.put("dataformat", dataformat);
+        }
+        if (template != null) {
+            root.put("template", Jsoner.escape(template));
+        }
+        root.put("body", Jsoner.escape(body));
+        if (headers != null) {
+            JsonArray arr = new JsonArray();
+            for (String h : headers) {
+                JsonObject jo = new JsonObject();
+                if (!h.contains("=")) {
+                    throw CliException.usage("Header must be in key=value format, was: " + h);
+                }
+                jo.put("key", StringHelper.before(h, "="));
+                jo.put("value", StringHelper.after(h, "="));
+                arr.add(jo);
+            }
+            root.put("headers", arr);
+        }
+        if (options != null) {
+            JsonArray arr = new JsonArray();
+            for (String h : options) {
+                JsonObject jo = new JsonObject();
+                if (!h.contains("=")) {
+                    throw CliException.usage("Option must be in key=value format, was: " + h);
+                }
+                jo.put("key", StringHelper.before(h, "="));
+                jo.put("value", StringHelper.after(h, "="));
+                arr.add(jo);
+            }
+            root.put("options", arr);
+        }
+        // the Camel this command started
+        ActionResult result = ActionClient.execute(pid, root, timeout);
+        JsonObject jo = result.reply();
+        if (jo == null) {
+            // an integration that stopped before it answered is not a timeout
+            String error
+                    = result.status() == ActionClient.Status.TIMEOUT ? "Transform timeout: " + result.error() : result.error();
+            throw new CliException(result.exitCode(), error);
+        }
+        printStatusLine(jo);
+        String exchangeId = jo.getString("exchangeId");
+        JsonObject message = jo.getMap("message");
+        JsonObject cause = jo.getMap("exception");
+        if (!result.isOk() && message == null && cause == null) {
+            // the integration failed the action itself, so there is no message to show
+            printer().printErr(result.error());
+        }
+        if (message != null || cause != null) {
+            if (output != null) {
+                Path target = Path.of(output);
+                String json = jo.toJson();
+                if (pretty) {
+                    json = Jsoner.prettyPrint(json, 2);
+                }
+                Files.writeString(target, json);
+            }
+            if (!showExchangeProperties && message != null) {
+                message.remove("exchangeProperties");
+            }
+            if (!showHeaders && message != null) {
+                message.remove("headers");
+            }
+            if (!showBody && message != null) {
+                message.remove("body");
+            }
+            if (!showException && cause != null) {
+                cause = null;
+            }
+            if (output == null) {
+                if (watch) {
+                    clearScreen();
+                }
+                tableHelper = new MessageTableHelper();
+                tableHelper.setPretty(pretty);
+                tableHelper.setLoggingColor(loggingColor);
+                tableHelper.setShowExchangeProperties(showExchangeProperties);
+                String table = tableHelper.getDataAsTable(exchangeId, "InOut", null, null, null, message, cause);
+                printer().println(table);
+            }
+        }
+
+        String status = jo.getString("status");
+        return "failed".equals(status) || "error".equals(status) ? CliExitCode.FAILURE : CliExitCode.OK;
+    }
+
+    private void printStatusLine(JsonObject jo) {
+        // timestamp
+        SimpleDateFormat sdf = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss.SSS");
+        // an action the integration failed has no timestamp nor elapsed time
+        String ts = sdf.format(new Date(jo.getLongOrDefault("timestamp", System.currentTimeMillis())));
+        if (loggingColor) {
+            printColored(Ansi.ansi().fgBrightDefault().a(Ansi.Attribute.INTENSITY_FAINT).a(ts).reset());
+        } else {
+            printer().print(ts);
+        }
+        // pid
+        printer().print("  ");
+        String p = String.format("%5.5s", this.pid);
+        if (loggingColor) {
+            printColored(Ansi.ansi().fgMagenta().a(p).reset());
+            printColored(Ansi.ansi().fgBrightDefault().a(Ansi.Attribute.INTENSITY_FAINT).a(" --- ").reset());
+        } else {
+            printer().print(p);
+            printer().print(" --- ");
+        }
+        // status
+        printer().print(getStatus(jo));
+        // elapsed
+        String e = TimeUtils.printDuration(jo.getLongOrDefault("elapsed", 0), true);
+        if (loggingColor) {
+            printColored(Ansi.ansi().fgBrightDefault().a(" (" + e + ")").reset());
+        } else {
+            printer().print(" (" + e + ")");
+        }
+        printer().println();
+    }
+
+    private String getStatus(JsonObject r) {
+        boolean failed = "failed".equals(r.getString("status")) || "error".equals(r.getString("status"));
+        String status;
+        if (failed) {
+            status = "Failed (exception)";
+        } else if (output != null) {
+            status = "Output saved to file (success)";
+        } else {
+            status = "Message transformed (success)";
+        }
+        if (loggingColor) {
+            return Ansi.ansi().fg(failed ? Ansi.Color.RED : Ansi.Color.GREEN).a(status).reset().toString();
+        } else {
+            return status;
+        }
+    }
+
+}

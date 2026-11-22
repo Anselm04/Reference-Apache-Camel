@@ -1,0 +1,535 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.camel.maven.packaging;
+
+import java.io.File;
+import java.nio.file.Path;
+import java.util.Arrays;
+import java.util.List;
+import java.util.Locale;
+import java.util.Map;
+import java.util.Set;
+import java.util.StringJoiner;
+import java.util.TreeMap;
+import java.util.TreeSet;
+import java.util.stream.Stream;
+
+import javax.inject.Inject;
+
+import org.apache.camel.tooling.model.BaseOptionModel;
+import org.apache.camel.tooling.model.ComponentModel;
+import org.apache.camel.tooling.model.DataFormatModel;
+import org.apache.camel.tooling.model.JsonMapper;
+import org.apache.camel.tooling.model.LanguageModel;
+import org.apache.camel.tooling.model.MainModel;
+import org.apache.camel.tooling.model.PojoBeanModel;
+import org.apache.camel.tooling.util.PackageHelper;
+import org.apache.camel.tooling.util.Strings;
+import org.apache.camel.util.json.JsonArray;
+import org.apache.camel.util.json.JsonObject;
+import org.apache.camel.util.json.Jsoner;
+import org.apache.maven.plugin.MojoExecutionException;
+import org.apache.maven.plugins.annotations.Mojo;
+import org.apache.maven.plugins.annotations.Parameter;
+import org.apache.maven.project.MavenProjectHelper;
+import org.codehaus.plexus.build.BuildContext;
+
+import static org.apache.camel.tooling.util.PackageHelper.findCamelDirectory;
+
+/**
+ * Updates the SensitiveHelper.java with the known secret option names
+ */
+@Mojo(name = "update-sensitive-helper", threadSafe = true)
+public class UpdateSensitizeHelper extends AbstractGeneratorMojo {
+
+    private static final String KEYS_START_TOKEN = "// SENSITIVE-KEYS: START";
+    private static final String KEYS_END_TOKEN = "// SENSITIVE-KEYS: END";
+    private static final String WHOLE_KEYS_START_TOKEN = "// SENSITIVE-WHOLE-KEYS: START";
+    private static final String WHOLE_KEYS_END_TOKEN = "// SENSITIVE-WHOLE-KEYS: END";
+    private static final String PATTERN_START_TOKEN = "// SENSITIVE-PATTERN: START";
+    private static final String PATTERN_END_TOKEN = "// SENSITIVE-PATTERN: END";
+    private static final String SECURITY_START_TOKEN = "// SECURITY-OPTIONS: START";
+    private static final String SECURITY_END_TOKEN = "// SECURITY-OPTIONS: END";
+    private static final String OWNERS_START_TOKEN = "// SECURITY-OPTION-OWNERS: START";
+    private static final String OWNERS_END_TOKEN = "// SECURITY-OPTION-OWNERS: END";
+    private static final String SECURITY_KEYS_START_TOKEN = "// SECURITY-KEYS: START";
+    private static final String SECURITY_KEYS_END_TOKEN = "// SECURITY-KEYS: END";
+
+    private static final String SECRET = "secret";
+    private static final String INSECURE_DEV = "insecure:dev";
+    private static final String INSECURE_SSL = "insecure:ssl";
+    private static final String INSECURE_SERIALIZATION = "insecure:serialization";
+
+    // mapping from category string to the constant name used in SecurityUtils.java
+    private static final Map<String, String> CATEGORY_CONSTANTS = Map.of(
+            INSECURE_SSL, "INSECURE_SSL",
+            INSECURE_SERIALIZATION, "INSECURE_SERIALIZATION",
+            INSECURE_DEV, "INSECURE_DEV");
+
+    // mapping from insecure value to the constant name used in SecurityUtils.java
+    private static final Map<String, String> VALUE_CONSTANTS = Map.of(
+            "false", "VALUE_FALSE");
+
+    // extra keys that are regarded as secret which may not yet been in any component.
+    // they MUST be in lowercase; keep them without a dash unless a dashed variant is required to cover a
+    // hyphenated parameter/header name in the URISupport.sanitizeUri regex path (which, unlike
+    // SensitiveUtils.containsSensitive, does not strip dashes before matching): "api-key" covers the Azure
+    // OpenAI api-key header, and "authorization" covers the standard Authorization header.
+    private static final String[] EXTRA_KEYS
+            = new String[] {
+                    "apipassword", "apisecret", "apiuser", "apiusername", "api_key", "api-key", "api_secret", "authorization",
+                    "callbacksecret", "db_password",
+                    // the login secrets of camel.vault.hashicorp, which are on the endpoint only in the component
+                    "jwt", "roleid", "secretid",
+                    SECRET, "keystorePassword" };
+
+    // the camel-main configuration options (camel.server, camel.vault and others), whose secret options are matched by
+    // their whole key, as a component can have an option with the same name that is not secret (such as tenantId)
+    private static final String MAIN_METADATA = "camel-main-configuration-metadata.json";
+
+    // extra security options that are not in component JSON files, matched by their option name
+    // each entry: option name (lowercase, no dashes), security category, insecure value
+    // (the camel-main options with a security category are generated into SECURITY_KEYS of SecurityUtils, matched by
+    // their whole key; the camel-main options below are also matched by name, for the security scan of the Camel MCP
+    // server, which reads the option names from SecurityUtils.getSecurityOptions())
+    private static final String[][] EXTRA_SECURITY_OPTIONS = {
+            { "devconsoleenabled", INSECURE_DEV, "true" },
+            { "uploadenabled", INSECURE_DEV, "true" },
+            { "downloadenabled", INSECURE_DEV, "true" },
+            { "sendenabled", INSECURE_DEV, "true" },
+            // SpiffeSSLContextParameters is a bean referenced through sslContextParameters=#bean, not a component
+            // option, so its @Metadata never reaches a component JSON and the scan above cannot see it
+            { "acceptanyspiffeid", INSECURE_SSL, "true" },
+    };
+
+    @Parameter(defaultValue = "${project.basedir}/src/generated/resources/org/apache/camel/catalog/")
+    protected File jsonDir;
+
+    @Parameter(defaultValue = "${project.basedir}/")
+    protected File baseDir;
+
+    @Inject
+    public UpdateSensitizeHelper(MavenProjectHelper projectHelper, BuildContext buildContext) {
+        super(projectHelper, buildContext);
+    }
+
+    /**
+     * Execute goal.
+     *
+     * @throws MojoExecutionException execution of the main class or one of the threads it generated failed.
+     */
+    @Override
+    public void execute() throws MojoExecutionException {
+        File camelDir = findCamelDirectory(baseDir, "core/camel-util");
+        if (camelDir == null) {
+            getLog().debug("No core/camel-util folder found, skipping execution");
+            return;
+        }
+        List<Path> jsonFiles;
+        try (Stream<Path> stream = PackageHelper.findJsonFiles(jsonDir.toPath())) {
+            jsonFiles = stream.toList();
+        }
+        Set<String> secrets = new TreeSet<>();
+        // the whole keys of the camel-main options flagged secret (such as camel.vault.azure.tenantid)
+        Set<String> wholeKeys = new TreeSet<>();
+        // key -> [category, insecureValue]
+        Map<String, String[]> securityOptions = new TreeMap<>();
+        // key -> the components, data formats and languages that declare the option (such as component:netty)
+        // the whole key of the camel-main options with a security category (such as camel.management.mcpenabled)
+        // -> [category, insecureValue]
+        Map<String, String[]> securityKeys = new TreeMap<>();
+        Map<String, Set<String>> securityOptionOwners = new TreeMap<>();
+
+        for (Path file : jsonFiles) {
+            final String name = PackageHelper.asName(file);
+
+            try {
+                String json = PackageHelper.loadText(file.toFile());
+                Object jo = Jsoner.deserialize(json);
+                JsonObject obj;
+                if (jo instanceof JsonObject) {
+                    obj = (JsonObject) jo;
+                } else {
+                    continue;
+                }
+
+                boolean isComponent = obj.getMap("component") != null;
+                boolean isDataFormat = !isComponent && obj.getMap("dataformat") != null;
+                boolean isLanguage = !isComponent && !isDataFormat && obj.getMap("language") != null;
+                boolean isBean = !isComponent && !isDataFormat && !isLanguage && obj.getMap("bean") != null;
+                boolean isMain = MAIN_METADATA.equals(file.getFileName().toString());
+
+                // only check these kind
+                if (!isComponent && !isDataFormat && !isLanguage && !isBean && !isMain) {
+                    continue;
+                }
+
+                if (isMain) {
+                    // the option names are whole keys (such as camel.server.jwtKeystorePassword)
+                    MainModel mm = JsonMapper.generateMainModel(obj);
+                    mm.getOptions().forEach(o -> {
+                        collectSecretOption(o, wholeKeys);
+                        collectSecurityKey(o, securityKeys);
+                    });
+                } else if (isBean) {
+                    PojoBeanModel pm = JsonMapper.generatePojoBeanModel(obj);
+                    pm.getOptions().forEach(o -> collectSecretOption(o, secrets));
+                } else if (isComponent) {
+                    ComponentModel cm = JsonMapper.generateComponentModel(json);
+                    Set<String> owners = owners("component:", cm.getScheme(), cm.getAlternativeSchemes());
+                    cm.getComponentOptions().forEach(o -> {
+                        collectSecretOption(o, secrets);
+                        collectSecurityOption(o, securityOptions, securityOptionOwners, owners);
+                    });
+                    cm.getEndpointOptions()
+                            .forEach(o -> collectSecurityOption(o, securityOptions, securityOptionOwners, owners));
+                } else if (isDataFormat) {
+                    DataFormatModel dm = JsonMapper.generateDataFormatModel(json);
+                    Set<String> owners = owners("dataformat:", dm.getName(), null);
+                    dm.getOptions().forEach(o -> {
+                        collectSecretOption(o, secrets);
+                        collectSecurityOption(o, securityOptions, securityOptionOwners, owners);
+                    });
+                } else if (isLanguage) {
+                    LanguageModel lm = JsonMapper.generateLanguageModel(json);
+                    Set<String> owners = owners("language:", lm.getName(), null);
+                    lm.getOptions().forEach(o -> {
+                        collectSecretOption(o, secrets);
+                        collectSecurityOption(o, securityOptions, securityOptionOwners, owners);
+                    });
+                    // the options of the language itself, which camel.language.<name>.<option> sets
+                    if (lm.getLanguageOptions() != null) {
+                        lm.getLanguageOptions().forEach(o -> {
+                            collectSecretOption(o, secrets);
+                            collectSecurityOption(o, securityOptions, securityOptionOwners, owners);
+                        });
+                    }
+                }
+            } catch (Exception e) {
+                throw new MojoExecutionException("Error loading json: " + name, e);
+            }
+        }
+
+        // add extra keys
+        secrets.addAll(Arrays.asList(EXTRA_KEYS));
+
+        getLog().info("There are " + secrets.size()
+                      + " distinct secret options across all the Camel components/dataformats/languages/beans, and "
+                      + wholeKeys.size() + " secret camel-main options");
+
+        try {
+            boolean updated = updateSensitiveHelperKeys(camelDir, KEYS_START_TOKEN, KEYS_END_TOKEN, secrets,
+                    "                    ");
+            updated |= updateSensitiveHelperKeys(camelDir, WHOLE_KEYS_START_TOKEN, WHOLE_KEYS_END_TOKEN, wholeKeys,
+                    "            ");
+            updated |= updateSensitiveHelperPatterns(camelDir, secrets);
+            if (updated) {
+                getLog().info("Updated camel-util/src/main/java/org/apache/camel/util/SensitiveUtils.java file");
+            } else {
+                getLog().debug("No changes to camel-util/src/main/java/org/apache/camel/util/SensitiveUtils.java file");
+            }
+        } catch (Exception e) {
+            throw new MojoExecutionException("Error updating SensitiveUtils.java", e);
+        }
+
+        try {
+            updateSensitiveJsonSchema(baseDir, "sensitive-keys.json", secrets);
+            updateSensitiveJsonSchema(baseDir, "sensitive-whole-keys.json", wholeKeys);
+        } catch (Exception e) {
+            throw new MojoExecutionException("Error updating sensitive-keys.json or sensitive-whole-keys.json", e);
+        }
+
+        // add extra security options from camel-main properties
+        for (String[] extra : EXTRA_SECURITY_OPTIONS) {
+            securityOptions.putIfAbsent(extra[0], new String[] { extra[1], extra[2] });
+        }
+
+        // update SecurityUtils with insecure options
+        if (!securityOptions.isEmpty()) {
+            getLog().info("There are " + securityOptions.size()
+                          + " distinct insecure security options across all the Camel components/dataformats/languages");
+            try {
+                boolean updated = updateSecurityUtils(camelDir, securityOptions);
+                updated |= updateSecurityOptionOwners(camelDir, securityOptionOwners);
+                updated |= updateSecurityKeys(camelDir, securityKeys);
+                if (updated) {
+                    getLog().info("Updated camel-util/src/main/java/org/apache/camel/util/SecurityUtils.java file");
+                } else {
+                    getLog().debug("No changes to camel-util/src/main/java/org/apache/camel/util/SecurityUtils.java file");
+                }
+            } catch (Exception e) {
+                throw new MojoExecutionException("Error updating SecurityUtils.java", e);
+            }
+        }
+    }
+
+    private boolean updateSensitiveHelperKeys(
+            File camelDir, String startToken, String endToken, Set<String> secrets, String indent)
+            throws Exception {
+        // load source code and update
+        File java = new File(camelDir, "src/main/java/org/apache/camel/util/SensitiveUtils.java");
+        String text = PackageHelper.loadText(java);
+        String spaces12 = "            ";
+
+        StringJoiner sb = new StringJoiner(",\n");
+        for (String name : secrets) {
+            sb.add(indent + "\"" + name + "\"");
+        }
+        String changed = sb.toString();
+
+        String existing = Strings.between(text, startToken, endToken);
+        if (existing != null) {
+            // remove leading line breaks etc
+            existing = existing.trim();
+            changed = changed.trim();
+            if (existing.equals(changed)) {
+                return false;
+            } else {
+                String before = Strings.before(text, startToken);
+                String after = Strings.after(text, endToken);
+                text = before + startToken + "\n" + indent + changed + "\n" + spaces12 + endToken + after;
+                PackageHelper.writeText(java, text);
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private boolean updateSensitiveHelperPatterns(File camelDir, Set<String> secrets) throws Exception {
+        // load source code and update
+        File java = new File(camelDir, "src/main/java/org/apache/camel/util/SensitiveUtils.java");
+        String text = PackageHelper.loadText(java);
+        String spaces52 = "                                                    ";
+
+        StringJoiner sb = new StringJoiner("\n");
+        boolean first = true;
+        for (String name : secrets) {
+            StringBuilder line = new StringBuilder(name.length() + 32);
+            line.append(spaces52);
+            line.append("+ \"");
+            if (!first) {
+                line.append("|");
+            }
+            line.append("\\\\Q");
+            line.append(name);
+            line.append("\\\\E\"");
+            sb.add(line);
+            first = false;
+        }
+        String changed = sb.toString();
+
+        String existing = Strings.between(text, PATTERN_START_TOKEN, PATTERN_END_TOKEN);
+        if (existing != null) {
+            // remove leading line breaks etc
+            existing = existing.trim();
+            changed = changed.trim();
+            if (existing.equals(changed)) {
+                return false;
+            } else {
+                String before = Strings.before(text, PATTERN_START_TOKEN);
+                String after = Strings.after(text, PATTERN_END_TOKEN);
+                text = before + PATTERN_START_TOKEN + "\n" + spaces52 + changed + "\n" + spaces52 + PATTERN_END_TOKEN + after;
+                PackageHelper.writeText(java, text);
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private void updateSensitiveJsonSchema(File camelDir, String fileName, Set<String> secrets) throws Exception {
+        File target = new File(camelDir, "src/generated/resources/org/apache/camel/catalog/main/" + fileName);
+        JsonArray arr = new JsonArray();
+        arr.addAll(secrets);
+        String json = JsonMapper.serialize(arr);
+        PackageHelper.writeText(target, json);
+    }
+
+    private static void collectSecretOption(
+            BaseOptionModel o, Set<String> secrets) {
+        if (o.isSecret() || SECRET.equals(o.getSecurity())) {
+            String key = o.getName().toLowerCase(Locale.ENGLISH);
+            key = key.replace("-", "");
+            secrets.add(key);
+        }
+    }
+
+    /**
+     * The owner names (such as component:nettyhttp) of a component, data format or language, in the same form as
+     * SecurityUtils computes them from a configuration key (lower case and without dashes)
+     */
+    private static Set<String> owners(String kind, String name, String alternativeNames) {
+        Set<String> answer = new TreeSet<>();
+        answer.add(kind + normalizeOwnerName(name));
+        if (!Strings.isNullOrEmpty(alternativeNames)) {
+            for (String alternative : alternativeNames.split(",")) {
+                if (!alternative.isBlank()) {
+                    answer.add(kind + normalizeOwnerName(alternative.trim()));
+                }
+            }
+        }
+        return answer;
+    }
+
+    private static String normalizeOwnerName(String name) {
+        return name.toLowerCase(Locale.ENGLISH).replace("-", "");
+    }
+
+    private static void collectSecurityOption(
+            BaseOptionModel o, Map<String, String[]> securityOptions, Map<String, Set<String>> securityOptionOwners,
+            Set<String> owners) {
+        String security = o.getSecurity();
+        if (!Strings.isNullOrEmpty(security) && !SECRET.equals(security)) {
+            // only collect insecure:* categories; secrets are handled by SensitiveUtils
+            String key = o.getName().toLowerCase(Locale.ENGLISH);
+            key = key.replace("-", "");
+            String insecureValue = o.getInsecureValue();
+            if (Strings.isNullOrEmpty(insecureValue)) {
+                // default: boolean options are insecure when true
+                insecureValue = "boolean".equals(o.getType()) ? "true" : "";
+            }
+            // only add if not already present (first wins)
+            securityOptions.putIfAbsent(key, new String[] { security, insecureValue });
+            securityOptionOwners.computeIfAbsent(key, k -> new TreeSet<>()).addAll(owners);
+        }
+    }
+
+    private static void collectSecurityKey(BaseOptionModel o, Map<String, String[]> securityKeys) {
+        String security = o.getSecurity();
+        if (!Strings.isNullOrEmpty(security) && !SECRET.equals(security)) {
+            String key = o.getName().toLowerCase(Locale.ENGLISH).replace("-", "");
+            String insecureValue = o.getInsecureValue();
+            if (Strings.isNullOrEmpty(insecureValue)) {
+                // boolean options are insecure when true, and other options with any value that is not empty
+                insecureValue = "boolean".equals(o.getType()) ? "true" : null;
+            }
+            securityKeys.put(key, new String[] { security, insecureValue });
+        }
+    }
+
+    private boolean updateSecurityKeys(File camelDir, Map<String, String[]> securityKeys) throws Exception {
+        File java = new File(camelDir, "src/main/java/org/apache/camel/util/SecurityUtils.java");
+        String text = PackageHelper.loadText(java);
+        String spaces8 = "        ";
+
+        StringJoiner sb = new StringJoiner("\n");
+        for (Map.Entry<String, String[]> entry : securityKeys.entrySet()) {
+            String category = entry.getValue()[0];
+            String insecureValue = entry.getValue()[1];
+            String categoryRef = CATEGORY_CONSTANTS.get(category);
+            String categoryExpr = categoryRef != null ? categoryRef : "\"" + category + "\"";
+            String valueExpr;
+            if (insecureValue == null) {
+                valueExpr = "null";
+            } else {
+                String valueRef = VALUE_CONSTANTS.get(insecureValue);
+                valueExpr = valueRef != null ? valueRef : "\"" + insecureValue + "\"";
+            }
+            sb.add(spaces8 + "keys.put(\"" + entry.getKey() + "\", new SecurityOption(" + categoryExpr + ", " + valueExpr
+                   + "));");
+        }
+        String changed = sb.toString().trim();
+
+        String existing = Strings.between(text, SECURITY_KEYS_START_TOKEN, SECURITY_KEYS_END_TOKEN);
+        if (existing != null) {
+            existing = existing.trim();
+            if (existing.equals(changed)) {
+                return false;
+            }
+            String before = Strings.before(text, SECURITY_KEYS_START_TOKEN);
+            String after = Strings.after(text, SECURITY_KEYS_END_TOKEN);
+            String block = changed.isEmpty() ? "" : spaces8 + changed + "\n";
+            text = before + SECURITY_KEYS_START_TOKEN + "\n" + block + spaces8 + SECURITY_KEYS_END_TOKEN + after;
+            PackageHelper.writeText(java, text);
+            return true;
+        }
+
+        return false;
+    }
+
+    private boolean updateSecurityUtils(File camelDir, Map<String, String[]> securityOptions) throws Exception {
+        File java = new File(camelDir, "src/main/java/org/apache/camel/util/SecurityUtils.java");
+        String text = PackageHelper.loadText(java);
+        String spaces8 = "        ";
+
+        StringJoiner sb = new StringJoiner("\n");
+        for (Map.Entry<String, String[]> entry : securityOptions.entrySet()) {
+            String key = entry.getKey();
+            String category = entry.getValue()[0];
+            String insecureValue = entry.getValue()[1];
+            String categoryRef = CATEGORY_CONSTANTS.get(category);
+            String categoryExpr = categoryRef != null ? categoryRef : "\"" + category + "\"";
+            String valueRef = VALUE_CONSTANTS.get(insecureValue);
+            String valueExpr = valueRef != null ? valueRef : "\"" + insecureValue + "\"";
+            sb.add(spaces8 + "map.put(\"" + key + "\", new SecurityOption(" + categoryExpr + ", " + valueExpr + "));");
+        }
+        String changed = sb.toString();
+
+        String existing = Strings.between(text, SECURITY_START_TOKEN, SECURITY_END_TOKEN);
+        if (existing != null) {
+            existing = existing.trim();
+            changed = changed.trim();
+            if (existing.equals(changed)) {
+                return false;
+            } else {
+                String before = Strings.before(text, SECURITY_START_TOKEN);
+                String after = Strings.after(text, SECURITY_END_TOKEN);
+                text = before + SECURITY_START_TOKEN + "\n" + spaces8 + changed + "\n" + spaces8 + SECURITY_END_TOKEN + after;
+                PackageHelper.writeText(java, text);
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private boolean updateSecurityOptionOwners(File camelDir, Map<String, Set<String>> securityOptionOwners)
+            throws Exception {
+        File java = new File(camelDir, "src/main/java/org/apache/camel/util/SecurityUtils.java");
+        String text = PackageHelper.loadText(java);
+        String spaces8 = "        ";
+        String spaces16 = "                ";
+
+        // one owner per line (the block is not formatted, as an option can have many owners)
+        StringJoiner sb = new StringJoiner("\n");
+        for (Map.Entry<String, Set<String>> entry : securityOptionOwners.entrySet()) {
+            StringJoiner owners = new StringJoiner(",\n");
+            entry.getValue().forEach(o -> owners.add(spaces16 + "\"" + o + "\""));
+            sb.add(spaces8 + "owners.put(\"" + entry.getKey() + "\", Set.of(\n" + owners + "));");
+        }
+        String changed = sb.toString();
+
+        String existing = Strings.between(text, OWNERS_START_TOKEN, OWNERS_END_TOKEN);
+        if (existing != null) {
+            existing = existing.trim();
+            changed = changed.trim();
+            if (existing.equals(changed)) {
+                return false;
+            } else {
+                String before = Strings.before(text, OWNERS_START_TOKEN);
+                String after = Strings.after(text, OWNERS_END_TOKEN);
+                text = before + OWNERS_START_TOKEN + "\n" + spaces8 + changed + "\n" + spaces8 + OWNERS_END_TOKEN + after;
+                PackageHelper.writeText(java, text);
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+}

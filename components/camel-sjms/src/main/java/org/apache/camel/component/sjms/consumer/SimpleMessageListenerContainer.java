@@ -1,0 +1,529 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.camel.component.sjms.consumer;
+
+import java.time.Duration;
+import java.util.HashSet;
+import java.util.Set;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Future;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.locks.Lock;
+import java.util.concurrent.locks.ReentrantLock;
+
+import jakarta.jms.Connection;
+import jakarta.jms.ConnectionFactory;
+import jakarta.jms.ExceptionListener;
+import jakarta.jms.IllegalStateException;
+import jakarta.jms.JMSException;
+import jakarta.jms.Message;
+import jakarta.jms.MessageConsumer;
+import jakarta.jms.MessageListener;
+import jakarta.jms.Session;
+
+import org.apache.camel.CamelContext;
+import org.apache.camel.component.sjms.MessageListenerContainer;
+import org.apache.camel.component.sjms.SessionMessageListener;
+import org.apache.camel.component.sjms.SjmsEndpoint;
+import org.apache.camel.component.sjms.jms.DestinationCreationStrategy;
+import org.apache.camel.support.service.ServiceSupport;
+import org.apache.camel.support.task.BackgroundTask;
+import org.apache.camel.support.task.TaskRunFailureException;
+import org.apache.camel.support.task.Tasks;
+import org.apache.camel.support.task.budget.Budgets;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import static org.apache.camel.component.sjms.SjmsHelper.*;
+
+public class SimpleMessageListenerContainer extends ServiceSupport
+        implements MessageListenerContainer, ExceptionListener {
+
+    private static final Logger LOG = LoggerFactory.getLogger(SimpleMessageListenerContainer.class);
+
+    private final SjmsEndpoint endpoint;
+    private SessionMessageListener messageListener;
+    private String clientId;
+    private int concurrentConsumers = 1;
+    private ExceptionListener exceptionListener;
+    private String destinationName;
+    private DestinationCreationStrategy destinationCreationStrategy;
+
+    private final Lock connectionLock = new ReentrantLock();
+    private Connection connection;
+    private volatile boolean connectionStarted;
+    private final Lock consumerLock = new ReentrantLock();
+    private Set<MessageConsumer> consumers;
+    private Set<Session> sessions;
+    // the number of onException calls: a connection recovery compares it before and after its attempt, as an
+    // onException that comes before the consumers of the new connection are created finds none to drop
+    private final AtomicLong connectionFailures = new AtomicLong();
+    private ScheduledExecutorService recoverPool;
+    private BackgroundTask recoverTask;
+    private Future<?> recoverFuture;
+    // stops and starts the connection when the container is suspended and resumed, in that order (guarded by the
+    // lifecycle lock of the container: suspend, resume and stop)
+    private ExecutorService suspendExecutor;
+    private volatile Future<?> suspendTask;
+
+    public SimpleMessageListenerContainer(SjmsEndpoint endpoint) {
+        this.endpoint = endpoint;
+    }
+
+    public SjmsEndpoint getEndpoint() {
+        return endpoint;
+    }
+
+    public void setMessageListener(SessionMessageListener messageListener) {
+        this.messageListener = messageListener;
+    }
+
+    public void setExceptionListener(ExceptionListener exceptionListener) {
+        this.exceptionListener = exceptionListener;
+    }
+
+    public String getClientId() {
+        return clientId;
+    }
+
+    public void setClientId(String clientId) {
+        this.clientId = clientId;
+    }
+
+    public String getDestinationName() {
+        return destinationName;
+    }
+
+    public void setDestinationName(String destinationName) {
+        this.destinationName = destinationName;
+    }
+
+    public DestinationCreationStrategy getDestinationCreationStrategy() {
+        return destinationCreationStrategy;
+    }
+
+    public void setDestinationCreationStrategy(DestinationCreationStrategy destinationCreationStrategy) {
+        this.destinationCreationStrategy = destinationCreationStrategy;
+    }
+
+    public int getConcurrentConsumers() {
+        return concurrentConsumers;
+    }
+
+    public void setConcurrentConsumers(int concurrentConsumers) {
+        this.concurrentConsumers = concurrentConsumers;
+    }
+
+    @Override
+    public void afterPropertiesConfigured(CamelContext camelContext) {
+        // noop
+    }
+
+    @Override
+    public ConnectionFactory getConnectionFactory() {
+        return endpoint.getConnectionFactory();
+    }
+
+    protected void configureConsumer(MessageConsumer consumer, Session session) throws Exception {
+        consumer.setMessageListener(new SimpleMessageListener(messageListener, session));
+    }
+
+    private class SimpleMessageListener implements MessageListener {
+
+        private final SessionMessageListener messageListener;
+        private final Session session;
+
+        public SimpleMessageListener(SessionMessageListener messageListener, Session session) {
+            this.messageListener = messageListener;
+            this.session = session;
+        }
+
+        @Override
+        public void onMessage(Message message) {
+            try {
+                doOnMessage(message);
+            } catch (Exception e) {
+                if (e instanceof JMSException jmsException) {
+                    if (endpoint.getExceptionListener() != null) {
+                        endpoint.getExceptionListener().onException(jmsException);
+                    }
+                } else {
+                    LOG.warn("Execution of JMS message listener failed. This exception is ignored.", e);
+                }
+            }
+        }
+
+        protected void doOnMessage(Message message) throws Exception {
+            try {
+                messageListener.onMessage(message, session);
+            } catch (Exception e) {
+                // unexpected error so rollback
+                rollbackIfNeeded(session);
+                throw e;
+            }
+            // success then commit if we need to
+            commitIfNeeded(session, message);
+        }
+
+    }
+
+    protected void invalidateConsumers() {
+        connectionLock.lock();
+        try {
+            this.sessions = null;
+            this.consumers = null;
+        } finally {
+            connectionLock.unlock();
+        }
+    }
+
+    @Override
+    public void onException(JMSException exception) {
+        connectionFailures.incrementAndGet();
+        if (exceptionListener != null) {
+            try {
+                exceptionListener.onException(exception);
+            } catch (Exception e) {
+                // ignore
+            }
+        }
+        if (endpoint.getExceptionListener() != null) {
+            try {
+                endpoint.getExceptionListener().onException(exception);
+            } catch (Exception e) {
+                // ignore
+            }
+        }
+
+        invalidateConsumers();
+        scheduleConnectionRecovery();
+    }
+
+    protected boolean recoverConnection(BackgroundTask task) {
+        LOG.debug("Recovering from JMS Connection exception (attempt: {})", task.iteration());
+        try {
+            long failures = refreshConnectionAndCountFailures();
+            initConsumers();
+            connectionLock.lock();
+            try {
+                if (consumers == null || connectionFailures.get() != failures) {
+                    // the new connection failed during this attempt: onException dropped its consumers while they
+                    // were created, or it came before and found none to drop (then the consumers on the failed
+                    // connection are dropped here). onException did not schedule another recovery as this one is
+                    // running. So this one has to try again
+                    this.sessions = null;
+                    this.consumers = null;
+                    LOG.debug("JMS Connection failed again during recovery (attempt: {}). Will try again in {} millis",
+                            task.iteration(), endpoint.getRecoveryInterval());
+                    return false;
+                }
+                if (recoverFuture != null) {
+                    recoverFuture.cancel(false);
+                }
+                recoverTask = null;
+                recoverFuture = null;
+            } finally {
+                connectionLock.unlock();
+            }
+            LOG.debug("Successfully recovered JMS Connection (attempt: {})", task.iteration());
+            // success so do not try again
+            return true;
+        } catch (Exception e) {
+            String message = "Failed to recover JMS Connection (attempt: " + task.iteration() + "). Will try again in "
+                             + endpoint.getRecoveryInterval() + " millis";
+            LOG.warn(message);
+            // make the task runner aware of the exception (will retry)
+            throw new TaskRunFailureException(message, e);
+        }
+    }
+
+    protected void scheduleConnectionRecovery() {
+        connectionLock.lock();
+        try {
+            if (recoverPool == null) {
+                recoverPool = endpoint.getCamelContext().getExecutorServiceManager().newSingleThreadScheduledExecutor(this,
+                        "SjmsConnectionRecovery");
+            }
+            if (recoverTask == null || !recoverTask.isRunning()) {
+                recoverTask = createTask();
+                recoverFuture = recoverTask.schedule(endpoint.getCamelContext(), () -> recoverConnection(recoverTask));
+            }
+        } finally {
+            connectionLock.unlock();
+        }
+    }
+
+    private BackgroundTask createTask() {
+        return Tasks.backgroundTask()
+                .withScheduledExecutor(recoverPool)
+                .withBudget(Budgets.iterationTimeBudget()
+                        .withInterval(Duration.ofMillis(endpoint.getRecoveryInterval()))
+                        .withInitialDelay(Duration.ofSeconds(1))
+                        .withUnlimitedDuration()
+                        .build())
+                .withName("SjmsConnectionRecovery")
+                .build();
+    }
+
+    @Override
+    protected void doStart() throws Exception {
+        createConnection();
+        initConsumers();
+
+        startConnection();
+    }
+
+    @Override
+    protected void doStop() throws Exception {
+        if (suspendExecutor != null) {
+            // let a pending stop or start of the connection finish first
+            endpoint.getCamelContext().getExecutorServiceManager().shutdownGraceful(suspendExecutor);
+            suspendExecutor = null;
+            suspendTask = null;
+        }
+        stopConnection();
+        stopConsumers();
+        if (recoverPool != null) {
+            endpoint.getCamelContext().getExecutorServiceManager().shutdown(recoverPool);
+            recoverPool = null;
+        }
+        if (recoverTask != null && recoverTask.isRunning()) {
+            // cancelled through the task and not through its future, so the task also leaves the
+            // TaskManagerRegistry. Only a run of the task removes it from there, and once the schedule
+            // is cancelled no run is coming
+            recoverTask.cancel(true);
+            recoverTask = null;
+            recoverFuture = null;
+        }
+    }
+
+    @Override
+    protected void doSuspend() throws Exception {
+        // stop the delivery of messages; the consumers and sessions stay open, as the exchanges in flight may still
+        // use them (e.g. to send the reply of an async consumer). Connection.stop() waits for the message listeners
+        // in progress, and must not be called by a message listener (the JMS provider throws an
+        // IllegalStateException): a route policy suspends the consumer when an exchange is done, on the thread of
+        // the message listener or on a thread that the listener waits for, and the suspend must not wait for the
+        // listeners while it holds the lock of the consumer. So another thread stops the connection
+        submitSuspendTask(this::stopConnection);
+    }
+
+    @Override
+    protected void doResume() throws Exception {
+        // after a pending stop of the connection
+        submitSuspendTask(() -> {
+            try {
+                startConnection();
+            } catch (Exception e) {
+                LOG.warn("Error starting the JMS connection on resume. This exception is ignored.", e);
+            }
+        });
+    }
+
+    private void submitSuspendTask(Runnable task) {
+        if (suspendExecutor == null) {
+            suspendExecutor = endpoint.getCamelContext().getExecutorServiceManager().newSingleThreadExecutor(this,
+                    "SjmsSuspendResume");
+        }
+        suspendTask = suspendExecutor.submit(task);
+    }
+
+    /**
+     * Whether a stop or start of the connection requested by a suspend or resume is still pending. Only for tests.
+     */
+    boolean isSuspendResumePending() {
+        Future<?> task = suspendTask;
+        return task != null && !task.isDone();
+    }
+
+    /**
+     * Whether the connection is started (false as soon as a stop of the connection began). Only for tests.
+     */
+    boolean isConnectionStarted() {
+        return connectionStarted;
+    }
+
+    @Override
+    protected void doShutdown() throws Exception {
+        closeConnection(connection);
+        this.connection = null;
+        // the connection recovery may have created consumers after stopConsumers, they are closed with the connection
+        consumerLock.lock();
+        try {
+            this.consumers = null;
+            this.sessions = null;
+        } finally {
+            consumerLock.unlock();
+        }
+    }
+
+    protected void initConsumers() throws Exception {
+        consumerLock.lock();
+        try {
+            if (consumers == null) {
+                LOG.debug("Initializing {} concurrent consumers as JMS listener on destination: {}", concurrentConsumers,
+                        destinationName);
+                Set<Session> newSessions = new HashSet<>(concurrentConsumers);
+                Set<MessageConsumer> newConsumers = new HashSet<>(concurrentConsumers);
+                // assigned before the loop, so that an onException during the creation (it sets the fields to null)
+                // is seen by recoverConnection, which then tries again
+                sessions = newSessions;
+                consumers = newConsumers;
+                try {
+                    for (int i = 0; i < this.concurrentConsumers; i++) {
+                        Session session = createSession(connection, endpoint);
+                        newSessions.add(session);
+                        MessageConsumer consumer = createMessageConsumer(session);
+                        newConsumers.add(consumer);
+                        configureConsumer(consumer, session);
+                    }
+                } catch (Exception e) {
+                    // not all the consumers could be created (the connection failed again, the destination is not
+                    // available yet). Close the ones that were, and leave no half filled set behind: the next
+                    // attempt (connection recovery, restart) would take it for the consumers and create none
+                    this.consumers = null;
+                    this.sessions = null;
+                    for (MessageConsumer consumer : newConsumers) {
+                        closeConsumer(consumer);
+                    }
+                    for (Session session : newSessions) {
+                        closeSession(session);
+                    }
+                    throw e;
+                }
+            }
+        } finally {
+            consumerLock.unlock();
+        }
+    }
+
+    protected Session createSession(Connection connection, SjmsEndpoint endpoint) throws Exception {
+        return connection.createSession(endpoint.isTransacted(), endpoint.getAcknowledgementMode().intValue());
+    }
+
+    protected MessageConsumer createMessageConsumer(Session session) throws Exception {
+        return endpoint.getJmsObjectFactory().createMessageConsumer(session, endpoint);
+    }
+
+    protected void stopConsumers() {
+        consumerLock.lock();
+        try {
+            if (consumers != null) {
+                LOG.debug("Stopping JMS MessageConsumers");
+                for (MessageConsumer consumer : this.consumers) {
+                    closeConsumer(consumer);
+                }
+                if (this.sessions != null) {
+                    LOG.debug("Stopping JMS Sessions");
+                    for (Session session : this.sessions) {
+                        closeSession(session);
+                    }
+                }
+                // so that a restart creates new consumers
+                this.consumers = null;
+                this.sessions = null;
+            }
+        } finally {
+            consumerLock.unlock();
+        }
+    }
+
+    protected void createConnection() throws Exception {
+        connectionLock.lock();
+        try {
+            if (this.connection == null) {
+                Connection con = null;
+                try {
+                    con = endpoint.getConnectionFactory().createConnection();
+                    String cid = clientId != null ? clientId : endpoint.getClientId();
+                    if (cid != null) {
+                        con.setClientID(cid);
+                    }
+                    con.setExceptionListener(this);
+                } catch (JMSException e) {
+                    closeConnection(con);
+                    throw e;
+                }
+                this.connection = con;
+                LOG.debug("Created JMS Connection");
+            }
+        } finally {
+            connectionLock.unlock();
+        }
+    }
+
+    protected final void refreshConnection() throws Exception {
+        refreshConnectionAndCountFailures();
+    }
+
+    /**
+     * Closes the connection and creates a new one, which is started if the container is started.
+     *
+     * @return the number of connection failures (onException calls) before the new connection was created, so a failure
+     *         that is counted later may be one of the new connection
+     */
+    private long refreshConnectionAndCountFailures() throws Exception {
+        connectionLock.lock();
+        try {
+            closeConnection(connection);
+            this.connection = null;
+            // read after the old connection is closed and before the new one has this container as exception listener
+            long failures = connectionFailures.get();
+            createConnection();
+            if (this.connectionStarted) {
+                startConnection();
+            }
+            return failures;
+        } finally {
+            connectionLock.unlock();
+        }
+    }
+
+    protected void startConnection() throws Exception {
+        connectionLock.lock();
+        try {
+            this.connectionStarted = true;
+            if (this.connection != null) {
+                try {
+                    this.connection.start();
+                } catch (IllegalStateException e) {
+                    // ignore as it may already be started
+                }
+            }
+        } finally {
+            connectionLock.unlock();
+        }
+    }
+
+    protected void stopConnection() {
+        connectionLock.lock();
+        try {
+            this.connectionStarted = false;
+            if (this.connection != null) {
+                try {
+                    this.connection.stop();
+                } catch (Exception e) {
+                    LOG.debug("Error stopping connection. This exception is ignored.", e);
+                }
+            }
+        } finally {
+            connectionLock.unlock();
+        }
+    }
+
+}

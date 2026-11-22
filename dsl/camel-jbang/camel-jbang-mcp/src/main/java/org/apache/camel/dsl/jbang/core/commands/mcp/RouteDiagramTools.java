@@ -1,0 +1,217 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.camel.dsl.jbang.core.commands.mcp;
+
+import java.io.File;
+import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.Set;
+import java.util.stream.Collectors;
+
+import jakarta.enterprise.context.ApplicationScoped;
+
+import io.quarkiverse.mcp.server.Tool;
+import io.quarkiverse.mcp.server.ToolArg;
+import io.quarkiverse.mcp.server.ToolCallException;
+import io.quarkiverse.mcp.server.ToolGuardrails;
+import org.apache.camel.dsl.jbang.core.commands.CamelJBangMain;
+import org.apache.camel.dsl.jbang.core.commands.action.CamelRouteDiagramAction;
+import org.apache.camel.dsl.jbang.core.common.CliException;
+import org.apache.camel.dsl.jbang.run.common.Printer;
+
+/**
+ * MCP Tool for generating a visual diagram of Camel routes from a source file (non-running integration). Wraps the
+ * {@code camel route-diagram} jbang command. Supports both PNG image output and plain-text ASCII/Unicode output.
+ */
+@McpSecured
+@ApplicationScoped
+public class RouteDiagramTools {
+
+    private static final Set<String> TEXT_THEMES = Set.of("ascii", "unicode");
+
+    @ToolGuardrails(input = McpArgumentGuardrail.class, output = McpArgumentGuardrail.class)
+    @Tool(annotations = @Tool.Annotations(readOnlyHint = false, destructiveHint = false, openWorldHint = false),
+          description = "Generate a diagram of Camel routes from a route source file (YAML, XML, Java, ...). "
+                        + "Java routes are read by the Java DSL parser, without compiling them; a step it cannot "
+                        + "work out (a lambda, a processor) is shown as a placeholder, and the parts it could not read "
+                        + "are listed in the message. "
+                        + "An image marks the steps that the checks of camel validate find a problem with, and says "
+                        + "what the problem is beside the route. "
+                        + "For image themes (light, dark, transparent) the PNG is written to disk and the absolute path "
+                        + "is returned. For text themes (ascii, unicode) the diagram is returned directly as text so "
+                        + "it can be read and understood by the caller. "
+                        + "Useful to visualize a route structure for review, documentation, or troubleshooting.")
+    public RouteDiagramResult camel_render_route_diagram(
+            @ToolArg(description = "Absolute or relative path to the Camel route source file (YAML, XML, Java, ...)") String sourceFile,
+            @ToolArg(description = "Optional output file path. For image themes a PNG is written; for text themes a .txt "
+                                   + "file is written. If not specified, a PNG goes to a temporary file, and a text diagram is only returned.",
+                     required = false) String outputFile,
+            @ToolArg(description = "Color theme: 'light' (default), 'dark', 'transparent', 'ascii' (plain ASCII art), "
+                                   + "'unicode' (box-drawing characters), or a custom spec like "
+                                   + "'bg=#1e1e1e:from=#2e7d32:to=#1565c0'. "
+                                   + "Use 'ascii' or 'unicode' to get a text diagram that can be read directly.",
+                     required = false) String theme,
+            @ToolArg(description = "Optional filter to limit the diagram to routes whose route id or source filename "
+                                   + "matches the given pattern (supports wildcards)",
+                     required = false) String filter,
+            @ToolArg(description = "Image width in pixels; 0 (or unset) = auto (only used for image themes)",
+                     required = false) Integer width,
+            @ToolArg(description = "Font size in logical pixels for node text (default 12)", required = false) Integer fontSize,
+            @ToolArg(description = "Node box width in logical pixels (default 180)", required = false) Integer boxWidth,
+            @ToolArg(description = "What text to display in diagram nodes: 'code' (default), 'description' (prefer "
+                                   + "description over code if available), or 'both' (show description and code)",
+                     required = false) String nodeLabel,
+            @ToolArg(description = "Whether to ignore route loading and compilation errors (use with care)",
+                     required = false) Boolean ignoreLoadingError) {
+
+        if (sourceFile == null || sourceFile.isBlank()) {
+            throw new ToolCallException("'sourceFile' parameter is required", null);
+        }
+
+        File source = new File(sourceFile);
+        if (!source.isFile()) {
+            throw new ToolCallException("Source file does not exist: " + sourceFile, null);
+        }
+
+        boolean textMode = theme != null && TEXT_THEMES.contains(theme.toLowerCase());
+
+        String resolvedOutput;
+        // a text diagram is returned as text: a file of its own only when the caller asks for one
+        boolean tempText = textMode && (outputFile == null || outputFile.isBlank());
+        try {
+            if (outputFile == null || outputFile.isBlank()) {
+                String suffix = textMode ? ".txt" : ".png";
+                Path tmp = Files.createTempFile("camel-route-diagram-", suffix);
+                resolvedOutput = tmp.toAbsolutePath().toString();
+            } else {
+                resolvedOutput = new File(outputFile).getAbsolutePath();
+            }
+        } catch (Exception e) {
+            throw new ToolCallException(
+                    "Failed to resolve output file (" + e.getClass().getName() + "): " + e.getMessage(), null);
+        }
+
+        // headless rendering — required when running inside the MCP server
+        System.setProperty("java.awt.headless", "true");
+
+        CapturingPrinter capturingPrinter = new CapturingPrinter();
+        CamelJBangMain main = new CamelJBangMain()
+                .withPrinter(capturingPrinter);
+        CamelRouteDiagramAction action = main.command(new CamelRouteDiagramAction());
+
+        try {
+            int exit = action.renderSourceToFile(
+                    sourceFile, resolvedOutput, theme,
+                    filter != null && !filter.isBlank() ? filter : null,
+                    width != null ? width : 0,
+                    ignoreLoadingError != null && ignoreLoadingError,
+                    fontSize != null ? fontSize : 12,
+                    boxWidth != null ? boxWidth : 180,
+                    nodeLabel);
+
+            File out = new File(resolvedOutput);
+            boolean success = exit == 0 && out.isFile() && out.length() > 0;
+            long size = out.exists() ? out.length() : 0L;
+
+            if (textMode) {
+                String asciiContent = success ? Files.readString(out.toPath()) : null;
+                String message = success
+                        ? withNotes("ASCII diagram generated (" + size + " bytes)", capturingPrinter, resolvedOutput)
+                        : "Failed to render diagram (exit code " + exit + "): " + capturingPrinter.getOutput();
+                if (tempText) {
+                    // the diagram is in the answer: no file is left behind for each call (CAMEL-26932)
+                    Files.deleteIfExists(out.toPath());
+                    return new RouteDiagramResult(success, null, size, message, asciiContent);
+                }
+                return new RouteDiagramResult(success, resolvedOutput, size, message, asciiContent);
+            }
+
+            String message = success
+                    ? withNotes("Diagram saved to: " + resolvedOutput, capturingPrinter, resolvedOutput)
+                    : "Failed to render diagram (exit code " + exit + "): " + capturingPrinter.getOutput();
+            return new RouteDiagramResult(success, resolvedOutput, size, message, null);
+        } catch (CliException e) {
+            // an expected failure, such as a source file without routes, or a filter that matches no route
+            deleteTempText(tempText, resolvedOutput);
+            return new RouteDiagramResult(
+                    false, tempText ? null : resolvedOutput, 0L,
+                    "Failed to render diagram (exit code " + e.getExitCode() + "): " + e.getMessage(), null);
+        } catch (Throwable e) {
+            deleteTempText(tempText, resolvedOutput);
+            throw new ToolCallException(
+                    "Failed to render route diagram (" + e.getClass().getName() + "): " + e.getMessage(), null);
+        }
+    }
+
+    /**
+     * The message, followed by what the command printed, such as the parts of a Java route the parser could not read,
+     * without the line that says where the diagram is saved, which the message already says (or which is a file of the
+     * tool's own).
+     */
+    private static String withNotes(String message, CapturingPrinter printer, String output) {
+        String saved = "Diagram saved to: " + output;
+        String notes = printer.getOutput().lines().filter(line -> !line.strip().equals(saved))
+                .collect(Collectors.joining("\n")).strip();
+        return notes.isEmpty() ? message : message + "\n" + notes;
+    }
+
+    private static void deleteTempText(boolean tempText, String file) {
+        if (tempText && file != null) {
+            try {
+                Files.deleteIfExists(Path.of(file));
+            } catch (IOException e) {
+                // a file in the temporary directory
+            }
+        }
+    }
+
+    /**
+     * @param asciiDiagram plain-text diagram content for ascii/unicode themes; null for image themes
+     */
+    public record RouteDiagramResult(boolean success, String outputFile, long sizeBytes, String message,
+            String asciiDiagram) {
+    }
+
+    static class CapturingPrinter implements Printer {
+        private final StringBuilder sb = new StringBuilder();
+
+        @Override
+        public void println() {
+            sb.append('\n');
+        }
+
+        @Override
+        public void println(String line) {
+            sb.append(line).append('\n');
+        }
+
+        @Override
+        public void print(String output) {
+            sb.append(output);
+        }
+
+        @Override
+        public void printf(String format, Object... args) {
+            sb.append(String.format(format, args));
+        }
+
+        String getOutput() {
+            return sb.toString().strip();
+        }
+    }
+}

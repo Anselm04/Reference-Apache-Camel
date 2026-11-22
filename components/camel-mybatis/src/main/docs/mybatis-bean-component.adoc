@@ -1,0 +1,132 @@
+= MyBatis Bean Component
+:doctitle: MyBatis Bean
+:shortname: mybatis-bean
+:artifactid: camel-mybatis
+:description: Perform queries, inserts, updates or deletes in a relational database using MyBatis.
+:since: 2.22
+:supportlevel: Stable
+:tabs-sync-option:
+:component-header: Only producer is supported
+
+*Since Camel {since}*
+
+*{component-header}*
+
+The MyBatis Bean component allows you to query, insert, update and
+delete data in a relational database using http://mybatis.org/[MyBatis] bean annotations.
+
+This component can **only** be used as a producer. If you want to consume
+from MyBatis, then use the regular **mybatis** component.
+
+Maven users will need to add the following dependency to their `pom.xml`
+for this component:
+
+[source,xml]
+----
+<dependency>
+    <groupId>org.apache.camel</groupId>
+    <artifactId>camel-mybatis</artifactId>
+    <version>x.x.x</version>
+    <!-- use the same version as your Camel core version -->
+</dependency>
+----
+
+This component will by default load the MyBatis SqlMapConfig file from
+the root of the classpath with the expected name of
+`SqlMapConfig.xml`.
+If the file is located in another location, you will need to configure
+the `configurationUri` option on the `MyBatisComponent` component.
+
+
+// component options: START
+include::partial$component-configure-options.adoc[]
+include::partial$component-endpoint-options.adoc[]
+include::partial$component-endpoint-headers.adoc[]
+// component options: END
+
+
+== Usage
+
+=== Message Body
+
+The value the mapper method returns is set as the body, and is also stored in
+the header with the key `CamelMyBatisResult`. That is the bean, the `List` or
+the `Map` of a select (or null when there is no row), and the count of rows of an
+`INSERT`, `UPDATE` or `DELETE` method that returns an `int`. A `void` method
+leaves the body as it was, which allows you to continue routing with the
+original body. With the `outputHeader` option the result is stored in that
+header instead, and the body is not changed.
+
+== Examples
+
+For example, if you wish to consume beans from a JMS queue and insert
+them into a database, you could do the following:
+
+[tabs]
+====
+Java::
++
+[source,java]
+----
+from("activemq:queue:newAccount")
+    .to("mybatis-bean:AccountService:insertBeanAccount");
+----
+
+XML::
++
+[source,xml]
+----
+<route>
+  <from uri="activemq:queue:newAccount"/>
+  <to uri="mybatis-bean:AccountService:insertBeanAccount"/>
+</route>
+----
+
+YAML::
++
+[source,yaml]
+----
+- route:
+    from:
+      uri: activemq:queue:newAccount
+      steps:
+        - to:
+            uri: mybatis-bean:AccountService:insertBeanAccount
+----
+====
+
+Notice we have to specify the bean name and method name, as we need to instruct
+Camel which kind of operation to invoke.
+
+Where `AccountService` is the type alias for the bean that has the MyBatis
+bean annotations. You can configure type alias in the SqlMapConfig file:
+
+[source,xml]
+----
+    <typeAliases>
+        <typeAlias alias="Account" type="org.apache.camel.component.mybatis.Account"/>
+        <typeAlias alias="AccountService" type="org.apache.camel.component.mybatis.bean.AccountService"/>
+    </typeAliases>
+----
+
+On the `AccountService` bean you can declare the MyBatis mappins using annotations as shown:
+
+._Java-only: MyBatis bean annotation mappings_
+[source,java]
+----
+public interface AccountService {
+
+    @Select("select ACC_ID as id, ACC_FIRST_NAME as firstName, ACC_LAST_NAME as lastName"
+        + ", ACC_EMAIL as emailAddress from ACCOUNT where ACC_ID = #{id}")
+    Account selectBeanAccountById(@Param("id") int no);
+
+    @Select("select * from ACCOUNT order by ACC_ID")
+    @ResultMap("Account.AccountResult")
+    List<Account> selectBeanAllAccounts();
+
+    @Insert("insert into ACCOUNT (ACC_ID,ACC_FIRST_NAME,ACC_LAST_NAME,ACC_EMAIL)"
+        + " values (#{id}, #{firstName}, #{lastName}, #{emailAddress})")
+    void insertBeanAccount(Account account);
+
+}
+----

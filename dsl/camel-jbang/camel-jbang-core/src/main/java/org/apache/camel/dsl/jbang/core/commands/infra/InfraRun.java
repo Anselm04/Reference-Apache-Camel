@@ -1,0 +1,655 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.camel.dsl.jbang.core.commands.infra;
+
+import java.io.File;
+import java.io.IOException;
+import java.lang.reflect.InvocationTargetException;
+import java.lang.reflect.Method;
+import java.net.URL;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.TreeMap;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.atomic.AtomicBoolean;
+
+import org.aesh.command.CommandDefinition;
+import org.aesh.command.option.Arguments;
+import org.aesh.command.option.Option;
+import org.aesh.command.option.OptionList;
+import org.apache.camel.dsl.jbang.core.commands.BackgroundWait;
+import org.apache.camel.dsl.jbang.core.common.BackgroundLog;
+import org.apache.camel.dsl.jbang.core.common.CliException;
+import org.apache.camel.dsl.jbang.core.common.CliExitCode;
+import org.apache.camel.dsl.jbang.core.common.CommandLineHelper;
+import org.apache.camel.dsl.jbang.core.common.EnvironmentHelper;
+import org.apache.camel.dsl.jbang.core.common.JsonOutput;
+import org.apache.camel.dsl.jbang.run.common.CliLogging;
+import org.apache.camel.dsl.jbang.run.common.Printer;
+import org.apache.camel.dsl.jbang.run.common.RuntimeUtil;
+import org.apache.camel.main.download.DependencyDownloaderClassLoader;
+import org.apache.camel.main.download.MavenDependencyDownloader;
+import org.apache.camel.tooling.maven.MavenArtifact;
+import org.apache.camel.util.TimeUtils;
+import org.apache.camel.util.json.JsonObject;
+import org.apache.logging.log4j.core.config.Configurator;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import static org.apache.camel.dsl.jbang.core.commands.RunHelper.addCamelCLICommand;
+
+@CommandDefinition(name = "run", description = "Run an external service", generateHelp = true,
+                   footer = {
+                           "Examples:",
+                           "  camel infra run kafka",
+                           "  camel infra run kafka --background",
+                           "  camel infra run ollama --property ollama.model=qwen2.5:0.5b" })
+public class InfraRun extends InfraBaseCommand {
+
+    private static final Logger LOG = LoggerFactory.getLogger(InfraRun.class);
+
+    // how often a run in the background checks whether the service has started
+    private static final long STARTUP_POLL_INTERVAL = 200;
+
+    @Arguments(paramLabel = "service", required = true, description = "Service name")
+    List<String> serviceName;
+
+    @Option(name = "log", hasValue = false, description = "Log container output to console")
+    boolean logToStdout;
+
+    @Option(name = "background", hasValue = false, description = "Run in the background", defaultValue = "false")
+    boolean background;
+
+    @Option(name = "background-wait",
+            description = "How long to wait for the service in the background to start, before returning, in millis"
+                          + " or as a duration such as 2m (true waits 60 seconds, false does not wait)",
+            defaultValue = "60s", optionalValue = true, fallbackValue = "true", converter = BackgroundWait.Converter.class,
+            parser = BackgroundWait.Parser.class)
+    long backgroundWait = BackgroundWait.DEFAULT;
+
+    @Option(name = "port", description = "Override the default port for the service")
+    Integer port;
+
+    @Option(name = "no-ui", hasValue = false, description = "Do not start companion UI containers", defaultValue = "false")
+    boolean noUi;
+
+    @OptionList(name = "prop", aliases = { "property" }, valueSeparator = OptionList.NO_SEPARATOR,
+                description = "Service properties, ex. --property=ollama.model=qwen2.5:0.5b")
+    List<String> serviceProperties = new ArrayList<>();
+
+    @Override
+    public Integer doCall() throws Exception {
+        if (serviceName == null || serviceName.isEmpty()) {
+            return 0;
+        }
+
+        String service = serviceName.get(0);
+        String serviceImplementation = serviceName.size() > 1 ? serviceName.get(1) : null;
+
+        return run(service, serviceImplementation);
+    }
+
+    private Integer run(String testService, String testServiceImplementation) throws Exception {
+        List<TestInfraService> services = getMetadata();
+
+        TestInfraService testInfraService = services
+                .stream()
+                .filter(service -> {
+                    if (testServiceImplementation != null && !testServiceImplementation.isEmpty()
+                            && service.aliasImplementation() != null) {
+                        return service.alias().contains(testService)
+                                && service.aliasImplementation().contains(testServiceImplementation);
+                    } else if (testServiceImplementation == null) {
+                        return service.alias().contains(testService)
+                                && (service.aliasImplementation() == null || service.aliasImplementation().isEmpty());
+                    }
+
+                    return false;
+                })
+                .findFirst()
+                .orElse(null);
+
+        if (testInfraService == null) {
+            String message = ", use the list command for the available services";
+            if (testServiceImplementation != null) {
+                throw CliException.notFound("service " + testService + " with implementation " + testServiceImplementation
+                                            + " not found" + message);
+            } else {
+                throw CliException.notFound("service " + testService + " not found" + message);
+            }
+        }
+
+        Map<String, String> parsedProperties;
+        try {
+            parsedProperties = parseServiceProperties();
+        } catch (IllegalArgumentException e) {
+            // before the background branch, so that a run in the background fails here and not in a process
+            // whose only trace is its pid
+            throw CliException.usage(e.getMessage());
+        }
+
+        if (background) {
+            return runBackground(testService);
+        } else {
+            return doRun(testService, testServiceImplementation, testInfraService, parsedProperties);
+        }
+    }
+
+    protected int runBackground(String testService) throws Exception {
+        List<String> cmds;
+        if (originalArgs() != null) {
+            cmds = new ArrayList<>(originalArgs());
+        } else {
+            cmds = new ArrayList<>();
+            cmds.add("infra");
+            cmds.add("run");
+            if (serviceName != null) {
+                cmds.addAll(serviceName);
+            }
+            if (port != null) {
+                cmds.add("--port");
+                cmds.add(String.valueOf(port));
+            }
+            if (logToStdout) {
+                cmds.add("--log");
+            }
+            if (noUi) {
+                cmds.add("--no-ui");
+            }
+            for (String property : serviceProperties) {
+                cmds.add("--property=" + property);
+            }
+        }
+
+        cmds = BackgroundWait.withoutBackgroundOptions(cmds);
+
+        addCamelCLICommand(cmds);
+
+        ProcessBuilder pb = new ProcessBuilder();
+        pb.command(cmds);
+
+        return startInBackground(pb, testService);
+    }
+
+    /**
+     * Starts the service in the background, with its output in <tt>~/.camel/&lt;pid&gt;-run.log</tt>, and waits until
+     * it has written its pid file with its service data, which it does once it has started (CAMEL-27004: the output
+     * went to a pipe that nobody read, so a service that could not start, such as with Docker down, was gone without a
+     * word, and the command exited with 0).
+     *
+     * @param  pb           the process of the service
+     * @param  testService  the alias of the service, which names its pid file
+     * @return              0 when the service started, or the exit code of a service that ended before it started
+     * @throws CliException a timeout when the service is still starting after the wait, and is left running
+     */
+    int startInBackground(ProcessBuilder pb, String testService) throws Exception {
+        BackgroundLog.Started started = BackgroundLog.start(pb);
+        Process p = started.process();
+        Path log = started.log();
+        String pid = String.valueOf(p.pid());
+
+        if (!jsonOutput) {
+            printer().println("Running " + testService + " in background with PID: " + pid
+                              + (backgroundWait > 0 ? " (waiting for it to start)" : ""));
+        }
+        if (backgroundWait <= 0) {
+            if (jsonOutput) {
+                JsonObject jo = new JsonObject();
+                jo.put("pid", pid);
+                jo.put("alias", testService);
+                jo.put("log", log.toString());
+                JsonOutput.print(printer(), jo);
+            } else {
+                printer().println("Log: " + log);
+            }
+            return 0;
+        }
+
+        Path pidFile = CommandLineHelper.getCamelDir().resolve(getJsonFileName(testService, pid));
+        long deadline = System.currentTimeMillis() + backgroundWait;
+        String serviceData = startedServiceData(pidFile);
+        while (serviceData == null && p.isAlive() && System.currentTimeMillis() < deadline) {
+            try {
+                Thread.sleep(STARTUP_POLL_INTERVAL);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                break;
+            }
+            serviceData = startedServiceData(pidFile);
+        }
+
+        if (serviceData != null) {
+            if (jsonOutput) {
+                JsonObject jo = new JsonObject();
+                jo.put("pid", pid);
+                jo.put("alias", testService);
+                jo.put("log", log.toString());
+                jo.put("serviceData", parseServiceData(serviceData));
+                JsonOutput.print(printer(), jo);
+            } else {
+                printer().println(jsonMapper.writerWithDefaultPrettyPrinter()
+                        .writeValueAsString(jsonMapper.readTree(serviceData)));
+                printer().println("Log: " + log);
+            }
+            return 0;
+        }
+        if (!p.isAlive()) {
+            // ended before it started: why is in its output
+            int exitCode = p.exitValue();
+            printer().printErr("Service " + testService + " (PID: " + pid + ") did not start (exit code " + exitCode + ")");
+            String output = BackgroundLog.read(log);
+            if (!output.isBlank()) {
+                // on stderr with --json, so the output stays JSON
+                if (jsonOutput) {
+                    printer().printDiagnostic(output.stripTrailing());
+                } else {
+                    printer().println(output.stripTrailing());
+                }
+            }
+            Files.deleteIfExists(log);
+            return exitCode != 0 ? exitCode : CliExitCode.FAILURE;
+        }
+        // still starting, such as pulling its container image the first time: it is left running
+        String waited = backgroundWait < 1000 ? backgroundWait + "ms" : TimeUtils.printDuration(backgroundWait);
+        throw CliException.timeout("Service " + testService + " (PID: " + pid + ") is still starting after " + waited
+                                   + "; the log is in " + log);
+    }
+
+    /**
+     * The service data the service wrote to its pid file once it started, or null while it has not (the file is created
+     * empty, and written after).
+     */
+    private static String startedServiceData(Path pidFile) {
+        String data = readServiceData(pidFile);
+        return data != null && !data.isBlank() && parseServiceData(data) != null ? data : null;
+    }
+
+    protected Integer doRun(
+            String testService, String testServiceImplementation, TestInfraService testInfraService,
+            Map<String, String> parsedProperties)
+            throws Exception {
+        DependencyDownloaderClassLoader cl = getDependencyDownloaderClassLoader(testInfraService, printer());
+
+        // Update the class loader
+        Thread.currentThread().setContextClassLoader(cl);
+
+        String serviceInterface = testInfraService.service();
+        String serviceImpl = testInfraService.implementation();
+
+        // Set the fixed port property BEFORE instantiating the service so it uses fixed ports
+        System.setProperty("camel.infra.fixedPort", "true");
+        // Set the port property if a specific port was requested
+        if (port != null) {
+            System.setProperty("camel.infra.port", String.valueOf(port));
+        }
+        if (noUi) {
+            System.setProperty("camel.infra.ui", "false");
+        }
+        // the service resolves its own properties from the system properties first, so they must be set
+        // before it is instantiated
+        Map<String, String> replacedProperties = applyServiceProperties(parsedProperties);
+        try {
+            return startService(testService, testServiceImplementation, testInfraService, cl, serviceInterface,
+                    serviceImpl, replacedProperties);
+        } finally {
+            // the service may never have started, so this and not only the shutdown is where a JVM that keeps
+            // running, such as the TUI or a test, gets its properties back
+            restoreProperties(replacedProperties);
+            clearInfraProperties();
+        }
+    }
+
+    private Integer startService(
+            String testService, String testServiceImplementation, TestInfraService testInfraService,
+            DependencyDownloaderClassLoader cl, String serviceInterface, String serviceImpl,
+            Map<String, String> replacedProperties)
+            throws Exception {
+        Object actualService = cl.loadClass(serviceImpl).newInstance();
+
+        // Make sure the actualService can be run with initialize method
+        boolean actualServiceIsAnInfrastructureService = false;
+
+        for (Method method : actualService.getClass().getMethods()) {
+            if (method.getName().contains("initialize")) {
+                actualServiceIsAnInfrastructureService = true;
+                break;
+            }
+        }
+
+        if (!actualServiceIsAnInfrastructureService) {
+            throw CliException.failure("Service " + serviceImpl + " is not an InfrastructureService");
+        }
+
+        if (!jsonOutput) {
+            // show the progress of pulling the container image, which can take minutes the first time
+            // (logging may have started already with the default configuration, so reconfigure it)
+            URL logConfig = InfraRun.class.getClassLoader().getResource("log4j2-infra.properties");
+            if (logConfig != null) {
+                Configurator.reconfigure(logConfig.toURI());
+                CliLogging.loggingConfigured();
+            }
+            String prefix = "";
+            if (testServiceImplementation != null) {
+                prefix = " with implementation " + testServiceImplementation;
+            }
+            printer().println("Starting service " + testService + prefix + " (PID: " + RuntimeUtil.getPid() + ")");
+        }
+
+        try {
+            actualService.getClass().getMethod("initialize").invoke(actualService);
+        } catch (InvocationTargetException e) {
+            String message = portInUseMessage(testService, e.getCause());
+            if (message != null) {
+                throw CliException.failure(message);
+            }
+            throw e;
+        }
+
+        Method[] serviceMethods = cl.loadClass(serviceInterface).getDeclaredMethods();
+        Map<String, Object> properties = new TreeMap<>();
+        for (Method method : serviceMethods) {
+            // Skip methods that return complex objects or have side effects
+            if (method.getParameterCount() == 0
+                    && !method.getName().equals("registerProperties")
+                    && !method.getName().equals("getContainer")) {
+                Object value = null;
+                try {
+                    value = method.invoke(actualService);
+                } catch (Exception e) {
+                    // ignore
+                }
+                if (value != null) {
+                    properties.put(method.getName(), value);
+                }
+            }
+        }
+
+        if (testInfraService.serviceVersion() != null && !testInfraService.serviceVersion().isEmpty()) {
+            properties.put("serviceVersion", testInfraService.serviceVersion());
+        }
+        if (testInfraService.description() != null && !testInfraService.description().isEmpty()) {
+            properties.put("description", testInfraService.description());
+        }
+        addContainerDetails(actualService, properties);
+
+        String jsonProperties = jsonMapper.writerWithDefaultPrettyPrinter().writeValueAsString(properties);
+        printer().println(jsonProperties);
+
+        String name = getLogFileName(testService, RuntimeUtil.getPid());
+        Path logFile = createFile(name);
+
+        String jsonName = getJsonFileName(testService, RuntimeUtil.getPid());
+        Path jsonFile = createFile(jsonName);
+        Files.write(jsonFile, jsonMapper.writeValueAsString(properties).getBytes());
+
+        if (Arrays.stream(actualService.getClass().getInterfaces()).anyMatch(c -> c.getName().contains("ContainerService"))) {
+            Object containerLogConsumer = cl.loadClass("org.apache.camel.test.infra.common.CamelLogConsumer")
+                    .getConstructor(Path.class, boolean.class).newInstance(logFile, logToStdout);
+            actualService.getClass()
+                    .getMethod("followLog", cl.loadClass("org.testcontainers.containers.output.BaseConsumer"))
+                    .invoke(actualService, containerLogConsumer);
+        }
+
+        AtomicBoolean closed = new AtomicBoolean();
+        // use shutdown hook as fallback to shut-down and delete files
+        Runtime.getRuntime()
+                .addShutdownHook(new Thread(() -> shutdownInfra(closed, logFile, jsonFile, actualService, replacedProperties)));
+
+        final CountDownLatch latch = new CountDownLatch(1);
+
+        // running in foreground then wait for user to exit
+        if (EnvironmentHelper.isInteractiveTerminal()) {
+            if (!jsonOutput) {
+                printer().println("Press ENTER to stop the execution");
+            }
+            Thread t = new Thread(() -> {
+                boolean quit = false;
+                do {
+                    String line = EnvironmentHelper.readLine();
+                    if (line != null) {
+                        quit = true;
+                        latch.countDown();
+                    }
+                } while (!quit);
+            }, "WaitEnter");
+            t.start();
+        } else if (!jsonOutput) {
+            // wait for this process to be stopped
+            printer().println("Running (use camel infra stop "
+                              + testService + (testServiceImplementation != null ? " " + testServiceImplementation : "")
+                              + " to stop the execution)");
+        }
+
+        // always wait for external signal to stop if the json-file is deleted
+        Thread t = new Thread(() -> {
+            while (latch.getCount() > 0) {
+                try {
+                    Thread.sleep(1000);
+                } catch (Exception e) {
+                    // ignore
+                }
+                File f = jsonFile.toFile();
+                if (!f.exists()) {
+                    latch.countDown();
+                }
+            }
+        }, "WaitShutdownSignal");
+        t.start();
+
+        try {
+            latch.await();
+        } catch (Exception e) {
+            // ignore
+        }
+
+        shutdownInfra(closed, logFile, jsonFile, actualService, replacedProperties);
+
+        return 0;
+    }
+
+    /**
+     * The one line for a service that did not start because a port it maps on the host is taken, naming the running
+     * infra service that has it, instead of the stack trace of the container runtime.
+     *
+     * @param  service the service that did not start
+     * @param  failure why it did not start
+     * @return         the line, or {@code null} when the failure is not about a port in use
+     */
+    String portInUseMessage(String service, Throwable failure) {
+        int port = InfraPortInUse.port(failure);
+        if (port < 0) {
+            return null;
+        }
+        for (RunningService running : findRunningServices(null)) {
+            if (InfraPortInUse.hasPort(readServiceData(running.pidFile()), port)) {
+                return InfraPortInUse.message(service, port, running.alias(), running.pid());
+            }
+        }
+        return InfraPortInUse.message(service, port, null, null);
+    }
+
+    /**
+     * Reads the --property options, which is how a service takes a setting the CLI has no flag of its own for, such as
+     * the model of ollama. Only the pairs are read here, so that a malformed one is refused before anything is set and
+     * before a run in the background leaves the complaint in a process nobody is watching.
+     *
+     * @throws IllegalArgumentException if an option is not a key=value pair
+     */
+    Map<String, String> parseServiceProperties() {
+        Map<String, String> parsed = new LinkedHashMap<>();
+        for (String property : serviceProperties) {
+            int separator = property.indexOf('=');
+            if (separator < 1 || separator == property.length() - 1) {
+                throw new IllegalArgumentException(
+                        "Property " + property + " is not in the key=value form, for example ollama.model=qwen2.5:0.5b");
+            }
+            parsed.put(property.substring(0, separator), property.substring(separator + 1));
+        }
+        return parsed;
+    }
+
+    /**
+     * Sets the properties the service resolves, and returns what they held before, so that a JVM which runs more than
+     * one service keeps the values it was started with.
+     */
+    static Map<String, String> applyServiceProperties(Map<String, String> parsedProperties) {
+        Map<String, String> replaced = new LinkedHashMap<>();
+        parsedProperties.forEach((name, value) -> {
+            replaced.put(name, System.getProperty(name));
+            System.setProperty(name, value);
+        });
+        return replaced;
+    }
+
+    static void restoreProperties(Map<String, String> replacedProperties) {
+        replacedProperties.forEach((name, previous) -> {
+            if (previous == null) {
+                System.clearProperty(name);
+            } else {
+                System.setProperty(name, previous);
+            }
+        });
+    }
+
+    /**
+     * Adds the name and id of the container a service runs in, so that {@code docker exec}, {@code docker logs} and
+     * {@code camel infra ps} can tell which container it is. A service that does not run in a container, such as an
+     * embedded broker, has none.
+     *
+     * @param service    the started service
+     * @param properties the service data to add the container details to
+     */
+    static void addContainerDetails(Object service, Map<String, Object> properties) {
+        Object container;
+        try {
+            container = service.getClass().getMethod("getContainer").invoke(service);
+        } catch (Exception e) {
+            // not a container service
+            return;
+        }
+        if (container == null) {
+            return;
+        }
+        String name = (String) invokeQuietly(container, "getContainerName");
+        if (name != null && !name.isBlank()) {
+            // Docker answers the name with a leading slash
+            properties.put("containerName", name.startsWith("/") ? name.substring(1) : name);
+        }
+        String id = (String) invokeQuietly(container, "getContainerId");
+        if (id != null && !id.isBlank()) {
+            // the short id, as docker ps shows it
+            properties.put("containerId", id.length() > 12 ? id.substring(0, 12) : id);
+        }
+    }
+
+    private static Object invokeQuietly(Object target, String methodName) {
+        try {
+            return target.getClass().getMethod(methodName).invoke(target);
+        } catch (InvocationTargetException e) {
+            // the service has the method, but it failed, such as when docker cannot be reached
+            LOG.debug("{}#{} failed", target.getClass().getSimpleName(), methodName, e.getCause());
+            return null;
+        } catch (Exception e) {
+            // not a container service
+            return null;
+        }
+    }
+
+    private static void clearInfraProperties() {
+        System.clearProperty("camel.infra.port");
+        System.clearProperty("camel.infra.fixedPort");
+        System.clearProperty("camel.infra.ui");
+    }
+
+    private static void shutdownInfra(
+            AtomicBoolean closed, Path logFile, Path jsonFile, Object actualService,
+            Map<String, String> replacedProperties) {
+        if (closed.compareAndSet(false, true)) {
+            try {
+                actualService.getClass().getMethod("shutdown").invoke(actualService);
+            } catch (Exception e) {
+                // ignore
+            }
+            try {
+                Files.deleteIfExists(logFile);
+            } catch (Exception e) {
+                // ignore
+            }
+            try {
+                Files.deleteIfExists(jsonFile);
+            } catch (Exception e) {
+                // ignore
+            }
+            // the output of a service in the background, which is of no use once it is stopped
+            BackgroundLog.remove(ProcessHandle.current().pid());
+            clearInfraProperties();
+            restoreProperties(replacedProperties);
+        }
+    }
+
+    private static Path createFile(String name) throws IOException {
+        Path logDir = CommandLineHelper.getCamelDir();
+        Files.createDirectories(logDir); //make sure the parent dir exists
+        Path logFile = logDir.resolve(name);
+        Files.createFile(logFile);
+        return logFile;
+    }
+
+    private static DependencyDownloaderClassLoader getDependencyDownloaderClassLoader(
+            TestInfraService testInfraService, Printer printer) {
+        DependencyDownloaderClassLoader cl = new DependencyDownloaderClassLoader(InfraRun.class.getClassLoader());
+
+        try (MavenDependencyDownloader downloader = new MavenDependencyDownloader()) {
+            downloader.setClassLoader(cl);
+            downloader.start();
+            // download required camel-test-infra-* dependency
+            downloader.downloadDependency(testInfraService.groupId(),
+                    testInfraService.artifactId(),
+                    testInfraService.version(), true);
+
+            MavenArtifact ma = downloader.downloadArtifact(testInfraService.groupId(),
+                    testInfraService.artifactId(),
+                    testInfraService.version());
+            cl.addFile(ma.getFile());
+        } catch (Exception e) {
+            printer.printErr(e);
+        }
+        return cl;
+    }
+
+    public List<String> getServiceName() {
+        return serviceName;
+    }
+
+    public void setServiceName(List<String> serviceName) {
+        this.serviceName = serviceName;
+    }
+
+    public boolean isLogToStdout() {
+        return logToStdout;
+    }
+
+    public void setLogToStdout(boolean logToStdout) {
+        this.logToStdout = logToStdout;
+    }
+
+}

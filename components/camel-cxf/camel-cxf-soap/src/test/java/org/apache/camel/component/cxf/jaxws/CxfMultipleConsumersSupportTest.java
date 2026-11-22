@@ -1,0 +1,107 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.camel.component.cxf.jaxws;
+
+import org.apache.camel.builder.RouteBuilder;
+import org.apache.camel.component.mock.MockEndpoint;
+import org.apache.camel.test.AvailablePortFinder;
+import org.apache.camel.test.junit6.CamelTestSupport;
+import org.junit.jupiter.api.AfterAll;
+import org.junit.jupiter.api.BeforeAll;
+import org.junit.jupiter.api.Test;
+
+import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
+
+public class CxfMultipleConsumersSupportTest extends CamelTestSupport {
+    private static AvailablePortFinder.Port PORT;
+    private static AvailablePortFinder.Port PORT_2;
+
+    @BeforeAll
+    static void allocatePorts() {
+        PORT = AvailablePortFinder.find();
+        PORT_2 = AvailablePortFinder.find();
+        SIMPLE_ENDPOINT_ADDRESS = "http://localhost:" + PORT.getPort() + "/CxfMultipleConsumersSupportTest/test";
+        SIMPLE_ENDPOINT_URI = "cxf://" + SIMPLE_ENDPOINT_ADDRESS
+                              + "?serviceClass=org.apache.camel.component.cxf.jaxws.HelloService";
+        SIMPLE_OTHER_ADDRESS = "http://localhost:" + PORT_2.getPort() + "/CxfMultipleConsumersSupportTest/test";
+        SIMPLE_OTHER_URI = "cxf://" + SIMPLE_OTHER_ADDRESS
+                           + "?serviceClass=org.apache.camel.component.cxf.jaxws.HelloService";
+    }
+
+    @AfterAll
+    static void releasePorts() {
+        if (PORT != null) {
+            PORT.release();
+        }
+        if (PORT_2 != null) {
+            PORT_2.release();
+        }
+    }
+
+    protected static String SIMPLE_ENDPOINT_ADDRESS;
+    protected static String SIMPLE_ENDPOINT_URI;
+
+    protected static String SIMPLE_OTHER_ADDRESS;
+    protected static String SIMPLE_OTHER_URI;
+
+    @Test
+    public void testMultipleConsumersNotAllowed() throws Exception {
+        testConfiguration().withUseRouteBuilder(false);
+        context.stop();
+        context.addRoutes(new RouteBuilder() {
+            @Override
+            public void configure() throws Exception {
+                from(SIMPLE_ENDPOINT_URI).to("mock:a");
+
+                from("direct:start").to("mock:result");
+
+                from(SIMPLE_ENDPOINT_URI).to("mock:b");
+            }
+        });
+        Exception e = assertThrows(Exception.class, context::start);
+        assertTrue(e.getMessage().endsWith(
+                "Multiple consumers for the same endpoint is not allowed: cxf://http://localhost:" + PORT.getPort()
+                                           + "/CxfMultipleConsumersSupportTest/test?serviceClass=org.apache.camel.component.cxf.jaxws.HelloService"));
+    }
+
+    @Test
+    public void testNoMultipleConsumers() throws Exception {
+        testConfiguration().withUseRouteBuilder(false);
+        context.stop();
+        context.addRoutes(new RouteBuilder() {
+            @Override
+            public void configure() throws Exception {
+                from(SIMPLE_ENDPOINT_URI).to("mock:a");
+
+                from("direct:start").to("mock:result");
+
+                from(SIMPLE_OTHER_URI).to("mock:b");
+            }
+        });
+
+        // is allowed
+        context.start();
+
+        getMockEndpoint("mock:result").expectedMessageCount(1);
+
+        template.sendBody("direct:start", "Hello World");
+
+        MockEndpoint.assertIsSatisfied(context);
+    }
+
+}

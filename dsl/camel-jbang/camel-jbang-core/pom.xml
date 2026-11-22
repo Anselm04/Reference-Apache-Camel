@@ -1,0 +1,634 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+
+    Licensed to the Apache Software Foundation (ASF) under one or more
+    contributor license agreements.  See the NOTICE file distributed with
+    this work for additional information regarding copyright ownership.
+    The ASF licenses this file to You under the Apache License, Version 2.0
+    (the "License"); you may not use this file except in compliance with
+    the License.  You may obtain a copy of the License at
+
+         http://www.apache.org/licenses/LICENSE-2.0
+
+    Unless required by applicable law or agreed to in writing, software
+    distributed under the License is distributed on an "AS IS" BASIS,
+    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+    See the License for the specific language governing permissions and
+    limitations under the License.
+
+-->
+<project xmlns="http://maven.apache.org/POM/4.0.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+
+    <modelVersion>4.0.0</modelVersion>
+
+    <parent>
+        <groupId>org.apache.camel</groupId>
+        <artifactId>camel-jbang-parent</artifactId>
+        <version>4.24.0-SNAPSHOT</version>
+        <relativePath>../pom.xml</relativePath>
+    </parent>
+
+    <artifactId>camel-jbang-core</artifactId>
+    <packaging>jar</packaging>
+
+    <name>Camel :: JBang :: Core</name>
+    <description>Camel CLI Core</description>
+
+    <properties>
+        <firstVersion>3.12.0</firstVersion>
+        <label>jbang</label>
+        <supportLevel>Stable</supportLevel>
+        <camel-prepare-component>false</camel-prepare-component>
+        <!-- the tests run in parallel forks that are reused, each with a home of its own (see the surefire
+             configuration). No concurrency inside a fork: the CLI keeps the home directory in a static field -->
+        <camel.surefire.forkCount>4</camel.surefire.forkCount>
+        <camel.surefire.reuseForks>true</camel.surefire.reuseForks>
+        <camel.surefire.parallel>false</camel.surefire.parallel>
+        <!-- the tests are short and start many CamelContexts: the C1 compiler only and the serial GC cost far less CPU
+             than the defaults (about 30% less in total), which matters as the CI machine runs other modules at the
+             same time -->
+        <camel.surefire.fork.additional-vmargs>-XX:TieredStopAtLevel=1 -XX:+UseSerialGC</camel.surefire.fork.additional-vmargs>
+    </properties>
+
+    <dependencies>
+        <!-- camel -->
+        <dependency>
+            <groupId>org.apache.camel</groupId>
+            <artifactId>camel-jbang-run</artifactId>
+        </dependency>
+        <!-- the CVE audit, shared with the TUI (CAMEL-27343) -->
+        <dependency>
+            <groupId>org.apache.camel</groupId>
+            <artifactId>camel-catalog-cve</artifactId>
+        </dependency>
+        <!-- the GenAI span attributes, read by the TUI and the MCP server (CAMEL-27312) -->
+        <dependency>
+            <groupId>org.apache.camel</groupId>
+            <artifactId>camel-ai-observability-api</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>org.apache.camel</groupId>
+            <artifactId>camel-dataweave</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>org.apache.camel</groupId>
+            <artifactId>camel-diagram</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>org.apache.camel</groupId>
+            <artifactId>camel-main</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>org.apache.camel</groupId>
+            <artifactId>camel-jbang-console</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>org.apache.camel</groupId>
+            <artifactId>camel-kamelet-main</artifactId>
+        </dependency>
+        <!-- Maven version ranges, to select the plugin release built for the Camel CLI -->
+        <dependency>
+            <groupId>org.apache.maven.resolver</groupId>
+            <artifactId>maven-resolver-api</artifactId>
+            <version>${maven-resolver-version}</version>
+        </dependency>
+        <dependency>
+            <groupId>org.apache.maven.resolver</groupId>
+            <artifactId>maven-resolver-util</artifactId>
+            <version>${maven-resolver-version}</version>
+        </dependency>
+        <dependency>
+            <groupId>org.apache.camel</groupId>
+            <artifactId>camel-resourceresolver-github</artifactId>
+        </dependency>
+        <dependency>
+            <!-- the Java DSL parser for the project overview; also comes with camel-kamelet-main -->
+            <groupId>org.apache.camel</groupId>
+            <artifactId>camel-java-io</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>org.apache.camel</groupId>
+            <!-- camel transform route writes YAML from Java routes read without compiling them -->
+            <artifactId>camel-yaml-io</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>org.apache.camel</groupId>
+            <artifactId>camel-xml-io-util</artifactId>
+        </dependency>
+        <!-- source validation for the shared AI authoring tools (CAMEL-24695) -->
+        <dependency>
+            <groupId>org.apache.camel</groupId>
+            <artifactId>camel-yaml-dsl-validator</artifactId>
+        </dependency>
+
+        <!-- yaml -->
+        <dependency>
+            <groupId>org.yaml</groupId>
+            <artifactId>snakeyaml</artifactId>
+            <version>${snakeyaml-version}</version>
+        </dependency>
+
+        <!-- cli -->
+        <dependency>
+            <groupId>org.apache.camel</groupId>
+            <artifactId>camel-cli-connector</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>commons-io</groupId>
+            <artifactId>commons-io</artifactId>
+            <version>${commons-io-version}</version>
+        </dependency>
+        <dependency>
+            <groupId>org.aesh</groupId>
+            <artifactId>aesh</artifactId>
+            <version>${aesh-version}</version>
+        </dependency>
+        <dependency>
+            <groupId>org.jline</groupId>
+            <artifactId>jline</artifactId>
+            <version>${jline-version}</version>
+        </dependency>
+        <dependency>
+            <groupId>com.github.freva</groupId>
+            <artifactId>ascii-table</artifactId>
+            <version>${ascii-table-version}</version>
+        </dependency>
+
+        <!-- jolokia -->
+        <dependency>
+            <groupId>org.jolokia</groupId>
+            <artifactId>jolokia-agent-jvm</artifactId>
+            <version>${jolokia-version}</version>
+            <classifier>javaagent</classifier>
+        </dependency>
+        <!-- servlet for launching hawtio -->
+        <dependency>
+            <groupId>jakarta.servlet</groupId>
+            <artifactId>jakarta.servlet-api</artifactId>
+            <version>${jakarta-servlet-api-version}</version>
+        </dependency>
+
+        <!-- logging -->
+        <dependency>
+            <groupId>org.slf4j</groupId>
+            <artifactId>slf4j-api</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>org.apache.logging.log4j</groupId>
+            <artifactId>log4j-api</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>org.apache.logging.log4j</groupId>
+            <artifactId>log4j-core</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>org.apache.logging.log4j</groupId>
+            <artifactId>log4j-layout-template-json</artifactId>
+            <version>${log4j2-version}</version>
+        </dependency>
+        <dependency>
+            <groupId>org.apache.logging.log4j</groupId>
+            <artifactId>log4j-slf4j2-impl</artifactId>
+        </dependency>
+
+        <dependency>
+            <groupId>org.codehaus.plexus</groupId>
+            <artifactId>plexus-xml</artifactId>
+        </dependency>
+
+        <!-- template engine for code generation -->
+        <dependency>
+            <groupId>org.freemarker</groupId>
+            <artifactId>freemarker</artifactId>
+            <version>${freemarker-version}</version>
+        </dependency>
+
+        <!-- test dependencies -->
+        <dependency>
+            <groupId>org.apache.camel</groupId>
+            <artifactId>camel-test-junit6</artifactId>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.junit-pioneer</groupId>
+            <artifactId>junit-pioneer</artifactId>
+            <version>${junit-pioneer-version}</version>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.assertj</groupId>
+            <artifactId>assertj-core</artifactId>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.awaitility</groupId>
+            <artifactId>awaitility</artifactId>
+            <version>${awaitility-version}</version>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.wiremock</groupId>
+            <artifactId>wiremock</artifactId>
+            <version>${wiremock-version}</version>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.mockito</groupId>
+            <artifactId>mockito-junit-jupiter</artifactId>
+            <version>${mockito-version}</version>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.apache.camel</groupId>
+            <artifactId>camel-platform-http-main</artifactId>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.apache.camel</groupId>
+            <artifactId>camel-mcp-server</artifactId>
+            <scope>test</scope>
+        </dependency>
+        <!-- languages camel_eval_expression evaluates locally with headers, variables and a resultType; on the
+             classpath of the tests, so they are not downloaded -->
+        <dependency>
+            <groupId>org.apache.camel</groupId>
+            <artifactId>camel-xpath</artifactId>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.apache.camel</groupId>
+            <artifactId>camel-groovy</artifactId>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.apache.camel</groupId>
+            <artifactId>camel-jq</artifactId>
+            <scope>test</scope>
+        </dependency>
+        <!-- the JsonPath a jsonpath expression of a route is compiled with (the CLI has it from camel-jsonpath,
+             downloaded as for an evaluation) -->
+        <dependency>
+            <groupId>com.jayway.jsonpath</groupId>
+            <artifactId>json-path</artifactId>
+            <version>${json-path-version}</version>
+            <scope>test</scope>
+        </dependency>
+        <!-- the test schema a Citrus test is checked against; on the classpath of the tests, so it is not downloaded
+             (the test plugin brings it to the CLI) -->
+        <dependency>
+            <groupId>org.citrusframework</groupId>
+            <artifactId>citrus-catalog-schema</artifactId>
+            <version>${citrus-version}</version>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>io.modelcontextprotocol.sdk</groupId>
+            <artifactId>mcp-core</artifactId>
+            <version>${mcp-java-sdk-version}</version>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>io.modelcontextprotocol.sdk</groupId>
+            <artifactId>mcp-json-jackson3</artifactId>
+            <version>${mcp-java-sdk-version}</version>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>tools.jackson.core</groupId>
+            <artifactId>jackson-databind</artifactId>
+        </dependency>
+        <!-- the YAML DSL validator (source validation for the AI authoring tools) and the MCP SDK schema validation
+             in the tests need networknt 3 (Jackson 3); wiremock transitively pulls 1.5.x -->
+        <dependency>
+            <groupId>com.networknt</groupId>
+            <artifactId>json-schema-validator</artifactId>
+            <version>${networknt-json-schema-validator-version}</version>
+        </dependency>
+    </dependencies>
+
+    <build>
+        <plugins>
+            <!-- the aesh annotation processor generates the metadata of the commands at compile time (see
+                 CommandMetadataRegistry); not for the tests: aesh would also generate it for their sub classes of
+                 commands, which it cannot reach when they are private nested classes -->
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-compiler-plugin</artifactId>
+                <configuration>
+                    <annotationProcessorPaths combine.children="append">
+                        <path>
+                            <groupId>org.aesh</groupId>
+                            <artifactId>aesh-processor</artifactId>
+                            <version>${aesh-version}</version>
+                        </path>
+                    </annotationProcessorPaths>
+                    <compilerArgs combine.children="append">
+                        <arg>-AaeshNativeImageDisable=true</arg>
+                    </compilerArgs>
+                </configuration>
+                <executions>
+                    <execution>
+                        <id>default-testCompile</id>
+                        <configuration>
+                            <proc>none</proc>
+                        </configuration>
+                    </execution>
+                </executions>
+            </plugin>
+            <!-- the CLI uses its own registry of the generated metadata (CommandMetadataRegistry): the one of the
+                 processor must not be found, as it has the metadata of commands that a plugin extends with options of
+                 its own (and it is in the package of the command the processor happens to see first) -->
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-antrun-plugin</artifactId>
+                <executions>
+                    <execution>
+                        <id>remove-aesh-metadata-registry</id>
+                        <!-- after the recompile execution (process-classes), which runs the processor again -->
+                        <phase>generate-test-sources</phase>
+                        <goals>
+                            <goal>run</goal>
+                        </goals>
+                        <configuration>
+                            <target>
+                                <delete file="${project.build.outputDirectory}/META-INF/aesh/registry"/>
+                                <delete file="${project.build.outputDirectory}/META-INF/services/org.aesh.command.metadata.MetadataRegistry"/>
+                            </target>
+                        </configuration>
+                    </execution>
+                </executions>
+            </plugin>
+            <!-- the tests jar has only the helpers the tests of the plugins use too -->
+            <plugin>
+                <artifactId>maven-jar-plugin</artifactId>
+                <executions>
+                    <execution>
+                        <goals>
+                            <goal>test-jar</goal>
+                        </goals>
+                        <configuration>
+                            <includes>
+                                <include>org/apache/camel/dsl/jbang/core/common/CommandLineTestHelper*</include>
+                            </includes>
+                        </configuration>
+                    </execution>
+                </executions>
+            </plugin>
+            <plugin>
+                <groupId>org.apache.camel</groupId>
+                <artifactId>camel-package-maven-plugin</artifactId>
+                <executions>
+                    <execution>
+                        <id>prepare-jbang</id>
+                        <goals>
+                            <goal>prepare-jbang</goal>
+                            <goal>prepare-jbang-doc</goal>
+                        </goals>
+                        <phase>generate-resources</phase>
+                        <configuration>
+                            <!-- where the Camel CLI configuration is, also for a camel-package-maven-plugin of a
+                                 snapshot built before camel-jbang-export was renamed to camel-jbang-run -->
+                            <configurationDir>${project.basedir}/../camel-jbang-run/src/main/java/org/apache/camel/dsl/jbang/run/common</configurationDir>
+                        </configuration>
+                    </execution>
+                    <execution>
+                        <id>prepare-jbang-commands</id>
+                        <goals>
+                            <goal>prepare-jbang-commands</goal>
+                            <goal>prepare-jbang-commands-doc</goal>
+                        </goals>
+                        <phase>process-classes</phase>
+                    </execution>
+                </executions>
+            </plugin>
+            <plugin>
+                <!-- the YAML samples per EIP and file entry that the AI tools return, from the documentation (CAMEL-24713) -->
+                <groupId>org.apache.camel</groupId>
+                <artifactId>camel-yaml-dsl-validator-maven-plugin</artifactId>
+                <version>${project.version}</version>
+                <executions>
+                    <execution>
+                        <id>generate-doc-samples</id>
+                        <goals>
+                            <goal>generate-doc-samples</goal>
+                        </goals>
+                        <phase>generate-resources</phase>
+                        <configuration>
+                            <!-- user manual pages whose YAML examples are the samples of a file entry -->
+                            <pages>
+                                <routes>route</routes>
+                                <rest-dsl>rest</rest-dsl>
+                                <route-template>routeTemplate</route-template>
+                                <route-configuration>routeConfiguration</route-configuration>
+                                <exception-clause>onException</exception-clause>
+                                <error-handler>errorHandler</error-handler>
+                                <oncompletion>onCompletion</oncompletion>
+                                <try-catch-finally>doTry</try-catch-finally>
+                            </pages>
+                            <entryPages>
+                                <entryPage>../../camel-yaml-dsl/camel-yaml-dsl/src/main/docs/yaml-dsl.adoc=beans</entryPage>
+                                <!-- the contract-first rest, next to the path-based examples of rest-dsl -->
+                                <entryPage>../../../docs/user-manual/modules/ROOT/pages/rest-dsl-openapi.adoc=rest</entryPage>
+                                <!-- the top-level entries whose examples are on a page about something else (CAMEL-25719) -->
+                                <entryPage>../../../docs/user-manual/modules/ROOT/pages/route-template.adoc=templatedRoute</entryPage>
+                                <entryPage>../../../docs/user-manual/modules/ROOT/pages/rest-dsl.adoc=restConfiguration</entryPage>
+                                <entryPage>../../../docs/user-manual/modules/ROOT/pages/transformer.adoc=transformers</entryPage>
+                                <entryPage>../../../docs/user-manual/modules/ROOT/pages/validator.adoc=validators</entryPage>
+                                <entryPage>../../../docs/user-manual/modules/ROOT/pages/camel-configuration-utilities.adoc=sslContextParameters</entryPage>
+                                <entryPage>../../../docs/user-manual/modules/ROOT/pages/data-format.adoc=dataFormats</entryPage>
+                            </entryPages>
+                            <!-- user manual pages that show old syntax or YAML that is not a Camel file -->
+                            <excludes>
+                                <exclude>camel-*upgrade-guide*.adoc</exclude>
+                                <exclude>camel-4-migration-guide.adoc</exclude>
+                                <exclude>camel-jbang-transforming.adoc</exclude>
+                                <exclude>camel-report-maven-plugin.adoc</exclude>
+                                <exclude>improving-the-documentation.adoc</exclude>
+                                <exclude>release-guide*.adoc</exclude>
+                            </excludes>
+                        </configuration>
+                    </execution>
+                </executions>
+            </plugin>
+            <plugin>
+                <groupId>org.codehaus.mojo</groupId>
+                <artifactId>build-helper-maven-plugin</artifactId>
+                <executions>
+                    <execution>
+                        <phase>generate-sources</phase>
+                        <goals>
+                            <goal>add-source</goal>
+                            <goal>add-resource</goal>
+                        </goals>
+                        <configuration>
+                            <sources>
+                                <source>src/generated/java</source>
+                            </sources>
+                            <resources>
+                                <resource>
+                                    <directory>src/generated/resources</directory>
+                                </resource>
+                            </resources>
+                        </configuration>
+                    </execution>
+                </executions>
+            </plugin>
+            <plugin>
+                <groupId>org.codehaus.mojo</groupId>
+                <artifactId>templating-maven-plugin</artifactId>
+                <executions>
+                    <execution>
+                        <id>filter-src</id>
+                        <goals>
+                            <goal>filter-sources</goal>
+                        </goals>
+                    </execution>
+                </executions>
+            </plugin>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-surefire-plugin</artifactId>
+                <configuration>
+                    <systemPropertyVariables>
+                        <!-- a home of its own per fork (~/.camel, the user configuration and plugins), out of the
+                             developer's and away from the other forks. The local Maven repository stays the build's,
+                             so what the tests resolve is not downloaded again -->
+                        <user.home>${project.build.directory}/test-home-${surefire.forkNumber}</user.home>
+                        <maven.repo.local>${settings.localRepository}</maven.repo.local>
+                        <!-- the home of the developer, for a test that talks to a Camel launched through JBang -->
+                        <camel.test.user.home>${user.home}</camel.test.user.home>
+                    </systemPropertyVariables>
+                </configuration>
+                <executions>
+                    <execution>
+                        <!-- the serial tests run after, one class at a time -->
+                        <id>default-test</id>
+                        <configuration>
+                            <excludedGroups>serial</excludedGroups>
+                        </configuration>
+                    </execution>
+                    <execution>
+                        <!-- the tests of what the forks share: the working directory (the .camel-jbang directory of
+                             camel run, export and others, a local camel-cli.properties) or a fixed port. These tests
+                             (@UsesWorkingDirectory, @UsesFixedPort) run in one fork -->
+                        <id>serial-test</id>
+                        <phase>none</phase><!-- unbound like default-test, so -Dquickly / -Pfastinstall skip it; bound in the full profile -->
+                        <goals>
+                            <goal>test</goal>
+                        </goals>
+                        <configuration>
+                            <forkCount>1</forkCount>
+                            <groups>serial</groups>
+                            <systemPropertyVariables>
+                                <user.home>${project.build.directory}/test-home-serial</user.home>
+                            </systemPropertyVariables>
+                        </configuration>
+                    </execution>
+                </executions>
+            </plugin>
+        </plugins>
+    </build>
+
+    <profiles>
+
+        <profile>
+            <id>full</id>
+            <activation>
+                <property>
+                    <name>!quickly</name>
+                </property>
+            </activation>
+            <build>
+                <plugins>
+                    <plugin>
+                        <groupId>org.apache.maven.plugins</groupId>
+                        <artifactId>maven-surefire-plugin</artifactId>
+                        <executions>
+                            <execution>
+                                <id>serial-test</id>
+                                <phase>test</phase>
+                            </execution>
+                        </executions>
+                    </plugin>
+                </plugins>
+            </build>
+        </profile>
+
+        <profile>
+            <id>sync-example-catalog</id>
+            <build>
+                <plugins>
+                    <plugin>
+                        <groupId>org.apache.maven.plugins</groupId>
+                        <artifactId>maven-antrun-plugin</artifactId>
+                        <dependencies>
+                            <dependency>
+                                <groupId>org.apache.groovy</groupId>
+                                <artifactId>groovy-ant</artifactId>
+                                <version>${groovy-version}</version>
+                            </dependency>
+                            <dependency>
+                                <groupId>org.apache.groovy</groupId>
+                                <artifactId>groovy-json</artifactId>
+                                <version>${groovy-version}</version>
+                            </dependency>
+                            <dependency>
+                                <groupId>org.apache.groovy</groupId>
+                                <artifactId>groovy</artifactId>
+                                <version>${groovy-version}</version>
+                            </dependency>
+                        </dependencies>
+                        <executions>
+                            <execution>
+                                <id>download-example-catalog</id>
+                                <phase>generate-resources</phase>
+                                <goals>
+                                    <goal>run</goal>
+                                </goals>
+                                <configuration>
+                                    <target>
+                                        <property name="examples.base" value="https://raw.githubusercontent.com/apache/camel-jbang-examples/main"/>
+                                        <property name="examples.dest" value="${project.basedir}/src/main/resources/examples"/>
+                                        <!-- the catalog first; the bundled examples and their files are read from it -->
+                                        <get src="${examples.base}/camel-jbang-example-catalog.json"
+                                             dest="${examples.dest}/camel-jbang-example-catalog.json"/>
+                                        <taskdef name="groovy" classname="org.codehaus.groovy.ant.Groovy" classpathref="maven.plugin.classpath"/>
+                                        <groovy><![CDATA[
+                                            import groovy.json.JsonSlurper
+                                            def base = properties['examples.base']
+                                            def dest = new File(properties['examples.dest'])
+                                            def catalog = new JsonSlurper().parse(new File(dest, 'camel-jbang-example-catalog.json'))
+                                            // start from a clean tree so examples that left the catalog, or moved, do not linger
+                                            def files = dest.listFiles()
+                                            if (files == null) {
+                                                throw new RuntimeException("Cannot list ${dest}: does it exist and is it a directory?")
+                                            }
+                                            files.findAll { it.directory }.each { it.deleteDir() }
+                                            catalog.findAll { it.bundled }.each { ex ->
+                                                // the files it runs with, and its Citrus test (test/<name>.citrus.it.yaml), which the catalog does not list
+                                                def leaf = ex.name.substring(ex.name.lastIndexOf('/') + 1)
+                                                def fetched = ex.files + (ex.hasCitrusTests ? ['test/' + leaf + '.citrus.it.yaml'] : [])
+                                                fetched.each { f ->
+                                                    def target = new File(dest, ex.name + '/' + f)
+                                                    target.parentFile.mkdirs()
+                                                    try {
+                                                        new URL("${base}/${ex.name}/${f}").withInputStream { i -> target.withOutputStream { o -> o << i } }
+                                                    } catch (Exception e) {
+                                                        throw new RuntimeException("Failed to fetch ${ex.name}/${f} from ${base}: ${e.message}", e)
+                                                    }
+                                                    println "synced ${ex.name}/${f}"
+                                                }
+                                            }
+                                        ]]></groovy>
+                                    </target>
+                                </configuration>
+                            </execution>
+                        </executions>
+                    </plugin>
+                </plugins>
+            </build>
+        </profile>
+    </profiles>
+
+</project>

@@ -1,0 +1,364 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.camel.component.pqc.crypto.hybrid;
+
+import java.nio.ByteBuffer;
+import java.nio.charset.StandardCharsets;
+import java.security.*;
+import java.security.interfaces.ECPublicKey;
+import java.security.interfaces.XECPublicKey;
+import java.security.spec.NamedParameterSpec;
+import java.security.spec.X509EncodedKeySpec;
+
+import javax.crypto.KeyAgreement;
+import javax.crypto.KeyGenerator;
+import javax.crypto.SecretKey;
+import javax.crypto.spec.SecretKeySpec;
+
+import org.apache.camel.component.pqc.PQCKemLocks;
+import org.apache.camel.component.pqc.PQCSymmetricAlgorithms;
+import org.apache.camel.util.SecureRandomHelper;
+import org.bouncycastle.crypto.digests.SHA256Digest;
+import org.bouncycastle.crypto.digests.SHA384Digest;
+import org.bouncycastle.crypto.digests.SHA512Digest;
+import org.bouncycastle.crypto.generators.HKDFBytesGenerator;
+import org.bouncycastle.crypto.params.HKDFParameters;
+import org.bouncycastle.jcajce.SecretKeyWithEncapsulation;
+import org.bouncycastle.jcajce.spec.KEMExtractSpec;
+import org.bouncycastle.jcajce.spec.KEMGenerateSpec;
+
+/**
+ * Utility class for hybrid Key Encapsulation Mechanism (KEM) operations combining classical key agreement (e.g., ECDH,
+ * X25519) with post-quantum KEM algorithms (e.g., ML-KEM).
+ * <p>
+ * Hybrid KEM provides defense-in-depth by combining:
+ * <ul>
+ * <li>Classical ECDH/X25519 key agreement for quantum-vulnerable but well-understood security</li>
+ * <li>Post-quantum KEM for quantum-resistant security</li>
+ * </ul>
+ * The shared secrets from both algorithms are combined using HKDF to produce the final shared secret.
+ * <p>
+ * The {@link KeyAgreement} and {@link KeyGenerator} passed in may be shared by concurrent callers. Both keep state from
+ * their {@code init()} call to the call that returns the result and are not thread-safe, so each of those sequences
+ * runs while holding the instance's monitor.
+ * <p>
+ * Wire format: [4 bytes: classical encap length][classical encap][pqc encap]
+ */
+public final class HybridKEM {
+
+    private HybridKEM() {
+        // Utility class
+    }
+
+    /**
+     * Generates a hybrid encapsulation using both classical ECDH/XDH and PQC KEM.
+     *
+     * @param  classicalPublicKey the recipient's classical public key (EC or XDH)
+     * @param  pqcPublicKey       the recipient's PQC public key
+     * @param  classicalKA        the classical key agreement instance
+     * @param  pqcKemGenerator    the PQC KEM key generator
+     * @param  symmetricAlgorithm the symmetric algorithm for the shared secret (e.g., "AES")
+     * @param  keyLength          the symmetric key length in bits
+     * @param  kdfAlgorithm       the KDF algorithm (e.g., "HKDF-SHA256")
+     * @return                    the hybrid encapsulation result containing the combined secret
+     * @throws Exception          if encapsulation fails
+     */
+    public static HybridEncapsulationResult encapsulate(
+            PublicKey classicalPublicKey,
+            PublicKey pqcPublicKey,
+            KeyAgreement classicalKA,
+            KeyGenerator pqcKemGenerator,
+            String symmetricAlgorithm,
+            int keyLength,
+            String kdfAlgorithm)
+            throws Exception {
+
+        if (classicalPublicKey == null || pqcPublicKey == null || classicalKA == null
+                || pqcKemGenerator == null || symmetricAlgorithm == null) {
+            throw new IllegalArgumentException("All parameters must be non-null");
+        }
+
+        // Generate ephemeral key pair for classical key agreement
+        KeyPair ephemeralKeyPair = generateEphemeralKeyPair(classicalPublicKey);
+
+        // Perform classical key agreement
+        byte[] classicalSharedSecret;
+        synchronized (classicalKA) {
+            classicalKA.init(ephemeralKeyPair.getPrivate());
+            classicalKA.doPhase(classicalPublicKey, true);
+            classicalSharedSecret = classicalKA.generateSecret();
+        }
+
+        // The classical "encapsulation" is the ephemeral public key
+        byte[] classicalEncapsulation = ephemeralKeyPair.getPublic().getEncoded();
+
+        // Perform PQC KEM encapsulation
+        SecretKeyWithEncapsulation pqcResult;
+        synchronized (PQCKemLocks.lockFor(pqcKemGenerator, pqcPublicKey)) {
+            pqcKemGenerator.init(
+                    new KEMGenerateSpec(pqcPublicKey, symmetricAlgorithm, keyLength),
+                    SecureRandomHelper.getSecureRandom());
+            pqcResult = (SecretKeyWithEncapsulation) pqcKemGenerator.generateKey();
+        }
+        byte[] pqcSharedSecret = pqcResult.getEncoded();
+        byte[] pqcEncapsulation = pqcResult.getEncapsulation();
+
+        // Combine shared secrets using HKDF
+        byte[] combinedSecret = combineSecrets(
+                classicalSharedSecret,
+                pqcSharedSecret,
+                kdfAlgorithm,
+                keyLength / 8,
+                symmetricAlgorithm);
+
+        // The label only: the value handed to combineSecrets above is the HKDF info and must stay exactly as the
+        // caller gave it, or every encapsulation produced by an earlier version stops decrypting.
+        SecretKey hybridSecretKey = new SecretKeySpec(combinedSecret, PQCSymmetricAlgorithms.toJceName(symmetricAlgorithm));
+
+        // Combine encapsulations
+        byte[] hybridEncapsulation = combineEncapsulations(classicalEncapsulation, pqcEncapsulation);
+
+        return new HybridEncapsulationResult(
+                hybridEncapsulation,
+                hybridSecretKey,
+                classicalSharedSecret,
+                pqcSharedSecret);
+    }
+
+    /**
+     * Extracts the shared secret from a hybrid encapsulation.
+     *
+     * @param  hybridEncapsulation the hybrid encapsulation to extract from
+     * @param  classicalPrivateKey the recipient's classical private key
+     * @param  pqcPrivateKey       the recipient's PQC private key
+     * @param  classicalKA         the classical key agreement instance
+     * @param  pqcKemGenerator     the PQC KEM key generator
+     * @param  symmetricAlgorithm  the symmetric algorithm for the shared secret
+     * @param  keyLength           the symmetric key length in bits
+     * @param  kdfAlgorithm        the KDF algorithm
+     * @return                     the extracted shared secret key
+     * @throws Exception           if extraction fails
+     */
+    public static SecretKey extract(
+            byte[] hybridEncapsulation,
+            PrivateKey classicalPrivateKey,
+            PrivateKey pqcPrivateKey,
+            KeyAgreement classicalKA,
+            KeyGenerator pqcKemGenerator,
+            String symmetricAlgorithm,
+            int keyLength,
+            String kdfAlgorithm)
+            throws Exception {
+
+        if (hybridEncapsulation == null || classicalPrivateKey == null || pqcPrivateKey == null
+                || classicalKA == null || pqcKemGenerator == null || symmetricAlgorithm == null) {
+            throw new IllegalArgumentException("All parameters must be non-null");
+        }
+
+        // Parse the hybrid encapsulation
+        HybridEncapsulationComponents components = parse(hybridEncapsulation);
+
+        // Reconstruct the ephemeral public key from classical encapsulation
+        PublicKey ephemeralPublicKey = reconstructPublicKey(
+                components.classicalEncapsulation(),
+                classicalPrivateKey.getAlgorithm());
+
+        // Perform classical key agreement
+        byte[] classicalSharedSecret;
+        synchronized (classicalKA) {
+            classicalKA.init(classicalPrivateKey);
+            classicalKA.doPhase(ephemeralPublicKey, true);
+            classicalSharedSecret = classicalKA.generateSecret();
+        }
+
+        // Perform PQC KEM extraction
+        SecretKeyWithEncapsulation pqcResult;
+        synchronized (PQCKemLocks.lockFor(pqcKemGenerator, pqcPrivateKey)) {
+            pqcKemGenerator.init(
+                    new KEMExtractSpec(pqcPrivateKey, components.pqcEncapsulation(), symmetricAlgorithm, keyLength),
+                    SecureRandomHelper.getSecureRandom());
+            pqcResult = (SecretKeyWithEncapsulation) pqcKemGenerator.generateKey();
+        }
+        byte[] pqcSharedSecret = pqcResult.getEncoded();
+
+        // Combine shared secrets using HKDF
+        byte[] combinedSecret = combineSecrets(
+                classicalSharedSecret,
+                pqcSharedSecret,
+                kdfAlgorithm,
+                keyLength / 8,
+                symmetricAlgorithm);
+
+        // As in encapsulate(): the label is mapped, the HKDF info is not
+        return new SecretKeySpec(combinedSecret, PQCSymmetricAlgorithms.toJceName(symmetricAlgorithm));
+    }
+
+    /**
+     * Parses a hybrid encapsulation into its component parts.
+     *
+     * @param  hybridEncapsulation      the hybrid encapsulation to parse
+     * @return                          the parsed components
+     * @throws IllegalArgumentException if the format is invalid
+     */
+    public static HybridEncapsulationComponents parse(byte[] hybridEncapsulation) {
+        if (hybridEncapsulation == null || hybridEncapsulation.length < 5) {
+            throw new IllegalArgumentException("Invalid hybrid encapsulation: too short");
+        }
+
+        ByteBuffer buffer = ByteBuffer.wrap(hybridEncapsulation);
+
+        // Read classical encapsulation length
+        int classicalLength = buffer.getInt();
+        if (classicalLength <= 0 || classicalLength > hybridEncapsulation.length - 4) {
+            throw new IllegalArgumentException("Invalid hybrid encapsulation: invalid classical length");
+        }
+
+        // Read classical encapsulation
+        byte[] classicalEncapsulation = new byte[classicalLength];
+        buffer.get(classicalEncapsulation);
+
+        // Read PQC encapsulation (remaining bytes)
+        int pqcLength = buffer.remaining();
+        if (pqcLength <= 0) {
+            throw new IllegalArgumentException("Invalid hybrid encapsulation: missing PQC encapsulation");
+        }
+        byte[] pqcEncapsulation = new byte[pqcLength];
+        buffer.get(pqcEncapsulation);
+
+        return new HybridEncapsulationComponents(classicalEncapsulation, pqcEncapsulation);
+    }
+
+    /**
+     * Combines classical and PQC encapsulations into a hybrid encapsulation.
+     */
+    public static byte[] combineEncapsulations(byte[] classicalEncapsulation, byte[] pqcEncapsulation) {
+        ByteBuffer buffer = ByteBuffer.allocate(4 + classicalEncapsulation.length + pqcEncapsulation.length);
+        buffer.putInt(classicalEncapsulation.length);
+        buffer.put(classicalEncapsulation);
+        buffer.put(pqcEncapsulation);
+        return buffer.array();
+    }
+
+    /**
+     * Combines two shared secrets using HKDF.
+     */
+    private static byte[] combineSecrets(
+            byte[] secret1,
+            byte[] secret2,
+            String kdfAlgorithm,
+            int outputLength,
+            String info)
+            throws Exception {
+
+        // Concatenate the secrets as input key material
+        byte[] ikm = new byte[secret1.length + secret2.length];
+        System.arraycopy(secret1, 0, ikm, 0, secret1.length);
+        System.arraycopy(secret2, 0, ikm, secret1.length, secret2.length);
+
+        // Use HKDF to derive the final key
+        HKDFBytesGenerator hkdf = createHKDF(kdfAlgorithm);
+        hkdf.init(new HKDFParameters(ikm, null, info.getBytes(StandardCharsets.UTF_8)));
+
+        byte[] output = new byte[outputLength];
+        hkdf.generateBytes(output, 0, outputLength);
+
+        return output;
+    }
+
+    /**
+     * Creates an HKDF instance based on the algorithm name.
+     */
+    private static HKDFBytesGenerator createHKDF(String algorithm) {
+        return switch (algorithm) {
+            case "HKDF-SHA256" -> new HKDFBytesGenerator(new SHA256Digest());
+            case "HKDF-SHA384" -> new HKDFBytesGenerator(new SHA384Digest());
+            case "HKDF-SHA512" -> new HKDFBytesGenerator(new SHA512Digest());
+            // Falling back to SHA-256 here would let a typo derive a different key on each side of the exchange,
+            // with both ends reporting success
+            default -> throw new IllegalArgumentException(
+                    "Unsupported hybrid KDF algorithm: " + algorithm
+                                                          + ". Supported values are HKDF-SHA256, HKDF-SHA384 and HKDF-SHA512");
+        };
+    }
+
+    /**
+     * Generates the ephemeral key pair used for the classical half of the key agreement.
+     * <p/>
+     * The ephemeral key must live in the same group as the recipient's key, so the group is taken from that key rather
+     * than from its algorithm name: {@code getAlgorithm()} returns a bare {@code EC} for every curve, so deriving the
+     * curve from it would pin every agreement to one curve regardless of the key actually in use.
+     */
+    private static KeyPair generateEphemeralKeyPair(PublicKey recipientPublicKey) throws Exception {
+        KeyPairGenerator kpg;
+
+        if (recipientPublicKey instanceof ECPublicKey ecPublicKey) {
+            kpg = KeyPairGenerator.getInstance("EC");
+            kpg.initialize(ecPublicKey.getParams(), SecureRandomHelper.getSecureRandom());
+        } else if (recipientPublicKey instanceof XECPublicKey xecPublicKey
+                && xecPublicKey.getParams() instanceof NamedParameterSpec namedSpec) {
+            kpg = KeyPairGenerator.getInstance(namedSpec.getName());
+            kpg.initialize(namedSpec, SecureRandomHelper.getSecureRandom());
+        } else {
+            // BouncyCastle XDH keys report the concrete name (X25519 / X448), which fully determines the group
+            String algorithm = recipientPublicKey.getAlgorithm();
+            if ("XDH".equals(algorithm)) {
+                throw new InvalidKeyException(
+                        "Cannot determine the X25519/X448 group of the classical public key of type "
+                                              + recipientPublicKey.getClass().getName()
+                                              + ": it exposes neither XECPublicKey parameters nor a concrete algorithm name");
+            }
+            kpg = KeyPairGenerator.getInstance(algorithm);
+        }
+
+        return kpg.generateKeyPair();
+    }
+
+    /**
+     * Reconstructs a public key from encoded bytes. The X.509 encoding carries its own domain parameters, so a key
+     * factory for the family is enough - naming a concrete curve here would reject the other curves of that family.
+     */
+    private static PublicKey reconstructPublicKey(byte[] encoded, String algorithm) throws Exception {
+        KeyFactory kf;
+
+        if ("EC".equals(algorithm) || "ECDH".equals(algorithm)) {
+            kf = KeyFactory.getInstance("EC");
+        } else if ("XDH".equals(algorithm)) {
+            kf = KeyFactory.getInstance("XDH");
+        } else {
+            kf = KeyFactory.getInstance(algorithm);
+        }
+
+        X509EncodedKeySpec keySpec = new X509EncodedKeySpec(encoded);
+        return kf.generatePublic(keySpec);
+    }
+
+    /**
+     * Record holding the result of a hybrid encapsulation operation.
+     */
+    public record HybridEncapsulationResult(
+            byte[] encapsulation,
+            SecretKey sharedSecret,
+            byte[] classicalSharedSecret,
+            byte[] pqcSharedSecret) {
+    }
+
+    /**
+     * Record holding the parsed components of a hybrid encapsulation.
+     */
+    public record HybridEncapsulationComponents(byte[] classicalEncapsulation, byte[] pqcEncapsulation) {
+    }
+}

@@ -1,0 +1,102 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.camel.dsl.jbang.core.commands.config;
+
+import org.apache.camel.dsl.jbang.core.commands.CamelJBangMain;
+import org.apache.camel.dsl.jbang.core.commands.UserConfigHelper;
+import org.apache.camel.dsl.jbang.core.common.CliException;
+import org.apache.camel.dsl.jbang.core.common.CliExitCode;
+import org.apache.camel.dsl.jbang.core.common.CommandLineHelper;
+import org.junit.jupiter.api.Assertions;
+import org.junit.jupiter.api.Test;
+
+class ConfigSetTest extends BaseConfigTestSupport {
+
+    @Test
+    public void shouldSetConfig() throws Exception {
+        UserConfigHelper.createUserConfig("");
+
+        ConfigSet command = new CamelJBangMain().withPrinter(printer).command(new ConfigSet());
+        command.configuration = "foo=bar";
+        command.doCall();
+
+        Assertions.assertEquals("", printer.getOutput());
+
+        CommandLineHelper.loadProperties(properties -> {
+            Assertions.assertEquals(1, properties.size());
+            Assertions.assertEquals("bar", properties.get("foo"));
+        });
+    }
+
+    @Test
+    public void shouldOverwriteConfig() throws Exception {
+        UserConfigHelper.createUserConfig("foo=bar");
+
+        ConfigSet command = new CamelJBangMain().withPrinter(printer).command(new ConfigSet());
+        command.configuration = "foo=baz";
+        command.doCall();
+
+        Assertions.assertEquals("", printer.getOutput());
+
+        CommandLineHelper.loadProperties(properties -> {
+            Assertions.assertEquals(1, properties.size());
+            Assertions.assertEquals("baz", properties.get("foo"));
+        });
+    }
+
+    @Test
+    public void setLocalConfig() throws Exception {
+        ConfigSet command = new CamelJBangMain().withPrinter(printer).command(new ConfigSet());
+        command.configuration = "foo=local";
+        command.global = false;
+        command.doCall();
+
+        Assertions.assertEquals("", printer.getOutput());
+
+        CommandLineHelper.loadProperties(properties -> {
+            Assertions.assertEquals(1, properties.size());
+            Assertions.assertEquals("local", properties.get("foo"));
+        }, true);
+    }
+
+    @Test
+    public void shouldRejectConfigWithoutKey() throws Exception {
+        UserConfigHelper.createUserConfig("");
+
+        ConfigSet command = new CamelJBangMain().withPrinter(printer).command(new ConfigSet());
+        command.configuration = "=bar";
+
+        CliException e = Assertions.assertThrows(CliException.class, command::doCall);
+        Assertions.assertEquals(CliExitCode.USAGE, e.getExitCode());
+        Assertions.assertEquals("Configuration parameter not in key=value format: =bar", e.getMessage());
+        CommandLineHelper.loadProperties(properties -> Assertions.assertTrue(properties.isEmpty()));
+    }
+
+    @Test
+    public void shouldRejectConfigWithoutValue() throws Exception {
+        ConfigSet command = new CamelJBangMain().withPrinter(printer).command(new ConfigSet());
+        command.configuration = "foo";
+        command.global = false;
+
+        CliException e = Assertions.assertThrows(CliException.class, command::doCall);
+        Assertions.assertEquals(CliExitCode.USAGE, e.getExitCode());
+        // no local configuration file is created
+        Assertions.assertFalse(CommandLineHelper.hasLocalUserConfig());
+    }
+
+}

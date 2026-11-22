@@ -1,0 +1,34 @@
+{
+  "transformer": {
+    "kind": "transformer",
+    "name": "application-x-java-object",
+    "title": "Application X Java Object",
+    "description": "Transforms from JSon to Java object using Jackson (supports content schema)",
+    "deprecated": false,
+    "javaType": "org.apache.camel.component.jackson3.transform.JsonPojoDataTypeTransformer",
+    "groupId": "org.apache.camel",
+    "artifactId": "camel-jackson3",
+    "version": "4.24.0-SNAPSHOT"
+  },
+  "bodyTypes": {
+    "transformerIn": {
+      "carriers": [
+        "text",
+        "bytes",
+        "stream",
+        "file",
+        "pojo",
+        "map",
+        "list"
+      ],
+      "description": "Json read into the class of the X-Content-Class exchange property, which a body other than a POJO needs: a POJO of that class, or any POJO without it, is kept, and so is a Map or a List without it; a Map or a List with it, and a null body, fail"
+    },
+    "transformerOut": {
+      "carriers": [
+        "unknown"
+      ],
+      "description": "An object of the class of the X-Content-Class exchange property, or the POJO, Map or List as it was without it"
+    }
+  }
+}
+

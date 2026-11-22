@@ -1,0 +1,650 @@
+= Camel CLI - Export to Maven
+
+Export your Camel CLI integrations to production-ready Maven projects, manage dependencies, and upgrade Camel versions.
+
+== Creating Projects
+
+Export your Camel CLI integration to a Maven-based project for Spring Boot, Quarkus, or standalone Camel Main.
+
+[source,bash]
+----
+camel export --runtime=spring-boot --gav=com.foo:acme:1.0-SNAPSHOT
+camel export --runtime=quarkus --gav=com.foo:acme:1.0-SNAPSHOT
+camel export --runtime=camel-main --gav=com.foo:acme:1.0-SNAPSHOT
+----
+
+NOTE: Without `--directory`, files are exported to the current directory. Use `--directory=../myproject` to copy to a separate folder.
+
+The export writes a `.camel-export` file in a separate folder, and replaces that folder when it exports to it again, so
+no stale files of the earlier export are left. It does not delete the files of a folder that no export created: the
+export fails, unless `--clean-dir` is given. Without `--directory`, the files of the current directory are kept.
+
+TIP: Run `camel export --help` for all options.
+
+Notes:
+
+- The Quarkus platform version is automatically resolved from the registry based on the Camel version.
+- The `--profile` option is not supported when exporting to Quarkus.
+- To find the dependencies, the export boots the integration with the profile of `--profile` (or the `dev` profile, as `camel run`, when none is given), so a component that only `application-<profile>.properties` uses is in the exported project.
+- For Spring Boot, you can override versions with `--camel-spring-boot-version`.
+
+=== Exporting with a parent POM
+
+When organizations run many Camel integrations, they typically use a parent POM to standardize
+plugin versions, required extensions, and common dependencies. Use `--parent-pom` to set the
+parent POM in the exported project:
+
+[source,bash]
+----
+camel export --runtime=quarkus --gav=com.foo:acme:1.0-SNAPSHOT --parent-pom=com.ourorg:camel-parent:1.0
+----
+
+This generates the `<parent>` block in the exported `pom.xml`:
+
+[source,xml]
+----
+<parent>
+    <groupId>com.ourorg</groupId>
+    <artifactId>camel-parent</artifactId>
+    <version>1.0</version>
+    <relativePath/>
+</parent>
+----
+
+For Spring Boot, specifying `--parent-pom` replaces the default `spring-boot-starter-parent`.
+The Spring Boot BOM (`spring-boot-dependencies`) remains in `<dependencyManagement>`, so version
+management continues to work.
+
+You can also configure this in `application.properties`:
+
+[source,properties]
+----
+camel.jbang.parentPom=com.ourorg:camel-parent:1.0
+----
+
+=== Exporting with Java Agent included
+
+NOTE: Only `camel-main` runtime supports Java Agents.
+
+Specify the agent with `agent:` prefix in `application.properties`:
+
+[source,properties]
+----
+camel.jbang.dependencies=camel:opentelemetry,agent:io.opentelemetry.javaagent:opentelemetry-javaagent:1.31.0
+camel.opentelemetry.enabled=true
+----
+
+Export and run:
+
+[source,bash]
+----
+camel export --runtime=camel-main --gav=com.foo:acme:1.0-SNAPSHOT --directory=../myproject
+cd ../myproject
+mvn clean package
+java -javaagent:agent/opentelemetry-javaagent-1.31.0.jar -jar target/acme-1.0-SNAPSHOT.jar
+----
+
+The agent JAR is downloaded from Maven and saved to the `agent/` folder.
+
+=== Exporting with selected files
+
+By default, all files from the current directory are exported. Specify files explicitly to split into multiple projects:
+
+[source,bash]
+----
+camel export Foo.java --runtime=quarkus --gav=com.foo:acme:1.0-SNAPSHOT --directory=../export1
+camel export bar.xml cheese.yaml --runtime=spring-boot --gav=com.foo:cheese:1.0-SNAPSHOT --directory=../export2
+----
+
+NOTE: `application.properties` is included in all exports automatically.
+
+=== Exporting with Camel Wrapper
+
+Use `--camel-wrapper` to include Camel Wrapper scripts in the exported project.
+This works like the Maven Wrapper — it pins a specific Camel CLI version so that anyone
+working on the project uses the same version without a separate install:
+
+[source,bash]
+----
+camel export --runtime=spring-boot --gav=com.foo:acme:1.0-SNAPSHOT --camel-wrapper
+----
+
+This adds the following files to the exported project:
+
+- `camel` and `camel.cmd` — launcher scripts that download and run the pinned Camel CLI version
+- `.camel/camel-wrapper.properties` — contains the pinned `camel.version` and download URL
+
+The pinned version matches the Camel version used in the export. After exporting, use `./camel`
+instead of a globally installed `camel` to ensure the project always uses the correct version.
+
+You can also set this in `application.properties`:
+
+[source,properties]
+----
+camel.jbang.camelWrapper=true
+----
+
+TIP: The Camel Wrapper can also be installed standalone with `camel wrapper`.
+See xref:camel-jbang-installation.adoc[Installation Options] for details.
+
+=== Including JMX management or CLI connector
+
+JMX management and CLI connector are not included by default. Add them with `--dep`:
+
+[source,bash]
+----
+camel export --runtime=quarkus --gav=com.foo:acme:1.0-SNAPSHOT --dep=camel:management
+camel export --runtime=quarkus --gav=com.foo:acme:1.0-SNAPSHOT --dep=camel:cli-connector
+----
+
+=== Including resource directories
+
+To include entire directories of resource files (such as XSD schemas, WSDL files, etc.)
+in the exported project while preserving their directory structure, use `--resource-dirs`:
+
+[source,bash]
+----
+camel export --resource-dirs=soap
+----
+
+This recursively copies all files from the `soap/` directory into `src/main/resources/soap/`,
+preserving the directory structure. For example, `soap/schemas/common.xsd` becomes
+`src/main/resources/soap/schemas/common.xsd`.
+
+Multiple directories can be specified with commas:
+
+[source,bash]
+----
+camel export --resource-dirs=soap,wsdl
+----
+
+You can also reference directories outside the current project using relative paths.
+When using `..` paths, only the last directory name is used as the target:
+
+[source,bash]
+----
+camel export --resource-dirs=../shared/schemas
+----
+
+This copies the contents into `src/main/resources/schemas/`.
+
+NOTE: Absolute paths (e.g., `/some/path`) are not allowed.
+The directory is limited to at most 1000 files as a safety measure.
+
+=== Troubleshooting exporting
+
+Use `--verbose` and `--logging` for more detail, or `--logging-level=DEBUG` for full output.
+Try `--ignore-loading-error` if custom Java code prevents export.
+
+TIP: Export logs are stored in `~/.camel/camel-export.log` by default.
+
+=== Configuring exporting
+
+Export loads configuration from `application.properties`, where you can set runtime, Java version, and other parameters.
+See xref:camel-jbang-configuration.adoc[Configuration] for all `camel.jbang.*` options.
+
+=== Exporting from Java
+
+*Since Camel 4.24 (preview)*
+
+Tools that create Camel projects, such as an IDE or a visual designer, can export (and run) from Java instead of running the `camel` command:
+
+[source,java]
+----
+ExportRequest request = new ExportRequest();
+request.files.add("hello.camel.yaml");
+request.runtime = RuntimeType.main; // or springBoot, quarkus
+request.exportDir = "target/hello";
+
+int exit = new ProjectExporter().export(request);
+----
+
+See xref:camel-jbang-java-api.adoc[Java API for Export and Run] for the export and run API of the `camel-jbang-run` module.
+
+== Gathering list of dependencies
+
+List the Camel components and JARs required to run your integration:
+
+[source,bash]
+----
+camel dependency list
+org.apache.camel:camel-dsl-modeline:3.20.0
+org.apache.camel:camel-health:3.20.0
+org.apache.camel:camel-kamelet:3.20.0
+org.apache.camel:camel-log:3.20.0
+...
+----
+
+Output defaults to GAV format. Use `--output=maven` for Maven XML format.
+Use `--runtime=spring-boot` or `--runtime=quarkus` for runtime-specific dependencies.
+
+== Generating SBOM report
+
+Generate a Software Bill of Materials for your integration:
+
+[source,bash]
+----
+camel sbom
+camel sbom --sbom-format=spdx
+camel sbom --runtime=quarkus
+----
+
+Defaults to CycloneDX format (`sbom.json`) with `camel-main` runtime.
+
+== Checking dependencies for known vulnerabilities
+
+Check the dependencies of your integration, with the ones they bring in, for known vulnerabilities (CVEs). Every JAR
+is checked against https://osv.dev[OSV.dev], and the Camel JARs against the Apache Camel security advisories that ship
+with the Camel catalog:
+
+[source,bash]
+----
+camel dependency audit
+ SEVERITY  SCORE  CVE             ARTIFACT                               FIX     VIA           USED  SUMMARY
+ CRITICAL    9.8  CVE-2022-42889  org.apache.commons:commons-text:1.9    1.10.0                      Arbitrary code execution in Apache Commons Text
+ HIGH        8.3  CVE-2022-1471   org.yaml:snakeyaml:1.33                2.0                         SnakeYaml Constructor Deserialization Remote Code Executi…
+ MEDIUM      6.5  CVE-2025-48924  org.apache.commons:commons-lang3:3.11  3.18.0  commons-text        Apache Commons Lang is vulnerable to Uncontrolled Recursi…
+
+3 vulnerabilities in 3 of 27 dependencies of the project (1 CRITICAL, 1 HIGH, 1 MEDIUM)
+----
+
+* *FIX* is the version that fixes the JAR, on the line its version is in, or the Camel release to upgrade to for a
+  Camel advisory.
+* *VIA* is the dependency chain that brings the JAR in, such as `camel-kafka > kafka-clients`; empty when the project
+  declares it itself.
+* *USED* is `yes` when the routes have an endpoint of the Camel component that brings the JAR in, and `no` when they
+  have none; empty when no component brings it in.
+
+The options:
+
+* `--integration=<name or pid>` checks the classpath of a running integration instead of the project files: the
+  versions it actually loaded.
+* `--by-artifact` shows one row per vulnerable JAR, with the version that fixes all its CVEs, which is what to upgrade.
+* `--severity=high` lists only the vulnerabilities of that severity or worse.
+* `--json` prints one JSON document, for a script or an AI agent. `vulnerabilities` counts the ones listed (`--severity`),
+  `totalVulnerabilities` all of them, and `failed` is `true` when the command exits with 1.
+* `--offline` checks only the Apache Camel security advisories, without OSV.dev.
+* `--osv-database` checks with the offline OSV database instead of the OSV.dev API, see below.
+
+The command exits with 1 when it finds a vulnerability of the `--fail-on` severity or worse (default `low`: any), so a
+CI job fails; `--fail-on=none` always exits with 0. When OSV.dev (or the OSV database) cannot be used, the command
+warns and checks the Apache Camel security advisories only; with `--fail-on-error` it exits with 1 then, so a CI job
+does not pass without the check. The CVE Audit screen of the xref:camel-jbang-tui.adoc[Camel TUI]
+shows the same for a running integration, and explains a vulnerability with AI. For a Maven build in a CI/CD
+pipeline, the xref:camel-report-maven-plugin.adoc#_camel_reportaudit[camel-report:audit] goal does the same checks
+on the dependencies Maven resolved, fails the build on a severity, and writes a SARIF report.
+
+=== The offline OSV database
+
+By default, the command sends the coordinates (`groupId:artifactId:version`) of every dependency to the OSV.dev API,
+including those of the internal libraries of a company. With `--osv-database` it does not: it downloads the export of
+all the Maven vulnerabilities of OSV.dev (one ZIP file of about 10 MB, updated every day by OSV.dev) and matches the
+versions locally, so no coordinates leave the machine:
+
+[source,bash]
+----
+camel dependency audit --osv-database
+----
+
+The ZIP is kept in `~/.camel/osv` and downloaded again once a day, and only when it changed (`If-Modified-Since`).
+When the download fails, the copy of the day before is used, with a warning.
+
+A build machine without internet access can download the ZIP from the repository manager of the company: a raw
+repository of Nexus or a generic remote repository of Artifactory that proxies
+`https://osv-vulnerabilities.storage.googleapis.com/Maven/all.zip`, or a file on disk:
+
+[source,bash]
+----
+camel dependency audit --osv-database-url=https://nexus.corp.com/repository/osv/Maven/all.zip
+camel dependency audit --osv-database-url=/opt/osv/all.zip
+----
+
+The offline database and the OSV.dev API give the same vulnerabilities: OSV.dev matches the versions with the same
+data.
+
+=== Proxy
+
+The command reaches OSV.dev (or the URL of `--osv-database-url`) through a proxy, which is taken from, in order:
+
+. the active proxy of the Maven settings: `~/.m2/settings.xml`, or the file of `--maven-settings`, with its username,
+  its password (encrypted with `settings-security.xml` or not) and its `nonProxyHosts`;
+. the `HTTPS_PROXY` (or `HTTP_PROXY`) and `NO_PROXY` environment variables, as CI runners set them, such as
+  `HTTPS_PROXY=http://user:secret@proxy.corp.com:3128`;
+. the proxy settings of the JVM, such as `JAVA_OPTS="-Dhttps.proxyHost=proxy.corp.com -Dhttps.proxyPort=3128"`.
+
+The JDK does not send a username and password to a proxy with Basic authentication when it tunnels HTTPS through it
+(`jdk.http.auth.tunneling.disabledSchemes=Basic`); the command allows it when the proxy has a username, unless the
+property is set already. When OSV.dev cannot be reached, the command checks the Apache Camel security advisories only,
+and says why.
+
+== Checking for outdated dependencies
+
+List the dependencies with a newer release, and those whose version does not fit the Camel version:
+
+[source,bash]
+----
+camel dependency outdated
+Camel 4.24.0-SNAPSHOT (not released)
+
+ ARTIFACT                         VERSION  CAMEL  STATUS    NEWER  LATEST
+ org.apache.commons:commons-text  1.9                              1.15.0
+ org.snakeyaml:snakeyaml-engine   2.9      3.2    override         3.2 (major)
+ org.yaml:snakeyaml               1.33                             2.7 (major)
+
+3 of 8 dependencies of the project to look at (1 override, 3 with a newer release)
+----
+
+The first line tells where the Camel version stands, from the known releases in the Camel catalog. On Camel 4.18.1 it
+reads:
+
+[source,text]
+----
+Camel 4.18.1 LTS, end of life 2027-02-16 · newer on this line: 4.18.5 · latest LTS: 4.22.2 · latest: 4.23.0
+----
+
+The Camel JARs move together, so they are not listed with newer versions of their own: upgrade Camel instead.
+
+* *CAMEL* is the version the Camel dependencies bring of the library; empty when Camel does not bring it.
+* *STATUS* is `override` when the project declares another version than the one Camel brings, `conflict` when the JAR
+  is loaded in more than one version or in another version than declared (with `--integration`), `mixed` for a Camel
+  JAR of another Camel version, and `managed` when it is the version Camel brings.
+* *NEWER* is the latest release of the same major.minor line, and *LATEST* the latest release, marked `(major)` when it
+  is another major version. A version newer than the one Camel brings, or another major version, may not work with
+  this Camel version.
+
+The newer versions come from the Maven repositories of your Maven settings (Maven Central, mirrors). The options:
+
+* `--integration=<name or pid>` checks the JARs a running integration loaded, which finds the ones loaded twice.
+* `--transitive` also lists the dependencies the declared ones bring in, with the one that brings each (VIA).
+* `--all` lists all dependencies, not only those with something to report.
+* `--offline` does not look up newer versions: only the versions Camel brings.
+* `--json` prints one JSON document, for a script or an AI agent.
+
+The command exits with 1 when a dependency is outdated, so a CI job fails. `--fail-on` sets what counts: `any` (the
+default) a status to act on or any newer release, `patch` a status to act on or a newer release of the same line,
+`status` only a status to act on, and `none` never. The Maven Dependencies screen of the
+xref:camel-jbang-tui.adoc[Camel TUI] shows the same, with the CVEs of each dependency.
+
+=== Copying dependency JARs
+
+Copy required JARs to a folder (defaults to `lib/`). The dependencies are resolved together, as one dependency graph,
+so the folder has one version of each library:
+
+[source,bash]
+----
+camel dependency copy
+----
+
+IMPORTANT: Both `camel dependency copy` and `camel dependency list` require Apache Maven (`mvn`) in PATH.
+
+== Manage plugins
+
+Plugins extend the CLI with additional commands. List available plugins (ASF and community):
+
+[source,bash]
+----
+camel plugin get --all
+----
+
+The plugins of the Apache Camel project:
+
+[cols="1m,3",options="header"]
+|===
+| Plugin | Commands
+
+| kubernetes | `camel kubernetes`: deploy to Kubernetes, see xref:camel-jbang-kubernetes.adoc[Kubernetes Plugin]
+| test | `camel test`: Citrus tests, see xref:camel-jbang-test.adoc[Testing Plugin]
+| validate | `camel validate`: check source files, see xref:camel-jbang-validation.adoc[Validation]
+| generate | `camel generate`: REST DSL and DTOs from OpenAPI, JSON schemas (see below)
+| tui | `camel tui`: the xref:camel-jbang-tui.adoc[Camel TUI]
+| mcp | `camel mcp`: the xref:camel-jbang-mcp.adoc[Camel CLI MCP Server]
+| edit | `camel edit`: edit a Camel file in the terminal with suggestions and diagnostics
+|===
+
+The plugins of the Apache Camel project are installed on first use: the first `camel tui` installs the tui plugin.
+The Camel CLI launcher, as installed by the install script or a package manager such as Homebrew, has kubernetes, test,
+validate, tui and mcp in it, and downloads generate and edit from Maven Central the first time they are used.
+
+Add, list installed, and remove plugins:
+
+[source,bash]
+----
+camel plugin add generate
+camel plugin add forage
+camel plugin get
+camel plugin delete <plugin-name>
+----
+
+`camel plugin add` checks that a plugin it does not know (neither a plugin of the Apache Camel project nor a known
+community plugin) can be loaded before it stores it: a name such as `kubernets` exits with code `3` and the plugins of a
+similar name. Give `--gav` for a plugin of your own. A stored plugin that cannot be loaded no longer fails `camel run`
+and `camel export`: they warn and go on without it. This includes a plugin built for another Camel version, whose
+classes (or only those of its exporter or run customizer) do not link with this Camel CLI: the warning says so, and the
+plugin's own command fails with the same reason. Run `camel plugin add <plugin-name>` to select a release built for
+this Camel version, or remove the plugin with `camel plugin delete <plugin-name>`.
+
+=== Custom plugin configuration
+
+By default, the CLI stores the plugin configuration in `~/.camel-jbang-plugins.json`.
+To use a different location, pass the `--plugin-config` option to any `plugin` subcommand:
+
+[source,bash]
+----
+camel plugin get --plugin-config /path/to/my-plugins.json
+camel plugin add kubernetes --plugin-config /path/to/my-plugins.json
+----
+
+The path can point to a JSON file, an existing file with any name, or a directory (in which case the default filename `.camel-jbang-plugins.json` is resolved inside it).
+A path that does not exist and does not end with `.json` is treated as a directory and created on first save.
+
+Alternatively, set the `CAMEL_CLI_PLUGIN_CONFIG` environment variable:
+
+[source,bash]
+----
+export CAMEL_CLI_PLUGIN_CONFIG=/path/to/my-plugins.json
+camel plugin get
+----
+
+The resolution order is: `--plugin-config` option > `CAMEL_CLI_PLUGIN_CONFIG` environment variable > default `~/.camel-jbang-plugins.json`.
+
+NOTE: The `--plugin-config` option only applies to the `plugin` subcommands (`add`, `get`, `delete`, `list`).
+Running a plugin's own command (e.g. `camel kubernetes ...`) discovers plugins only through the environment variable or the default file.
+So a plugin added with `camel plugin add --plugin-config X` is not seen unless `CAMEL_CLI_PLUGIN_CONFIG` is also set.
+
+=== Plugin versions
+
+The plugins of the Apache Camel project always use the version of the CLI.
+
+A community plugin, such as `forage` or `kit`, is released on its own, and each release is built for a Camel version.
+`camel plugin add <name>` selects the newest release of the plugin built for the version of the installed CLI, and prints it:
+
+[source,bash]
+----
+$ camel plugin add forage
+Selected forage 1.6.2 for Camel CLI 4.22.2 (built for Camel 4.22.2)
+Plugin forage added
+----
+
+To select the release, the CLI lists the releases of the plugin from the Maven repositories it is configured with:
+Maven Central, the repositories of the active profiles in the Maven `settings.xml` (with its mirrors applied), and the
+repositories given with `--repos` (or by the catalog of known plugins). The list is always checked again in these
+repositories, so a new release is found. Releases with a qualifier, such as `-SNAPSHOT` or `-RC1`, are not used.
+
+The releases are grouped by release line of the plugin (its major and minor version: `1.6.0`, `1.6.1` and `1.6.2` are
+the line `1.6`), and the CLI reads the POM of the newest release of each line, newest line first (at most 10 lines). The
+Camel versions a release supports are:
+
+. the Maven version range in the property `camel.jbang.plugin.camel-versions` of its POM, when the plugin declares it
+(see <<Building custom plugins>>)
+. otherwise the minor version of Camel of its `org.apache.camel:camel-jbang-core` dependency: a release built with
+Camel 4.22.2 supports Camel 4.22.x (the range `[4.22.0,4.23.0)`)
+
+A SNAPSHOT build of the CLI is compared without `-SNAPSHOT`. The `--camel-version` option of the commands is not used for
+this: it is the version of the installed CLI that counts.
+
+`camel plugin add` downloads the selected release before it saves the configuration, and stores the exact version in
+`~/.camel-jbang-plugins.json`, together with the Camel versions it supports. The plugin therefore stays at that version:
+run `camel plugin add <name>` again to select the newest matching release, for example after a new patch release of the
+plugin. When the CLI is upgraded to a Camel version that the stored release does not support, the CLI warns when the
+plugin is loaded, and tells to run `camel plugin add <name>` again. Plugins added with an older CLI are not checked.
+
+The CLI selects the newest release of the first line that supports its version. When no release read supports it:
+
+* if the CLI is newer than the Camel versions of all the releases (for example, the plugin has no release for a new
+Camel version yet), `camel plugin add` warns and uses the newest release (Maven `LATEST`), as older versions of the CLI
+do
+* if the CLI is between the Camel versions of the releases, it selects the newest release for the nearest older Camel
+version, and warns
+* if the CLI is older than the Camel versions of all the releases read, or no release tells which Camel versions it
+supports, it warns and uses `LATEST`
+
+The warnings list the newest release per Camel version found. When the releases cannot be read (for example, when
+offline), `camel plugin add` warns that it could not check the compatibility, and uses `LATEST`.
+
+To use a specific release, give its version, or the Maven coordinates of the plugin. It is used as given; the CLI only
+warns when the release is known to be built for another Camel version:
+
+[source,bash]
+----
+camel plugin add forage --version 1.6.2
+camel plugin add forage --gav io.kaoto.forage:camel-jbang-plugin-forage:1.6.2
+----
+
+Older versions of the CLI do not select a release, and use the newest one. With them, give the release the plugin
+documents for your Camel version with `--version`, or with `--gav` before Camel 4.21, where the CLI does not know the
+Maven `groupId` of community plugins yet (and `--version` alone looks for the plugin in the `org.apache.camel` group).
+For example, Forage 1.4.2 is built for Camel 4.18:
+
+[source,bash]
+----
+camel plugin add forage --gav io.kaoto.forage:camel-jbang-plugin-forage:1.4.2
+----
+
+=== Building custom plugins
+
+It is possible to build custom Camel CLI plugins. We suggest to take a look at one of the https://github.com/apache/camel/tree/main/dsl/camel-jbang[existing plugins],
+to see how that is done.
+
+IMPORTANT: The name of the plugin Maven **artifactId** must start with `camel-jbang-plugin-`. For example if the plugin is named `cheese`, then
+the maven artifact must be named `camel-jbang-plugin-cheese`.
+
+A plugin should declare the Camel versions each release supports, as a Maven version range in the property
+`camel.jbang.plugin.camel-versions` of the POM of the plugin, so `camel plugin add` selects the right release
+(see <<Plugin versions>>):
+
+[source,xml]
+----
+<properties>
+    <camel.jbang.plugin.camel-versions>[4.23.0,4.24.0)</camel.jbang.plugin.camel-versions>
+</properties>
+----
+
+Keep the value a literal range, updated together with the Camel version the plugin is built with. A value that is not a
+version range (such as a single version) is ignored. Without the property, a release is taken to support the minor
+version of Camel of its `org.apache.camel:camel-jbang-core` dependency.
+
+== Generate plugin
+
+=== REST DSL from OpenAPI
+
+Generate the REST DSL (YAML or XML) from an OpenAPI specification, for contract-first REST development:
+
+[source,bash]
+----
+camel generate rest --input=petstore.yaml --output=petstore-rest.yaml
+camel generate rest --input=petstore.yaml --output=petstore-rest.yaml --routes
+camel generate rest --input=petstore.yaml --dto --runtime=quarkus --package=com.acme.model
+----
+
+`--routes` also generates a route for each operation (YAML only), and `--dto` generates Java data objects
+for the schemas of the specification. Each generated route has a `log` step that says it is not implemented yet: the
+routes run as they are (`camel run petstore-rest.yaml`), and you replace that step with the implementation.
+
+=== JSON schema
+
+Generate JSON Schema definitions from Java objects for use with visual development tools (Kaoto, Karavan):
+
+[source,bash]
+----
+camel generate schema fhir org.hl7.fhir.r4.model.Patient > patient-schema.json
+----
+
+The schema is printed on stdout; `--output=patient-schema.json` writes it to a file instead. `--verbose` tells on
+stderr what the command does (the dependencies it downloads, the class it loads), so stdout stays the schema.
+
+== Version management
+
+Show the current Camel CLI version:
+
+[source,bash]
+----
+camel version
+----
+
+=== Running with a different version
+
+Use `--camel-version` to run with a specific Camel version:
+
+[source,bash]
+----
+camel run * --camel-version=3.18.4
+----
+
+Or set a persistent version override:
+
+[source,bash]
+----
+camel version set 3.18.2
+camel version set --reset
+----
+
+`camel version set` checks in the Maven repositories that the version exists, and refuses one that does not
+(exit code 3). `--reset` removes the `camel-version`, `kamelets-version`, `repos` and `runtime` settings.
+
+IMPORTANT: You cannot combine `camel version set` with `--camel-version`.
+
+For SNAPSHOT versions:
+
+[source,bash]
+----
+jbang --fresh -Dcamel.jbang.version=3.21.0-SNAPSHOT camel@apache/camel [command]
+----
+
+=== Listing available releases
+
+Show available Camel releases from Maven Central:
+
+[source,bash]
+----
+camel version list
+ CAMEL VERSION   JDK   KIND     RELEASED     SUPPORTED UNTIL
+    3.18.0      11,17  LTS        July 2022        July 2023
+    3.20.0      11,17  LTS    December 2022    December 2023
+   4.0.0-M1        17   RC    February 2023
+   ...
+----
+
+Use `--runtime=quarkus` or `--runtime=spring-boot` to see runtime-specific versions.
+Use `--from-version=3.0` to show older releases (back to Camel 2.18).
+
+TIP: Run `camel version list --help` for all options.
+
+== Automated updates (OpenRewrite)
+
+Update Camel applications automatically using https://github.com/apache/camel-upgrade-recipes[OpenRewrite recipes].
+Supports Camel Main, Spring Boot, and Quarkus.
+
+List available updates and run:
+
+[source,bash]
+----
+camel update list
+camel update run 4.9.0 --runtime=spring-boot --dry-run
+----
+
+NOTE: Run from the project directory containing `pom.xml`.
+
+Options: `--runtime` (camel-main, spring-boot, quarkus), `--repos` (extra Maven repos),
+`--dry-run` (preview only), `--extraActiveRecipes`, `--extraRecipeArtifactCoordinates`.
+
+TIP: Run `camel update run --help` for all options.

@@ -1,0 +1,487 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.camel.component.undertow;
+
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.OutputStream;
+import java.net.URI;
+import java.nio.ByteBuffer;
+import java.nio.charset.StandardCharsets;
+import java.util.Collection;
+import java.util.List;
+import java.util.StringJoiner;
+
+import io.undertow.Handlers;
+import io.undertow.server.HttpHandler;
+import io.undertow.server.HttpServerExchange;
+import io.undertow.server.handlers.accesslog.AccessLogHandler;
+import io.undertow.server.handlers.accesslog.AccessLogReceiver;
+import io.undertow.server.handlers.accesslog.JBossLoggingAccessLogReceiver;
+import io.undertow.server.handlers.form.EagerFormParsingHandler;
+import io.undertow.server.handlers.form.FormParserFactory;
+import io.undertow.util.AttachmentKey;
+import io.undertow.util.Headers;
+import io.undertow.util.HttpString;
+import io.undertow.util.Methods;
+import io.undertow.util.MimeMappings;
+import io.undertow.util.StatusCodes;
+import io.undertow.websockets.core.CloseMessage;
+import io.undertow.websockets.core.WebSocketChannel;
+import io.undertow.websockets.core.WebSockets;
+import io.undertow.websockets.spi.WebSocketHttpExchange;
+import org.apache.camel.AsyncCallback;
+import org.apache.camel.Exchange;
+import org.apache.camel.ExchangePattern;
+import org.apache.camel.ExchangePropertyKey;
+import org.apache.camel.Message;
+import org.apache.camel.NoTypeConversionAvailableException;
+import org.apache.camel.Processor;
+import org.apache.camel.Suspendable;
+import org.apache.camel.TypeConverter;
+import org.apache.camel.component.undertow.UndertowConstants.EventType;
+import org.apache.camel.component.undertow.handlers.CamelWebSocketHandler;
+import org.apache.camel.http.base.OAuthHttpSecuritySupport;
+import org.apache.camel.spi.OAuthTokenValidationResult;
+import org.apache.camel.support.CamelContextHelper;
+import org.apache.camel.support.DefaultConsumer;
+import org.apache.camel.support.EndpointHelper;
+import org.apache.camel.support.TlsPeerCertificateSupport;
+import org.apache.camel.util.IOHelper;
+import org.apache.camel.util.ObjectHelper;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+/**
+ * The Undertow consumer which is also an Undertow HttpHandler implementation to handle incoming request.
+ */
+public class UndertowConsumer extends DefaultConsumer implements HttpHandler, Suspendable {
+
+    private static final Logger LOG = LoggerFactory.getLogger(UndertowConsumer.class);
+    static final AttachmentKey<OAuthTokenValidationResult> OAUTH_TOKEN_VALIDATION_RESULT_ATTACHMENT
+            = AttachmentKey.create(OAuthTokenValidationResult.class);
+    private CamelWebSocketHandler webSocketHandler;
+    private boolean rest;
+    private volatile boolean suspended;
+    // what doStart registered, so doStop undoes only that: a consumer that never started, or whose start failed, must
+    // not unregister the path of another consumer, nor unset the consumer of a shared WebSocket handler
+    private boolean registered;
+    private boolean webSocketConsumerSet;
+
+    public UndertowConsumer(UndertowEndpoint endpoint, Processor processor) {
+        super(endpoint, processor);
+    }
+
+    @Override
+    public boolean isHostedService() {
+        return true;
+    }
+
+    public boolean isRest() {
+        return rest;
+    }
+
+    public void setRest(boolean rest) {
+        this.rest = rest;
+    }
+
+    @Override
+    public UndertowEndpoint getEndpoint() {
+        return (UndertowEndpoint) super.getEndpoint();
+    }
+
+    public List<String> computeAllowedRoles() {
+        return getEndpoint().computeAllowedRoles();
+    }
+
+    @Override
+    protected void doStart() throws Exception {
+        this.suspended = false;
+        super.doStart();
+        final UndertowEndpoint endpoint = getEndpoint();
+        if (endpoint.isWebSocket()) {
+            /*
+             * note that the new CamelWebSocketHandler() we pass to registerEndpoint() does not necessarily have to be
+             * the same instance that is returned from there
+             */
+            this.webSocketHandler = (CamelWebSocketHandler) endpoint.getComponent().registerEndpoint(this,
+                    endpoint.getHttpHandlerRegistrationInfo(), endpoint.getSslContext(), new CamelWebSocketHandler());
+            this.registered = true;
+            // the access log and the custom handlers run before the upgrade, as they run before an HTTP request
+            this.webSocketHandler.setConsumer(this,
+                    wrapWithAccessLogAndHandlers(this.webSocketHandler.getUpgradeHandler(), endpoint));
+            this.webSocketConsumerSet = true;
+        } else {
+            // allow for HTTP 1.1 continue
+            // form fields of a request that declares no charset are UTF-8 (as browsers send them), not the
+            // ISO-8859-1 default of Undertow; a charset that the request declares is still used
+            HttpHandler httpHandler = new EagerFormParsingHandler(
+                    FormParserFactory.builder().withDefaultCharset(StandardCharsets.UTF_8.name()).build())
+                    .setNext(UndertowConsumer.this);
+            if (endpoint.getOauthHttpSecurity() != null) {
+                httpHandler = new OAuthUndertowHttpHandler(
+                        endpoint.getCamelContext(), endpoint.getOauthHttpSecurity(), httpHandler, endpoint.isOptionsEnabled(),
+                        this::isSuspended);
+            }
+            httpHandler = wrapWithAccessLogAndHandlers(httpHandler, endpoint);
+            endpoint.getComponent().registerEndpoint(this, endpoint.getHttpHandlerRegistrationInfo(), endpoint.getSslContext(),
+                    Handlers.httpContinueRead(
+                            // wrap with EagerFormParsingHandler to enable undertow form parsers
+                            httpHandler));
+            this.registered = true;
+        }
+    }
+
+    private HttpHandler wrapWithAccessLogAndHandlers(HttpHandler handler, UndertowEndpoint endpoint) {
+        HttpHandler httpHandler = handler;
+        if (endpoint.getAccessLog()) {
+            AccessLogReceiver accessLogReceiver;
+            if (endpoint.getAccessLogReceiver() != null) {
+                accessLogReceiver = endpoint.getAccessLogReceiver();
+            } else {
+                accessLogReceiver = new JBossLoggingAccessLogReceiver();
+            }
+            httpHandler = new AccessLogHandler(
+                    httpHandler,
+                    accessLogReceiver,
+                    "common",
+                    AccessLogHandler.class.getClassLoader());
+        }
+        if (endpoint.getHandlers() != null) {
+            httpHandler = this.wrapHandler(httpHandler, endpoint);
+        }
+        return httpHandler;
+    }
+
+    @Override
+    protected void doStop() throws Exception {
+        this.suspended = false;
+        super.doStop();
+        if (this.webSocketConsumerSet) {
+            this.webSocketConsumerSet = false;
+            this.webSocketHandler.setConsumer(null);
+        }
+        if (this.registered) {
+            this.registered = false;
+            UndertowEndpoint endpoint = getEndpoint();
+            endpoint.getComponent().unregisterEndpoint(this, endpoint.getHttpHandlerRegistrationInfo(),
+                    endpoint.getSslContext());
+        }
+    }
+
+    @Override
+    protected void doSuspend() throws Exception {
+        this.suspended = true;
+        super.doSuspend();
+    }
+
+    @Override
+    protected void doResume() throws Exception {
+        this.suspended = false;
+        super.doResume();
+    }
+
+    @Override
+    public boolean isSuspended() {
+        return this.suspended;
+    }
+
+    @Override
+    public void handleRequest(HttpServerExchange httpExchange) throws Exception {
+        HttpString requestMethod = httpExchange.getRequestMethod();
+        if (Methods.OPTIONS.equals(requestMethod) && !getEndpoint().isOptionsEnabled()) {
+            final String allowedMethods = evalAllowedMethods();
+            //return list of allowed methods in response headers
+            httpExchange.setStatusCode(StatusCodes.OK);
+            httpExchange.getResponseHeaders().put(ExchangeHeaders.CONTENT_LENGTH, 0);
+            // do not include content-type as that would indicate to the caller that we can only do text/plain
+            httpExchange.getResponseHeaders().put(Headers.ALLOW, allowedMethods);
+            httpExchange.endExchange();
+            return;
+        }
+
+        //perform blocking operation on exchange
+        if (httpExchange.isInIoThread()) {
+            httpExchange.dispatch(this);
+            return;
+        }
+
+        // are we suspended
+        if (isSuspended()) {
+            httpExchange.setStatusCode(StatusCodes.SERVICE_UNAVAILABLE);
+            httpExchange.endExchange();
+            return;
+        }
+
+        int statusCode = getEndpoint().authenticate(httpExchange);
+        if (statusCode != StatusCodes.OK) {
+            httpExchange.setStatusCode(statusCode);
+            httpExchange.endExchange();
+            return;
+        }
+
+        //create new Exchange
+        //binding is used to extract header and payload(if available)
+        Exchange camelExchange = createExchange(httpExchange);
+        try {
+            //Unit of Work to process the Exchange
+            createUoW(camelExchange);
+            getProcessor().process(camelExchange);
+            sendResponse(httpExchange, camelExchange);
+        } catch (Exception e) {
+            if (!httpExchange.isResponseStarted()) {
+                // the reply could not be written, such as a body that cannot be converted: answer 500 rather than end
+                // the exchange with the status code of the reply and an empty body
+                httpExchange.setStatusCode(StatusCodes.INTERNAL_SERVER_ERROR);
+                httpExchange.getResponseHeaders().remove(Headers.CONTENT_TYPE);
+                httpExchange.getResponseHeaders().put(Headers.CONTENT_LENGTH, 0);
+                httpExchange.endExchange();
+            }
+            getExceptionHandler().handleException(e);
+        } finally {
+            doneUoW(camelExchange);
+            releaseExchange(camelExchange, false);
+        }
+    }
+
+    private String evalAllowedMethods() {
+        StringJoiner methodsBuilder = new StringJoiner(",");
+
+        Collection<HttpHandlerRegistrationInfo> handlers = getEndpoint().getComponent().getHandlers();
+        for (HttpHandlerRegistrationInfo reg : handlers) {
+            URI uri = reg.getUri();
+            // what other HTTP methods may exists for the same path
+            if (reg.getMethodRestrict() != null && getEndpoint().getHttpURI().equals(uri)) {
+                String restrict = reg.getMethodRestrict();
+                if (restrict.endsWith(",OPTIONS")) {
+                    restrict = restrict.substring(0, restrict.length() - 8);
+                }
+                methodsBuilder.add(restrict);
+            }
+        }
+        String allowedMethods = methodsBuilder.toString();
+        if (ObjectHelper.isEmpty(allowedMethods)) {
+            allowedMethods = getEndpoint().getHttpMethodRestrict();
+        }
+        if (ObjectHelper.isEmpty(allowedMethods)) {
+            allowedMethods = "GET,HEAD,POST,PUT,DELETE,TRACE,OPTIONS,CONNECT,PATCH";
+        }
+        if (!allowedMethods.contains("OPTIONS")) {
+            allowedMethods = allowedMethods + ",OPTIONS";
+        }
+        return allowedMethods;
+    }
+
+    private void sendResponse(HttpServerExchange httpExchange, Exchange camelExchange)
+            throws IOException, NoTypeConversionAvailableException {
+        Object body = getResponseBody(httpExchange, camelExchange);
+
+        if (body == null) {
+            LOG.trace("No payload to send as reply for exchange: {}", camelExchange);
+            // respect Content-Type assigned from HttpBinding if any
+            String contentType = camelExchange.getIn().getHeader(UndertowConstants.CONTENT_TYPE,
+                    MimeMappings.DEFAULT_MIME_MAPPINGS.get("txt"), String.class);
+            httpExchange.getResponseHeaders().put(ExchangeHeaders.CONTENT_TYPE, contentType);
+            httpExchange.getResponseSender().send(""); // empty body
+            return;
+        }
+
+        if (getEndpoint().isUseStreaming() && body instanceof InputStream) {
+            httpExchange.startBlocking();
+            try (InputStream input = (InputStream) body;
+                 OutputStream output = httpExchange.getOutputStream()) {
+                // flush on each write so that it won't cause OutOfMemoryError
+                IOHelper.copy(input, output, IOHelper.DEFAULT_BUFFER_SIZE, true);
+            }
+        } else {
+            // write text in the charset that the response Content-Type declares, if any, and a number as its text
+            String contentType = httpExchange.getResponseHeaders().getFirst(Headers.CONTENT_TYPE);
+            TypeConverter tc = getEndpoint().getCamelContext().getTypeConverter();
+            ByteBuffer bodyAsByteBuffer = UndertowHelper.toByteBuffer(tc, body, contentType);
+            if (bodyAsByteBuffer == null) {
+                // a Map, a List or an object must be marshalled first
+                throw new NoTypeConversionAvailableException(
+                        UndertowHelper.notAnHttpBody(camelExchange, "response", contentType), body, ByteBuffer.class);
+            }
+            httpExchange.getResponseSender().send(bodyAsByteBuffer);
+        }
+    }
+
+    /**
+     * Create an {@link Exchange} from the associated {@link UndertowEndpoint} and set the {@code in} {@link Message}'s
+     * body to the given {@code message} and {@link UndertowConstants#CONNECTION_KEY} header to the given
+     * {@code connectionKey}.
+     *
+     * @param connectionKey an identifier of {@link WebSocketChannel} through which the {@code message} was received
+     * @param channel       the {@link WebSocketChannel} through which the {@code message} was received
+     * @param message       the message received via the {@link WebSocketChannel}
+     */
+    public void sendMessage(final String connectionKey, WebSocketChannel channel, final Object message) {
+        if (rejectUnauthenticatedWebSocketChannel(connectionKey, channel)) {
+            return;
+        }
+
+        final Exchange exchange = createExchange(true);
+
+        // set header and body
+        setSecurityProviderHeaders(exchange.getIn(), channel);
+        exchange.getIn().setHeader(UndertowConstants.CONNECTION_KEY, connectionKey);
+        if (channel != null) {
+            exchange.getIn().setHeader(UndertowConstants.CHANNEL, channel);
+        }
+        setOAuthTokenValidationResult(exchange, channel);
+        exchange.getIn().setBody(message);
+
+        // use default consumer callback
+        AsyncCallback cb = defaultConsumerCallback(exchange, true);
+        getAsyncProcessor().process(exchange, cb);
+    }
+
+    /**
+     * Send a notification related a WebSocket peer.
+     *
+     * @param connectionKey     of WebSocket peer
+     * @param transportExchange the exchange for the websocket transport, only available for ON_OPEN events
+     * @param channel           the {@link WebSocketChannel} through which the {@code message} was received
+     * @param eventType         the type of the event
+     */
+    public void sendEventNotification(
+            String connectionKey, WebSocketHttpExchange transportExchange, WebSocketChannel channel, EventType eventType) {
+        if (rejectUnauthenticatedWebSocketChannel(connectionKey, channel)) {
+            return;
+        }
+        final Exchange exchange = createExchange(true);
+
+        final Message in = exchange.getIn();
+        setSecurityProviderHeaders(in, channel);
+        in.setHeader(UndertowConstants.CONNECTION_KEY, connectionKey);
+        in.setHeader(UndertowConstants.EVENT_TYPE, eventType.getCode());
+        in.setHeader(UndertowConstants.EVENT_TYPE_ENUM, eventType);
+        if (channel != null) {
+            in.setHeader(UndertowConstants.CHANNEL, channel);
+        }
+        setOAuthTokenValidationResult(exchange, channel);
+        if (transportExchange != null) {
+            in.setHeader(UndertowConstants.EXCHANGE, transportExchange);
+        }
+        // use default consumer callback
+        AsyncCallback cb = defaultConsumerCallback(exchange, true);
+        getAsyncProcessor().process(exchange, cb);
+    }
+
+    private Object getResponseBody(HttpServerExchange httpExchange, Exchange camelExchange) throws IOException {
+        return getEndpoint().getUndertowHttpBinding().toHttpResponse(httpExchange, camelExchange.getMessage());
+    }
+
+    private HttpHandler wrapHandler(HttpHandler handler, UndertowEndpoint endpoint) {
+        HttpHandler nextHandler = handler;
+        String[] handlders = endpoint.getHandlers().split(",");
+        for (String obj : handlders) {
+            if (EndpointHelper.isReferenceParameter(obj)) {
+                obj = obj.substring(1);
+            }
+            CamelUndertowHttpHandler h
+                    = CamelContextHelper.mandatoryLookup(endpoint.getCamelContext(), obj, CamelUndertowHttpHandler.class);
+            h.setNext(nextHandler);
+            nextHandler = h;
+        }
+        return nextHandler;
+    }
+
+    static void populateTlsPeer(Exchange exchange, HttpServerExchange request) {
+        // SSL-header forwarding handlers can install synthetic SSLSessionInfo. Only the connection's actual TLS
+        // session is evidence of a handshake; a forwarded certificate without a session must not become identity.
+        var info = request.getConnection().getSslSessionInfo();
+        TlsPeerCertificateSupport.populateFromSession(exchange, info != null ? info.getSSLSession() : null);
+    }
+
+    private Exchange createExchange(HttpServerExchange httpExchange) throws Exception {
+        Exchange exchange = createExchange(false);
+        exchange.setPattern(ExchangePattern.InOut);
+        populateTlsPeer(exchange, httpExchange);
+
+        Message in = getEndpoint().getUndertowHttpBinding().toCamelMessage(httpExchange, exchange);
+        OAuthTokenValidationResult oauthTokenValidationResult
+                = httpExchange.getAttachment(OAUTH_TOKEN_VALIDATION_RESULT_ATTACHMENT);
+        if (oauthTokenValidationResult != null) {
+            exchange.setProperty(OAuthHttpSecuritySupport.OAUTH_TOKEN_VALIDATION_RESULT, oauthTokenValidationResult);
+        }
+
+        if (getEndpoint().getSecurityProvider() != null) {
+            // the request has been authenticated by the securityProvider (see handleRequest), so the credential is not
+            // passed on to the route
+            OAuthHttpSecuritySupport.removeAuthorizationHeader(in);
+            //securityProvider could add its own header into result exchange
+            getEndpoint().getSecurityProvider().addHeader((key, value) -> in.setHeader(key, value), httpExchange);
+        }
+
+        if (oauthTokenValidationResult != null) {
+            OAuthHttpSecuritySupport.removeAuthorizationHeader(in);
+        }
+
+        // Only set charset if explicitly specified in the Content-Type header.
+        // Undertow's getRequestCharset() defaults to ISO-8859-1 when no charset is present,
+        // but Camel (and JSON/modern APIs) expect UTF-8 as the default.
+        // By not setting the property when charset is absent, Camel's type conversion
+        // system will use its own default (UTF-8), matching the behavior of DefaultHttpBinding.
+        String contentType = httpExchange.getRequestHeaders().getFirst(Headers.CONTENT_TYPE);
+        String charset = UndertowHelper.getCharsetFromContentType(contentType);
+        if (charset != null) {
+            exchange.setProperty(ExchangePropertyKey.CHARSET_NAME, charset);
+            in.setHeader(UndertowConstants.HTTP_CHARACTER_ENCODING, charset);
+        }
+
+        exchange.setIn(in);
+        return exchange;
+    }
+
+    /**
+     * Fails closed for WebSocket channels whose handshake did not pass the security checks of this consumer's endpoint
+     * (OAuth validation, security provider, allowed roles and custom handlers). Such channels can exist when the shared
+     * {@link CamelWebSocketHandler} accepted a handshake before these checks applied to its path, for example while the
+     * path was only used by producers. Returns {@code true} when the event must not be delivered to the route; the
+     * channel is closed if still open.
+     */
+    private boolean rejectUnauthenticatedWebSocketChannel(String connectionKey, WebSocketChannel channel) {
+        if (CamelWebSocketHandler.isAuthenticated(channel, getEndpoint())) {
+            return false;
+        }
+        LOG.warn("Rejecting WebSocket event from connection {} whose handshake did not pass the security checks",
+                connectionKey);
+        if (channel != null && channel.isOpen()) {
+            WebSockets.sendClose(CloseMessage.MSG_VIOLATES_POLICY, "Authentication required", channel, null);
+        }
+        return true;
+    }
+
+    private static void setSecurityProviderHeaders(Message in, WebSocketChannel channel) {
+        if (channel != null) {
+            CamelWebSocketHandler.getSecurityProviderHeaders(channel).forEach(in::setHeader);
+        }
+    }
+
+    private static void setOAuthTokenValidationResult(Exchange exchange, WebSocketChannel channel) {
+        if (channel == null) {
+            return;
+        }
+        Object oauthTokenValidationResult = channel.getAttribute(OAuthHttpSecuritySupport.OAUTH_TOKEN_VALIDATION_RESULT);
+        if (oauthTokenValidationResult instanceof OAuthTokenValidationResult) {
+            exchange.setProperty(OAuthHttpSecuritySupport.OAUTH_TOKEN_VALIDATION_RESULT, oauthTokenValidationResult);
+        }
+    }
+
+}

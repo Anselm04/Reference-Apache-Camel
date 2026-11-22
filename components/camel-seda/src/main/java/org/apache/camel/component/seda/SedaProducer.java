@@ -1,0 +1,372 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.camel.component.seda;
+
+import java.io.IOException;
+import java.util.concurrent.BlockingQueue;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.RejectedExecutionException;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
+
+import org.apache.camel.AsyncCallback;
+import org.apache.camel.Exchange;
+import org.apache.camel.ExchangePropertyKey;
+import org.apache.camel.ExchangeTimedOutException;
+import org.apache.camel.RouteStoppingException;
+import org.apache.camel.StreamCache;
+import org.apache.camel.WaitForTaskToComplete;
+import org.apache.camel.support.DefaultAsyncProducer;
+import org.apache.camel.support.ExchangeHelper;
+import org.apache.camel.support.SynchronizationAdapter;
+import org.apache.camel.support.UnitOfWorkHelper;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+public class SedaProducer extends DefaultAsyncProducer {
+
+    private static final Logger LOG = LoggerFactory.getLogger(SedaProducer.class);
+    private final SedaEndpoint endpoint;
+    private final WaitForTaskToComplete waitForTaskToComplete;
+    private final long timeout;
+    private final boolean blockWhenFull;
+    private final boolean discardWhenFull;
+    private final long offerTimeout;
+
+    public SedaProducer(SedaEndpoint endpoint, WaitForTaskToComplete waitForTaskToComplete,
+                        long timeout, boolean blockWhenFull, boolean discardWhenFull, long offerTimeout) {
+        super(endpoint);
+        this.endpoint = endpoint;
+        this.waitForTaskToComplete = waitForTaskToComplete;
+        this.timeout = timeout;
+        this.blockWhenFull = blockWhenFull;
+        this.discardWhenFull = discardWhenFull;
+        this.offerTimeout = offerTimeout;
+    }
+
+    @Override
+    public boolean process(final Exchange exchange, final AsyncCallback callback) {
+        WaitForTaskToComplete wait = waitForTaskToComplete;
+        if (exchange.getProperty(Exchange.ASYNC_WAIT) != null) {
+            wait = exchange.getProperty(Exchange.ASYNC_WAIT, WaitForTaskToComplete.class);
+        }
+
+        if (wait == WaitForTaskToComplete.Always
+                || wait == WaitForTaskToComplete.IfReplyExpected && ExchangeHelper.isOutCapable(exchange)) {
+
+            // do not handover the completion as we wait for the copy to complete, and copy its result back when it done
+            Exchange copy = prepareCopy(exchange, false);
+
+            // latch that waits until we are complete
+            final CountDownLatch latch = new CountDownLatch(1);
+            // either the response or the timeout completes the exchange, whichever claims it first
+            final AtomicBoolean completed = new AtomicBoolean();
+
+            // we should wait for the reply so install a on completion so we know when its complete
+            copy.getExchangeExtension().addOnCompletion(new SynchronizationAdapter() {
+                @Override
+                public void onDone(Exchange response) {
+                    // check for timeout, which then already has completed the exchange
+                    if (!completed.compareAndSet(false, true)) {
+                        if (LOG.isTraceEnabled()) {
+                            LOG.trace("{}. Timeout occurred so response will be ignored: {}", this, response.getMessage());
+                        }
+                        return;
+                    } else {
+                        if (LOG.isTraceEnabled()) {
+                            LOG.trace("{} with response: {}", this, response.getMessage());
+                        }
+                        try {
+                            ExchangeHelper.copyResults(exchange, response);
+                        } finally {
+                            // always ensure latch is triggered
+                            latch.countDown();
+                        }
+                    }
+                }
+
+                @Override
+                public boolean allowHandover() {
+                    // do not allow handover as we want to seda producer to have its completion triggered
+                    // at this point in the routing (at this leg), instead of at the very last (this ensure timeout is honored)
+                    return false;
+                }
+
+                @Override
+                public String toString() {
+                    return "onDone at endpoint: " + endpoint;
+                }
+            });
+
+            try {
+                // do not copy as we already did the copy
+                addToQueue(copy, false);
+            } catch (SedaConsumerNotAvailableException | IOException e) {
+                exchange.setException(e);
+                callback.done(true);
+                return true;
+            }
+
+            if (timeout > 0) {
+                if (LOG.isTraceEnabled()) {
+                    LOG.trace("Waiting for task to complete using timeout (ms): {} at [{}]", timeout,
+                            endpoint.getEndpointUri());
+                }
+                // lets see if we can get the task done before the timeout
+                boolean done = false;
+                InterruptedException interrupted = null;
+                try {
+                    done = latch.await(timeout, TimeUnit.MILLISECONDS);
+                } catch (InterruptedException e) {
+                    interrupted = e;
+                    Thread.currentThread().interrupt();
+                }
+                if (!done) {
+                    if (completed.compareAndSet(false, true)) {
+                        // an interruption is not a timeout: a stop cut it off, or something else interrupted the wait
+                        exchange.setException(interrupted != null
+                                ? interruptedWhileWaiting(exchange, interrupted)
+                                : new ExchangeTimedOutException(exchange, timeout));
+                        // remove timed out Exchange from queue
+                        endpoint.getQueue().remove(copy);
+                    } else {
+                        // the response is being copied into the exchange, so wait for the copy to complete
+                        // (the exchange must not be changed after we have returned)
+                        awaitUninterruptibly(latch);
+                    }
+                }
+            } else {
+                if (LOG.isTraceEnabled()) {
+                    LOG.trace("Waiting for task to complete (blocking) at [{}]", endpoint.getEndpointUri());
+                }
+                // no timeout then wait until its done
+                try {
+                    latch.await();
+                } catch (InterruptedException e) {
+                    LOG.debug("Interrupted while waiting for task to complete at [{}]", endpoint.getEndpointUri());
+                    if (completed.compareAndSet(false, true)) {
+                        // the task has not completed so fail the exchange (do not return the request as the reply)
+                        exchange.setException(interruptedWhileWaiting(exchange, e));
+                        // remove the Exchange from queue (if not yet processed), and a later reply is ignored
+                        endpoint.getQueue().remove(copy);
+                    } else {
+                        // the response is being copied into the exchange, so wait for the copy to complete
+                        // (the exchange must not be changed after we have returned)
+                        awaitUninterruptibly(latch);
+                    }
+                    Thread.currentThread().interrupt();
+                }
+            }
+        } else {
+            // no wait, eg its a InOnly then just add to queue and return
+            try {
+                addToQueue(exchange, true);
+            } catch (SedaConsumerNotAvailableException | IOException e) {
+                exchange.setException(e);
+                callback.done(true);
+                return true;
+            }
+        }
+
+        // we use OnCompletion on the Exchange to callback and wait for the Exchange to be done
+        // so we should just signal the callback we are done synchronously
+        callback.done(true);
+        return true;
+    }
+
+    private static void awaitUninterruptibly(CountDownLatch latch) {
+        boolean interrupted = false;
+        while (true) {
+            try {
+                latch.await();
+                break;
+            } catch (InterruptedException e) {
+                interrupted = true;
+            }
+        }
+        if (interrupted) {
+            Thread.currentThread().interrupt();
+        }
+    }
+
+    protected Exchange prepareCopy(Exchange exchange, boolean handover) {
+        // use a new copy of the exchange to route async (and use same message id)
+        // if handover we need to do special handover to avoid handing over
+        // RestBindingMarshalOnCompletion as it should not be handed over with SEDA
+        return ExchangeHelper.createCorrelatedCopy(exchange, handover, true);
+    }
+
+    @Override
+    protected void doStart() throws Exception {
+        super.doStart();
+        endpoint.onStarted(this);
+    }
+
+    @Override
+    protected void doStop() throws Exception {
+        endpoint.onStopped(this);
+        super.doStop();
+    }
+
+    /**
+     * Strategy method for adding the exchange to the queue.
+     * <p>
+     * Will perform a blocking "put" if blockWhenFull is true, otherwise it will simply add which will throw exception
+     * if the queue is full
+     *
+     * @param exchange the exchange to add to the queue
+     * @param copy     whether to create a copy of the exchange to use for adding to the queue
+     */
+    protected void addToQueue(Exchange exchange, boolean copy) throws SedaConsumerNotAvailableException, IOException {
+        BlockingQueue<Exchange> queue = null;
+        QueueReference queueReference = endpoint.getQueueReference();
+        if (queueReference != null) {
+            queue = queueReference.getQueue();
+        }
+        if (queue == null) {
+            throw new SedaConsumerNotAvailableException("No queue available on endpoint: " + endpoint, exchange);
+        }
+
+        boolean empty = !queueReference.hasConsumers();
+        if (empty) {
+            if (endpoint.isFailIfNoConsumers()) {
+                throw new SedaConsumerNotAvailableException("No consumers available on endpoint: " + endpoint, exchange);
+            } else if (endpoint.isDiscardIfNoConsumers()) {
+                LOG.debug("Discard message as no active consumers on endpoint: {}", endpoint);
+                if (!copy) {
+                    discardedWhileWaiting(exchange, "Exchange discarded as the SEDA queue has no consumers");
+                }
+                return;
+            }
+        }
+
+        Exchange target = exchange;
+
+        // handover the completion so its the copy which performs that, as we do not wait
+        if (copy) {
+            target = prepareCopy(exchange, true);
+            // the copy is routed independently of the original exchange, so any stream cache it holds must be
+            // released when the copy is done, and not with the unit of work of a parent (multicast/split) exchange
+            // (same as the Wire Tap EIP does, see CAMEL-12108)
+            target.removeProperty(ExchangePropertyKey.STREAM_CACHE_UNIT_OF_WORK);
+            // if the body is stream caching based we need to make a deep copy
+            if (target.getMessage().getBody() instanceof StreamCache sc) {
+                StreamCache newBody = sc.copy(target);
+                if (newBody != null) {
+                    target.getMessage().setBody(newBody);
+                }
+            }
+        }
+
+        LOG.trace("Adding Exchange to queue: {}", target);
+        boolean added = false;
+        try {
+            added = offerToQueue(queue, target);
+        } finally {
+            if (copy && !added) {
+                // the copy is not queued (discarded, or failed to be added), so the exchange takes back its on
+                // completions (such as a consumer committing or rolling back the message), which also releases the
+                // stream cache of the copy
+                target.getExchangeExtension().handoverCompletions(exchange);
+            }
+        }
+        if (!added && !copy) {
+            // discarded as the queue is full
+            discardedWhileWaiting(target, "Exchange discarded as the SEDA queue is full");
+        }
+    }
+
+    /**
+     * The producer waits for the reply of the given copy, which is discarded: the copy fails and its on completions are
+     * run (as {@link SedaEndpoint#purgeQueue()} does), so the producer fails at once, instead of waiting for a reply
+     * that never comes, until the timeout, or for ever when there is no timeout.
+     */
+    private static void discardedWhileWaiting(Exchange copy, String reason) {
+        copy.setException(new RejectedExecutionException(reason));
+        UnitOfWorkHelper.doneSynchronizations(copy, copy.getExchangeExtension().handoverCompletions());
+    }
+
+    /**
+     * Adds the exchange to the queue
+     *
+     * @return {@code false} if the exchange is discarded as the queue is full
+     */
+    private boolean offerToQueue(BlockingQueue<Exchange> queue, Exchange target) {
+        if (discardWhenFull) {
+            try {
+                boolean added = queue.offer(target, 0, TimeUnit.MILLISECONDS);
+                if (!added) {
+                    LOG.trace("Discarding Exchange as queue is full: {}", target);
+                }
+                return added;
+            } catch (InterruptedException e) {
+                LOG.debug("Offer interrupted, are we stopping? {}", isStopping() || isStopped());
+                Thread.currentThread().interrupt();
+                throw interruptedWhileAddingToQueue(target, e);
+            }
+        } else if (blockWhenFull && offerTimeout == 0) {
+            try {
+                queue.put(target);
+            } catch (InterruptedException e) {
+                LOG.debug("Put interrupted, are we stopping? {}", isStopping() || isStopped());
+                Thread.currentThread().interrupt();
+                throw interruptedWhileAddingToQueue(target, e);
+            }
+        } else if (blockWhenFull && offerTimeout > 0) {
+            try {
+                boolean added = queue.offer(target, offerTimeout, TimeUnit.MILLISECONDS);
+                if (!added) {
+                    throw new IllegalStateException(
+                            "Fails to insert element into queue, "
+                                                    + "after timeout of " + offerTimeout + " milliseconds");
+                }
+            } catch (InterruptedException e) {
+                LOG.debug("Offer interrupted, are we stopping? {}", isStopping() || isStopped());
+                Thread.currentThread().interrupt();
+                throw interruptedWhileAddingToQueue(target, e);
+            }
+        } else {
+            queue.add(target);
+        }
+        return true;
+    }
+
+    private static RejectedExecutionException interruptedWhileAddingToQueue(Exchange exchange, InterruptedException cause) {
+        // the exchange was not added to the queue, so the exchange must fail; a stop that interrupts it cuts it off
+        // (CAMEL-25502)
+        if (ExchangeHelper.isRouteStopping(exchange)) {
+            return new RouteStoppingException(
+                    "Interrupted while adding the exchange to the queue, as the route is being stopped", cause);
+        }
+        return new RejectedExecutionException("Interrupted while adding the exchange to the queue", cause);
+    }
+
+    /**
+     * The exception of an exchange whose wait for the reply is interrupted: a cut-off when the route or CamelContext is
+     * being stopped (CAMEL-25502), else the interruption.
+     */
+    private Exception interruptedWhileWaiting(Exchange exchange, InterruptedException cause) {
+        if (ExchangeHelper.isRouteStopping(exchange)) {
+            return new RouteStoppingException(
+                    "Interrupted while waiting for the reply from " + endpoint.getEndpointBaseUri()
+                                              + ", as the route is being stopped",
+                    cause);
+        }
+        return cause;
+    }
+
+}

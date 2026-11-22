@@ -1,0 +1,174 @@
+= Google Drive Component
+:doctitle: Google Drive
+:shortname: google-drive
+:artifactid: camel-google-drive
+:description: Manage files in Google Drive.
+:since: 2.14
+:supportlevel: Stable
+:tabs-sync-option:
+:component-header: Both producer and consumer are supported
+//Manually maintained attributes
+:group: Google
+
+*Since Camel {since}*
+
+*{component-header}*
+
+The Google Drive component provides access to the
+http://drive.google.com[Google Drive file storage service] via the
+https://developers.google.com/drive/v2/reference[Google Drive Web APIs].
+
+Google Drive uses
+the https://developers.google.com/accounts/docs/OAuth2[OAuth 2.0
+protocol] for authenticating a Google account and authorizing access to
+user data. Before you can use this component, you will need to
+https://developers.google.com/drive/web/auth/web-server[create an
+account and generate OAuth credentials]. Credentials consist of a
+`clientId`, `clientSecret`, and a `refreshToken`. A handy resource for
+generating a long-lived `refreshToken` is the
+https://developers.google.com/oauthplayground[OAuth playground].
+
+In the case of a https://developers.google.com/identity/protocols/oauth2#serviceaccount[service account],
+credentials consist of a JSON-file (serviceAccountKey). You can also use
+https://developers.google.com/identity/protocols/oauth2/service-account#delegatingauthority[delegation domain-wide authority]
+(delegate) and one, several, or all possible
+https://developers.google.com/drive/api/v2/about-auth[Drive API (V2) Auth Scopes].
+
+Maven users will need to add the following dependency to their pom.xml
+for this component:
+
+[source,xml]
+----
+<dependency>
+        <groupId>org.apache.camel</groupId>
+        <artifactId>camel-google-drive</artifactId>
+        <!-- use the same version as your Camel core version -->
+        <version>x.x.x</version>
+</dependency>
+----
+
+== URI Format
+
+The GoogleDrive Component uses the following URI format:
+
+----
+google-drive://endpoint-prefix/endpoint?[options]
+----
+
+
+// component options: START
+include::partial$component-configure-options.adoc[]
+include::partial$component-endpoint-options.adoc[]
+include::partial$component-endpoint-headers.adoc[]
+// component options: END
+
+[NOTE]
+====
+This is an API-based component, so per-call parameters can be supplied through `Camel`-prefixed
+exchange headers in addition to the endpoint options. If the route consumes messages from untrusted
+producers, strip these internal headers at the trust boundary -- for example with
+`removeHeaders("Camel*")` -- before the message reaches this component, so that a sender cannot
+override the API call. See xref:manual::security-model.adoc[the Camel security model] for details.
+====
+
+
+== Usage
+
+The endpoint is the API name and the method name, such as `drive-files/list`.
+The parameters of the method are endpoint options or headers with the `CamelGoogleDrive.` prefix.
+The following route lists the files that the credentials give access to:
+
+[source,yaml]
+----
+- route:
+    from:
+      uri: timer:drive
+      parameters:
+        repeatCount: 1
+      steps:
+        - to:
+            uri: google-drive:drive-files/list
+            parameters:
+              clientId: "{{google.clientId}}"
+              clientSecret: "{{google.clientSecret}}"
+              refreshToken: "{{google.refreshToken}}"
+              applicationName: camel-example
+        - log:
+            message: "Found ${body.files.size()} files"
+----
+
+=== Downloading the content of a file
+
+The methods return a model object, such as the `File` of `drive-files/get`, which holds the metadata of a file and not
+its content. These methods give the content of a file as the body:
+
+* `drive-files/export` exports a Google Workspace document, such as a Google Docs document, to the MIME type of the
+  `mimeType` option, such as `text/plain` or `application/pdf`.
+* `drive-files/get` and `drive-revisions/get` download the content of a file that is stored in Drive, when the
+  `CamelGoogleDrive.alt` header is set to `media`.
+
+The body is then an `InputStream`, which holds the connection to Google Drive until it is read to the end or closed.
+In a route, stream caching (enabled by default) reads it into the stream cache before the next step: if nothing follows
+the google-drive step, read or close the body yourself. The consumer closes it when the exchange is done. The caller of
+a `ProducerTemplate` gets the stream and must close it.
+
+The following route exports a Google Docs document as text and writes it to a file:
+
+[source,yaml]
+----
+- route:
+    from:
+      uri: timer:export
+      parameters:
+        repeatCount: 1
+      steps:
+        - to:
+            uri: google-drive:drive-files/export
+            parameters:
+              fileId: "{{google.documentId}}"
+              mimeType: text/plain
+              clientId: "{{google.clientId}}"
+              clientSecret: "{{google.clientSecret}}"
+              refreshToken: "{{google.refreshToken}}"
+              applicationName: camel-example
+        - to:
+            uri: file:target/export
+            parameters:
+              fileName: document.txt
+----
+
+And the following downloads a file that is stored in Drive:
+
+[source,yaml]
+----
+- route:
+    from:
+      uri: timer:download
+      parameters:
+        repeatCount: 1
+      steps:
+        - setHeader:
+            name: CamelGoogleDrive.alt
+            expression:
+              constant:
+                expression: media
+        - to:
+            uri: google-drive:drive-files/get
+            parameters:
+              fileId: "{{google.fileId}}"
+              clientId: "{{google.clientId}}"
+              clientSecret: "{{google.clientSecret}}"
+              refreshToken: "{{google.refreshToken}}"
+              applicationName: camel-example
+        - to:
+            uri: file:target/download
+            parameters:
+              fileName: report.pdf
+----
+
+== More Information
+
+For more information on the endpoints and options see API documentation
+at: https://developers.google.com/drive/api/reference/rest/v3[https://developers.google.com/drive/api/reference/rest/v3]
+
+

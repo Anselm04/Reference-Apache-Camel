@@ -1,0 +1,194 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.camel.dsl.jbang.core.commands.version;
+
+import java.nio.file.Files;
+import java.nio.file.Paths;
+
+import org.apache.camel.dsl.jbang.core.commands.CamelJBangMain;
+import org.apache.camel.dsl.jbang.core.commands.UserConfigHelper;
+import org.apache.camel.dsl.jbang.core.commands.config.BaseConfigTestSupport;
+import org.apache.camel.dsl.jbang.core.common.CliExitCode;
+import org.apache.camel.dsl.jbang.core.common.CommandLineHelper;
+import org.apache.camel.dsl.jbang.run.common.RuntimeType;
+import org.junit.jupiter.api.Test;
+
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertTrue;
+
+/**
+ * Unit tests for {@link VersionSet}.
+ *
+ * The command persists the selected Camel version, repositories and runtime into the user configuration property file.
+ * These tests pin down which keys are written (only the non-null ones), the {@code --reset} behavior, and the choice
+ * between the global and local configuration file. Config file cleanup is inherited from {@link BaseConfigTestSupport}.
+ */
+class VersionSetTest extends BaseConfigTestSupport {
+
+    @Test
+    void shouldStoreVersionInGlobalConfig() throws Exception {
+        UserConfigHelper.createUserConfig("");
+
+        VersionSet command = command();
+        command.version = "4.10.0";
+        command.doCall();
+
+        CommandLineHelper.loadProperties(properties -> {
+            assertEquals("4.10.0", properties.get("camel-version"));
+            // repos and runtime were not requested, so they must not be written
+            assertFalse(properties.containsKey("repos"), "repos must not be set when no --repo is given");
+            assertFalse(properties.containsKey("runtime"), "runtime must not be set when no --runtime is given");
+        });
+    }
+
+    @Test
+    void shouldStoreVersionRepoAndRuntimeTogether() throws Exception {
+        UserConfigHelper.createUserConfig("");
+
+        VersionSet command = command();
+        command.version = "4.10.0";
+        command.repo = "https://repo.example.org/maven";
+        command.runtime = RuntimeType.springBoot;
+        String[] asked = new String[1];
+        command.versionCheck = (version, repos) -> {
+            asked[0] = repos;
+            return true;
+        };
+        command.doCall();
+        // the version is checked in the repository that is given
+        assertEquals("https://repo.example.org/maven", asked[0]);
+
+        CommandLineHelper.loadProperties(properties -> {
+            assertEquals("4.10.0", properties.get("camel-version"));
+            assertEquals("https://repo.example.org/maven", properties.get("repos"));
+            // runtime is stored using its canonical runtime() name, not the enum constant
+            assertEquals(RuntimeType.springBoot.runtime(), properties.get("runtime"));
+        });
+    }
+
+    @Test
+    void shouldRefuseACallWithNothingToSet() throws Exception {
+        UserConfigHelper.createUserConfig("""
+                camel-version=4.9.0
+                """);
+
+        VersionSet command = command();
+        // no version, repo, runtime or reset: it was a silent no-op (CAMEL-26931)
+        assertEquals(CliExitCode.USAGE, command.doCall());
+        assertTrue(printer.getStderr().contains("Give the Camel version to set"), printer.getOutput());
+
+        CommandLineHelper.loadProperties(properties -> assertEquals("4.9.0", properties.get("camel-version")));
+    }
+
+    @Test
+    void shouldRefuseAVersionThatDoesNotExist() throws Exception {
+        UserConfigHelper.createUserConfig("""
+                camel-version=4.9.0
+                """);
+
+        VersionSet command = command();
+        command.version = "9.9.9";
+        command.versionCheck = (version, repos) -> false;
+        assertEquals(CliExitCode.NOT_FOUND, command.doCall());
+        assertTrue(printer.getStderr().contains("Camel version 9.9.9 not found"), printer.getOutput());
+
+        CommandLineHelper.loadProperties(properties -> assertEquals("4.9.0", properties.get("camel-version")));
+    }
+
+    @Test
+    void shouldSetAVersionThatCannotBeCheckedWithAWarning() throws Exception {
+        UserConfigHelper.createUserConfig("""
+                repos=https://repo.example.org/maven
+                """);
+
+        String[] asked = new String[1];
+        VersionSet command = command();
+        command.version = "4.10.0";
+        command.versionCheck = (version, repos) -> {
+            asked[0] = repos;
+            return null;
+        };
+        assertEquals(CliExitCode.OK, command.doCall());
+        assertTrue(printer.getStderr().contains("Cannot check that Camel version 4.10.0 exists"), printer.getOutput());
+        // the check asks the repositories that are set already
+        assertEquals("https://repo.example.org/maven", asked[0]);
+
+        CommandLineHelper.loadProperties(properties -> assertEquals("4.10.0", properties.get("camel-version")));
+    }
+
+    @Test
+    void shouldRemoveAllSettingsOnReset() throws Exception {
+        UserConfigHelper.createUserConfig("""
+                camel-version=4.9.0
+                kamelets-version=4.9.0
+                repos=https://repo.example.org/maven
+                runtime=spring-boot
+                other=keep-me
+                """);
+
+        VersionSet command = command();
+        command.reset = true;
+        command.doCall();
+
+        CommandLineHelper.loadProperties(properties -> {
+            assertFalse(properties.containsKey("camel-version"), "camel-version must be removed on reset");
+            assertFalse(properties.containsKey("kamelets-version"), "kamelets-version must be removed on reset");
+            assertFalse(properties.containsKey("repos"), "repos must be removed on reset");
+            assertFalse(properties.containsKey("runtime"), "runtime must be removed on reset");
+            // unrelated settings are preserved: reset only clears the version keys
+            assertEquals("keep-me", properties.get("other"));
+        });
+    }
+
+    @Test
+    void shouldStoreVersionInLocalConfigWhenNotGlobal() throws Exception {
+        VersionSet command = command();
+        command.version = "4.10.0";
+        command.global = false;
+        command.doCall();
+
+        // the value lands in the local config file, not the global one
+        assertTrue(Files.exists(Paths.get(CommandLineHelper.LOCAL_USER_CONFIG)),
+                "local config file should have been created");
+        CommandLineHelper.loadProperties(properties -> assertEquals("4.10.0", properties.get("camel-version")), true);
+    }
+
+    @Test
+    void malformedConfigRefusesWriteAndReturnsNonZero() throws Exception {
+        // A malformed config file (Windows-style path without escaping) must not be overwritten
+        UserConfigHelper.createUserConfig("path=C:\\users\\name");
+        String originalContent = Files.readString(
+                CommandLineHelper.getHomeDir().resolve(CommandLineHelper.USER_CONFIG));
+
+        VersionSet command = command();
+        command.version = "4.10.0";
+        Integer exitCode = command.doCall();
+
+        // must return non-zero and leave the file untouched
+        assertEquals(CliExitCode.FAILURE, exitCode, "exit code must be 1 on malformed config");
+        String afterContent = Files.readString(
+                CommandLineHelper.getHomeDir().resolve(CommandLineHelper.USER_CONFIG));
+        assertEquals(originalContent, afterContent, "malformed config file must not be overwritten");
+    }
+
+    private VersionSet command() {
+        VersionSet command = new CamelJBangMain().withPrinter(printer).command(new VersionSet());
+        command.versionCheck = (version, repos) -> true;
+        return command;
+    }
+}

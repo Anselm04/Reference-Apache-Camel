@@ -1,0 +1,816 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.camel.dsl.jbang.core.commands.tui.diagram;
+
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+
+import dev.tamboui.buffer.Buffer;
+import dev.tamboui.layout.Rect;
+import dev.tamboui.style.Color;
+import dev.tamboui.style.Style;
+import dev.tamboui.text.CharWidth;
+import dev.tamboui.widget.Widget;
+import org.apache.camel.diagram.TopologyErrorFrame;
+import org.apache.camel.diagram.TopologyLayoutEngine.TopologyLayoutEdge;
+import org.apache.camel.diagram.TopologyLayoutEngine.TopologyLayoutNode;
+import org.apache.camel.diagram.TopologyLayoutEngine.TopologyLayoutResult;
+import org.apache.camel.dsl.jbang.core.commands.tui.Theme;
+
+import static org.apache.camel.dsl.jbang.core.commands.tui.diagram.DiagramColors.*;
+
+public class TopologyDiagramWidget implements Widget {
+
+    private static final int Y_SCALE = 20;
+    private static final int MIN_BOX_WIDTH = 16;
+    private static final int X_DIVISOR = 15;
+    private static final int MAX_WRAP_LINES = 3;
+    private static final String AI_MARK = "\u2726 ";
+    /**
+     * The node type of the box of the error handling in the architecture view (CAMEL-25466): drawn dashed, as are the
+     * links into it, which carry failures.
+     */
+    public static final String ERROR_HANDLING = "error-handling";
+
+    private final TopologyLayoutResult layout;
+    private final int nodeWidth;
+    private final int boxWidth;
+    private final int selectedNodeIndex;
+    private final int scrollX;
+    private final int scrollY;
+    private final boolean showMetrics;
+    private final boolean showDescription;
+    private final Set<String> highlightRouteIds;
+    private final boolean highlightFailed;
+
+    private final List<NodeBox> nodeBoxes = new ArrayList<>();
+    private Map<String, String> aiDescriptions = Map.of();
+    private Map<String, List<NodeLine>> nodeLines = Map.of();
+    private Map<String, NodeLine> groupTags = Map.of();
+    private Map<String, Color> groupColors = Map.of();
+    private Style aiStyle = Style.EMPTY.italic();
+    private TopologyErrorFrame errorLayer;
+    private Set<String> errorMarks = Set.of();
+    private Map<TopologyLayoutNode, List<String>> errorLabels;
+    private RouteDensity density = RouteDensity.DETAILED;
+    private FlowAnimation flow;
+    private FlowFeed flowFeed;
+    private final List<FlowDots.Path> flowArrows = new ArrayList<>();
+
+    public record NodeBox(String routeId, int startRow, int endRow, int startCol, int endCol, int layer) {
+    }
+
+    /** A line of a box's own content, in its own style. */
+    public record NodeLine(String text, Style style) {
+    }
+
+    public TopologyDiagramWidget(
+                                 TopologyLayoutResult layout, int nodeWidth,
+                                 int selectedNodeIndex, int scrollX, int scrollY,
+                                 boolean showMetrics, boolean showDescription) {
+        this(layout, nodeWidth, selectedNodeIndex, scrollX, scrollY, showMetrics, showDescription,
+             Collections.emptySet(), false);
+    }
+
+    public TopologyDiagramWidget(
+                                 TopologyLayoutResult layout, int nodeWidth,
+                                 int selectedNodeIndex, int scrollX, int scrollY,
+                                 boolean showMetrics, boolean showDescription,
+                                 Set<String> highlightRouteIds, boolean highlightFailed) {
+        this.layout = layout;
+        this.nodeWidth = nodeWidth;
+        this.boxWidth = Math.max(MIN_BOX_WIDTH, nodeWidth / X_DIVISOR);
+        this.selectedNodeIndex = selectedNodeIndex;
+        this.scrollX = scrollX;
+        this.scrollY = scrollY;
+        this.showMetrics = showMetrics;
+        this.showDescription = showDescription;
+        this.highlightRouteIds = highlightRouteIds;
+        this.highlightFailed = highlightFailed;
+    }
+
+    /**
+     * Descriptions an AI suggested for routes that have none, by route id, shown with a mark in the given style when
+     * descriptions are shown, so they are not taken for what the route says.
+     */
+    public TopologyDiagramWidget withAiDescriptions(Map<String, String> descriptions, Style style) {
+        this.aiDescriptions = descriptions != null ? descriptions : Map.of();
+        this.aiStyle = style != null ? style : this.aiStyle;
+        return this;
+    }
+
+    /**
+     * The content of the boxes, by node id, instead of the route id and endpoint: for diagrams whose nodes are not
+     * routes, such as the architecture view. At most four lines a box.
+     */
+    public TopologyDiagramWidget withNodeLines(Map<String, List<NodeLine>> lines) {
+        this.nodeLines = lines != null ? lines : Map.of();
+        return this;
+    }
+
+    /**
+     * The group of each route (a route group, an AI capability, shared services, utility), shown as a tag line in the
+     * box and as the colour of its border.
+     */
+    public TopologyDiagramWidget withGroups(Map<String, NodeLine> tags, Map<String, Color> colors) {
+        this.groupTags = tags != null ? tags : Map.of();
+        this.groupColors = colors != null ? colors : Map.of();
+        return this;
+    }
+
+    /** The AI description a route node shows instead of its id, or null. */
+    private String aiDescription(TopologyLayoutNode node) {
+        if (!showDescription || isExternal(node) || node.routeId == null
+                || node.description != null && !node.description.isBlank()) {
+            return null;
+        }
+        String ai = aiDescriptions.get(node.routeId);
+        return ai != null && !ai.isBlank() ? AI_MARK + ai : null;
+    }
+
+    /** A description as a box shows it: at most two lines, cut with an ellipsis. */
+    private List<String> labelLines(String label) {
+        List<String> wrapped = wrapText(label, boxWidth - 4);
+        if (wrapped.size() <= 2) {
+            return wrapped;
+        }
+        String second = wrapped.get(1);
+        int max = Math.max(1, boxWidth - 4 - 3);
+        return List.of(wrapped.get(0), CharWidth.substringByWidth(second, max) + "...");
+    }
+
+    /** A box's lines and which of them are the AI label, the route id and the group tag (-1 when none). */
+    private record TextLines(List<String> lines, int aiLines, int idLine, int tagLine, NodeLine tag) {
+    }
+
+    /**
+     * The lines of a route box: the label and route id (descriptions on) or the route id and its endpoint, then the
+     * group tag when groups are shown, then metrics; at most {@code MAX_WRAP_LINES + 1}. Drawing and the box height
+     * both use it, so they agree.
+     */
+    private TextLines textLines(TopologyLayoutNode node, boolean ext) {
+        String line1;
+        String ai = aiDescription(node);
+        if (ext) {
+            line1 = node.from;
+        } else if (ai != null) {
+            line1 = ai;
+        } else if (showDescription && node.description != null && !node.description.isBlank()) {
+            line1 = node.description;
+        } else {
+            line1 = node.routeId;
+        }
+        // a route in the error frame needs no group tag: the frame says what it is
+        NodeLine tag = ext || node.routeId == null || inFrame(node) ? null : groupTags.get(node.routeId);
+
+        List<String> lines = new ArrayList<>(wrapText(line1, boxWidth - 4));
+        int aiLines = ai != null ? lines.size() : 0;
+        int idLine = -1;
+        boolean labelled = !ext && !line1.equals(node.routeId);
+        if (labelled) {
+            // a description is a label: at most two lines (one when the group is shown), then the route id
+            List<String> label = labelLines(line1);
+            if (tag != null && label.size() > 1) {
+                int max = Math.max(1, boxWidth - 4 - 3);
+                String first = label.get(0);
+                label = List.of(CharWidth.substringByWidth(first, max) + "...");
+            }
+            lines = new ArrayList<>(label);
+            aiLines = ai != null ? lines.size() : 0;
+            idLine = lines.size();
+            lines.add(node.routeId);
+        }
+        if (!ext && !showDescription) {
+            String line2 = "(" + node.from + ")";
+            List<String> fromLines = wrapText(line2, boxWidth - 4);
+            if (tag != null) {
+                // room for the group: the endpoint on one line, no spacer
+                lines.add(fromLines.size() > 1 ? fromLines.get(0) + "..." : fromLines.get(0));
+            } else {
+                lines.addAll(fromLines);
+                if (fromLines.size() < 2) {
+                    lines.add("");
+                }
+            }
+        }
+        int tagLine = -1;
+        if (tag != null) {
+            tagLine = lines.size();
+            lines.add(tag.text());
+        }
+
+        if (showMetrics) {
+            if (node.exchangesTotal > 0 || node.exchangesFailed > 0) {
+                long ok = node.exchangesTotal - node.exchangesFailed;
+                StringBuilder sb = new StringBuilder();
+                if (ok > 0) {
+                    sb.append(ok);
+                }
+                if (node.exchangesFailed > 0) {
+                    if (!sb.isEmpty()) {
+                        sb.append("/");
+                    }
+                    sb.append(node.exchangesFailed);
+                }
+                lines.add(sb.toString());
+            } else if (!ext) {
+                lines.add("");
+            }
+        }
+
+        while (lines.size() > MAX_WRAP_LINES + 1) {
+            lines.remove(lines.size() - 1);
+        }
+        return new TextLines(lines, aiLines, idLine, tagLine < lines.size() ? tagLine : -1, tag);
+    }
+
+    private List<NodeLine> ownLines(TopologyLayoutNode node) {
+        List<NodeLine> own = node.routeId != null ? nodeLines.get(node.routeId) : null;
+        return own == null || own.isEmpty() ? null : own.subList(0, Math.min(own.size(), MAX_WRAP_LINES + 1));
+    }
+
+    /**
+     * The error handling, drawn in a frame of its own below the routes: the routes reached only on error, and under
+     * each one where its failures come from (no arrows: with a global error handler every route would have one). A
+     * route that sends to the frame has a mark on its box.
+     */
+    public TopologyDiagramWidget withErrorLayer(TopologyErrorFrame layer) {
+        this.errorLayer = layer;
+        this.errorLabels = null;
+        return this;
+    }
+
+    /**
+     * How much room a route takes ({@link TopologyZoom}): a box with its lines, a box of one line with the count in its
+     * border, or a mark and a name on a row. The layout must have been placed with the same density.
+     */
+    public TopologyDiagramWidget withDensity(RouteDensity density) {
+        this.density = density != null ? density : RouteDensity.DETAILED;
+        return this;
+    }
+
+    /** The routes with error handling: a dim mark on their box, whether the error handling is shown or not. */
+    public TopologyDiagramWidget withErrorMarks(Set<String> routeIds) {
+        this.errorMarks = routeIds != null ? routeIds : Set.of();
+        return this;
+    }
+
+    /**
+     * The messages moving between the routes (with the metrics on): dots on the edges into the routes that get
+     * messages, faster and closer together the more messages a second the route gets.
+     */
+    public TopologyDiagramWidget withFlow(FlowAnimation flow) {
+        return withFlow(flow, null);
+    }
+
+    /**
+     * The messages moving along the edges, at the counts of the boxes (the routes, with the metrics on), or of the feed
+     * when the boxes are not the running routes (the architecture).
+     */
+    public TopologyDiagramWidget withFlow(FlowAnimation flow, FlowFeed feed) {
+        this.flowFeed = feed;
+        this.flow = flow != null && flow.isEnabled() && (showMetrics || feed != null) ? flow : null;
+        return this;
+    }
+
+    public List<NodeBox> getNodeBoxes() {
+        return nodeBoxes;
+    }
+
+    @Override
+    public void render(Rect area, Buffer buffer) {
+        nodeBoxes.clear();
+        flowArrows.clear();
+        if (flow != null) {
+            updateFlow();
+        }
+
+        if (errorLayer != null) {
+            drawErrorFrame(buffer, area);
+        }
+
+        for (TopologyLayoutEdge edge : layout.edges) {
+            if (!edge.selfLoop) {
+                drawEdge(buffer, area, edge);
+            }
+        }
+
+        for (TopologyLayoutEdge edge : layout.edges) {
+            if (edge.selfLoop) {
+                drawSelfLoop(buffer, area, edge);
+            }
+        }
+        // the dots over the lines, before the boxes
+        for (FlowDots.Path arrow : flowArrows) {
+            FlowDots.draw(buffer, area, scrollX, scrollY, arrow, flow.get(arrow.key()), density.boxed(), FLOW_KEEP);
+        }
+
+        for (TopologyLayoutNode node : layout.nodes) {
+            drawNode(buffer, area, node);
+        }
+
+        if (errorLayer != null) {
+            drawErrorLabels(buffer, area);
+        }
+        drawErrorMarks(buffer, area);
+    }
+
+    /** A mark on the border of each route with error handling (shown in the frame, or hidden until x). */
+    private void drawErrorMarks(Buffer buffer, Rect area) {
+        for (TopologyLayoutNode node : layout.nodes) {
+            if (density.boxed() && node.routeId != null && errorMarks.contains(node.routeId) && !inFrame(node)) {
+                int col = toCol(node.x) + boxWidth - 3;
+                writeText(buffer, area, toRow(node.y), col, "\u26a1", errorStyle().dim());
+            }
+        }
+    }
+
+    private Style errorStyle() {
+        return Theme.warning();
+    }
+
+    private boolean inFrame(TopologyLayoutNode node) {
+        return errorLayer != null && node.routeId != null && errorLayer.routeIds().contains(node.routeId);
+    }
+
+    /** The frame of the error handling: from its top to the bottom of the diagram, as wide as the diagram. */
+    private void drawErrorFrame(Buffer buffer, Rect area) {
+        int top = toRow(errorLayer.topY());
+        int bottom = toRow(layout.totalHeight) - 1;
+        int right = getTotalCols() - 2;
+        Style s = errorStyle().dim();
+        for (int c = 1; c < right; c++) {
+            setChar(buffer, area, top, c, DASH_H, s);
+            setChar(buffer, area, bottom, c, DASH_H, s);
+        }
+        for (int r = top + 1; r < bottom; r++) {
+            setChar(buffer, area, r, 0, DASH_V, s);
+            setChar(buffer, area, r, right, DASH_V, s);
+        }
+        setChar(buffer, area, top, 0, '\u256d', s);
+        setChar(buffer, area, top, right, '\u256e', s);
+        setChar(buffer, area, bottom, 0, '\u2570', s);
+        setChar(buffer, area, bottom, right, '\u256f', s);
+        writeText(buffer, area, top, 2, " " + TopologyErrorFrame.TITLE + " ", errorStyle().bold());
+    }
+
+    /**
+     * The label lines under each route of the frame: where its failures come from and how they are handled, one line
+     * per route that sends there.
+     */
+    private Map<TopologyLayoutNode, List<String>> errorLabels() {
+        // the same for every use in a widget (a widget is made for one frame)
+        if (errorLabels != null) {
+            return errorLabels;
+        }
+        Map<TopologyLayoutNode, List<String>> answer = new java.util.LinkedHashMap<>();
+        errorLabels = answer;
+        if (errorLayer == null) {
+            return answer;
+        }
+        for (TopologyLayoutNode node : layout.nodes) {
+            if (!inFrame(node)) {
+                continue;
+            }
+            answer.put(node, errorLayer.lines(node.routeId, TopologyErrorFrame.LineStyle.UNICODE));
+        }
+        return answer;
+    }
+
+    private void drawErrorLabels(Buffer buffer, Rect area) {
+        for (Map.Entry<TopologyLayoutNode, List<String>> e : errorLabels().entrySet()) {
+            int row = toRow(e.getKey().y) + boxHeight(e.getKey());
+            int col = toCol(e.getKey().x);
+            for (String line : e.getValue()) {
+                writeText(buffer, area, row++, col, line, errorStyle());
+            }
+        }
+    }
+
+    /** The column right of the widest label of the error frame, so the frame and the scrolling take it in. */
+    private int errorLabelsRight() {
+        int right = 0;
+        for (Map.Entry<TopologyLayoutNode, List<String>> e : errorLabels().entrySet()) {
+            for (String line : e.getValue()) {
+                right = Math.max(right, toCol(e.getKey().x) + CharWidth.of(line) + 2);
+            }
+        }
+        return right;
+    }
+
+    public int getTotalRows() {
+        return toRow(layout.totalHeight) + 10;
+    }
+
+    public int getTotalCols() {
+        return Math.max(toCol(layout.totalWidth) + boxWidth + 4, errorLabelsRight() + 2);
+    }
+
+    private void drawNode(Buffer buffer, Rect area, TopologyLayoutNode node) {
+        int col = toCol(node.x);
+        int row = toRow(node.y);
+
+        boolean ext = isExternal(node);
+        boolean dashedBox = ext || ERROR_HANDLING.equals(node.nodeType);
+        List<NodeLine> own = ownLines(node);
+
+        TextLines text = textLines(node, ext);
+        if (!density.boxed()) {
+            drawBareNode(buffer, area, node, text, ext, own);
+            return;
+        }
+        List<String> lines = text.lines();
+        int aiLines = text.aiLines();
+        int idLine = text.idLine();
+        int tagLine = text.tagLine();
+        NodeLine tag = text.tag();
+        if (own != null) {
+            // a box of its own lines, such as a group of the architecture: at compact its first line, its name
+            List<NodeLine> shown = density == RouteDensity.COMPACT ? own.subList(0, 1) : own;
+            own = shown;
+            lines = new ArrayList<>(shown.stream().map(NodeLine::text).toList());
+            tagLine = -1;
+        } else if (density == RouteDensity.COMPACT) {
+            // one line: the label (or the route id), the count goes in the border; the colour of the border is the group
+            lines = List.of(lines.get(0));
+            aiLines = Math.min(aiLines, 1);
+            idLine = idLine == 0 ? 0 : -1;
+            tagLine = -1;
+        }
+        boolean compact = own == null && density == RouteDensity.COMPACT;
+
+        int height = 2 + lines.size();
+        int nodeIdx = nodeBoxes.size();
+        boolean selected = nodeIdx == selectedNodeIndex;
+
+        boolean highlighted = !ext && node.routeId != null && highlightRouteIds.contains(node.routeId);
+
+        // a selected box has a solid frame like any other: dashes on the selection colour break up, the vertical ones most
+        char hChar = dashedBox && !selected ? DASH_H : H;
+        char vChar = dashedBox && !selected ? DASH_V : V;
+        Style borderStyle;
+        if (highlighted) {
+            Color hlColor = highlightFailed ? highlightFailColor() : highlightOkColor();
+            borderStyle = Style.EMPTY.fg(hlColor).bold();
+        } else if (!ext && groupColors.containsKey(node.routeId)) {
+            // the colour of the route's group, when groups are shown
+            borderStyle = Style.EMPTY.fg(groupColors.get(node.routeId));
+        } else {
+            borderStyle = dashedBox ? dashedBorderStyle() : borderStyle();
+        }
+        if (selected) {
+            borderStyle = borderStyle.patch(selectionStyle());
+        }
+
+        // Top border
+        setChar(buffer, area, row, col, TL, borderStyle);
+        for (int c = col + 1; c < col + boxWidth - 1; c++) {
+            setChar(buffer, area, row, c, hChar, borderStyle);
+        }
+        setChar(buffer, area, row, col + boxWidth - 1, TR, borderStyle);
+
+        // Bottom border
+        int bottom = row + height - 1;
+        setChar(buffer, area, bottom, col, BL, borderStyle);
+        for (int c = col + 1; c < col + boxWidth - 1; c++) {
+            setChar(buffer, area, bottom, c, hChar, borderStyle);
+        }
+        setChar(buffer, area, bottom, col + boxWidth - 1, BR, borderStyle);
+
+        // Content rows
+        int innerWidth = boxWidth - 4;
+        for (int i = 0; i < lines.size(); i++) {
+            int r = row + 1 + i;
+            setChar(buffer, area, r, col, vChar, borderStyle);
+            setChar(buffer, area, r, col + boxWidth - 1, vChar, borderStyle);
+
+            // Clear interior
+            Style bgStyle = selected ? selectionStyle() : Style.EMPTY;
+            for (int c = col + 1; c < col + boxWidth - 1; c++) {
+                setChar(buffer, area, r, c, ' ', bgStyle);
+            }
+
+            String lineText = lines.get(i);
+            if (CharWidth.of(lineText) > innerWidth) {
+                lineText = CharWidth.substringByWidth(lineText, Math.max(1, innerWidth - 3)) + "...";
+            }
+            int textCol = col + 2 + Math.max(0, (innerWidth - CharWidth.of(lineText)) / 2);
+
+            // Choose style based on content type
+            if (own != null) {
+                writeText(buffer, area, r, textCol, lineText, style(own.get(i).style(), selected));
+            } else if (ext && i == 0) {
+                writeText(buffer, area, r, textCol, lineText, style(dashedBorderStyle(), selected));
+            } else if (!compact && showMetrics && i == lines.size() - 1 && node.exchangesTotal > 0) {
+                drawMetricsLine(buffer, area, r, textCol, lineText, node, selected);
+            } else if (i == tagLine) {
+                writeText(buffer, area, r, textCol, lineText, style(tag.style(), selected));
+            } else if (i < aiLines) {
+                writeText(buffer, area, r, textCol, lineText, style(aiStyle, selected));
+            } else if (i == idLine) {
+                writeText(buffer, area, r, textCol, lineText, style(fromLabelStyle(), selected));
+            } else if (i == 0 && !ext) {
+                Style idStyle = highlighted
+                        ? Style.EMPTY.fg(highlightFailed ? highlightFailColor() : highlightOkColor()).bold()
+                        : routeIdStyle();
+                writeText(buffer, area, r, textCol, lineText, style(idStyle, selected));
+            } else {
+                writeText(buffer, area, r, textCol, lineText, style(fromLabelStyle(), selected));
+            }
+        }
+
+        if (compact && showMetrics && (node.exchangesTotal > 0 || node.exchangesFailed > 0)) {
+            String count = count(node);
+            int countCol = col + boxWidth - 3 - CharWidth.of(count);
+            writeText(buffer, area, bottom, countCol - 1, " ", borderStyle);
+            drawMetricsLine(buffer, area, bottom, countCol, count, node, false);
+            writeText(buffer, area, bottom, countCol + CharWidth.of(count), " ", borderStyle);
+        }
+
+        nodeBoxes.add(new NodeBox(node.routeId, row, row + height - 1, col, col + boxWidth - 1, node.layer));
+    }
+
+    /** The messages of a route: ok, and failed after a slash. */
+    private static String count(TopologyLayoutNode node) {
+        long ok = node.exchangesTotal - node.exchangesFailed;
+        StringBuilder sb = new StringBuilder();
+        if (ok > 0) {
+            sb.append(ok);
+        }
+        if (node.exchangesFailed > 0) {
+            sb.append(sb.isEmpty() ? "" : "/").append(node.exchangesFailed);
+        }
+        return sb.toString();
+    }
+
+    /**
+     * A route at the bare density: a mark in the colour of its group, its label (or id) and its count on one row, with
+     * no box; the arrows meet at the mark.
+     */
+    private void drawBareNode(
+            Buffer buffer, Rect area, TopologyLayoutNode node, TextLines text, boolean ext, List<NodeLine> own) {
+        int col = toCol(node.x);
+        int row = toRow(node.y);
+        boolean selected = nodeBoxes.size() == selectedNodeIndex;
+        boolean highlighted = !ext && node.routeId != null && highlightRouteIds.contains(node.routeId);
+        Style markStyle;
+        if (highlighted) {
+            markStyle = Style.EMPTY.fg(highlightFailed ? highlightFailColor() : highlightOkColor()).bold();
+        } else if (!ext && groupColors.containsKey(node.routeId)) {
+            markStyle = Style.EMPTY.fg(groupColors.get(node.routeId)).bold();
+        } else {
+            markStyle = ext ? dashedBorderStyle() : routeIdStyle();
+        }
+        String count = showMetrics ? count(node) : "";
+        // up to half way to the next route of the layer
+        int room = Math.max(4, boxWidth + 4 - 3 - (count.isEmpty() ? 0 : CharWidth.of(count) + 1));
+        String label = DiagramText.fit(own != null ? own.get(0).text() : text.lines().get(0), room);
+        Style labelStyle = own != null ? own.get(0).style()
+                : ext ? dashedBorderStyle() : text.aiLines() > 0 ? aiStyle : highlighted ? markStyle : routeIdStyle();
+        writeText(buffer, area, row, col + 1, ext ? "\u25cc" : "\u25cf", style(markStyle, selected));
+        if (selected) {
+            setChar(buffer, area, row, col + 2, ' ', selectionStyle());
+        }
+        writeText(buffer, area, row, col + 3, label, style(labelStyle, selected));
+        int end = col + 3 + CharWidth.of(label);
+        if (!count.isEmpty()) {
+            drawMetricsLine(buffer, area, row, end + 1, count, node, false);
+        }
+        nodeBoxes.add(new NodeBox(node.routeId, row, row, col, end - 1, node.layer));
+    }
+
+    /** Where the arrows meet a route: the middle of its box, or the mark of a bare route. */
+    private int anchorCol(TopologyLayoutNode node) {
+        return density.boxed() ? toCol(node.x + node.width / 2) : toCol(node.x) + 1;
+    }
+
+    private void drawMetricsLine(
+            Buffer buffer, Rect area, int row, int col, String text,
+            TopologyLayoutNode node, boolean selected) {
+        long ok = node.exchangesTotal - node.exchangesFailed;
+        if (ok > 0 && node.exchangesFailed > 0) {
+            String okStr = String.valueOf(ok);
+            String failStr = String.valueOf(node.exchangesFailed);
+            writeText(buffer, area, row, col, okStr, style(metricsOkStyle(), selected));
+            int slashCol = col + okStr.length();
+            writeText(buffer, area, row, slashCol, "/", style(Style.EMPTY.fg(Theme.diagramBorder()), selected));
+            writeText(buffer, area, row, slashCol + 1, failStr, style(metricsFailStyle(), selected));
+        } else if (ok > 0) {
+            writeText(buffer, area, row, col, text, style(metricsOkStyle(), selected));
+        } else if (node.exchangesFailed > 0) {
+            writeText(buffer, area, row, col, text, style(metricsFailStyle(), selected));
+        }
+    }
+
+    private void drawEdge(Buffer buffer, Rect area, TopologyLayoutEdge edge) {
+        int fromCx = anchorCol(edge.from);
+        int fromBottom = toRow(edge.from.y) + boxHeight(edge.from);
+        int toCx = anchorCol(edge.to);
+        int toTop = toRow(edge.to.y);
+
+        if (fromBottom >= toTop) {
+            return;
+        }
+
+        boolean dashed = isExternal(edge.from) || isExternal(edge.to) || ERROR_HANDLING.equals(edge.to.nodeType);
+        // ⇅ the route waits for the answer (a call, a request-reply over a broker), ▼ it hands the message off
+        char head = edge.reply ? REPLY_ARROW : ARROW;
+        char vChar = dashed ? DASH_V : V;
+        char hChar = dashed ? DASH_H : H;
+        boolean edgeHighlighted = !dashed
+                && edge.from.routeId != null && highlightRouteIds.contains(edge.from.routeId)
+                && edge.to.routeId != null && highlightRouteIds.contains(edge.to.routeId);
+        Style edgeStyle;
+        if (edgeHighlighted) {
+            edgeStyle = Style.EMPTY.fg(highlightFailed ? highlightFailColor() : highlightOkColor());
+        } else {
+            edgeStyle = dashed ? dashedBorderStyle() : Style.EMPTY.fg(Theme.diagramBorder());
+        }
+
+        if (fromCx == toCx) {
+            for (int r = fromBottom; r < toTop - 1; r++) {
+                plotLine(buffer, area, r, fromCx, vChar, edgeStyle);
+            }
+            setChar(buffer, area, toTop - 1, toCx, head, edgeStyle);
+        } else {
+            int midRow = fromBottom + (toTop - fromBottom) / 2;
+
+            for (int r = fromBottom; r < midRow; r++) {
+                plotLine(buffer, area, r, fromCx, vChar, edgeStyle);
+            }
+
+            int minC = Math.min(fromCx, toCx);
+            int maxC = Math.max(fromCx, toCx);
+            for (int c = minC; c <= maxC; c++) {
+                plotLine(buffer, area, midRow, c, hChar, edgeStyle);
+            }
+
+            setChar(buffer, area, midRow, fromCx, T_UP, edgeStyle);
+            setChar(buffer, area, midRow, toCx, T_DOWN, edgeStyle);
+
+            for (int r = midRow + 1; r < toTop - 1; r++) {
+                plotLine(buffer, area, r, toCx, vChar, edgeStyle);
+            }
+            setChar(buffer, area, toTop - 1, toCx, head, edgeStyle);
+        }
+        String key = flowKey(edge);
+        if (key != null) {
+            flowArrows.add(FlowDots.path(key, fromCx, fromBottom, toCx, toTop, head));
+        }
+    }
+
+    // ---- the flow of the messages ----
+
+    /** What a dot does not cover: the head of another edge. */
+    private static final String FLOW_KEEP = "" + ARROW + REPLY_ARROW;
+
+    /** The key of the counts of a route (or an external system) of the topology. */
+    private static String flowKey(TopologyLayoutNode node) {
+        String id = node.routeId != null ? node.routeId : node.from;
+        return id != null ? "topology/" + id : null;
+    }
+
+    /** The counts of the routes to the flow, and of the external systems that have counts. */
+    private void updateFlow() {
+        if (flowFeed != null) {
+            flow.update(flowFeed.readings());
+            return;
+        }
+        Map<String, FlowAnimation.Reading> readings = new HashMap<>();
+        for (TopologyLayoutNode node : layout.nodes) {
+            String key = flowKey(node);
+            if (key != null && counted(node)) {
+                // a reload lays the topology out anew: new nodes are a new reading
+                readings.put(key, new FlowAnimation.Reading(node, node.exchangesTotal, node.exchangesFailed, 0));
+            }
+        }
+        flow.update(readings);
+    }
+
+    /** A route has counts; an external system only when the integration counts its messages. */
+    private static boolean counted(TopologyLayoutNode node) {
+        return !isExternal(node) || node.exchangesTotal > 0;
+    }
+
+    /**
+     * The counts an edge moves at: those of the route it goes into, which gets the messages; or of the route it comes
+     * from when it goes to a system that is not counted. None from a route that gets no messages: the route it goes
+     * into may get them from another one.
+     */
+    private String flowKey(TopologyLayoutEdge edge) {
+        if (flow == null || edge.to == null || edge.from == null) {
+            return null;
+        }
+        if (flowFeed != null) {
+            FlowFeed.Edge e = flowFeed.edges().get(FlowFeed.edgeId(edge.from.routeId, edge.to.routeId));
+            if (e == null || !e.senders().isEmpty() && e.senders().stream().map(flow::get)
+                    .noneMatch(t -> t != null && t.rate() > 0)) {
+                return null;
+            }
+            return e.key();
+        }
+        String from = flowKey(edge.from);
+        String to = flowKey(edge.to);
+        if (from == null || to == null) {
+            return null;
+        }
+        if (counted(edge.from)) {
+            FlowAnimation.Track source = flow.get(from);
+            if (source == null || source.rate() <= 0) {
+                return null;
+            }
+        }
+        return counted(edge.to) ? to : counted(edge.from) ? from : null;
+    }
+
+    private void drawSelfLoop(Buffer buffer, Rect area, TopologyLayoutEdge edge) {
+        int col = toCol(edge.from.x) + boxWidth;
+        int topRow = toRow(edge.from.y) + 1;
+        int botRow = topRow + 2;
+
+        Style s = Style.EMPTY.fg(Theme.diagramBorder());
+        for (int c = col; c < col + 3; c++) {
+            setChar(buffer, area, topRow, c, H, s);
+            setChar(buffer, area, botRow, c, H, s);
+        }
+        setChar(buffer, area, topRow + 1, col + 2, V, s);
+        setChar(buffer, area, topRow, col + 2, TR, s);
+        setChar(buffer, area, botRow, col + 2, BR, s);
+    }
+
+    private int boxHeight(TopologyLayoutNode node) {
+        List<NodeLine> own = ownLines(node);
+        if (density != RouteDensity.DETAILED) {
+            return TopologyZoom.boxRows(density);
+        }
+        if (own != null) {
+            return 2 + own.size();
+        }
+        if (isExternal(node)) {
+            int lines = 1;
+            if (showMetrics && node.exchangesTotal > 0) {
+                lines++;
+            }
+            return 2 + lines;
+        }
+        return 2 + textLines(node, false).lines().size();
+    }
+
+    private void setChar(Buffer buffer, Rect area, int gridRow, int gridCol, char ch, Style style) {
+        int x = area.x() + gridCol - scrollX;
+        int y = area.y() + gridRow - scrollY;
+        if (x >= area.left() && x < area.right() && y >= area.top() && y < area.bottom()) {
+            buffer.setString(x, y, String.valueOf(ch), style);
+        }
+    }
+
+    private void plotLine(Buffer buffer, Rect area, int gridRow, int gridCol, char ch, Style style) {
+        setChar(buffer, area, gridRow, gridCol, ch, style);
+    }
+
+    private void writeText(Buffer buffer, Rect area, int gridRow, int gridCol, String text, Style style) {
+        DiagramText.write(buffer, area, area.x() + gridCol - scrollX, area.y() + gridRow - scrollY, text, style);
+    }
+
+    private Style style(Style base, boolean selected) {
+        return selected ? base.patch(selectionStyle()) : base;
+    }
+
+    private int toCol(int pixelX) {
+        if (nodeWidth == 0) {
+            return 0;
+        }
+        return pixelX * boxWidth / nodeWidth;
+    }
+
+    private int toRow(int pixelY) {
+        return pixelY / Y_SCALE;
+    }
+
+    private static boolean isExternal(TopologyLayoutNode node) {
+        return "external-in".equals(node.nodeType) || "external-out".equals(node.nodeType)
+                || "external".equals(node.nodeType);
+    }
+
+    public static List<String> wrapText(String text, int maxWidth) {
+        return DiagramText.wrap(text, maxWidth, MAX_WRAP_LINES);
+    }
+}

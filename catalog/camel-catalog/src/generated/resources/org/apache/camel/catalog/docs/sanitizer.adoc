@@ -1,0 +1,542 @@
+= Sanitizer Component
+:doctitle: Sanitizer
+:shortname: sanitizer
+:artifactid: camel-sanitizer
+:description: Check during development and tests that the processors of the routes keep the contract of AsyncProcessor and that the commits of the consumers run exactly once, and report where they break it
+:since: 4.24
+:supportlevel: Preview
+:tabs-sync-option:
+
+*Since Camel {since}*
+
+The `camel-sanitizer` module is a checker for development and tests. It watches the calls of the steps of the routes
+of a running Camel application and reports, when it happens, that a processor breaks the contract of `AsyncProcessor`
+(a callback called twice, a processor that throws instead of calling its callback, or one that returns a value other
+than the one its callback is called with), that the commit of a consumer
+runs twice, never, or with the outcome of another exchange, or, in tests, that two threads use the same exchange at the
+same time. It also warns about a step whose callback has not come. It
+checks the code of Camel users as much as Camel's own: a custom `AsyncProcessor`, the producer or the consumer of a
+custom component, a bean. A test that runs a broken path fails with a report that names the step and the class.
+
+It checks the paths the tests run; it does not find untested ones.
+
+[IMPORTANT]
+====
+The sanitizer is for development and tests only. It stays off with profile `prod`, and costs time at each step when it
+is on.
+====
+
+== Getting it
+
+Add the `camel-sanitizer` dependency, in test scope for tests (see <<_in_a_test,In a test>>), or with
+`camel run --sanitizer` (or `--dep camel:sanitizer`) for a run in development (profile `dev`, the default of
+`camel run`, switches it on; see <<_in_development,In development>>).
+
+== The rules it checks
+
+The sanitizer checks three rules in this version: R1, R2 and R3.
+
+=== R1: the callback of a step is called exactly once
+
+Each time the processor of a step is called (each attempt, also
+each redelivery of the error handler), its callback must be called exactly once, and `process(exchange, callback)` must
+not throw. A step is any node of a route with its node id (`to`, `process`, `split`, ...). It reports:
+
+* *callback called twice* (`COMPLETED_TWICE`): the callback of a call is called a second time. The report is logged at
+the second call, before that call continues the exchange, with the thread and stack of the first call and of the second
+call.
+* *process threw before calling the callback* (`THREW_BEFORE_CALLBACK`): `process` throws and the callback has not been
+called. Camel catches this in most places and fails the exchange, but the processor still breaks the contract, and on
+older Camel versions the exchange hangs. The report names the exception. A processor that throws after it called its
+callback is reported too (`THREW_AFTER_CALLBACK`).
+* *callback called after process threw* (`CALLBACK_AFTER_THROW`): the callback comes after `process` threw. Camel then
+fails the exchange with what was thrown, and the callback and that failure race to continue the exchange.
+
+An exception that a processor throws on through an outer step is reported once, at the step that threw it first.
+
+A plain `Processor` does not break the rule when it throws: the adapter Camel puts around it (`DelegateSyncProcessor`
+for `process(...)`, the bridge of `AsyncProcessorConverterHelper`, and the bean component for a bean that is a
+`Processor`) sets what it throws on the exchange, also an `Error` such as an `AssertionError` of a test, and then calls
+the callback. The exchange fails, and nothing is reported. A `VirtualMachineError` (such as an `OutOfMemoryError` or
+a `StackOverflowError`) is the exception: the adapter does not catch it, so it is thrown on after the callback, as in
+earlier versions, and is reported as thrown after the callback (`THREW_AFTER_CALLBACK`).
+
+A report looks like this:
+
+[source,text]
+----
+Exchange sanitizer: callback called twice (R1)
+  exchange 5A1B...-0000000000000001, route route1, step lookup, processor com.acme.PriceLookup
+  first call of the callback: thread price-timeout-1
+      at com.acme.PriceLookup.lambda$process$0(PriceLookup.java:41)
+      ...
+  second call of the callback: thread price-client-3
+      at com.acme.PriceLookup.lambda$process$1(PriceLookup.java:47)
+      ...
+  The callback of process(exchange, callback) must be called exactly once, and process must not throw (see AsyncProcessor).
+  Usual fix: let only the first path call the callback (for example with a compareAndSet on the outcome).
+----
+
+The processor named is the one of the step, looking through the delegates Camel puts around a processor (such as the one
+that `process(...)` uses for an `AsyncProcessor` that is not a `Service`); for `bean(...)` it is the class of the bean,
+not Camel's `BeanProcessor`. For a step that sends to an endpoint, such as
+`to`, that is Camel's `SendProcessor`, and the report adds the endpoint (its URI, sanitized, and its class), as the
+producer that broke the rule is behind it. The stacks start at the code that called the callback, or at what threw, so
+they show the class of the producer or the bean. The report holds ids, names, threads, stacks, and the class and message
+of an exception; never bodies or headers. An exception message can carry message data, so the report is for development.
+
+The check is at the processor of each step, below the error handler of the step, as the step listener SPI of camel-core
+sees it (see `StepListener`). A processor that is not a step, such as the producer of a recipient of a recipient list,
+is seen through its step. An `InterceptStrategy` can hide part of the call: `intercept()` calls the processor later, so
+its own return or throw is not seen, and a strategy that returns a plain `Processor` makes a second callback of an
+asynchronous processor go to the await manager, not to the sanitizer.
+
+=== Still pending
+
+A call whose callback has not come is not a violation, as a slow endpoint looks the same, but it is what a hung
+exchange shows. When nothing happened in an exchange for `camel.sanitizer.pendingTimeout` (default `60s`: no call of a
+step, no return, throw or callback, also in its parts), the sanitizer logs a WARN with its innermost pending call: the
+step whose callback the exchange waits for, whether `process` returned, threw or has not returned yet (then with the
+stack of the thread that is still in it), and the enclosing calls that wait for it. The parts of an exchange are the
+correlated copies that a split, multicast, recipient list, enrich, kamelet, circuit breaker or a `to("kamelet:...")`
+step of it waits for: a copy that carries the id of the exchange as its correlation id while such a step is the
+innermost pending call of the exchange. Other copies, such as the one a `seda` producer queues, are exchanges of their
+own (unless the producing exchange is already in such a step when the copy starts). So a long split, or a
+`to("direct:...")` whose route is still busy, is not reported, and a step inside them that does not call back is. An
+exchange is not reported while it waits for its parts and they still have pending calls. Each call is reported once;
+if its callback comes later, an INFO line says after how long. A call that threw stays pending until its callback
+comes or the exchange is done (Camel catches the throw and fails the exchange; on older Camel versions the exchange
+hung there). The parts of a split with `shareUnitOfWork()` have no done event of their own: what they threw goes when
+their exchange is done. A call of a part that has not called back stays when its exchange is done, and is reported:
+the part may hang after the step that waited for it gave up, such as a split with a `timeout`. A recipient of a
+recipient list is not a step: a producer of a recipient that does not call back shows as the recipient list step still
+pending. Steps that wait on purpose for longer than the timeout are reported too: a delay or a throttle, a redelivery
+delay, a `pollEnrich` that waits, a processor that waits for something, or one that sends with a `ProducerTemplate` and
+waits for the reply. So are steps that wait for an exchange copy of their own, as the consumer side works on that copy,
+not on a part: a request-reply `to` over `seda` or `vm` whose consumer is slow but still making progress, and an
+`aggregate` step whose completion runs the aggregated exchange synchronously in the caller. A chaos `delay` on a step
+(a `step=` rule of camel-chaos), or at the entry of a route (a `route=` rule), runs before the step is called, so a
+delay longer than `pendingTimeout` shows up at the enclosing step that waits (such as a split, or the `to` of the
+calling route), and not at all at the top level of a route. A `delay` of an `endpoint=` or `component=` rule at a send
+(`at=send`) runs inside the send, so it shows at that `to` step. At a poll (`at=poll`) there is no exchange yet, so it
+is not seen; at the send of a dead letter channel (`at=dlq`) the error handler runs it after the failed step called
+back, so it shows like a `step=` delay.
+
+[source,text]
+----
+Exchange sanitizer: callback still pending (R1, a warning)
+  exchange 5A1B...-0000000000000001, route route1, step lookup, processor com.acme.PriceLookup
+  called 60412 ms ago in CamelContext camel-1, and nothing happened in the exchange (its steps, and the steps of its parts) for 60012 ms
+  process returned false, and the callback has not been called
+  enclosing calls still pending: route route2 step to3
+  The callback of process(exchange, callback) must be called exactly once (see AsyncProcessor). This is a warning, not a violation: a slow endpoint looks the same (camel.sanitizer.pendingTimeout=60000 ms).
+----
+
+The warnings never fail a test, and are not charged to it. When the context stops, the calls still pending then are
+listed at WARN (with `reportOnShutdown`), and the report on shutdown counts the warnings. The pending calls are kept in
+a table that holds ids and names, not the exchanges, with a bound of 10000 calls. The table is split in stripes, each
+with its own lock (twice the number of processors, rounded up to a power of two, at most 32), so routing threads that
+work on unrelated exchanges do not wait for each other; an exchange, its parts and the copies made from it while it is
+in the table are in one stripe. Each stripe has a share of the bound (10000 divided by the number of stripes), and the
+share is soft: a stripe past it drops its oldest calls only while all the stripes together hold more than 10000, so an
+asynchronous parallel split with many parts in flight is still watched. When calls are dropped, one WARN says that the
+checks are incomplete, and the report counts the calls dropped. The timeout is measured with `System.nanoTime()`, not
+with the time source of camel-test-dst, so a virtual clock does not stretch it.
+
+To know when an exchange is done, the sanitizer adds an event notifier of the exchanges completed and failed (one
+notifier, shared with R2, which needs it too), so with the sanitizer on the exchange events of the context are fired
+(and the notifier is listed with the others, also in JMX). A pending timeout of `0` turns the warning off, and with it
+the table and the list when the context stops (and the notifier, unless R2 is checked). The warning follows the
+callbacks of R1, so with `camel.sanitizer.checks=commit` only it is off too.
+
+The parts of a split, multicast or recipient list are in the stripe of their exchange. With `parallelProcessing()`, the
+threads that run the parts therefore take the same lock of the table at each step call, return and callback. The lock is
+held briefly, but it costs more when the parts run on several threads, and it orders those threads, which can hide a
+race between parts that is not synchronized otherwise. To hunt races between the parts of a parallel split, set
+`camel.sanitizer.pendingTimeout=0`: the other checks of R1 stay on, and the table and its lock are not used. R2 takes
+one lock of its records of the context when an exchange or a part gets its unit of work, at each add, handover and run
+of an on completion, and when an exchange is done; in a test, where R2 is on by default, set
+`camel.sanitizer.checks=callback,threads` as well to leave that out too.
+
+=== R2: each consumer commit runs exactly once, for the unit of work that owns it
+
+R2 is checked by default only in a test (a CamelContext built on a thread the JUnit extension marked); elsewhere, such
+as with `camel run` or profile `dev`, `camel.sanitizer.checks=callback,commit,threads` turns it on.
+
+A _commit_ is the on completion (`Synchronization`) that a consumer adds to the exchange before it routes it
+(`exchange.getExchangeExtension().addOnCompletion(...)`), to commit or roll back its message when the exchange is done,
+such as the file consumer moving or deleting the file. In the sanitizer, the commits of an exchange are the on
+completions it holds when it gets the unit of work created for it; on completions added later (such as by the tracer,
+or a route `onCompletion`) are not commits. A commit can move: it is handed over to a copy that is routed on its own
+(such as an `InOnly` exchange sent to `seda`), and then runs when the copy is done, with the outcome of the copy. The
+rule, as the Javadoc of `Synchronization` states it: each add of a commit runs `onComplete` or `onFailure` exactly once,
+where it is held at the end, and while it is in a unit of work it moves only by a handover of the exchange that unit of
+work was created for. It reports:
+
+* *commit ran a second time* (`COMMIT_RUN_TWICE`): the commit runs again, such as when the `done` of a unit of work is
+called twice, or when it is run where it was handed over from and again by the copy it was handed over to. It is
+reported at the second run, before it runs, with the thread and stack of the first run and of the second.
+* *commit handed over by an exchange its unit of work was not created for* (`COMMIT_HANDED_OVER_BY_OTHER_EXCHANGE`):
+an exchange that uses the unit of work of another exchange hands its commit over, such as a part of a split that shares
+the unit of work of its parent and is sent to `seda` (CAMEL-26576). The commit would then run with the outcome of the
+copy, not of the exchange of the consumer. It is reported at the handover, with the step that runs on that thread (such
+as the `to` step that sends to `seda`).
+* *commit handed over twice* (`COMMIT_HANDED_OVER_TWICE`): a commit is handed over again from a unit of work it has
+already left, such as by two parts that share it and hand over at the same time (CAMEL-26569), with the stacks of both
+handovers.
+* *commit never ran* (`COMMIT_NEVER_RUN`): the exchange its unit of work was created for is done (its completed or
+failed event), and the commit was neither run, handed over nor taken out of the unit of work; or the `CamelContext`
+stopped while the commit waited in a copy that was never routed (such as a copy in a `seda` queue that has no consumer).
+
+A report of R2 looks like this (a split with `shareUnitOfWork` before CAMEL-26576, where a part sent to `seda` took
+the commit of the file):
+
+[source,text]
+----
+Exchange sanitizer: commit handed over by an exchange its unit of work was not created for (R2)
+  commit org.apache.camel.component.file.GenericFileOnCompletion of exchange 5A1B...-0000000000000001, route files, consumer org.apache.camel.component.file.FileConsumer, endpoint file://inbox?move=done
+  at step lines of route files, processor org.apache.camel.processor.SendProcessor, endpoint seda://lines (org.apache.camel.component.seda.SedaEndpoint)
+  its unit of work was created for exchange 5A1B...-0000000000000001, and exchange 5A1B...-0000000000000004 handed it over to exchange 5A1B...-0000000000000005, so it would run with the outcome of exchange 5A1B...-0000000000000005
+  handed over: thread Camel (camel-1) thread #2 - Split
+      at org.apache.camel.support.AbstractExchange.handoverCompletions(AbstractExchange.java:893)
+      ...
+  Each commit of a consumer (an on completion it adds to the exchange before routing it) must run once, where it is held at the end, and moves only by a handover of the exchange its unit of work was created for (see Synchronization).
+  Usual fix: an exchange that uses the unit of work of another must hand over only the on completions it added itself: ...
+----
+
+The exchange, route, consumer and endpoint are the ones the commit was added for; the step is the one that ran on the
+thread where the violation was found. The commit is named by the class of its on completion (for
+`@ExpectSanitizerViolation` and `SanitizerViolation.getProcessor()`).
+
+R2 follows each add of a commit, by the identity of its on completion, as the on completion listener SPI of camel-core
+reports them (see `OnCompletionListener`): one on completion can be added to many exchanges. On completions that are
+taken out of an exchange as a list to be run by someone else (`handoverCompletions()`, as the `seda` consumer does with
+`multipleConsumers`) are checked for running once only; nothing tells which exchange runs them, so they are matched by
+their on completion alone, and one on completion object shared by many exchanges can then be matched to another
+exchange's record. A commit in a `UnitOfWork` of a user that does not tell what it hands over, or does not report its
+adds, is not reported as never run. A consumer that commits in its own code after the callback (such as JMS with a
+transacted session) is covered by R1 only. The records keep no exchange; the commits that wait in exchanges without a
+unit of work (such as copies in a `seda` queue) and the commits taken out that have not run yet are bounded (10 000):
+past it the oldest commit taken out is no longer followed first, then the oldest waiting in an exchange; one WARN says
+so and the report counts them. A commit taken out that ran is kept (the last 1000) to see a second run.
+
+A commit that never ran because the context stopped while it waited in a copy that was never routed is found when the
+context stops. It is charged like any violation: to the test that runs then (a context stopped at the end of each
+test), or to the test class (a context stopped after its last test); a test that stops a context with such a copy on
+purpose says so with `@ExpectSanitizerViolation(Violation.COMMIT_NEVER_RUN)` and stops it in the test.
+
+To find the commits that never ran, R2 uses the event notifier of the exchanges completed and failed that the still
+pending warning uses too (one notifier for both, added when either is on).
+
+With `camel.sanitizer.checks=commit` only, the step listener is still installed (each step is still wrapped, and the
+report still counts the calls of steps), so a report of R2 can name the step that handed a commit over.
+
+=== R3: one thread at a time
+
+An exchange can move between threads, but it is never used by two threads at the same time. R3 checks this in two
+parts. The first is the contract of `AsyncProcessor` at the call of each step. The second, in tests, watches for
+accesses that overlap in time (see <<_accesses_that_overlap_in_time,Accesses that overlap in time>>).
+
+The value the callback of a call is called with (`doneSync`) must be the value `process(exchange, callback)` returns,
+and `true` means that the callback was called already, on the calling thread. A caller that uses the return value
+continues the exchange when `process` returns `true`, and leaves it to the callback when it returns `false`; a
+processor that returns the other value lets two threads continue the same exchange, or none. Most callers in Camel go
+on through the callback and do not use the return value, so in a route the mismatch is usually harmless today; it still
+breaks the contract, and the same processor breaks under a caller that uses it. It reports:
+
+* *process returned true, and its callback was called on another thread* (`RETURNED_TRUE_CALLBACK_ON_OTHER_THREAD`):
+the processor handed the exchange to another thread, which called the callback, and then returned `true` as if it had
+done the work itself (such as a processor that waits for its worker). With `false` the caller and that thread can both
+continue the exchange; with `true` that thread continued it while `process` still ran. The report has the thread and
+stack of the callback, and the return.
+* *process returned true before its callback was called* (`RETURNED_TRUE_BEFORE_CALLBACK`): `process` returned `true`,
+and the callback then came on another thread, or with `true`. The caller went on before the work of the processor was
+done.
+* *process returned false, and its callback was called with true* (`RETURNED_FALSE_CALLBACK_TRUE`): in either order,
+on any thread.
+
+The contract allows one case where the two values differ, and it is not reported: a processor that hands its callback
+to the reactive executor returns the value of the processor it calls, and the reactive executor then calls the callback
+with `false` on the calling thread, at once or after the work that thread is running. The channel of a step without an
+error handler does this, so a step that calls such a channel directly sees it: for example a `choice` whose branch has
+one step, in a route with `noErrorHandler()`.
+
+So a callback with `false` on the thread that called `process` is never reported, whatever `process` returns and
+whether it comes before or after the return. The check relies on the default reactive executor of camel-core, which
+runs a callback on the thread that scheduled it.
+
+Only the first call of the callback is compared (a second call is R1), and a call whose `process` threw is not
+compared (R1 reports it). The check is at the processor of each step, below its error handler, as R1 is; the channel of
+a step always continues the exchange through the reactive executor, so the value it returns itself says nothing and is
+not checked. It costs little: a small record per call, and a stack only for a callback on another thread before the
+return, or when a violation is reported. It is on by default, also with profile `dev`.
+
+A report of R3 looks like this:
+
+[source,text]
+----
+Exchange sanitizer: process returned true, and its callback was called on another thread (R3)
+  exchange 5A1B...-0000000000000001, route prices, step lookup, processor com.acme.PriceLookup
+  the callback was called with false: thread price-worker-2
+      at com.acme.PriceLookup.lambda$process$0(PriceLookup.java:38)
+      ...
+  then process returned true: thread Camel (camel-1) thread #3 - timer://prices
+      at org.apache.camel.support.StepHelper.process(StepHelper.java:63)
+      at org.apache.camel.processor.errorhandler.RedeliveryErrorHandler.processOutput(RedeliveryErrorHandler.java:266)
+      ...
+  process(exchange, callback) must return the value its callback is called with (see AsyncProcessor).
+  Usual fix: when the work goes on another thread, return false from process and let that thread call the callback with false; return true only after the callback was called with true on the calling thread.
+----
+
+=== Accesses that overlap in time
+
+The second part of R3 looks for two threads that use the same exchange at the same time, as KCSAN does in the Linux
+kernel. The routing engine uses an exchange at known points: a step is called, the callback of a step continues the
+exchange, and an on completion runs. At a sample of these points the thread opens a short watch window on the exchange
+and pauses in it. If another thread comes to a point of the same exchange during the window, both are reported.
+Each report names the thread and its stack (`USED_BY_TWO_THREADS`). A thread that only waits, such as a caller that waits
+for its task, is at no point, so it is not reported. The return of `process` is not a point: after an asynchronous
+processor handed the exchange on, its caller only unwinds, while the thread that got the exchange may already call the
+callback. An access between these points is not seen. Examples are an `AggregationStrategy` that runs on a thread of
+a pool, `copyResults` after a circuit breaker timed out, and a thread of the application that reads the headers. The
+rule finds overlaps at the points of the routing engine, not every overlap.
+
+The sample is taken by a counter, not at random: `camel.sanitizer.overlapSampling=100` opens a window at every 100th
+point of the context. When one thread routes the exchanges, a rerun samples the same points. When several threads do,
+they share the counter, and it falls on other points from run to run. A window pauses its thread for
+`camel.sanitizer.overlapWindow` (`1ms` by default). The pause uses the system clock, not the `TimeSource` of the
+context, so a virtual clock of camel-test-dst does not stretch it.
+
+The pause makes a rare overlap more likely, which is the point, but it changes the timing of the application, and a
+paused I/O thread (such as a Netty event loop) serves nothing else while it waits. So the sampling is off by default,
+also with profile `dev`, and on at 1 in 100 points in a test (`@CamelSanitizer`, or the CI switch). A test that fails
+only because of the pauses (a short timeout, a throttler) fails with its own assertion, not with a report of the
+sanitizer, so the two can be told apart. Such a test class turns the sampling off for itself with
+`@CamelSanitizer(overlapSampling = 0)`. With the sampling off nothing is installed for it, so it costs nothing.
+
+The windows are kept by the id of the exchange and hold no exchange. A copy that keeps the id of its exchange (the
+copies of a `loop` with `copy`, or an exchange that a transport in the same JVM rebuilds with the id of the sender, as
+`transferExchange` does) is another exchange: the windows tell the two apart by their identity hash, so they are not
+reported together. Two threads that both continue an exchange because of a violation already reported for it (a
+callback called twice, a callback after a throw, a return value that differs from the value of the callback, a commit
+run twice) overlap because of that violation, so the overlap is not reported again. An overlap with another cause in
+the same exchange is not reported either, but the exchange already has its report. An exchange gets at most one report
+of an overlap.
+
+A report of an overlap looks like this:
+
+[source,text]
+----
+Exchange sanitizer: exchange used by two threads at the same time (R3)
+  exchange 5A1B...-0000000000000003, route orders, step handOff, processor com.acme.AuditHandOff
+  watched while the callback of step handOff of route orders continues the exchange: thread Camel (camel-1) thread #3 - timer://orders
+      at com.acme.AuditHandOff.process(AuditHandOff.java:41)
+      ...
+  meanwhile step audit1 of route audit is called: thread audit-2
+      at org.apache.camel.support.StepHelper.process(StepHelper.java:63)
+      ...
+      at com.acme.AuditHandOff.lambda$process$0(AuditHandOff.java:38)
+  An exchange can move between threads, but it must never be used by two threads at the same time (see AsyncProcessor).
+  Usual fix: let one thread at a time use the exchange: a processor that hands it to another thread returns false from process and leaves it to that thread (only that thread calls the callback); work that must run beside the route gets a copy of the exchange (as the wire tap does).
+----
+
+Here `AuditHandOff` sends the exchange itself to the route `audit` on a thread of its own and goes on, as a wire tap
+by hand: the route and the audit route use the same exchange at the same time.
+
+== Switching it on
+
+With the `camel-sanitizer` JAR on the classpath, the sanitizer is switched on with profile `dev`, with
+`camel.sanitizer.enabled=true`, or for a CamelContext built by a test marked with `@CamelSanitizer` (see
+<<_in_a_test,In a test>>). It is never switched on with profile `prod`, also when `camel.sanitizer.enabled=true`.
+Without a profile it stays off unless enabled. It is installed when the `CamelContext` initializes, before the routes
+are created, and logs a WARN that it is on (for a context tied to a test, once per JVM and then at DEBUG). A route
+created while the sanitizer was not installed is not checked.
+
+It does not support pooled exchanges (`exchangeFactory=pooled`, deprecated, or a pooled processor exchange factory
+alone): it then stays off and logs a WARN. A pooled exchange keeps its unit of work for its next message (it is reset,
+not replaced), and R2 follows the commits by unit of work.
+
+Violations are logged at WARN when they happen, and the report of a context, with the counts per kind since the context
+was created, is logged when the context stops if there was a violation (the counts and one line per violation at WARN,
+the full reports again at DEBUG). After 1000 violations in a context, the others are counted and still charged to the
+test that runs when they happen, but not logged or listed in the report (one WARN says so), so a later test of a
+long-lived context, such as a cached test context, still fails.
+From Java, `Sanitizer.get(camelContext)` gives the violations.
+
+Spring Boot and Quarkus: the plugin uses only the `CamelContext` API, and reads `camel.sanitizer.*` from the
+properties component, so `camel.sanitizer.enabled=true` in the application properties is meant to switch it on there
+too (this version is tested with plain contexts, `CamelTestSupport` and `@CamelMainTest`); the tooling metadata of the
+options is in camel-main only. `camel run --sanitizer` with `--runtime=spring-boot` adds plain `camel-sanitizer` (there
+is no starter) and switches it on with `-Dcamel.sanitizer.enabled=true` unless the profile is `prod`; with
+`--runtime=quarkus` it is refused for now: there is no Camel Quarkus extension to add to an existing Quarkus project,
+and the sanitizer is not tested with Camel Quarkus yet.
+
+== In development
+
+`camel run --sanitizer` adds the dependency; with profile `dev`, the default of `camel run`, the sanitizer is on and
+checks R1 and R3 (R3 without its watch windows, which are off outside a test; `camel.sanitizer.overlapSampling`
+turns them on). R2 is on by default only in a test, as it costs more per message (see the `checks` option);
+`camel.sanitizer.checks=callback,commit,threads` turns it on in the run too. Violations are logged at WARN when they happen,
+and the report is also in the `sanitizer` developer console and in the Camel CLI:
+
+[source,bash]
+----
+camel run * --sanitizer
+camel run * --sanitizer --prop camel.sanitizer.checks=callback,commit,threads
+camel get sanitizer
+camel get sanitizer myapp --report
+----
+
+`camel get sanitizer` lists the violations of the running integrations with their rule (R1, R2 or R3), kind, route, step,
+processor and exchange (for R2 the processor column is the class of the commit, and the step is the one that ran where
+it was found, if any); `--report` shows the counts per rule and per kind, the commits followed (with R2; without it,
+the report says that R2 is not checked, and likewise for R3), each violation with its threads and stacks, and the still pending warnings
+(`--json` for both). An integration with still pending warnings and no violation is named on stderr.
+
+With the debugger on (`camel debug --sanitizer`, or `camel.debug.enabled=true`), `camel run` sets
+`camel.sanitizer.pendingTimeout=0` unless it is set: an exchange held at a breakpoint keeps the calls of the steps
+around it pending (such as a `to` of a `direct` route, a split or an enrich), which would be reported after a minute as
+callbacks still pending. The other checks stay on.
+
+The `sanitizer` developer console only reads. Its option `report` (default `true`) says whether the JSON has the full
+report of each violation and the still pending warnings; `camel get sanitizer` asks without them for its table. In JSON
+it has `enabled` (and the `reason` when it is off), `checks` (the checks that run, as in `camel.sanitizer.checks`),
+`calls` (the calls of steps checked), `commits` (the commits
+followed, with R2), `total` (the violations reported, also those past the first 1000 that are counted but not listed),
+`rules` and `kinds` (the counts per rule and per kind), `violations` (each with its rule, kind, route, step, processor,
+exchange id and, with `report`, its full report), and, with the still pending warning on, `pendingCalls` (the calls
+pending now), `stillPending` (the warnings so far) and, with `report`, `stillPendingWarnings` (the first 1000, as
+logged). As text it is the report that is logged when the context stops, followed by the still pending warnings. Like every developer console, it is served over HTTP only when the developer
+consoles are switched on (with Camel Main, `camel.management.devConsoleEnabled=true`, an `insecure:dev` option); the
+Camel CLI asks the integration for it through the CLI connector. An exception message in a report can carry message
+data, so keep the console to development.
+
+== Options
+
+The options are read from the properties component, and are camel-main options (`SanitizerConfigurationProperties`).
+
+[cols="2,1,4"]
+|===
+|Option |Default |Description
+
+|`camel.sanitizer.enabled` |`false` (`true` with profile `dev` or `@CamelSanitizer`) |Install the sanitizer. Ignored
+with profile `prod`.
+|`camel.sanitizer.checks` |`callback,threads` (`callback,commit,threads` in a test) |The checks to run, separated by
+commas: `callback` (R1), `commit` (R2) and `threads` (R3); `none` installs nothing, and an empty value is the default. An unknown check stops
+the application from starting. R2 is on by default only for a CamelContext built on a thread the JUnit extension
+marked (a test with `@CamelSanitizer`, or the CI switch): it costs more per message than R1, and its records take one
+lock for the whole context.
+|`camel.sanitizer.stackDepth` |`32` |How many frames of each stack a report keeps; `0` keeps only the name of the
+thread, which costs least.
+|`camel.sanitizer.pendingTimeout` |`60s` |How long an exchange waits, with nothing happening in it, before its
+innermost pending call is reported as still pending (a warning, which never fails a test), such as `60s` or `500`
+(milliseconds). `0` turns the warning off; use it, with `checks=callback,threads`, when hunting races between the parts of a
+parallel split, which share one lock of the table (and of the records of R2). It needs the `callback` check (R1): with
+`commit` only there is no warning.
+|`camel.sanitizer.reportOnShutdown` |`true` |Log the report when the context stops, if there was a violation or a still
+pending warning, and the calls still pending then.
+|`camel.sanitizer.overlapSampling` |`0` (`100` in a test) |The watch windows of R3: one is opened at every Nth point
+where the routing engine uses an exchange (a counter, not random), and its thread pauses in it; `0` is off. It needs
+the `threads` check. A test class that sets `@CamelSanitizer(overlapSampling = ...)` uses its own value.
+|`camel.sanitizer.overlapWindow` |`1ms` |How long a thread pauses in a watch window of R3, such as `1ms` or `5`
+(milliseconds); more than `0`.
+|===
+
+The stack of each first callback is what the sanitizer costs most: it is taken for every call of a step, in case a
+second callback comes. In a benchmark on one machine, a route of 6 steps took about 15 times as long per message with
+the default `stackDepth` of `32` as with `0`, and about half as long with `8` as with `32` (with `0` it was still
+slower than without the sanitizer). A lower `stackDepth` makes a test suite faster and changes the timing of the races
+less; the report then shows fewer frames.
+
+== In a test
+
+Add the dependency in test scope:
+
+[source,xml]
+----
+<dependency>
+    <groupId>org.apache.camel</groupId>
+    <artifactId>camel-sanitizer</artifactId>
+    <scope>test</scope>
+</dependency>
+----
+
+and `@CamelSanitizer` to the test class. It is the only change to the test:
+
+[source,java]
+----
+@CamelSanitizer
+class PriceRouteTest extends CamelTestSupport {
+    ...
+}
+----
+
+`@CamelSanitizer` registers the JUnit Jupiter extension `CamelSanitizerExtension` (in
+`org.apache.camel.sanitizer.junit`). It marks the thread that runs the test class, and a CamelContext built on that
+thread gets the sanitizer and is tied to the class; profile `prod` and `camel.sanitizer.enabled=false` still win. A
+violation is charged to the test that runs when it happens, and the extension fails that test after it ran, with the
+first violation and the reports of the others (up to ten); when the test also fails on its own, the sanitizer's failure
+is added to it as a suppressed exception. A violation that comes between tests or after the last one, such as a late
+second callback, fails the test class at its end. When the class ends, its contexts are untied; a violation of a context
+that is not tied (one still running, or built on another thread) fails the test classes that run when it happens.
+Nothing is set for the whole JVM, so test classes that run in parallel do not see each other's violations; the tests of
+one class must run one at a time (the default of JUnit).
+
+The extension uses only the JUnit Jupiter extension API, so it works with `camel-test-junit5`, `camel-test-junit6`,
+`@CamelMainTest`, and tests that use none of them.
+
+In a test, R3 opens a watch window at 1 in 100 points where the routing engine uses an exchange, and pauses the thread
+in it for `camel.sanitizer.overlapWindow` (see <<_accesses_that_overlap_in_time,Accesses that overlap in time>>). A
+test class with timing that the pauses would break turns them off for itself:
+
+[source,java]
+----
+@CamelSanitizer(overlapSampling = 0)
+class ThrottlerRouteTest extends CamelTestSupport {
+    ...
+}
+----
+
+The value of the annotation wins over `camel.sanitizer.overlapSampling`.
+
+A test that breaks the rule on purpose says so, and the extension then checks that the violation was reported instead
+of failing the test:
+
+[source,java]
+----
+@Test
+@ExpectSanitizerViolation(value = Violation.THREW_BEFORE_CALLBACK, step = "process1")
+void aProcessorThatThrowsFailsTheExchange() { ... }
+----
+
+The test fails if the expected violation was not reported, or if a violation was reported that no expectation of the
+test matches. The annotation can be repeated, and can list more than one kind, any of which meets it (for a processor
+that throws and calls its callback on another thread, the order the sanitizer sees decides the kinds). An expected
+violation is not required when the contexts of the test class stayed off on purpose (profile `prod`,
+`camel.sanitizer.enabled=false`, pooled exchanges).
+
+== In CI
+
+The module registers the extension for the automatic detection of JUnit. A pipeline adds the test dependency and runs
+the existing tests with
+
+[source,bash]
+----
+mvn test -Djunit.jupiter.extensions.autodetection.enabled=true \
+    -Djunit.jupiter.extensions.autodetection.include=org.apache.camel.sanitizer.junit.* \
+    -Dcamel.sanitizer.enabled=true -Dsurefire.rerunFailingTestsCount=0
+----
+
+and every test fails on its first violation, without a change to the tests. Detected automatically for a class without
+`@CamelSanitizer`, the extension acts only when `camel.sanitizer.enabled` is `true`, so a project that has JUnit detect
+its own extensions does not switch the sanitizer on by accident. The include pattern keeps JUnit from turning on other
+extensions found on the classpath. Reruns are turned off because a violation that happens now and then would pass a
+rerun; the extension also writes every violation of a run to `target/camel-sanitizer/<test class>.txt` of the module (or
+the directory of the system property `camel.sanitizer.reportDir`), the expected ones marked `(expected)`; the file is
+started again once per JVM, so a rerun in the same JVM cannot hide what the first attempt reported. Surefire passes the
+`-D` options to the forked test JVM; Gradle needs `systemProperty` in its `test` task. Here `camel.sanitizer.enabled` is
+a system property, so every context of the run gets the sanitizer. The watch windows of R3 are on at 1 in 100 points
+there too; `-Dcamel.sanitizer.overlapSampling=0` turns them off for the run, but not for a test class that sets its
+own value with `@CamelSanitizer(overlapSampling = ...)`.
+
+In the Camel build, `mvn test -Psanitizer` in `core/camel-core` does the same.

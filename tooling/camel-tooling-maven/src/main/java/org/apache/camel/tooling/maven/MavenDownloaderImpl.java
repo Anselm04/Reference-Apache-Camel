@@ -1,0 +1,1353 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.camel.tooling.maven;
+
+import java.io.BufferedInputStream;
+import java.io.File;
+import java.io.InputStream;
+import java.net.ConnectException;
+import java.net.MalformedURLException;
+import java.net.SocketTimeoutException;
+import java.net.URI;
+import java.net.URL;
+import java.net.UnknownHostException;
+import java.nio.file.Files;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collection;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Objects;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.function.Predicate;
+import java.util.stream.Collectors;
+
+import eu.maveniverse.maven.mima.context.Context;
+import eu.maveniverse.maven.mima.context.ContextOverrides;
+import eu.maveniverse.maven.mima.context.Runtime;
+import eu.maveniverse.maven.mima.context.Runtimes;
+import org.apache.camel.support.service.ServiceSupport;
+import org.apache.camel.util.HomeHelper;
+import org.apache.camel.util.StopWatch;
+import org.apache.maven.artifact.repository.metadata.Metadata;
+import org.apache.maven.artifact.repository.metadata.Versioning;
+import org.apache.maven.artifact.repository.metadata.io.xpp3.MetadataXpp3Reader;
+import org.apache.maven.model.Model;
+import org.apache.maven.repository.internal.ArtifactDescriptorReaderDelegate;
+import org.apache.maven.settings.Profile;
+import org.apache.maven.settings.Repository;
+import org.apache.maven.settings.Settings;
+import org.eclipse.aether.AbstractRepositoryListener;
+import org.eclipse.aether.ConfigurationProperties;
+import org.eclipse.aether.DefaultRepositorySystemSession;
+import org.eclipse.aether.RepositoryEvent;
+import org.eclipse.aether.RepositorySystem;
+import org.eclipse.aether.RepositorySystemSession;
+import org.eclipse.aether.artifact.Artifact;
+import org.eclipse.aether.artifact.DefaultArtifact;
+import org.eclipse.aether.collection.CollectRequest;
+import org.eclipse.aether.collection.DependencyCollectionContext;
+import org.eclipse.aether.collection.DependencyManagement;
+import org.eclipse.aether.collection.DependencyManager;
+import org.eclipse.aether.collection.DependencySelector;
+import org.eclipse.aether.graph.Dependency;
+import org.eclipse.aether.graph.DependencyFilter;
+import org.eclipse.aether.metadata.DefaultMetadata;
+import org.eclipse.aether.repository.AuthenticationContext;
+import org.eclipse.aether.repository.LocalRepository;
+import org.eclipse.aether.repository.LocalRepositoryManager;
+import org.eclipse.aether.repository.Proxy;
+import org.eclipse.aether.repository.RemoteRepository;
+import org.eclipse.aether.repository.RepositoryPolicy;
+import org.eclipse.aether.resolution.ArtifactDescriptorException;
+import org.eclipse.aether.resolution.ArtifactDescriptorRequest;
+import org.eclipse.aether.resolution.ArtifactDescriptorResult;
+import org.eclipse.aether.resolution.ArtifactRequest;
+import org.eclipse.aether.resolution.ArtifactResolutionException;
+import org.eclipse.aether.resolution.ArtifactResult;
+import org.eclipse.aether.resolution.DependencyRequest;
+import org.eclipse.aether.resolution.DependencyResolutionException;
+import org.eclipse.aether.resolution.DependencyResult;
+import org.eclipse.aether.resolution.MetadataRequest;
+import org.eclipse.aether.resolution.MetadataResult;
+import org.eclipse.aether.transfer.AbstractTransferListener;
+import org.eclipse.aether.transfer.MetadataNotFoundException;
+import org.eclipse.aether.transfer.RepositoryOfflineException;
+import org.eclipse.aether.transfer.TransferEvent;
+import org.eclipse.aether.util.graph.selector.AndDependencySelector;
+import org.eclipse.aether.util.listener.ChainedTransferListener;
+import org.eclipse.aether.util.repository.SimpleArtifactDescriptorPolicy;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+/**
+ * MIMA-based implementation of MavenDownloader. Uses MIMA (Minimal Maven) library to simplify Maven Resolver usage.
+ * This eliminates ~650 lines of manual DIRegistry component wiring.
+ */
+public class MavenDownloaderImpl extends ServiceSupport implements MavenDownloader {
+
+    public static final Logger LOG = LoggerFactory.getLogger(MavenDownloaderImpl.class);
+
+    public static final String MAVEN_CENTRAL_REPO = "https://repo1.maven.org/maven2";
+    public static final String APACHE_SNAPSHOT_REPO = "https://repository.apache.org/snapshots";
+
+    // extra default Maven repositories, as a comma-separated list of id=url pairs
+    private static final String EXTRA_DEFAULT_REPOS_PROPERTY = "camel.extra.repos";
+    // fallback for the above, consulted only when camel.extra.repos is not set
+    private static final String EXTRA_DEFAULT_REPOS_DEFAULT_VALUE = "camel.default.extra.repos.default.value";
+
+    private static final RepositoryPolicy POLICY_DEFAULT = new RepositoryPolicy(
+            true, RepositoryPolicy.UPDATE_POLICY_NEVER, RepositoryPolicy.CHECKSUM_POLICY_WARN);
+    private static final RepositoryPolicy POLICY_FRESH = new RepositoryPolicy(
+            true, RepositoryPolicy.UPDATE_POLICY_ALWAYS, RepositoryPolicy.CHECKSUM_POLICY_WARN);
+    private static final RepositoryPolicy POLICY_DISABLED = new RepositoryPolicy(
+            false, RepositoryPolicy.UPDATE_POLICY_NEVER, RepositoryPolicy.CHECKSUM_POLICY_IGNORE);
+    // see org.eclipse.aether.internal.impl.DefaultUpdateCheckManager
+    private static final String UPDATE_CHECK_SESSION_STATE = "aether.updateCheckManager.sessionState";
+    private static final DependencyFilter ACCEPT_ALL = (node, parents) -> true;
+    private static final int DEFAULT_REQUEST_TIMEOUT = 60000;
+    // see org.eclipse.aether.internal.impl.collect.DefaultDependencyCollector and BfDependencyCollector
+    private static final String COLLECTOR_IMPL = "aether.dependencyCollector.impl";
+    private static final String COLLECTOR_BF_THREADS = "aether.dependencyCollector.bf.threads";
+    private static final int COLLECTOR_THREADS = 10;
+
+    // Configuration
+    private boolean mavenCentralEnabled = true;
+    private boolean mavenApacheSnapshotEnabled = true;
+    private String mavenSettings;
+    private String mavenSettingsSecurity;
+    private String repos;
+    private String extraRepos;
+    private boolean fresh;
+    private boolean offline;
+    private boolean preferLocal = true;
+    // the resolver's default is 30 minutes, so a repository that stops sending would hang the download for that long
+    private int requestTimeout = DEFAULT_REQUEST_TIMEOUT;
+    private RemoteArtifactDownloadListener remoteArtifactDownloadListener;
+    private RepositoryResolver repositoryResolver;
+
+    // MIMA context (standalone mode only)
+    private Context mimaContext;
+
+    // Maven Resolver components
+    private RepositorySystem repositorySystem;
+    private RepositorySystemSession repositorySystemSession;
+    private RepositorySystemSession preferLocalSession;
+    private Settings settings;
+
+    // Embedded mode flag
+    private boolean embeddedMode;
+
+    // Repositories
+    private final List<RemoteRepository> remoteRepositories = new ArrayList<>();
+    private RemoteRepository centralRepository;
+    private RemoteRepository centralResolutionRepository;
+    private RemoteRepository apacheSnapshotsRepository;
+    private RemoteRepository apacheSnapshotsResolutionRepository;
+    private RepositoryPolicy defaultPolicy;
+    private boolean apacheSnapshotsIncluded;
+    private AtomicInteger customRepositoryCounter = new AtomicInteger(1);
+    // the repositories that could not be connected to (by URL): they are not used for the rest of the run
+    private Set<String> unreachableRepositories = ConcurrentHashMap.newKeySet();
+
+    /**
+     * Default constructor for standalone mode. MIMA will be used to create RepositorySystem and
+     * RepositorySystemSession.
+     */
+    public MavenDownloaderImpl() {
+        this.embeddedMode = false;
+    }
+
+    /**
+     * Constructor for embedded mode (Maven plugin context). When using this constructor, MIMA is not used - the
+     * provided components are used directly.
+     */
+    public MavenDownloaderImpl(RepositorySystem repositorySystem, RepositorySystemSession repositorySystemSession) {
+        this.repositorySystem = repositorySystem;
+        this.repositorySystemSession = repositorySystemSession;
+        this.embeddedMode = true;
+    }
+
+    /**
+     * Constructor for embedded mode (Maven plugin context) with Settings. When using this constructor, MIMA is not used
+     * - the provided components are used directly. Settings are used to extract repositories from active profiles.
+     */
+    public MavenDownloaderImpl(RepositorySystem repositorySystem, RepositorySystemSession repositorySystemSession,
+                               Settings settings) {
+        this.repositorySystem = repositorySystem;
+        this.repositorySystemSession = repositorySystemSession;
+        this.settings = settings;
+        this.embeddedMode = true;
+    }
+
+    @Override
+    protected void doBuild() {
+        // Initialize repository resolver if not already set
+        if (repositoryResolver == null) {
+            repositoryResolver = new DefaultRepositoryResolver();
+            repositoryResolver.build();
+        }
+
+        defaultPolicy = fresh ? POLICY_FRESH : POLICY_DEFAULT;
+
+        if (embeddedMode) {
+            LOG.debug("MavenDownloader in embedded mode (Maven plugin)");
+            configureRepositoriesForEmbeddedMode();
+        } else {
+            LOG.debug("MavenDownloader in standalone mode (using MIMA)");
+            configureMIMA();
+        }
+    }
+
+    private void configureRepositoriesForEmbeddedMode() {
+        // In embedded mode, repositories are configured from the Maven session
+        // We just need to set up our custom repositories if specified
+        List<RemoteRepository> originalRepositories = new ArrayList<>();
+
+        if (mavenCentralEnabled) {
+            centralRepository = new RemoteRepository.Builder("central", "default", MAVEN_CENTRAL_REPO)
+                    .setReleasePolicy(defaultPolicy)
+                    .setSnapshotPolicy(POLICY_DISABLED)
+                    .build();
+            originalRepositories.add(centralRepository);
+        }
+
+        if (mavenApacheSnapshotEnabled) {
+            apacheSnapshotsRepository = new RemoteRepository.Builder("apache-snapshot", "default", APACHE_SNAPSHOT_REPO)
+                    .setReleasePolicy(POLICY_DISABLED)
+                    .setSnapshotPolicy(defaultPolicy)
+                    .build();
+        }
+
+        // Load extra default repositories (classpath properties file + system property)
+        loadExtraDefaultRepositories(originalRepositories);
+
+        // Add custom repositories from repos parameter
+        if (repos != null) {
+            Set<String> urls = Arrays.stream(repos.split("\\s*,\\s*")).collect(Collectors.toSet());
+            configureRepositories(originalRepositories, urls);
+        }
+
+        // Add repositories from active profiles in settings.xml
+        if (settings != null) {
+            Set<String> repositoryURLs = originalRepositories.stream()
+                    .map(RemoteRepository::getUrl)
+                    .collect(Collectors.toSet());
+
+            for (String profileId : settings.getActiveProfiles()) {
+                Profile profile = settings.getProfilesAsMap().get(profileId);
+                if (profile != null) {
+                    for (Repository repo : profile.getRepositories()) {
+                        try {
+                            URL url = URI.create(repo.getUrl()).toURL();
+                            if (repositoryURLs.add(repo.getUrl())) {
+                                if (mavenApacheSnapshotEnabled && url.getHost().equals("repository.apache.org")
+                                        && url.getPath().startsWith("/snapshots")) {
+                                    // Use preconfigured Apache Snapshots repository
+                                    apacheSnapshotsIncluded = true;
+                                    originalRepositories.add(apacheSnapshotsRepository);
+                                } else {
+                                    RemoteRepository.Builder rb
+                                            = new RemoteRepository.Builder(repo.getId(), repo.getLayout(), repo.getUrl());
+                                    if (repo.getReleases() == null) {
+                                        rb.setReleasePolicy(defaultPolicy);
+                                    } else {
+                                        String updatePolicy = repo.getReleases().getUpdatePolicy() == null
+                                                ? RepositoryPolicy.UPDATE_POLICY_DAILY : repo.getReleases().getUpdatePolicy();
+                                        String checksumPolicy = repo.getReleases().getChecksumPolicy() == null
+                                                ? RepositoryPolicy.CHECKSUM_POLICY_WARN
+                                                : repo.getReleases().getChecksumPolicy();
+                                        rb.setReleasePolicy(new RepositoryPolicy(
+                                                repo.getReleases().isEnabled(),
+                                                updatePolicy, checksumPolicy));
+                                    }
+                                    if (repo.getSnapshots() == null) {
+                                        rb.setSnapshotPolicy(POLICY_DISABLED);
+                                    } else {
+                                        String updatePolicy = repo.getSnapshots().getUpdatePolicy() == null
+                                                ? RepositoryPolicy.UPDATE_POLICY_DAILY
+                                                : repo.getSnapshots().getUpdatePolicy();
+                                        String checksumPolicy = repo.getSnapshots().getChecksumPolicy() == null
+                                                ? RepositoryPolicy.CHECKSUM_POLICY_WARN
+                                                : repo.getSnapshots().getChecksumPolicy();
+                                        rb.setSnapshotPolicy(new RepositoryPolicy(
+                                                repo.getSnapshots().isEnabled(),
+                                                updatePolicy, checksumPolicy));
+                                    }
+                                    originalRepositories.add(rb.build());
+                                    LOG.debug("Added repository from settings.xml profile {}: {}", profileId, repo.getId());
+                                }
+                            }
+                        } catch (Exception e) {
+                            LOG.warn("Failed to add repository {} from profile {}: {}", repo.getId(), profileId,
+                                    e.getMessage());
+                        }
+                    }
+                }
+            }
+        }
+
+        // Apply mirroring/proxying
+        remoteRepositories.addAll(repositorySystem.newResolutionRepositories(repositorySystemSession,
+                originalRepositories));
+
+        // Find central repository after mirroring
+        if (centralRepository != null && !remoteRepositories.isEmpty()) {
+            for (RemoteRepository repo : remoteRepositories) {
+                if ("central".equals(repo.getId())) {
+                    centralResolutionRepository = repo;
+                    break;
+                }
+            }
+        }
+
+        if (mavenApacheSnapshotEnabled && !apacheSnapshotsIncluded) {
+            apacheSnapshotsResolutionRepository = repositorySystem.newResolutionRepositories(repositorySystemSession,
+                    Collections.singletonList(apacheSnapshotsRepository)).get(0);
+        }
+    }
+
+    private void configureMIMA() {
+        // Validate and locate Maven settings files
+        validateMavenSettingsLocations();
+
+        // Select MIMA runtime - prefer standalone-static for standalone mode
+        // (embedded-maven shares Maven build's session which can cause issues in tests)
+        Runtime mimaRuntime = null;
+        for (Runtime rt : Runtimes.INSTANCE.getRuntimes()) {
+            if (rt.managedRepositorySystem()) {
+                mimaRuntime = rt;
+                break;
+            }
+        }
+        if (mimaRuntime == null) {
+            mimaRuntime = Runtimes.INSTANCE.getRuntime();
+        }
+
+        // Build context overrides for customization
+        ContextOverrides.Builder overridesBuilder = ContextOverrides.create();
+
+        // Configure Maven settings support
+        if (mavenSettings != null || mavenSettingsSecurity != null) {
+            // Enable user settings processing
+            overridesBuilder.withUserSettings(true);
+
+            // Override settings.xml location if specified
+            if (mavenSettings != null) {
+                overridesBuilder.withUserSettingsXmlOverride(new File(mavenSettings).toPath());
+            }
+
+            // Override settings-security.xml location if specified
+            if (mavenSettingsSecurity != null) {
+                overridesBuilder.withUserSettingsSecurityXmlOverride(new File(mavenSettingsSecurity).toPath());
+            }
+        }
+
+        // Configure offline mode
+        if (offline) {
+            LOG.info("MavenDownloader in offline mode");
+            overridesBuilder.offline(true);
+        }
+
+        // Configure fresh mode (update policy)
+        if (fresh) {
+            overridesBuilder.snapshotUpdatePolicy(ContextOverrides.SnapshotUpdatePolicy.ALWAYS);
+        }
+
+        // Create MIMA context - this replaces ~650 lines of DIRegistry code!
+        mimaContext = mimaRuntime.create(overridesBuilder.build());
+
+        // Get RepositorySystem and RepositorySystemSession from MIMA
+        repositorySystem = mimaContext.repositorySystem();
+        repositorySystemSession = withCamelDefaults(withTrackingKeyCompat(mimaContext.repositorySystemSession()));
+
+        // Configure repositories (same as embedded mode)
+        List<RemoteRepository> originalRepositories = new ArrayList<>();
+
+        if (mavenCentralEnabled) {
+            centralRepository = new RemoteRepository.Builder("central", "default", MAVEN_CENTRAL_REPO)
+                    .setReleasePolicy(defaultPolicy)
+                    .setSnapshotPolicy(POLICY_DISABLED)
+                    .build();
+            originalRepositories.add(centralRepository);
+        }
+
+        if (mavenApacheSnapshotEnabled) {
+            apacheSnapshotsRepository = new RemoteRepository.Builder("apache-snapshot", "default", APACHE_SNAPSHOT_REPO)
+                    .setReleasePolicy(POLICY_DISABLED)
+                    .setSnapshotPolicy(defaultPolicy)
+                    .build();
+        }
+
+        // Load extra default repositories (classpath properties file + system property)
+        loadExtraDefaultRepositories(originalRepositories);
+
+        // Add repositories from settings.xml active profiles (provided by MIMA)
+        Set<String> repositoryURLs = originalRepositories.stream()
+                .map(RemoteRepository::getUrl)
+                .collect(Collectors.toSet());
+        for (RemoteRepository repo : mimaContext.remoteRepositories()) {
+            try {
+                URL url = URI.create(repo.getUrl()).toURL();
+                if (repositoryURLs.add(repo.getUrl())) {
+                    if (mavenApacheSnapshotEnabled && url.getHost().equals("repository.apache.org")
+                            && url.getPath().startsWith("/snapshots")) {
+                        apacheSnapshotsIncluded = true;
+                        originalRepositories.add(apacheSnapshotsRepository);
+                    } else {
+                        originalRepositories.add(repo);
+                        LOG.debug("Added repository from settings.xml profile: {}", repo.getId());
+                    }
+                }
+            } catch (Exception e) {
+                LOG.warn("Failed to add repository {} from settings.xml: {}", repo.getId(), e.getMessage());
+            }
+        }
+
+        // Add custom repositories from repos parameter
+        if (repos != null) {
+            Set<String> urls = Arrays.stream(repos.split("\\s*,\\s*")).collect(Collectors.toSet());
+            configureRepositories(originalRepositories, urls);
+        }
+
+        // Apply mirroring/proxying
+        remoteRepositories.addAll(repositorySystem.newResolutionRepositories(repositorySystemSession,
+                originalRepositories));
+
+        // Find central repository after mirroring
+        if (centralRepository != null && !remoteRepositories.isEmpty()) {
+            for (RemoteRepository repo : remoteRepositories) {
+                if ("central".equals(repo.getId())) {
+                    centralResolutionRepository = repo;
+                    break;
+                }
+            }
+        }
+
+        if (mavenApacheSnapshotEnabled && !apacheSnapshotsIncluded) {
+            apacheSnapshotsResolutionRepository = repositorySystem.newResolutionRepositories(repositorySystemSession,
+                    Collections.singletonList(apacheSnapshotsRepository)).get(0);
+        }
+    }
+
+    private void validateMavenSettingsLocations() {
+        if (mavenSettingsSecurity != null && !new File(mavenSettingsSecurity).isFile()) {
+            LOG.warn("Can't access {}. Skipping Maven settings-security.xml configuration.", mavenSettingsSecurity);
+            mavenSettingsSecurity = null;
+        }
+
+        boolean skip = false;
+        if ("false".equalsIgnoreCase(mavenSettings)) {
+            // no implicit settings
+            mavenSettings = null;
+            // disable the settings-security.xml too
+            mavenSettingsSecurity = null;
+            skip = true;
+        } else if (mavenSettings == null) {
+            // implicit settings
+            String m2settings = HomeHelper.resolveHomeDir() + File.separator + ".m2"
+                                + File.separator + "settings.xml";
+            if (new File(m2settings).isFile()) {
+                mavenSettings = m2settings;
+            }
+        } else {
+            if (!new File(mavenSettings).isFile()) {
+                LOG.warn("Can't access {}. Skipping Maven settings.xml configuration.", mavenSettings);
+                mavenSettings = null;
+            }
+        }
+
+        if (!skip) {
+            if (mavenSettingsSecurity == null) {
+                // implicit security settings
+                String m2settingsSecurity = HomeHelper.resolveHomeDir() + File.separator + ".m2"
+                                            + File.separator + "settings-security.xml";
+                if (new File(m2settingsSecurity).isFile()) {
+                    mavenSettingsSecurity = m2settingsSecurity;
+                }
+            } else {
+                if (!new File(mavenSettingsSecurity).isFile()) {
+                    LOG.warn("Can't access {}. Skipping Maven settings-security.xml configuration.",
+                            mavenSettingsSecurity);
+                    mavenSettingsSecurity = null;
+                }
+            }
+        }
+    }
+
+    /**
+     * Helper method to configure custom repositories from URLs or id=url pairs. Translates repository specifications to
+     * RemoteRepository instances.
+     * <p>
+     * Repository format: either a plain URL (e.g., {@code https://repo.example.com/maven}) or an {@code id=url} pair
+     * (e.g., {@code my-repo=https://repo.example.com/maven}). Using the {@code id=url} format preserves the repository
+     * ID, which is required for settings.xml server authentication matching.
+     */
+    private void configureRepositories(List<RemoteRepository> repositories, Set<String> urls) {
+        urls.forEach(repo -> {
+            try {
+                repo = repositoryResolver.resolveRepository(repo);
+                if (repo != null && !repo.isBlank()) {
+                    // Support id=url format for repository ID preservation (needed for settings.xml auth)
+                    String id;
+                    String repoUrl;
+                    int eqIdx = repo.indexOf('=');
+                    if (eqIdx > 0 && eqIdx < repo.length() - 1 && !repo.startsWith("http")) {
+                        id = repo.substring(0, eqIdx);
+                        repoUrl = repo.substring(eqIdx + 1);
+                    } else {
+                        id = "custom" + customRepositoryCounter.getAndIncrement();
+                        repoUrl = repo;
+                    }
+                    URL url = URI.create(repoUrl).toURL();
+                    if (mavenCentralEnabled && url.getHost().equals("repo1.maven.org")) {
+                        // Maven Central is always used, so skip it
+                        return;
+                    }
+                    if (mavenApacheSnapshotEnabled && url.getHost().equals("repository.apache.org")
+                            && url.getPath().contains("/snapshots")) {
+                        // Apache Snapshots added, so we'll use our own definition of this repository
+                        repositories.add(apacheSnapshotsRepository);
+                        apacheSnapshotsIncluded = true;
+                    } else {
+                        // both snapshots and releases allowed for custom repos
+                        repositories.add(new RemoteRepository.Builder(id, "default", repoUrl)
+                                .setReleasePolicy(defaultPolicy)
+                                .setSnapshotPolicy(defaultPolicy)
+                                .build());
+                    }
+                }
+            } catch (MalformedURLException e) {
+                LOG.warn("Cannot use {} URL: {}. Skipping.", repo, e.getMessage(), e);
+            }
+        });
+    }
+
+    /**
+     * Loads the extra default Maven repositories, so they are used in addition to Maven Central and the repositories
+     * from {@code settings.xml} without having to pass {@code --repos} on every command. They are the ones configured
+     * with {@link #setExtraRepos(String)}, else the ones of a system property.
+     * <p>
+     * The value is a comma-separated list of repositories, where each entry is either a plain URL or an {@code id=url}
+     * pair, for example {@code repo1=https://repo1.example.com/maven2,repo2=https://repo2.example.com/releases}. See
+     * {@link #configureRepositories(List, Set)} for why the {@code id=url} form is preferable.
+     * <p>
+     * Two system properties are consulted, in order:
+     * <ol>
+     * <li>{@value #EXTRA_DEFAULT_REPOS_PROPERTY} &ndash; intended for end users</li>
+     * <li>{@value #EXTRA_DEFAULT_REPOS_DEFAULT_VALUE} &ndash; a fallback used only when the former is not set, so that
+     * a custom Camel distribution can bake in a baseline that end users are still able to override</li>
+     * </ol>
+     * They are not merged: the first one that is set wins. Apache Camel does not set either of them, so this is a no-op
+     * unless configured.
+     */
+    private void loadExtraDefaultRepositories(List<RemoteRepository> repositories) {
+        String extra = getExtraRepos();
+        if (extra != null && !extra.isBlank()) {
+            Set<String> repoSpecs = Arrays.stream(extra.split("\\s*,\\s*"))
+                    .filter(s -> !s.isBlank())
+                    .collect(Collectors.toCollection(LinkedHashSet::new));
+
+            if (!repoSpecs.isEmpty()) {
+                LOG.debug("Loaded extra default repositories: {}", extra);
+                configureRepositories(repositories, repoSpecs);
+                LOG.debug("Configured {} extra default Maven repositories", repoSpecs.size());
+            }
+        }
+    }
+
+    @Override
+    protected void doInit() {
+        // Nothing to do
+    }
+
+    @Override
+    protected void doStop() throws Exception {
+        if (mimaContext != null) {
+            mimaContext.close();
+        }
+    }
+
+    // ========== Resolution Methods ==========
+
+    @Override
+    public List<MavenArtifact> resolveArtifacts(
+            List<String> dependencyGAVs, Set<String> extraRepositories,
+            boolean transitively, boolean useApacheSnapshots)
+            throws MavenResolutionException {
+        return resolveArtifacts(null, dependencyGAVs, extraRepositories, transitively, useApacheSnapshots);
+    }
+
+    @Override
+    public List<MavenArtifact> resolveArtifacts(
+            String rootGav,
+            List<String> dependencyGAVs, Set<String> extraRepositories,
+            boolean transitively, boolean useApacheSnapshots)
+            throws MavenResolutionException {
+        return resolveArtifacts(rootGav, dependencyGAVs, extraRepositories, transitively, useApacheSnapshots, null);
+    }
+
+    @Override
+    public List<MavenArtifact> resolveArtifacts(
+            String rootGav,
+            List<String> dependencyGAVs, Set<String> extraRepositories,
+            boolean transitively, boolean useApacheSnapshots, Predicate<MavenGav> available)
+            throws MavenResolutionException {
+        return resolveArtifacts(rootGav, dependencyGAVs, extraRepositories, transitively, useApacheSnapshots, available,
+                null);
+    }
+
+    @Override
+    public List<MavenArtifact> resolveArtifacts(
+            String rootGav,
+            List<String> dependencyGAVs, Set<String> extraRepositories,
+            boolean transitively, boolean useApacheSnapshots, Predicate<MavenGav> available,
+            Collection<MavenGav> managed)
+            throws MavenResolutionException {
+
+        // When preferLocal is enabled, what is already in the local repository is used as is: SNAPSHOT
+        // metadata is not checked again remotely, while anything missing is still downloaded
+        RepositorySystemSession session = preferLocal && !fresh ? getPreferLocalSession() : repositorySystemSession;
+        if (available != null && transitively) {
+            // leave out what is already available, with its dependencies, so it is not downloaded
+            DefaultRepositorySystemSession availableSession = new DefaultRepositorySystemSession(session);
+            availableSession.setDependencySelector(AndDependencySelector.newInstance(
+                    session.getDependencySelector(), new AvailableDependencySelector(available)));
+            session = availableSession;
+        }
+        if (managed != null && !managed.isEmpty() && transitively) {
+            // the versions of the managed artifacts, whatever their classifier
+            Map<String, String> versions = new HashMap<>();
+            for (MavenGav gav : managed) {
+                versions.putIfAbsent(gav.getGroupId() + ":" + gav.getArtifactId(), gav.getVersion());
+            }
+            DefaultRepositorySystemSession managedSession = new DefaultRepositorySystemSession(session);
+            managedSession.setDependencyManager(
+                    new ManagedVersionDependencyManager(session.getDependencyManager(), versions, 0));
+            session = managedSession;
+        }
+        return doResolveArtifacts(rootGav, dependencyGAVs, extraRepositories,
+                transitively, useApacheSnapshots, session);
+    }
+
+    /**
+     * Gives the transitive dependencies on the managed artifacts their version, whatever their classifier (such as a
+     * native JAR of another platform), as the dependencyManagement of a Maven project would. The dependencies asked for
+     * directly keep their version.
+     */
+    static final class ManagedVersionDependencyManager implements DependencyManager {
+
+        private final DependencyManager delegate;
+        private final Map<String, String> versions;
+        private final int depth;
+
+        ManagedVersionDependencyManager(DependencyManager delegate, Map<String, String> versions, int depth) {
+            this.delegate = delegate;
+            this.versions = versions;
+            this.depth = depth;
+        }
+
+        @Override
+        public DependencyManagement manageDependency(Dependency dependency) {
+            DependencyManagement management = delegate != null ? delegate.manageDependency(dependency) : null;
+            // depth 1 are the dependencies asked for
+            if (depth >= 2) {
+                Artifact a = dependency.getArtifact();
+                String version = versions.get(a.getGroupId() + ":" + a.getArtifactId());
+                if (version != null && !version.equals(a.getVersion())) {
+                    if (management == null) {
+                        management = new DependencyManagement();
+                    }
+                    management.setVersion(version);
+                }
+            }
+            return management;
+        }
+
+        @Override
+        public DependencyManager deriveChildManager(DependencyCollectionContext context) {
+            DependencyManager child = delegate != null ? delegate.deriveChildManager(context) : null;
+            return new ManagedVersionDependencyManager(child, versions, depth + 1);
+        }
+
+        @Override
+        public boolean equals(Object o) {
+            // the collector caches by dependency manager
+            return o instanceof ManagedVersionDependencyManager other && depth == other.depth
+                    && versions == other.versions && Objects.equals(delegate, other.delegate);
+        }
+
+        @Override
+        public int hashCode() {
+            return Objects.hash(delegate, depth, System.identityHashCode(versions));
+        }
+    }
+
+    /**
+     * Leaves out the dependencies that are already available, such as on the classpath, together with their own
+     * dependencies.
+     */
+    static final class AvailableDependencySelector implements DependencySelector {
+
+        private final Predicate<MavenGav> available;
+
+        AvailableDependencySelector(Predicate<MavenGav> available) {
+            this.available = available;
+        }
+
+        @Override
+        public boolean selectDependency(Dependency dependency) {
+            Artifact a = dependency.getArtifact();
+            return !available.test(MavenGav.fromCoordinates(a.getGroupId(), a.getArtifactId(), a.getBaseVersion(),
+                    a.getExtension(), a.getClassifier()));
+        }
+
+        @Override
+        public DependencySelector deriveChildSelector(DependencyCollectionContext context) {
+            return this;
+        }
+
+        @Override
+        public boolean equals(Object o) {
+            // the collector caches by selector
+            return o instanceof AvailableDependencySelector other && available == other.available;
+        }
+
+        @Override
+        public int hashCode() {
+            return System.identityHashCode(available);
+        }
+    }
+
+    private RepositorySystemSession getPreferLocalSession() {
+        if (preferLocalSession == null) {
+            DefaultRepositorySystemSession session = new DefaultRepositorySystemSession(repositorySystemSession);
+            session.setUpdatePolicy(RepositoryPolicy.UPDATE_POLICY_NEVER);
+            preferLocalSession = session;
+        }
+        return preferLocalSession;
+    }
+
+    private List<MavenArtifact> doResolveArtifacts(
+            String rootGav,
+            List<String> dependencyGAVs, Set<String> extraRepositories,
+            boolean transitively, boolean useApacheSnapshots,
+            RepositorySystemSession session)
+            throws MavenResolutionException {
+
+        StopWatch watch = new StopWatch();
+
+        List<RemoteRepository> repositories = resolutionRepositories(extraRepositories, useApacheSnapshots, session);
+
+        List<MavenArtifact> result = new ArrayList<>();
+
+        try {
+            if (transitively) {
+                // Transitive resolution
+                CollectRequest collectRequest = new CollectRequest();
+
+                if (rootGav != null) {
+                    collectRequest.setRoot(new Dependency(new DefaultArtifact(rootGav), null));
+                }
+
+                for (String gav : dependencyGAVs) {
+                    collectRequest.addDependency(new Dependency(new DefaultArtifact(gav), null));
+                }
+
+                collectRequest.setRepositories(repositories);
+
+                DependencyRequest dependencyRequest = new DependencyRequest(collectRequest, ACCEPT_ALL);
+
+                // Add download listener if configured
+                if (remoteArtifactDownloadListener != null) {
+                    DefaultRepositorySystemSession listenerSession = new DefaultRepositorySystemSession(session);
+                    listenerSession.setRepositoryListener(new AbstractRepositoryListener() {
+                        @Override
+                        public void artifactDownloading(RepositoryEvent event) {
+                            Artifact artifact = event.getArtifact();
+                            RemoteRepository repo = event.getRepository() instanceof RemoteRepository
+                                    ? (RemoteRepository) event.getRepository()
+                                    : null;
+                            remoteArtifactDownloadListener.artifactDownloading(artifact.getGroupId(),
+                                    artifact.getArtifactId(), artifact.getVersion(),
+                                    repo != null ? repo.getId() : "unknown",
+                                    repo != null ? repo.getUrl() : "unknown");
+                        }
+
+                        @Override
+                        public void artifactDownloaded(RepositoryEvent event) {
+                            Artifact artifact = event.getArtifact();
+                            RemoteRepository repo = event.getRepository() instanceof RemoteRepository
+                                    ? (RemoteRepository) event.getRepository()
+                                    : null;
+                            remoteArtifactDownloadListener.artifactDownloaded(artifact.getGroupId(),
+                                    artifact.getArtifactId(), artifact.getVersion(),
+                                    repo != null ? repo.getId() : "unknown",
+                                    repo != null ? repo.getUrl() : "unknown",
+                                    0L); // elapsed time not available from event
+                        }
+                    });
+
+                    DependencyResult dependencyResult
+                            = repositorySystem.resolveDependencies(listenerSession, dependencyRequest);
+                    dependencyResult.getArtifactResults().forEach(ar -> result.add(toMavenArtifact(ar)));
+                } else {
+                    DependencyResult dependencyResult
+                            = repositorySystem.resolveDependencies(session, dependencyRequest);
+                    dependencyResult.getArtifactResults().forEach(ar -> result.add(toMavenArtifact(ar)));
+                }
+            } else {
+                // Non-transitive resolution
+                List<ArtifactRequest> requests = new ArrayList<>();
+                for (String gav : dependencyGAVs) {
+                    ArtifactRequest request = new ArtifactRequest();
+                    request.setArtifact(new DefaultArtifact(gav));
+                    request.setRepositories(repositories);
+                    requests.add(request);
+                }
+
+                List<ArtifactResult> results = repositorySystem.resolveArtifacts(session, requests);
+                results.forEach(ar -> result.add(toMavenArtifact(ar)));
+            }
+
+            LOG.debug("Resolved {} artifacts in {}", result.size(), watch.taken());
+            return result;
+
+        } catch (DependencyResolutionException | ArtifactResolutionException e) {
+            MavenResolutionException mre = new MavenResolutionException(e.getMessage(), e);
+            Set<String> unreachable = new LinkedHashSet<>(unreachableRepositories);
+            for (RemoteRepository r : repositories) {
+                boolean reachable = !unreachable.remove(repositoryUrl(r.getUrl()));
+                mre.getRepositories().add(reachable ? r.getUrl() : r.getUrl() + " (not reachable)");
+            }
+            unreachable.forEach(url -> mre.getRepositories().add(url + " (not reachable)"));
+            throw mre;
+        }
+    }
+
+    /**
+     * The configured repositories (after mirroring), plus Apache Snapshots and the extra repositories if requested.
+     */
+    private List<RemoteRepository> resolutionRepositories(
+            Set<String> extraRepositories, boolean useApacheSnapshots, RepositorySystemSession session) {
+        List<RemoteRepository> repositories = new ArrayList<>(remoteRepositories);
+        if (useApacheSnapshots && apacheSnapshotsResolutionRepository != null) {
+            repositories.add(apacheSnapshotsResolutionRepository);
+        }
+
+        // Add extra repositories if specified
+        if (extraRepositories != null && !extraRepositories.isEmpty()) {
+            List<RemoteRepository> extraRepos = new ArrayList<>();
+            configureRepositories(extraRepos, extraRepositories);
+            List<RemoteRepository> resolvedExtraRepos = repositorySystem.newResolutionRepositories(
+                    session, extraRepos);
+            repositories.addAll(resolvedExtraRepos);
+        }
+        if (!unreachableRepositories.isEmpty()) {
+            // asking them again would only wait for the connect timeout again
+            repositories.removeIf(r -> unreachableRepositories.contains(repositoryUrl(r.getUrl())));
+        }
+        return repositories;
+    }
+
+    /**
+     * Sets the defaults of Camel (unless configured, such as with the aether.connector.requestTimeout system property):
+     * the request timeout, and the breadth-first dependency collector, which downloads the POMs in parallel (it
+     * resolves the same dependencies as the depth-first default of Maven Resolver). And stops using a repository that
+     * cannot be connected to.
+     */
+    private RepositorySystemSession withCamelDefaults(RepositorySystemSession session) {
+        DefaultRepositorySystemSession answer = new DefaultRepositorySystemSession(session);
+        if (session.getConfigProperties().get(ConfigurationProperties.REQUEST_TIMEOUT) == null) {
+            answer.setConfigProperty(ConfigurationProperties.REQUEST_TIMEOUT, requestTimeout);
+        }
+        if (session.getConfigProperties().get(COLLECTOR_IMPL) == null) {
+            answer.setConfigProperty(COLLECTOR_IMPL, "bf");
+        }
+        if (session.getConfigProperties().get(COLLECTOR_BF_THREADS) == null) {
+            answer.setConfigProperty(COLLECTOR_BF_THREADS, COLLECTOR_THREADS);
+        }
+        answer.setTransferListener(ChainedTransferListener.newInstance(session.getTransferListener(),
+                new UnreachableRepositoryListener(unreachableRepositories)));
+        return answer;
+    }
+
+    /**
+     * Notes the repositories that cannot be connected to: a host that does not resolve, refuses the connection, or does
+     * not answer within the connect timeout. A repository that is slow to send an artifact is still used.
+     */
+    static final class UnreachableRepositoryListener extends AbstractTransferListener {
+
+        private final Set<String> unreachable;
+
+        UnreachableRepositoryListener(Set<String> unreachable) {
+            this.unreachable = unreachable;
+        }
+
+        @Override
+        public void transferFailed(TransferEvent event) {
+            Throwable cause = connectFailure(event.getException());
+            if (cause != null && event.getResource() != null && event.getResource().getRepositoryUrl() != null) {
+                String url = repositoryUrl(event.getResource().getRepositoryUrl());
+                if (unreachable.add(url)) {
+                    LOG.warn("Cannot connect to Maven repository: {} due to: {}. The repository is not used anymore.",
+                            url, cause.getMessage() != null ? cause.getMessage() : cause.getClass().getName());
+                }
+            }
+        }
+
+        static Throwable connectFailure(Throwable e) {
+            // guard against a cause that points back to an exception in the chain
+            int depth = 0;
+            for (Throwable t = e; t != null && depth < 20; t = t.getCause(), depth++) {
+                if (t instanceof ConnectException || t instanceof UnknownHostException) {
+                    return t;
+                }
+                // the connect timeout of the JDK socket
+                if (t instanceof SocketTimeoutException && "Connect timed out".equalsIgnoreCase(t.getMessage())) {
+                    return t;
+                }
+                // the connect timeout of an HTTP client, by name to need none of them on the classpath:
+                // org.apache.http.conn.ConnectTimeoutException (HttpClient 4, the transport of Maven Resolver 1.x),
+                // org.apache.hc.client5.http.ConnectTimeoutException (HttpClient 5), whose message is not
+                // "Connect timed out", and java.net.http.HttpConnectTimeoutException (the JDK HTTP client)
+                if (t.getClass().getSimpleName().endsWith("ConnectTimeoutException")) {
+                    return t;
+                }
+            }
+            return null;
+        }
+    }
+
+    private static String repositoryUrl(String url) {
+        return url.endsWith("/") ? url.substring(0, url.length() - 1) : url;
+    }
+
+    /**
+     * The request timeout in millis: how long to wait for data from a Maven repository before failing (default 60
+     * seconds). The aether.connector.requestTimeout system property overrides it.
+     */
+    public void setRequestTimeout(int requestTimeout) {
+        this.requestTimeout = requestTimeout;
+    }
+
+    public int getRequestTimeout() {
+        return requestTimeout;
+    }
+
+    /**
+     * The repositories that could not be connected to (by URL), which are not used anymore.
+     */
+    Set<String> getUnreachableRepositories() {
+        return unreachableRepositories;
+    }
+
+    RepositorySystemSession getRepositorySystemSession() {
+        return repositorySystemSession;
+    }
+
+    @Override
+    public MavenArtifactDescriptor resolveArtifactDescriptor(String gav, Set<String> extraRepositories)
+            throws MavenResolutionException {
+        RepositorySystemSession session = preferLocal && !fresh ? getPreferLocalSession() : repositorySystemSession;
+        List<RemoteRepository> repositories = resolutionRepositories(extraRepositories, false, session);
+
+        DefaultRepositorySystemSession descriptorSession = new DefaultRepositorySystemSession(session);
+        // fail on a missing or invalid POM, instead of returning an empty descriptor
+        descriptorSession.setArtifactDescriptorPolicy(new SimpleArtifactDescriptorPolicy(false, false));
+        if (!embeddedMode) {
+            // the default descriptor reader does not expose the model properties, so a delegate copies them.
+            // Not in embedded mode, where Maven loads the reader (and its delegate type) from its own class loader
+            descriptorSession.setConfigProperty(ArtifactDescriptorReaderDelegate.class.getName(),
+                    new ModelPropertiesDelegate());
+        }
+
+        try {
+            ArtifactDescriptorRequest request = new ArtifactDescriptorRequest(new DefaultArtifact(gav), repositories, null);
+            ArtifactDescriptorResult result = repositorySystem.readArtifactDescriptor(descriptorSession, request);
+
+            List<MavenGav> dependencies = new ArrayList<>();
+            for (Dependency d : result.getDependencies()) {
+                Artifact a = d.getArtifact();
+                MavenGav dep = MavenGav.fromCoordinates(a.getGroupId(), a.getArtifactId(), a.getVersion(),
+                        a.getExtension(), a.getClassifier());
+                dep.setScope(d.getScope());
+                dependencies.add(dep);
+            }
+
+            Map<String, String> properties = new LinkedHashMap<>();
+            for (Map.Entry<String, Object> e : result.getProperties().entrySet()) {
+                if (e.getKey().startsWith(ModelPropertiesDelegate.PREFIX) && e.getValue() != null) {
+                    String value = e.getValue().toString();
+                    // a value that could not be interpolated is of no use
+                    if (!value.contains("${")) {
+                        properties.put(e.getKey().substring(ModelPropertiesDelegate.PREFIX.length()), value);
+                    }
+                }
+            }
+
+            Artifact artifact = result.getArtifact();
+            MavenGav descriptorGav = MavenGav.fromCoordinates(artifact.getGroupId(), artifact.getArtifactId(),
+                    artifact.getVersion(), artifact.getExtension(), artifact.getClassifier());
+            return new MavenArtifactDescriptor(descriptorGav, dependencies, properties);
+        } catch (ArtifactDescriptorException e) {
+            MavenResolutionException mre = new MavenResolutionException(e.getMessage(), e);
+            repositories.forEach(r -> mre.getRepositories().add(r.getUrl()));
+            throw mre;
+        }
+    }
+
+    /**
+     * Adds the effective model properties to the descriptor result properties, under a prefix so they do not clash with
+     * the properties set by the default delegate (such as {@code license.count}).
+     */
+    private static final class ModelPropertiesDelegate extends ArtifactDescriptorReaderDelegate {
+
+        static final String PREFIX = "camel.model.property.";
+
+        @Override
+        public void populateResult(RepositorySystemSession session, ArtifactDescriptorResult result, Model model) {
+            super.populateResult(session, result, model);
+            Map<String, Object> properties = new LinkedHashMap<>(result.getProperties());
+            model.getProperties().forEach((k, v) -> properties.put(PREFIX + k, v));
+            result.setProperties(properties);
+        }
+    }
+
+    @Override
+    public List<MavenGav> resolveAvailableVersions(String groupId, String artifactId, String repository)
+            throws MavenResolutionException {
+        MetadataRequest req = new MetadataRequest();
+        List<MavenGav> gavs = new ArrayList<>();
+
+        try {
+            if (repository == null) {
+                if (centralResolutionRepository == null) {
+                    throw new MavenResolutionException(
+                            "Cannot resolve available versions: no repository specified and Maven Central is disabled");
+                }
+                req.setRepository(centralResolutionRepository);
+            } else {
+                String id = "custom" + customRepositoryCounter.getAndIncrement();
+                RemoteRepository custom = new RemoteRepository.Builder(id, "default", repository)
+                        .setReleasePolicy(defaultPolicy)
+                        .setSnapshotPolicy(defaultPolicy)
+                        .build();
+
+                // simply configure them in addition to the default repositories
+                List<RemoteRepository> customResolutionRepository = repositorySystem.newResolutionRepositories(
+                        repositorySystemSession, Collections.singletonList(custom));
+
+                req.setRepository(customResolutionRepository.get(0));
+            }
+
+            req.setFavorLocalRepository(false);
+            req.setMetadata(new DefaultMetadata(
+                    groupId, artifactId, "maven-metadata.xml",
+                    org.eclipse.aether.metadata.Metadata.Nature.RELEASE));
+
+            List<MetadataResult> result = repositorySystem.resolveMetadata(repositorySystemSession, List.of(req));
+            for (MetadataResult mr : result) {
+                if (mr.isResolved() && mr.getMetadata().getFile() != null) {
+                    readVersions(mr.getMetadata().getFile(), groupId, artifactId, gavs);
+                }
+            }
+            return gavs;
+        } catch (Exception e) {
+            String msg = "Cannot resolve available versions in " + req.getRepository().getUrl();
+            MavenResolutionException mre = new MavenResolutionException(msg, e);
+            mre.getRepositories().add(req.getRepository().getUrl());
+            throw mre;
+        }
+    }
+
+    @Override
+    public List<MavenGav> resolveAvailableVersions(
+            String groupId, String artifactId, Set<String> extraRepositories, boolean fresh)
+            throws MavenResolutionException {
+        List<RemoteRepository> repositories
+                = resolutionRepositories(extraRepositories, false, repositorySystemSession);
+        RepositorySystemSession session = repositorySystemSession;
+        if (fresh) {
+            // check the remote repositories again, instead of using the metadata downloaded before
+            DefaultRepositorySystemSession freshSession = new DefaultRepositorySystemSession(repositorySystemSession);
+            freshSession.setUpdatePolicy(RepositoryPolicy.UPDATE_POLICY_ALWAYS);
+            // also when checked before in this session
+            freshSession.setConfigProperty(UPDATE_CHECK_SESSION_STATE, "bypass");
+            session = freshSession;
+        }
+
+        List<MetadataRequest> requests = new ArrayList<>();
+        for (RemoteRepository repository : repositories) {
+            MetadataRequest req = new MetadataRequest();
+            req.setRepository(repository);
+            req.setFavorLocalRepository(false);
+            req.setMetadata(new DefaultMetadata(
+                    groupId, artifactId, "maven-metadata.xml",
+                    org.eclipse.aether.metadata.Metadata.Nature.RELEASE));
+            requests.add(req);
+        }
+
+        // merge the versions of all repositories, and skip a repository that cannot be reached
+        Set<String> versions = new LinkedHashSet<>();
+        List<Exception> failures = new ArrayList<>();
+        for (MetadataResult mr : repositorySystem.resolveMetadata(session, requests)) {
+            Exception failure = mr.getException();
+
+            // not found means the repository does not have the artifact, unless it cannot be accessed offline
+            boolean notFound = failure instanceof MetadataNotFoundException
+                    && !(failure.getCause() instanceof RepositoryOfflineException);
+            if (failure != null && !notFound) {
+                LOG.debug("Cannot resolve available versions of {}:{} in {}: {}", groupId, artifactId,
+                        mr.getRequest().getRepository().getUrl(), failure.getMessage());
+                failures.add(failure);
+                continue;
+            }
+            if (mr.isResolved() && mr.getMetadata().getFile() != null) {
+                List<MavenGav> gavs = new ArrayList<>();
+                try {
+                    readVersions(mr.getMetadata().getFile(), groupId, artifactId, gavs);
+                } catch (Exception e) {
+                    failures.add(e);
+                    continue;
+                }
+                gavs.forEach(g -> versions.add(g.getVersion()));
+            }
+        }
+        if (!requests.isEmpty() && failures.size() == requests.size()) {
+            MavenResolutionException mre = new MavenResolutionException(
+                    "Cannot resolve available versions of " + groupId + ":" + artifactId + ": "
+                                                                        + failures.get(0).getMessage(),
+                    failures.get(0));
+            repositories.forEach(r -> mre.getRepositories().add(r.getUrl()));
+            throw mre;
+        }
+
+        List<MavenGav> answer = new ArrayList<>(versions.size());
+        for (String v : versions) {
+            answer.add(MavenGav.fromCoordinates(groupId, artifactId, v, null, null));
+        }
+        return answer;
+    }
+
+    private static void readVersions(File f, String groupId, String artifactId, List<MavenGav> gavs) throws Exception {
+        if (f.exists() && f.isFile()) {
+            MetadataXpp3Reader reader = new MetadataXpp3Reader();
+            try (InputStream is = new BufferedInputStream(Files.newInputStream(f.toPath()))) {
+                Metadata md = reader.read(is);
+                Versioning versioning = md.getVersioning();
+                if (versioning != null) {
+                    List<String> versions = versioning.getVersions();
+                    if (versions != null) {
+                        for (String v : versions) {
+                            if (v != null) {
+                                gavs.add(MavenGav.fromCoordinates(groupId, artifactId, v, null, null));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /**
+     * The proxy of the Maven settings ({@code settings.xml}, or the session of the Maven build in embedded mode) to
+     * reach the given URL through, such as {@code https://api.osv.dev/}, with its username and password; null when the
+     * URL is reached directly (no active proxy, or the host is one of its {@code nonProxyHosts}). The answer carries
+     * the {@code nonProxyHosts} too, for a client that reaches other URLs through the same proxy. Call after
+     * {@link #build()}.
+     */
+    public MavenProxy proxyFor(String url) {
+        if (repositorySystemSession == null || repositorySystemSession.getProxySelector() == null) {
+            return null;
+        }
+        RemoteRepository repository = new RemoteRepository.Builder("proxy-lookup", "default", url).build();
+        Proxy proxy = repositorySystemSession.getProxySelector().getProxy(repository);
+        if (proxy == null) {
+            return null;
+        }
+        String username = null;
+        String password = null;
+        if (proxy.getAuthentication() != null) {
+            RemoteRepository proxied = new RemoteRepository.Builder(repository).setProxy(proxy).build();
+            try (AuthenticationContext context = AuthenticationContext.forProxy(repositorySystemSession, proxied)) {
+                if (context != null) {
+                    username = context.get(AuthenticationContext.USERNAME);
+                    password = context.get(AuthenticationContext.PASSWORD);
+                }
+            }
+        }
+        return new MavenProxy(proxy.getHost(), proxy.getPort(), username, password, nonProxyHosts(proxy));
+    }
+
+    // the nonProxyHosts of the active proxy of the settings: the proxy of the session does not expose them
+    private String nonProxyHosts(Proxy proxy) {
+        if (mimaContext != null && mimaContext.httpProxy() != null
+                && proxy.getHost().equalsIgnoreCase(mimaContext.httpProxy().getHost())) {
+            return mimaContext.httpProxy().getNonProxyHosts();
+        }
+        if (settings != null && settings.getActiveProxy() != null
+                && proxy.getHost().equalsIgnoreCase(settings.getActiveProxy().getHost())) {
+            return settings.getActiveProxy().getNonProxyHosts();
+        }
+        return null;
+    }
+
+    // ========== Configuration Methods ==========
+
+    @Override
+    public void setMavenSettingsLocation(String mavenSettings) {
+        this.mavenSettings = mavenSettings;
+    }
+
+    @Override
+    public void setMavenSettingsSecurityLocation(String mavenSettingsSecurity) {
+        this.mavenSettingsSecurity = mavenSettingsSecurity;
+    }
+
+    public void setRepos(String repos) {
+        this.repos = repos;
+    }
+
+    @Override
+    public void setExtraRepos(String extraRepos) {
+        this.extraRepos = extraRepos;
+    }
+
+    @Override
+    public String getExtraRepos() {
+        if (extraRepos != null) {
+            return extraRepos;
+        }
+        // user-provided value first, then any baseline a custom distribution provided
+        return System.getProperty(EXTRA_DEFAULT_REPOS_PROPERTY, System.getProperty(EXTRA_DEFAULT_REPOS_DEFAULT_VALUE));
+    }
+
+    public void setFresh(boolean fresh) {
+        this.fresh = fresh;
+    }
+
+    public void setOffline(boolean offline) {
+        this.offline = offline;
+    }
+
+    @Override
+    public void setPreferLocal(boolean preferLocal) {
+        this.preferLocal = preferLocal;
+    }
+
+    @Override
+    public boolean isPreferLocal() {
+        return preferLocal;
+    }
+
+    public void setMavenCentralEnabled(boolean mavenCentralEnabled) {
+        this.mavenCentralEnabled = mavenCentralEnabled;
+    }
+
+    public boolean isMavenCentralEnabled() {
+        return mavenCentralEnabled;
+    }
+
+    public void setMavenApacheSnapshotEnabled(boolean mavenApacheSnapshotEnabled) {
+        this.mavenApacheSnapshotEnabled = mavenApacheSnapshotEnabled;
+    }
+
+    public boolean isMavenApacheSnapshotEnabled() {
+        return mavenApacheSnapshotEnabled;
+    }
+
+    @Override
+    public MavenDownloader customize(String localRepository, int connectTimeout, int requestTimeout) {
+        // Create a copy with most configuration shared
+        MavenDownloaderImpl copy = new MavenDownloaderImpl();
+        copy.embeddedMode = embeddedMode;
+        copy.repositorySystem = repositorySystem;
+        copy.remoteRepositories.addAll(remoteRepositories);
+        copy.apacheSnapshotsRepository = apacheSnapshotsRepository;
+        copy.apacheSnapshotsResolutionRepository = apacheSnapshotsResolutionRepository;
+        copy.defaultPolicy = defaultPolicy;
+        copy.mavenSettings = mavenSettings;
+        copy.mavenSettingsSecurity = mavenSettingsSecurity;
+        copy.repos = repos;
+        copy.fresh = fresh;
+        copy.apacheSnapshotsIncluded = apacheSnapshotsIncluded;
+        copy.customRepositoryCounter = customRepositoryCounter;
+        copy.unreachableRepositories = unreachableRepositories;
+        copy.repositoryResolver = repositoryResolver;
+        copy.offline = offline;
+
+        // Create a new session with custom settings (session can't be shared)
+        DefaultRepositorySystemSession rssCopy = new DefaultRepositorySystemSession(repositorySystemSession);
+        rssCopy.setConfigProperty(ConfigurationProperties.CONNECT_TIMEOUT, connectTimeout);
+        rssCopy.setConfigProperty(ConfigurationProperties.REQUEST_TIMEOUT, requestTimeout);
+
+        // Set custom local repository
+        try {
+            LocalRepositoryManager lrm = repositorySystem.newLocalRepositoryManager(rssCopy,
+                    new LocalRepository(localRepository));
+            rssCopy.setLocalRepositoryManager(embeddedMode
+                    ? lrm : TrackingKeyCompatLocalRepositoryManager.wrap(rssCopy, lrm));
+        } catch (Exception e) {
+            LOG.warn("Failed to set custom local repository: {}", e.getMessage(), e);
+        }
+
+        copy.repositorySystemSession = rssCopy;
+
+        return copy;
+    }
+
+    public void setRepositoryResolver(RepositoryResolver repositoryResolver) {
+        this.repositoryResolver = repositoryResolver;
+    }
+
+    public RepositoryResolver getRepositoryResolver() {
+        return repositoryResolver;
+    }
+
+    public void setRemoteArtifactDownloadListener(RemoteArtifactDownloadListener remoteArtifactDownloadListener) {
+        this.remoteArtifactDownloadListener = remoteArtifactDownloadListener;
+    }
+
+    /**
+     * Lets the local repository manager accept the artifacts tracked by Maven 3.10+ as downloaded from the requested
+     * repositories. See {@link TrackingKeyCompatLocalRepositoryManager}.
+     */
+    private static RepositorySystemSession withTrackingKeyCompat(RepositorySystemSession session) {
+        DefaultRepositorySystemSession compat = new DefaultRepositorySystemSession(session);
+        compat.setLocalRepositoryManager(
+                TrackingKeyCompatLocalRepositoryManager.wrap(compat, session.getLocalRepositoryManager()));
+        return compat;
+    }
+
+    static MavenArtifact toMavenArtifact(ArtifactResult ar) {
+        Artifact artifact = ar.getArtifact();
+        // the base version: a SNAPSHOT from a remote repository has a timestamped version (such as
+        // 4.24.0-20261112.143700-31), which does not match the same SNAPSHOT already on the classpath
+        MavenGav gav = MavenGav.fromCoordinates(
+                artifact.getGroupId(), artifact.getArtifactId(),
+                artifact.getBaseVersion(), artifact.getExtension(), artifact.getClassifier());
+        return new MavenArtifact(gav, artifact.getFile());
+    }
+
+}

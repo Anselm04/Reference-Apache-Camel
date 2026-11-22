@@ -1,0 +1,356 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.camel.dsl.jbang.core.commands;
+
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.Arrays;
+import java.util.Iterator;
+import java.util.List;
+import java.util.Locale;
+import java.util.Optional;
+
+import org.aesh.command.CommandDefinition;
+import org.aesh.command.option.Arguments;
+import org.aesh.command.option.Option;
+import org.apache.camel.catalog.CamelCatalog;
+import org.apache.camel.catalog.DefaultCamelCatalog;
+import org.apache.camel.dsl.jbang.core.commands.ai.RouteComponents;
+import org.apache.camel.dsl.jbang.core.common.CliException;
+import org.apache.camel.dsl.jbang.core.common.CliExitCode;
+import org.apache.camel.dsl.jbang.core.common.CompletionCandidates;
+import org.apache.camel.tooling.model.ComponentModel;
+import org.apache.camel.tooling.model.EipModel;
+import org.apache.camel.util.FileUtil;
+
+/**
+ * Command to explain Camel routes using AI/LLM services.
+ * <p>
+ * Supports multiple LLM providers: Ollama, OpenAI, Azure OpenAI, Anthropic, Vertex AI, vLLM, LM Studio, LocalAI, etc.
+ */
+@CommandDefinition(name = "explain", description = "Explain what a Camel route does using AI/LLM", generateHelp = true,
+                   footer = {
+                           "Examples:",
+                           "  camel explain hello.java",
+                           "  camel explain hello.yaml --format=markdown",
+                           "  camel explain hello.java --model=gpt-4",
+                           "  camel explain hello.yaml --api-type=anthropic" })
+public class Explain extends CamelCommand {
+
+    public static class FormatCompletionCandidates extends CompletionCandidates {
+
+        public FormatCompletionCandidates() {
+        }
+
+        @Override
+        public Iterator<String> iterator() {
+            return List.of("text", "markdown").iterator();
+        }
+    }
+
+    private static final List<String> COMMON_COMPONENTS = Arrays.asList(
+            "kafka", "http", "https", "file", "timer", "direct", "seda",
+            "log", "mock", "rest", "rest-api", "sql", "jms", "activemq",
+            "aws2-s3", "aws2-sqs", "aws2-sns", "aws2-kinesis",
+            "azure-storage-blob", "azure-storage-queue",
+            "google-pubsub", "google-storage",
+            "mongodb", "couchdb", "cassandraql",
+            "elasticsearch", "opensearch",
+            "ftp", "sftp", "ftps",
+            "smtp", "imap", "pop3",
+            "websocket", "netty-http", "vertx-http",
+            "bean", "process", "script");
+
+    private static final List<String> COMMON_EIPS = Arrays.asList(
+            "split", "aggregate", "filter", "choice", "when", "otherwise",
+            "multicast", "recipientList", "routingSlip", "dynamicRouter",
+            "circuitBreaker", "throttle", "delay", "resequence",
+            "idempotentConsumer", "loadBalance", "saga",
+            "onException", "doTry", "doCatch", "doFinally",
+            "transform", "setBody", "setHeader", "removeHeader",
+            "marshal", "unmarshal", "convertBodyTo",
+            "enrich", "pollEnrich", "wireTap", "pipeline");
+
+    @Arguments(paramLabel = "files", required = true, description = "Route file(s) to explain")
+    List<String> files;
+
+    @Option(name = "url",
+            description = "LLM API endpoint URL. Auto-detected from 'camel infra' for Ollama if not specified. Also reads AZURE_OPENAI_ENDPOINT or WATSONX_URL env vars")
+    String url;
+
+    @Option(name = "api-type",
+            description = "API type: 'ollama', 'openai' (OpenAI-compatible), 'anthropic' (Anthropic/Vertex AI), or 'watsonx' (IBM watsonx.ai)")
+    LlmClient.ApiType apiType;
+
+    @Option(name = "api-key",
+            description = "API key for authentication. Also reads ANTHROPIC_API_KEY, OPENAI_API_KEY, WATSONX_APIKEY, or LLM_API_KEY env vars")
+    String apiKey;
+
+    @Option(name = "model",
+            description = "Model to use. Default: the provider's default; with Ollama the installed model best at"
+                          + " tool calling, such as qwen3.6")
+    String model;
+
+    @Option(name = "verbose", shortName = 'v', hasValue = false, description = "Include detailed technical information")
+    boolean verbose;
+
+    @Option(name = "format", description = "Output format (${COMPLETION-CANDIDATES})", defaultValue = "text",
+            completer = FormatCompletionCandidates.class)
+    String format = "text";
+
+    @Option(name = "timeout", description = "Timeout in seconds for LLM response", defaultValue = "120")
+    int timeout = 120;
+
+    @Option(name = "catalog-context", hasValue = false, description = "Include Camel Catalog descriptions in the prompt")
+    boolean catalogContext;
+
+    @Option(name = "show-prompt", hasValue = false, description = "Show the prompt sent to the LLM")
+    boolean showPrompt;
+
+    @Option(name = "temperature",
+            description = "Temperature for response generation (0.0-2.0), for a model on this machine: a hosted model uses its own default",
+            defaultValue = "0.7")
+    double temperature = 0.7;
+
+    @Option(name = "system-prompt", description = "Custom system prompt")
+    String systemPrompt;
+
+    @Option(name = "stream", hasValue = false, description = "Stream the response as it's generated (shows progress)",
+            defaultValue = "true")
+    boolean stream = true;
+
+    @Override
+    public Integer doCall() throws Exception {
+        if (!"text".equals(format) && !"markdown".equals(format)) {
+            throw CliException.usage("--format must be text or markdown, was: " + format);
+        }
+        // check the input before reaching out to an LLM
+        for (String file : files) {
+            if (!Files.exists(Path.of(file))) {
+                printer().printErr("File not found: " + file);
+                return CliExitCode.FILE_NOT_FOUND;
+            }
+        }
+
+        LlmClient client = LlmClient.create()
+                .withUrl(url)
+                .withApiType(apiType)
+                .withApiKey(apiKey)
+                .withExplicitModel(model)
+                .withTimeout(timeout)
+                .withTemperature(temperature)
+                .withStream(stream)
+                .withPrinter(printer());
+
+        if (!client.detectEndpoint()) {
+            printUsageHelp();
+            return 1;
+        }
+
+        printConfiguration(client);
+
+        for (String file : files) {
+            int result = explainRoute(file, client);
+            if (result != 0) {
+                return result;
+            }
+        }
+        return 0;
+    }
+
+    private void printConfiguration(LlmClient client) {
+        printer().printDiagnostic("LLM Configuration:");
+        printer().printDiagnostic("  URL: " + (client.url != null ? client.url : "(Vertex AI)"));
+        printer().printDiagnostic("  API Type: " + client.apiType);
+        printer().printDiagnostic("  Model: " + client.model);
+        printMaskedApiKey(client.apiKey);
+        printer().printDiagnostic("");
+    }
+
+    private void printMaskedApiKey(String key) {
+        if (key == null || key.isBlank()) {
+            return;
+        }
+        // the last characters of a long key only: a short one would be shown whole
+        String masked = key.length() > 8 ? "****" + key.substring(key.length() - 4) : "****";
+        printer().printDiagnostic("  API Key: " + masked);
+    }
+
+    private void printUsageHelp() {
+        printer().printErr("LLM service is not running or not reachable.");
+        printer().printDiagnostic("");
+        printer().printDiagnostic("Options:");
+        printer().printDiagnostic("  1. camel infra run ollama");
+        printer().printDiagnostic("  2. camel explain my-route.yaml --url=http://localhost:11434");
+        printer().printDiagnostic(
+                "  3. camel explain my-route.yaml --url=https://api.openai.com --api-type=openai --api-key=sk-...");
+        printer().printDiagnostic(
+                "  4. camel explain my-route.yaml --api-type=anthropic  (uses ANTHROPIC_API_KEY or Vertex AI)");
+        printer().printDiagnostic(
+                "  5. camel explain my-route.yaml --api-type=watsonx    (uses WATSONX_APIKEY and WATSONX_URL)");
+    }
+
+    private int explainRoute(String file, LlmClient client) throws Exception {
+        Path path = Path.of(file);
+        String routeContent = Files.readString(path);
+        String ext = Optional.ofNullable(FileUtil.onlyExt(file, false)).orElse("yaml");
+
+        printFileHeader(file);
+
+        String sysPrompt = buildSystemPrompt();
+        String userPrompt = buildUserPrompt(routeContent, ext, file);
+
+        printPromptsIfRequested(sysPrompt, userPrompt);
+
+        printer().printDiagnostic("Analyzing route with " + client.model + " (" + client.apiType + ")...");
+
+        String explanation = client.generate(sysPrompt, userPrompt);
+
+        return handleExplanationResult(explanation);
+    }
+
+    private void printFileHeader(String file) {
+        printer().println("=".repeat(70));
+        printer().println("Explaining: " + file);
+        printer().println("=".repeat(70));
+        printer().println();
+    }
+
+    private void printPromptsIfRequested(String sysPrompt, String userPrompt) {
+        if (!showPrompt) {
+            return;
+        }
+        printer().printDiagnostic("--- SYSTEM PROMPT ---");
+        printer().printDiagnostic(sysPrompt);
+        printer().printDiagnostic("--- USER PROMPT ---");
+        printer().printDiagnostic(userPrompt);
+        printer().printDiagnostic("--- END PROMPTS ---");
+        printer().printDiagnostic("");
+    }
+
+    private int handleExplanationResult(String explanation) {
+        if (explanation == null) {
+            printer().printErr("Failed to get explanation from LLM");
+            return 1;
+        }
+        if (!stream) {
+            printer().println(explanation);
+        }
+        printer().println();
+        return 0;
+    }
+
+    private String buildSystemPrompt() {
+        if (systemPrompt != null && !systemPrompt.isBlank()) {
+            return systemPrompt;
+        }
+
+        StringBuilder prompt = new StringBuilder();
+        prompt.append("You are an Apache Camel integration expert. ");
+        prompt.append("Your task is to explain Camel routes in plain English.\n\n");
+        prompt.append("Guidelines:\n");
+        prompt.append("- Start with a one-sentence summary\n");
+        prompt.append("- Describe step by step what the route does\n");
+        prompt.append("- Explain each component and EIP used\n");
+        prompt.append("- Mention error handling if present\n");
+        prompt.append("- Use bullet points for clarity\n");
+
+        if ("markdown".equals(format)) {
+            prompt.append("- Format output as Markdown\n");
+        }
+        if (verbose) {
+            prompt.append("- Include technical details about options and expressions\n");
+        }
+        return prompt.toString();
+    }
+
+    private String buildUserPrompt(String routeContent, String fileExtension, String fileName) {
+        StringBuilder prompt = new StringBuilder();
+
+        if (catalogContext) {
+            appendCatalogContext(prompt, routeContent, fileExtension);
+        }
+
+        prompt.append("File: ").append(fileName).append("\n");
+        prompt.append("Format: ").append(fileExtension.toUpperCase(Locale.ROOT)).append("\n\n");
+        prompt.append("Route definition:\n```").append(fileExtension).append("\n");
+        prompt.append(routeContent).append("\n```\n\n");
+        prompt.append("Please explain this Camel route:");
+
+        return prompt.toString();
+    }
+
+    private void appendCatalogContext(StringBuilder prompt, String routeContent, String fileExtension) {
+        String catalogInfo = buildCatalogContext(routeContent, fileExtension);
+        if (catalogInfo.isEmpty()) {
+            return;
+        }
+        prompt.append("Reference information:\n").append(catalogInfo).append("\n");
+    }
+
+    private String buildCatalogContext(String routeContent, String fileExtension) {
+        StringBuilder context = new StringBuilder();
+        CamelCatalog catalog = new DefaultCamelCatalog();
+        String lowerContent = routeContent.toLowerCase();
+
+        appendComponentDescriptions(context, catalog, routeContent, fileExtension);
+        appendEipDescriptions(context, catalog, lowerContent);
+
+        return context.toString();
+    }
+
+    private void appendComponentDescriptions(
+            StringBuilder context, CamelCatalog catalog, String content, String fileExtension) {
+        // the components of the route's endpoints, not every name in the text (CAMEL-25586)
+        RouteComponents.of(content, fileExtension, catalog, COMMON_COMPONENTS)
+                .forEach(comp -> appendModelDescription(context, catalog.componentModel(comp), comp, ""));
+    }
+
+    private void appendEipDescriptions(StringBuilder context, CamelCatalog catalog, String content) {
+        COMMON_EIPS.stream()
+                .filter(eip -> content.contains(eip.toLowerCase()) || content.contains(camelCaseToDash(eip)))
+                .forEach(eip -> appendModelDescription(context, catalog.eipModel(eip), eip, " (EIP)"));
+    }
+
+    private void appendModelDescription(StringBuilder context, Object model, String name, String suffix) {
+        String description = getModelDescription(model);
+        if (description != null) {
+            context.append("- ").append(name).append(suffix).append(": ").append(description).append("\n");
+        }
+    }
+
+    private String getModelDescription(Object model) {
+        if (model instanceof ComponentModel componentModel) {
+            return componentModel.getDescription();
+        }
+        if (model instanceof EipModel eipModel) {
+            return eipModel.getDescription();
+        }
+        return null;
+    }
+
+    private String camelCaseToDash(String text) {
+        StringBuilder sb = new StringBuilder();
+        for (char c : text.toCharArray()) {
+            if (Character.isUpperCase(c) && sb.length() > 0) {
+                sb.append('-');
+            }
+            sb.append(Character.toLowerCase(c));
+        }
+        return sb.toString();
+    }
+}

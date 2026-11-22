@@ -1,0 +1,367 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.camel.dsl.jbang.core.commands.ai;
+
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+
+import org.apache.camel.catalog.CamelCatalog;
+import org.apache.camel.catalog.DefaultCamelCatalog;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
+
+import static org.assertj.core.api.Assertions.assertThat;
+
+/**
+ * CAMEL-24955: a direct: or seda: endpoint a route sends to, checked against the routes of every route file in the
+ * directory - YAML, Java and XML - since the routes of an application are spread over files.
+ */
+class SourceValidatorEndpointConsumersTest {
+
+    private static final CamelCatalog CATALOG = new DefaultCamelCatalog();
+
+    private static final String ROUTE = """
+            - route:
+                id: tick
+                from:
+                  uri: timer:tick
+                  steps:
+                    - to:
+                        uri: direct:lookup
+            """;
+
+    @TempDir
+    Path dir;
+
+    @Test
+    void anEndpointNoRouteFileConsumesIsReported() throws Exception {
+        Files.writeString(dir.resolve("other.camel.yaml"), """
+                - route:
+                    from:
+                      uri: direct:other
+                      steps:
+                        - log: other
+                """);
+        List<String> msgs = SourceValidator.validate("r.camel.yaml", ROUTE, CATALOG, null, dir);
+        assertThat(msgs).singleElement().asString()
+                .startsWith("route tick: sends to direct:lookup, and no route consumes it")
+                .contains("the exchange fails with No consumers available on endpoint");
+    }
+
+    @Test
+    void aSiblingYamlFileConsumesIt() throws Exception {
+        Files.writeString(dir.resolve("lookup.camel.yaml"), """
+                - route:
+                    from:
+                      uri: direct:lookup
+                      steps:
+                        - log: found
+                """);
+        assertThat(SourceValidator.validate("r.camel.yaml", ROUTE, CATALOG, null, dir)).isEmpty();
+    }
+
+    @Test
+    void aSiblingJavaRouteConsumesIt() throws Exception {
+        Files.writeString(dir.resolve("Lookup.java"), """
+                import org.apache.camel.builder.RouteBuilder;
+
+                public class Lookup extends RouteBuilder {
+                    @Override
+                    public void configure() {
+                        from("direct://lookup?timeout=1000").log("found");
+                    }
+                }
+                """);
+        assertThat(SourceValidator.validate("r.camel.yaml", ROUTE, CATALOG, null, dir)).isEmpty();
+    }
+
+    @Test
+    void aSiblingXmlRouteConsumesIt() throws Exception {
+        Files.writeString(dir.resolve("lookup.camel.xml"), """
+                <routes>
+                    <route>
+                        <from uri="direct:lookup"/>
+                        <log message="found"/>
+                    </route>
+                </routes>
+                """);
+        assertThat(SourceValidator.validate("r.camel.yaml", ROUTE, CATALOG, null, dir)).isEmpty();
+    }
+
+    @Test
+    void aJavaRouteInputThatIsNotALiteralKeepsTheCheckQuiet() throws Exception {
+        // from(LOOKUP) may well be direct:lookup: the check cannot be certain, so it says nothing
+        Files.writeString(dir.resolve("Lookup.java"), """
+                import org.apache.camel.builder.RouteBuilder;
+
+                public class Lookup extends RouteBuilder {
+                    static final String LOOKUP = "direct:lookup";
+
+                    @Override
+                    public void configure() {
+                        from(LOOKUP).log("found");
+                    }
+                }
+                """);
+        assertThat(SourceValidator.validate("r.camel.yaml", ROUTE, CATALOG, null, dir)).isEmpty();
+    }
+
+    @Test
+    void javaRouteInputsTheScanCannotReadKeepTheCheckQuiet() throws Exception {
+        // each may well consume direct:lookup: a route template's from(, fromF( and a concatenated uri
+        for (String configure : List.of(
+                "routeTemplate(\"t\").templateParameter(\"n\").from(\"direct:{{n}}\").log(\"found\");",
+                "fromF(\"direct:%s\", \"lookup\").log(\"found\");",
+                "from(\"direct:\" + NAME).log(\"found\");")) {
+            Files.writeString(dir.resolve("Lookup.java"), """
+                    import org.apache.camel.builder.RouteBuilder;
+
+                    public class Lookup extends RouteBuilder {
+                        static final String NAME = "lookup";
+
+                        @Override
+                        public void configure() {
+                            %s
+                        }
+                    }
+                    """.formatted(configure));
+            assertThat(SourceValidator.validate("r.camel.yaml", ROUTE, CATALOG, null, dir)).as(configure).isEmpty();
+        }
+    }
+
+    @Test
+    void theJavaRoutesAreReadByTheParser() throws Exception {
+        // CAMEL-25199: a constant, a format and the endpoint DSL are resolved, so the check knows what they consume
+        for (String configure : List.of(
+                "from(OTHER).log(\"found\");",
+                "fromF(\"direct:%s\", \"other\").log(\"found\");",
+                "from(direct(\"other\")).log(\"found\");")) {
+            Files.writeString(dir.resolve("Other.java"), """
+                    import org.apache.camel.builder.endpoint.EndpointRouteBuilder;
+
+                    public class Other extends EndpointRouteBuilder {
+                        static final String OTHER = "direct:other";
+
+                        @Override
+                        public void configure() {
+                            %s
+                        }
+                    }
+                    """.formatted(configure));
+            assertThat(SourceValidator.validate("r.camel.yaml", ROUTE, CATALOG, null, dir)).as(configure)
+                    .singleElement().asString().startsWith("route tick: sends to direct:lookup, and no route consumes it");
+        }
+        // the same with the endpoint DSL naming the endpoint the YAML route sends to: consumed
+        Files.writeString(dir.resolve("Other.java"), """
+                import org.apache.camel.builder.endpoint.EndpointRouteBuilder;
+
+                public class Other extends EndpointRouteBuilder {
+                    @Override
+                    public void configure() {
+                        from(direct("lookup")).log("found");
+                    }
+                }
+                """);
+        assertThat(SourceValidator.validate("r.camel.yaml", ROUTE, CATALOG, null, dir)).isEmpty();
+    }
+
+    @Test
+    void aJavaRouteInputKnownOnlyAtRuntimeKeepsTheCheckQuiet() throws Exception {
+        Files.writeString(dir.resolve("Lookup.java"), """
+                import org.apache.camel.builder.RouteBuilder;
+
+                public class Lookup extends RouteBuilder {
+                    @Override
+                    public void configure() {
+                        from(inputFromConfig()).log("found");
+                    }
+                }
+                """);
+        assertThat(SourceValidator.validate("r.camel.yaml", ROUTE, CATALOG, null, dir)).isEmpty();
+    }
+
+    @Test
+    void aRouteFileInASubdirectoryConsumesIt() throws Exception {
+        Files.createDirectories(dir.resolve("routes"));
+        Files.writeString(dir.resolve("routes/lookup.camel.yaml"), """
+                - route:
+                    from:
+                      uri: direct:lookup
+                      steps:
+                        - log: found
+                """);
+        assertThat(SourceValidator.validate("r.camel.yaml", ROUTE, CATALOG, null, dir)).isEmpty();
+    }
+
+    @Test
+    void theFileBeingValidatedIsLeftOutByItsPathUnderTheDirectory() throws Exception {
+        // camel_validate_source passes the project directory and the file's path relative to it
+        Files.createDirectories(dir.resolve("routes"));
+        Files.writeString(dir.resolve("routes/r.camel.yaml"), ROUTE + """
+                - route:
+                    from:
+                      uri: direct:lookup
+                      steps:
+                        - log: found
+                """);
+        assertThat(SourceValidator.validate("routes/r.camel.yaml", ROUTE, CATALOG, null, dir))
+                .singleElement().asString().contains("sends to direct:lookup");
+    }
+
+    @Test
+    void aMavenProjectIsScannedFromItsRootOnly() throws Exception {
+        Path camel = Files.createDirectories(dir.resolve("src/main/resources/camel"));
+        Path java = Files.createDirectories(dir.resolve("src/main/java/com/acme"));
+        Files.writeString(dir.resolve("pom.xml"), "<project/>");
+        Files.writeString(java.resolve("Lookup.java"), """
+                package com.acme;
+
+                import org.apache.camel.builder.RouteBuilder;
+
+                public class Lookup extends RouteBuilder {
+                    @Override
+                    public void configure() {
+                        from("direct:lookup").log("found");
+                    }
+                }
+                """);
+        // from the project root, the RouteBuilder under src/main/java is found
+        assertThat(SourceValidator.validate("src/main/resources/camel/r.camel.yaml", ROUTE, CATALOG, null, dir))
+                .isEmpty();
+        // from the directory of the YAML file, the rest of the project is not seen: the check says nothing
+        Files.delete(java.resolve("Lookup.java"));
+        assertThat(SourceValidator.validate("r.camel.yaml", ROUTE, CATALOG, null, camel)).isEmpty();
+        assertThat(SourceValidator.validate("src/main/resources/camel/r.camel.yaml", ROUTE, CATALOG, null, dir))
+                .singleElement().asString().contains("sends to direct:lookup");
+    }
+
+    @Test
+    void aFolderOutsideTheSourcesOfAProjectIsChecked() throws Exception {
+        // the folder of an example in a repository with a pom.xml at its root: camel run runs the folder on its own,
+        // so a direct: that no route of the folder consumes is reported
+        Files.writeString(dir.resolve("pom.xml"), "<project/>");
+        Path example = Files.createDirectories(dir.resolve("examples/orders"));
+        assertThat(SourceValidator.validate("r.camel.yaml", ROUTE, CATALOG, null, example))
+                .singleElement().asString().contains("sends to direct:lookup");
+        // the sources of a module under the root stay a part of that module
+        Path module = Files.createDirectories(dir.resolve("orders-module/src/main/resources/camel"));
+        Files.writeString(dir.resolve("orders-module/pom.xml"), "<project/>");
+        assertThat(SourceValidator.validate("r.camel.yaml", ROUTE, CATALOG, null, module)).isEmpty();
+    }
+
+    @Test
+    void theFileBeingValidatedIsReadFromItsContentNotFromDisk() throws Exception {
+        // the editor's buffer is newer than the file on disk, which still consumes direct:lookup
+        Files.writeString(dir.resolve("r.camel.yaml"), ROUTE + """
+                - route:
+                    from:
+                      uri: direct:lookup
+                      steps:
+                        - log: found
+                """);
+        assertThat(SourceValidator.validate("r.camel.yaml", ROUTE, CATALOG, null, dir))
+                .singleElement().asString().contains("sends to direct:lookup");
+    }
+
+    @Test
+    void withoutADirectoryTheCheckSaysNothing() {
+        assertThat(SourceValidator.validate("r.camel.yaml", ROUTE, CATALOG, null)).isEmpty();
+    }
+
+    @Test
+    void theEditorGetsTheMessageOnEachLineThatSendsToTheEndpoint() throws Exception {
+        Files.writeString(dir.resolve("other.camel.yaml"), """
+                - route:
+                    from:
+                      uri: direct:other
+                      steps:
+                        - log: other
+                """);
+        Set<String> consumed = EndpointConsumerChecks.consumed(dir, "r.camel.yaml", CATALOG);
+        assertThat(consumed).containsOnly("direct:other");
+        String route = """
+                - route:
+                    id: tick
+                    from:
+                      uri: timer:tick
+                      steps:
+                        # to: direct:cheese, not yet
+                        - to: direct:cheese
+                        - to: direct:cheeseburger
+                        - to: direct://cheese?timeout=1000
+                        - to: direct:other
+                """;
+        List<String> msgs = EndpointConsumerChecks.validateYamlConsumers(route, consumed);
+        assertThat(msgs).hasSize(3);
+        assertThat(msgs.get(0)).startsWith("Line 7: route tick: sends to direct:cheese, and no route consumes it");
+        assertThat(msgs.get(1)).startsWith("Line 9: route tick: sends to direct:cheese, and no route consumes it");
+        assertThat(msgs.get(2)).startsWith("Line 8: route tick: sends to direct:cheeseburger");
+        // consumed in the file itself
+        assertThat(EndpointConsumerChecks.validateYamlConsumers(route + """
+                - route:
+                    from:
+                      uri: direct:cheese
+                      steps:
+                        - log: cheese
+                - route:
+                    from:
+                      uri: direct:cheeseburger
+                      steps:
+                        - log: burger
+                """, consumed)).isEmpty();
+        // the other files not known: nothing is said
+        assertThat(EndpointConsumerChecks.validateYamlConsumers(route, null)).isEmpty();
+    }
+
+    @Test
+    void theEditorGetsTheMessageOfAJavaOrXmlRouteOnItsLine() {
+        String java = """
+                import org.apache.camel.builder.RouteBuilder;
+
+                public class Tick extends RouteBuilder {
+                    @Override
+                    public void configure() {
+                        from("timer:tick")
+                            .to("direct:cheese")
+                            .to("direct:other");
+                    }
+                }
+                """;
+        Set<String> consumed = Set.of("direct:other");
+        assertThat(EndpointConsumerChecks.validateRouteConsumers("Tick.java", java, CATALOG, Map.of(), consumed))
+                .singleElement().asString()
+                .startsWith("Line 7: sends to direct:cheese, and no route consumes it")
+                .endsWith("add a route with from(\"direct:cheese\"), or correct the name");
+        String xml = """
+                <routes>
+                    <route>
+                        <from uri="timer:tick"/>
+                        <to uri="direct:cheese"/>
+                    </route>
+                </routes>
+                """;
+        assertThat(EndpointConsumerChecks.validateRouteConsumers("tick.camel.xml", xml, CATALOG, Map.of(), consumed))
+                .singleElement().asString().startsWith("Line 4: sends to direct:cheese");
+        // the other files not known, or a file that is not a route source: nothing is said
+        assertThat(EndpointConsumerChecks.validateRouteConsumers("Tick.java", java, CATALOG, Map.of(), null)).isEmpty();
+        assertThat(EndpointConsumerChecks.validateRouteConsumers("pom.xml", "<project/>", CATALOG, Map.of(), consumed))
+                .isEmpty();
+    }
+}

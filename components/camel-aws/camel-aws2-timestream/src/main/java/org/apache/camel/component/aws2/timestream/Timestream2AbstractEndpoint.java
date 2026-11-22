@@ -1,0 +1,63 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.camel.component.aws2.timestream;
+
+import org.apache.camel.*;
+import org.apache.camel.spi.BodyType;
+import org.apache.camel.spi.BodyType.Carrier;
+import org.apache.camel.spi.BodyTypes;
+import org.apache.camel.spi.UriEndpoint;
+import org.apache.camel.spi.UriParam;
+import org.apache.camel.support.DefaultEndpoint;
+
+@UriEndpoint(firstVersion = "4.1.0", scheme = "aws2-timestream", title = "AWS Timestream",
+             syntax = "aws2-timestream:clientType:label",
+             producerOnly = true, category = { Category.CLOUD, Category.DATABASE },
+             headersClass = Timestream2Constants.class)
+@BodyTypes(producerIn = @BodyType(value = Carrier.ANY,
+                                  byOption = @BodyType.When(option = "pojoRequest", value = "true", carriers = Carrier.POJO),
+                                  description = "Not used: the operations of both client types take their input from headers,"
+                                                + " such as the records of writeRecords in CamelAwsTimestreamRecordList, a List"
+                                                + " of the Record of the AWS SDK, and the SQL of query in"
+                                                + " CamelAwsTimestreamQueryString. With pojoRequest=true the request of the AWS"
+                                                + " SDK for the operation, such as a WriteRecordsRequest or a QueryRequest:"
+                                                + " another body fails"),
+           producerOut = @BodyType(value = Carrier.POJO,
+                                   description = "The response of the AWS SDK for the operation, such as the"
+                                                 + " WriteRecordsResponse of writeRecords, or the QueryResponse of query with"
+                                                 + " one page of rows: the CamelAwsTimestreamQueryNextToken header gives the"
+                                                 + " next page, and queryAllPages=true gives the rows of all the pages"))
+public abstract class Timestream2AbstractEndpoint extends DefaultEndpoint {
+
+    @UriParam
+    private Timestream2Configuration configuration;
+
+    protected Timestream2AbstractEndpoint(String uri, Component component, Timestream2Configuration configuration) {
+        super(uri, component);
+        this.configuration = configuration;
+    }
+
+    @Override
+    public Timestream2Component getComponent() {
+        return (Timestream2Component) super.getComponent();
+    }
+
+    public Timestream2Configuration getConfiguration() {
+        return configuration;
+    }
+
+}

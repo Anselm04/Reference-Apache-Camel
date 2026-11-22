@@ -1,0 +1,158 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.camel.dsl.jbang.core.commands.action;
+
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Iterator;
+import java.util.List;
+
+import com.github.freva.asciitable.AsciiTable;
+import com.github.freva.asciitable.Column;
+import com.github.freva.asciitable.HorizontalAlign;
+import com.github.freva.asciitable.OverflowBehaviour;
+import org.aesh.command.CommandDefinition;
+import org.aesh.command.option.Argument;
+import org.aesh.command.option.Mixin;
+import org.aesh.command.option.Option;
+import org.apache.camel.dsl.jbang.core.common.CompletionCandidates;
+import org.apache.camel.dsl.jbang.core.common.JsonOutput;
+import org.apache.camel.dsl.jbang.core.common.ProcessFinder.CamelProcess;
+import org.apache.camel.dsl.jbang.core.common.RowSort;
+import org.apache.camel.dsl.jbang.core.common.TerminalWidthHelper;
+import org.apache.camel.util.StringHelper;
+import org.apache.camel.util.json.JsonArray;
+import org.apache.camel.util.json.JsonObject;
+
+@CommandDefinition(name = "startup-recorder", description = "Display startup recording", generateHelp = true,
+                   footer = {
+                           "Examples:",
+                           "  camel get startup-recorder",
+                           "  camel get startup-recorder --json" })
+public class CamelStartupRecorderAction extends ActionWatchCommand {
+
+    private static final RowSort<Row> ORDER = new RowSort<Row>()
+            .numeric("duration", r -> r.duration)
+            .text("type", r -> r.type);
+
+    @Argument(description = "Name or pid of running Camel integration")
+    String name = "*";
+
+    @Option(name = "sort", description = "Sort by duration, or type", completer = DurationTypeCompletionCandidates.class)
+    String sort;
+
+    @Option(name = "json", hasValue = false, description = "Output in JSON Format")
+    boolean jsonOutput;
+
+    @Mixin
+    ActionTimeoutMixin timeoutOption;
+
+    private volatile long pid;
+
+    @Override
+    public Integer doWatchCall() throws Exception {
+        List<Row> rows = new ArrayList<>();
+
+        CamelProcess process = findOne(name);
+        this.pid = process.pid();
+
+        JsonObject jo = executeAction(process, "startup-recorder", null);
+        JsonArray arr = (JsonArray) jo.get("steps");
+        for (int i = 0; arr != null && i < arr.size(); i++) {
+            JsonObject o = (JsonObject) arr.get(i);
+            Row row = new Row();
+            row.id = o.getInteger("id");
+            row.parentId = o.getInteger("parentId");
+            row.level = o.getInteger("level");
+            row.name = o.getString("name");
+            row.type = o.getString("type");
+            row.description = o.getString("description");
+            row.duration = o.getLong("duration");
+            rows.add(row);
+        }
+
+        // sort rows
+        rows.sort(ORDER.comparator(sort));
+
+        if (jsonOutput) {
+            JsonOutput.printList(printer(), rows.stream().map(r -> {
+                JsonObject step = new JsonObject();
+                step.put("id", r.id);
+                step.put("parentId", r.parentId);
+                step.put("level", r.level);
+                step.put("name", r.name);
+                step.put("type", r.type);
+                step.put("description", r.description);
+                step.put("duration", r.duration);
+                return step;
+            }).toList());
+        } else if (!rows.isEmpty()) {
+            int tw = terminalWidth();
+            int fixedWidth = 10 + 15; // DURATION + TYPE (approx)
+            int borderOverhead = TerminalWidthHelper.noBorderOverhead(3);
+            int stepWidth = TerminalWidthHelper.flexWidth(tw, fixedWidth, borderOverhead, 20, 80);
+
+            printer().println(AsciiTable.getTable(AsciiTable.NO_BORDERS, rows, Arrays.asList(
+                    new Column().header("DURATION").dataAlign(HorizontalAlign.RIGHT).with(this::getDuration),
+                    new Column().header("TYPE").dataAlign(HorizontalAlign.LEFT).with(r -> r.type),
+                    new Column().header("STEP (END)").dataAlign(HorizontalAlign.LEFT)
+                            .maxWidth(stepWidth, OverflowBehaviour.ELLIPSIS_RIGHT)
+                            .with(this::getStep))));
+        }
+
+        return 0;
+    }
+
+    private String getStep(Row r) {
+        String pad = StringHelper.padString(r.level);
+        String out = r.description;
+        if (r.name != null && !r.name.equals("null")) {
+            out = String.format("%s(%s)", r.description, r.name);
+        }
+        return pad + out;
+    }
+
+    private String getDuration(Row r) {
+        if (r.duration > 0) {
+            return Long.toString(r.duration);
+        }
+        return "";
+    }
+
+    private static class Row {
+        int id;
+        int parentId;
+        int level;
+        String name;
+        String type;
+        String description;
+        long duration;
+    }
+
+    public static class DurationTypeCompletionCandidates extends CompletionCandidates {
+
+        public DurationTypeCompletionCandidates() {
+        }
+
+        @Override
+        public Iterator<String> iterator() {
+            return List.of("duration", "type").iterator();
+        }
+
+    }
+
+}

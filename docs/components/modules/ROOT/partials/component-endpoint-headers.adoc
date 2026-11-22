@@ -1,0 +1,29 @@
+//component headers: START
+
+:tablespec: width="100%",cols="2,5a,^1,2",options="header"
+:cellformats: 'util.boldLink(path[2], "endpoint_header", value.group) + "\n\nConstant: " + camel.constantLink("{artifactid}",value.constantName) \
+|util.description(value) \
+|util.valueAsString(value.defaultValue) \
+|util.javaSimpleName(value.javaType)'
+include::jsonpathcount$example$json/{shortname}.json[queries='headercount=nodes$.headers.*']
+
+ifeval::[{headercount} != 0]
+== Message Headers
+
+The {doctitle} component supports the following message header(s), which is/are listed below:
+
+[{tablespec}]
+|===
+| Name | Description | Default | Type
+|===
+
+jsonpathTable::example$json/{shortname}.json['nodes$.headers.*',{cellformats},'util=camel-website-util,camel=xref:js/camel.js']
+
+endif::[]
+// component headers: END
+
+:body-types-module: ROOT
+:body-types-intro: The message body at each side of the {doctitle} component: _Consumer_ is the body of the messages the consumer creates, _Consumer reply_ the bodies a consumer that answers its caller can reply with, _Producer input_ the bodies the producer can send or write, and _Producer output_ the body after the producer.
+include::partial$body-types.adoc[]
+
+include::partial$dst-worlds.adoc[]

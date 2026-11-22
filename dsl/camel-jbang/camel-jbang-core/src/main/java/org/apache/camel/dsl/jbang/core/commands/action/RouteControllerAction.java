@@ -1,0 +1,283 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.camel.dsl.jbang.core.commands.action;
+
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Iterator;
+import java.util.List;
+import java.util.stream.Collectors;
+
+import com.github.freva.asciitable.AsciiTable;
+import com.github.freva.asciitable.Column;
+import com.github.freva.asciitable.HorizontalAlign;
+import com.github.freva.asciitable.OverflowBehaviour;
+import org.aesh.command.CommandDefinition;
+import org.aesh.command.option.Argument;
+import org.aesh.command.option.Mixin;
+import org.aesh.command.option.Option;
+import org.apache.camel.dsl.jbang.core.common.CliException;
+import org.apache.camel.dsl.jbang.core.common.CompletionCandidates;
+import org.apache.camel.dsl.jbang.core.common.JsonOutput;
+import org.apache.camel.dsl.jbang.core.common.ProcessFinder.CamelProcess;
+import org.apache.camel.dsl.jbang.core.common.RowSort;
+import org.apache.camel.dsl.jbang.core.common.TerminalWidthHelper;
+import org.apache.camel.util.StringHelper;
+import org.apache.camel.util.TimeUtils;
+import org.apache.camel.util.json.JsonArray;
+import org.apache.camel.util.json.JsonObject;
+
+@CommandDefinition(name = "route-controller", description = "List status of route controller", generateHelp = true,
+                   footer = {
+                           "Examples:",
+                           "  camel get route-controller",
+                           "  camel get route-controller --json" })
+public class RouteControllerAction extends ActionWatchCommand {
+
+    private static final RowSort<Row> ORDER = new RowSort<Row>()
+            .text("id", r -> r.routeId)
+            .text("state", r -> r.status);
+
+    public static class IdStateCompletionCandidates extends CompletionCandidates {
+
+        public IdStateCompletionCandidates() {
+        }
+
+        @Override
+        public Iterator<String> iterator() {
+            return List.of("id", "state").iterator();
+        }
+
+    }
+
+    @Argument(description = "Name or pid of running Camel integration")
+    String name = "*";
+
+    @Option(name = "sort", description = "Sort by id, or state", defaultValue = "id",
+            completer = IdStateCompletionCandidates.class)
+    String sort;
+
+    @Option(name = "header", hasValue = false, description = "Include controller configuration details", defaultValue = "true")
+    boolean header;
+
+    @Option(name = "trace", hasValue = false, description = "Include stack-traces in error messages", defaultValue = "true")
+    boolean trace;
+
+    @Option(name = "depth", description = "Max depth of stack-trace", defaultValue = "1")
+    int depth;
+
+    @Option(name = "json", hasValue = false, description = "Output in JSON Format")
+    boolean jsonOutput;
+
+    @Mixin
+    ActionTimeoutMixin timeoutOption;
+
+    private volatile long pid;
+
+    @Override
+    public Integer doWatchCall() throws Exception {
+        List<Row> rows = new ArrayList<>();
+
+        CamelProcess process = findOne(name);
+
+        // include stack-traces
+        if (trace && depth <= 1) {
+            depth = Integer.MAX_VALUE;
+        }
+
+        this.pid = process.pid();
+
+        JsonObject jo = executeAction(process, "route-controller",
+                root -> root.put("stacktrace", trace ? "true" : "false"));
+        boolean supervising = "SupervisingRouteController".equals(jo.getString("controller"));
+        JsonArray arr = (JsonArray) jo.get("routes");
+        if (arr == null) {
+            throw CliException.failure("Route controller data not available from the running integration");
+        }
+        if (jsonOutput) {
+            // the controller and its routes, as the integration answers
+            JsonOutput.print(printer(), jo);
+            return 0;
+        }
+        for (int i = 0; i < arr.size(); i++) {
+            JsonObject jt = (JsonObject) arr.get(i);
+
+            Row row = new Row();
+            row.routeId = jt.getString("routeId");
+            row.uri = jt.getString("uri");
+            row.status = jt.getString("status");
+
+            if (supervising) {
+                row.attempts = jt.getLong("attempts");
+                long time = jt.getLong("lastAttempt");
+                if (time > 0) {
+                    row.lastAttempt = TimeUtils.printSince(time);
+                }
+                time = jt.getLong("nextAttempt");
+                if (time > 0) {
+                    row.nextAttempt = TimeUtils.printDuration(time);
+                }
+                time = jt.getLong("elapsed");
+                if (time > 0) {
+                    row.elapsed = TimeUtils.printDuration(time);
+                }
+                row.supervising = jt.getString("supervising");
+                row.error = jt.getString("error");
+                row.stackTrace = jt.getCollection("stackTrace");
+            }
+
+            rows.add(row);
+        }
+
+        // sort rows
+        rows.sort(ORDER.comparator(sort));
+
+        if (watch) {
+            clearScreen();
+        }
+        if (!rows.isEmpty()) {
+            if (supervising) {
+                if (header) {
+                    printer().println("Supervising Route Controller");
+                    printer().printf("\tInitial Starting Routes: %b%n", jo.getBoolean("startingRoutes"));
+                    printer().printf("\tUnhealthy Routes: %b%n", jo.getBoolean("unhealthyRoutes"));
+                    printer().printf("\tRoutes Total: %s%n", jo.getInteger("totalRoutes"));
+                    printer().printf("\tRoutes Started: %d%n", jo.getLong("startedRoutes"));
+                    printer().printf("\tRoutes Restarting: %d%n", jo.getInteger("restartingRoutes"));
+                    printer().printf("\tRoutes Exhausted: %d%n", jo.getInteger("exhaustedRoutes"));
+                    // the delays and times in millis, and the attempts, are longs
+                    printer().printf("\tInitial Delay: %d%n", jo.getLong("initialDelay"));
+                    printer().printf("\tBackoff Delay: %d%n", jo.getLong("backoffDelay"));
+                    printer().printf("\tBackoff Max Delay: %d%n", jo.getLong("backoffMaxDelay"));
+                    printer().printf("\tBackoff Max Elapsed Time: %d%n", jo.getLong("backoffMaxElapsedTime"));
+                    printer().printf("\tBackoff Max Attempts: %d%n", jo.getLong("backoffMaxAttempts"));
+                    printer().printf("\tThread Pool Size: %d%n", jo.getInteger("threadPoolSize"));
+                    printer().printf("\tUnhealthy On Restarting: %b%n", jo.getBoolean("unhealthyOnRestarting"));
+                    printer().printf("\tUnhealthy On Exhaust: %b%n", jo.getBoolean("unhealthyOnExhausted"));
+                    printer().println("\n");
+                }
+                dumpTable(rows, true);
+            } else {
+                if (header) {
+                    printer().println("Default Route Controller");
+                    // only the supervising route controller tells
+                    if (jo.containsKey("startingRoutes")) {
+                        printer().printf("\tStarting Routes: %b%n", jo.getBoolean("startingRoutes"));
+                    }
+                    printer().printf("\tRoutes Total: %s%n", jo.getInteger("totalRoutes"));
+                    printer().println("\n");
+                }
+                dumpTable(rows, false);
+            }
+        }
+
+        return 0;
+    }
+
+    protected void dumpTable(List<Row> rows, boolean supervised) {
+        int tw = terminalWidth();
+        int fixedWidth = 25 + 12 + (supervised ? 10 + 10 + 10 : 0); // ID + STATE + ATTEMPT + ELAPSED + LAST-AGO
+        int colCount = supervised ? 7 : 3;
+        int borderOverhead = TerminalWidthHelper.noBorderOverhead(colCount);
+        int uriWidth = TerminalWidthHelper.flexWidth(tw, fixedWidth + (supervised ? 80 : 0), borderOverhead, 20, 60);
+        int errorWidth = supervised
+                ? TerminalWidthHelper.flexWidth(tw, fixedWidth + uriWidth, borderOverhead, 20, 80) : 80;
+
+        printer().println(AsciiTable.getTable(AsciiTable.NO_BORDERS, rows, Arrays.asList(
+                new Column().header("ID").dataAlign(HorizontalAlign.LEFT).maxWidth(25, OverflowBehaviour.ELLIPSIS_RIGHT)
+                        .with(r -> r.routeId),
+                new Column().header("URI").dataAlign(HorizontalAlign.LEFT).maxWidth(uriWidth, OverflowBehaviour.ELLIPSIS_RIGHT)
+                        .with(r -> r.uri),
+                new Column().header("STATE").headerAlign(HorizontalAlign.RIGHT).with(this::getSupervising),
+                new Column().visible(supervised).header("ATTEMPT").headerAlign(HorizontalAlign.CENTER)
+                        .dataAlign(HorizontalAlign.CENTER).with(this::getAttempts),
+                new Column().visible(supervised).header("ELAPSED").headerAlign(HorizontalAlign.CENTER).with(this::getElapsed),
+                new Column().visible(supervised).header("LAST-AGO").headerAlign(HorizontalAlign.CENTER).with(this::getLast),
+                new Column().visible(supervised).header("ERROR-MESSAGE").headerAlign(HorizontalAlign.LEFT)
+                        .dataAlign(HorizontalAlign.LEFT)
+                        .maxWidth(errorWidth, OverflowBehaviour.ELLIPSIS_RIGHT).with(r -> r.error))));
+
+        if (supervised && trace) {
+            rows = rows.stream().filter(r -> r.error != null && !r.error.isEmpty()).collect(Collectors.toList());
+            if (!rows.isEmpty()) {
+                for (Row row : rows) {
+                    printer().println("\n");
+                    printer().println(StringHelper.fillChars('-', 120));
+                    printer().println(StringHelper.padString(1, 55) + "STACK-TRACE");
+                    printer().println(StringHelper.fillChars('-', 120));
+                    StringBuilder sb = new StringBuilder();
+                    sb.append(String.format("\tID: %s%n", row.routeId));
+                    sb.append(String.format("\tURI: %s%n", row.uri));
+                    sb.append(String.format("\tSTATE: %s%n", getSupervising(row)));
+                    for (int i = 0; i < depth && i < row.stackTrace.size(); i++) {
+                        sb.append(String.format("\t%s%n", row.stackTrace.get(i)));
+                    }
+                    printer().println(String.valueOf(sb));
+                }
+            }
+        }
+    }
+
+    protected String getSupervising(Row r) {
+        if (r.supervising != null) {
+            if ("Active".equals(r.supervising)) {
+                if (r.attempts <= 1) {
+                    return "Starting";
+                } else {
+                    return "Restarting";
+                }
+            }
+            return r.supervising;
+        }
+        return r.status;
+    }
+
+    protected String getAttempts(Row r) {
+        if (r.supervising != null) {
+            return Long.toString(r.attempts);
+        }
+        return "";
+    }
+
+    protected String getLast(Row r) {
+        if (r.lastAttempt != null && !r.lastAttempt.isEmpty()) {
+            return r.lastAttempt;
+        }
+        return "";
+    }
+
+    protected String getElapsed(Row r) {
+        if (r.elapsed != null && !r.elapsed.isEmpty()) {
+            return r.elapsed;
+        }
+        return "";
+    }
+
+    private static class Row {
+        String routeId;
+        String status;
+        String uri;
+        long attempts;
+        String lastAttempt;
+        String nextAttempt;
+        String elapsed;
+        String supervising;
+        String error;
+        List<String> stackTrace;
+    }
+
+}

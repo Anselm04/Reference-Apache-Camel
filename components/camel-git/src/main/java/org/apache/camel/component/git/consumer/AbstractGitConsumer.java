@@ -1,0 +1,154 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.camel.component.git.consumer;
+
+import java.util.Queue;
+
+import org.apache.camel.Exchange;
+import org.apache.camel.ExchangePropertyKey;
+import org.apache.camel.Processor;
+import org.apache.camel.component.git.GitEndpoint;
+import org.apache.camel.component.git.RepositoryFactory;
+import org.apache.camel.support.ScheduledBatchPollingConsumer;
+import org.eclipse.jgit.api.Git;
+import org.eclipse.jgit.lib.Repository;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+public abstract class AbstractGitConsumer extends ScheduledBatchPollingConsumer {
+
+    private static final Logger LOG = LoggerFactory.getLogger(AbstractGitConsumer.class);
+
+    private final GitEndpoint endpoint;
+    private Repository repo;
+    private Git git;
+    // whether the last poll found items to deliver, consumed or not
+    private boolean lastPollFoundItems;
+
+    protected AbstractGitConsumer(GitEndpoint endpoint, Processor processor) {
+        super(endpoint, processor);
+        this.endpoint = endpoint;
+    }
+
+    @Override
+    protected void doStart() throws Exception {
+        // open the repository before super.doStart() starts the scheduler, which may poll at once (initialDelay=0)
+        this.repo = getLocalRepository();
+        this.git = new Git(repo);
+        super.doStart();
+    }
+
+    @Override
+    protected void doStop() throws Exception {
+        super.doStop();
+        repo.close();
+        git.close();
+    }
+
+    private Repository getLocalRepository() {
+        return RepositoryFactory.of(endpoint);
+    }
+
+    public Repository getRepository() {
+        return repo;
+    }
+
+    protected Git getGit() {
+        return git;
+    }
+
+    /**
+     * Hands the exchanges of a poll to the route.
+     *
+     * @return the number of items marked consumed. A failed item, or one that was not handed to the route, is not
+     *         counted: a poll whose items all failed does not make a greedy consumer poll again at once, and the
+     *         backoff options count it as an idle poll.
+     */
+    @Override
+    public int processBatch(Queue<Object> exchanges) throws Exception {
+        int total = exchanges.size();
+        int consumed = 0;
+        lastPollFoundItems = total > 0;
+        if (this.maxMessagesPerPoll > 0 && total > this.maxMessagesPerPoll) {
+            LOG.debug("Limiting to maximum messages to poll {} as there were {} messages in this poll.",
+                    this.maxMessagesPerPoll, total);
+            total = this.maxMessagesPerPoll;
+        }
+
+        for (int index = 0; index < total && this.isBatchAllowed(); ++index) {
+            Exchange exchange = (Exchange) exchanges.poll();
+            exchange.setProperty(ExchangePropertyKey.BATCH_INDEX, index);
+            exchange.setProperty(ExchangePropertyKey.BATCH_SIZE, total);
+            exchange.setProperty(ExchangePropertyKey.BATCH_COMPLETE, index == total - 1);
+            this.pendingExchanges = total - index - 1;
+            Object value = onPreProcessed(exchange);
+            try {
+                // only an item the route accepted is marked consumed, so a failed one is delivered again on the
+                // next poll
+                if (processExchange(exchange)) {
+                    onProcessed(exchange, value);
+                    consumed++;
+                }
+            } finally {
+                releaseExchange(exchange, false);
+            }
+        }
+
+        // release the exchanges that were not handed to the route, when the consumer stops in the middle of a batch
+        Exchange remaining;
+        while ((remaining = (Exchange) exchanges.poll()) != null) {
+            releaseExchange(remaining, false);
+        }
+
+        return consumed;
+    }
+
+    @Override
+    protected void processEmptyMessage() throws Exception {
+        // a poll whose items all failed counts no item, but it found and delivered them, so it is not idle
+        if (!lastPollFoundItems) {
+            super.processEmptyMessage();
+        }
+    }
+
+    /**
+     * Hands the exchange to the route and reports a failure through the exception handler of the consumer.
+     * <p/>
+     * A route that fails does not throw from {@code process()}: the failure is left on the exchange, so it is read
+     * there. The exchange is created with {@code createExchange(false)}, so it is not reset before its outcome is read.
+     *
+     * @return {@code true} if the route processed the exchange without a failure
+     */
+    private boolean processExchange(Exchange exchange) {
+        try {
+            getProcessor().process(exchange);
+        } catch (Exception e) {
+            exchange.setException(e);
+        }
+        Exception cause = exchange.getException();
+        if (cause != null) {
+            getExceptionHandler().handleException("Error processing exchange", exchange, cause);
+            return false;
+        }
+        return true;
+    }
+
+    public abstract Object onPreProcessed(Exchange exchange);
+
+    public abstract void onProcessed(Exchange exchange, Object value);
+
+}

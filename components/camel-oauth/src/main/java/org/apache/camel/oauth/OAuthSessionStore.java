@@ -1,0 +1,44 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.camel.oauth;
+
+import java.util.Optional;
+
+import org.apache.camel.Exchange;
+
+public interface OAuthSessionStore {
+
+    Optional<OAuthSession> getSession(Exchange exchange);
+
+    OAuthSession createSession(Exchange exchange);
+
+    /**
+     * Rotates the session, replacing the current session identifier with a newly generated one and transferring any
+     * session state.
+     *
+     * @implNote          The default implementation is a no-op that returns the existing session unchanged.
+     *                    Implementors MUST override this method to prevent session fixation — failing to do so leaves
+     *                    the session identifier unchanged across privilege escalation (login).
+     *
+     * @param    exchange the current exchange
+     * @param    session  the existing session to rotate
+     * @return            the rotated session with a new session identifier
+     */
+    default OAuthSession rotateSession(Exchange exchange, OAuthSession session) {
+        return session;
+    }
+}

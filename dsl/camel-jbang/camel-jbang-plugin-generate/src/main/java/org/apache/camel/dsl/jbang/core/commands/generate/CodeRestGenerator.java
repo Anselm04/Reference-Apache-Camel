@@ -1,0 +1,239 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.camel.dsl.jbang.core.commands.generate;
+
+import java.io.File;
+import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
+import java.nio.file.StandardCopyOption;
+import java.util.Iterator;
+import java.util.List;
+import java.util.Map;
+import java.util.stream.Stream;
+
+import io.swagger.v3.oas.models.OpenAPI;
+import io.swagger.v3.parser.OpenAPIV3Parser;
+import org.aesh.command.CommandDefinition;
+import org.aesh.command.option.Option;
+import org.apache.camel.CamelContext;
+import org.apache.camel.dsl.jbang.core.commands.CamelCommand;
+import org.apache.camel.dsl.jbang.core.common.CliExitCode;
+import org.apache.camel.dsl.jbang.core.common.CompletionCandidates;
+import org.apache.camel.dsl.jbang.core.common.RuntimeCompletionCandidates;
+import org.apache.camel.dsl.jbang.core.common.RuntimeTypeConverter;
+import org.apache.camel.dsl.jbang.run.common.RuntimeType;
+import org.apache.camel.generator.openapi.RestDslGenerator;
+import org.apache.camel.impl.DefaultCamelContext;
+import org.apache.camel.util.FileUtil;
+import org.apache.logging.log4j.Level;
+import org.apache.logging.log4j.core.config.Configurator;
+import org.openapitools.codegen.ClientOptInput;
+import org.openapitools.codegen.DefaultGenerator;
+import org.openapitools.codegen.config.CodegenConfigurator;
+
+import static org.openapitools.codegen.CodegenConstants.GENERATE_MODELS;
+import static org.openapitools.codegen.CodegenConstants.SERIALIZABLE_MODEL;
+
+@CommandDefinition(name = "rest", description = "Generate REST DSL source code from OpenApi specification", generateHelp = true,
+                   sortOptions = true)
+public class CodeRestGenerator extends CamelCommand {
+
+    public static class OpenApiVersionCompletionCandidates extends CompletionCandidates {
+
+        public OpenApiVersionCompletionCandidates() {
+        }
+
+        @Override
+        public Iterator<String> iterator() {
+            return List.of("3.0", "3.1").iterator();
+        }
+
+    }
+
+    public static class OpenApiTypeCompletionCandidates extends CompletionCandidates {
+
+        public OpenApiTypeCompletionCandidates() {
+        }
+
+        @Override
+        public Iterator<String> iterator() {
+            return List.of("xml", "yaml").iterator();
+        }
+
+    }
+
+    @Option(name = "input", description = "OpenApi specification file name", required = true)
+    private String input;
+    @Option(name = "output", description = "Output REST DSL file name")
+    private String output;
+    @Option(name = "type", description = "REST DSL type (YAML or XML)", defaultValue = "yaml",
+            completer = OpenApiTypeCompletionCandidates.class)
+    private String type;
+    @Option(name = "routes", hasValue = false, description = "Generate routes (only in YAML)")
+    private boolean generateRoutes;
+    @Option(name = "dto", hasValue = false, description = "Generate Java Data Objects")
+    private boolean generateDataObjects;
+    @Option(name = "runtime", description = "Runtime (${COMPLETION-CANDIDATES})", defaultValue = "quarkus",
+            completer = RuntimeCompletionCandidates.class, converter = RuntimeTypeConverter.class)
+    RuntimeType runtime = RuntimeType.quarkus;
+    @Option(name = "package", description = "Package for generated Java models", defaultValue = "model")
+    private String packageName;
+    @Option(name = "openapi-version", description = "Openapi specification 3.0 or 3.1", defaultValue = "3.0",
+            completer = OpenApiVersionCompletionCandidates.class)
+    private String openApiVersion = "3.0";
+
+    @Override
+    public Integer doCall() throws Exception {
+        // validate that the input file exists; a URL is read by the parser (it was refused as a file that does not exist)
+        File f = new File(input);
+        if (!isUrl(input) && !f.isFile()) {
+            printer().printErr("Input file " + input + " does not exist");
+            return CliExitCode.FILE_NOT_FOUND;
+        }
+
+        OpenAPI doc;
+
+        OpenAPIV3Parser parser = new OpenAPIV3Parser();
+        doc = parser.read(input);
+
+        if (doc == null) {
+            printer().printErr("Failed to parse OpenAPI specification: " + input);
+            return CliExitCode.FAILURE;
+        }
+
+        Configurator.setRootLevel(Level.OFF);
+        try (CamelContext context = new DefaultCamelContext()) {
+            String text = null;
+            if ("yaml".equalsIgnoreCase(type)) {
+                text = RestDslGenerator.toYaml(doc)
+                        .withDtoPackageName(generateDataObjects ? packageName : null)
+                        .generate(context, generateRoutes);
+            } else if ("xml".equalsIgnoreCase(type)) {
+                text = RestDslGenerator.toXml(doc)
+                        .withDtoPackageName(generateDataObjects ? packageName : null)
+                        .generate(context);
+            } else {
+                printer().printErr("Unknown type: " + type + " (supported: yaml, xml)");
+                return CliExitCode.USAGE;
+            }
+            if (text != null) {
+                if (output == null) {
+                    printer().println(text);
+                } else {
+                    Files.write(Paths.get(output), text.getBytes());
+                }
+            }
+        }
+        if (generateDataObjects) {
+            Path packageDir = packageDirectory();
+            try {
+                generateDto(packageDir);
+            } catch (IOException e) {
+                printer().printErr("Failed to write the generated DTOs to " + packageDir, e);
+                return CliExitCode.FAILURE;
+            }
+        }
+        return 0;
+    }
+
+    private static boolean isUrl(String input) {
+        return input.startsWith("http://") || input.startsWith("https://");
+    }
+
+    /**
+     * The directory of the package of the DTOs, in the working directory.
+     */
+    Path packageDirectory() {
+        return Paths.get(packageName.replace('.', File.separatorChar));
+    }
+
+    /**
+     * The temporary directory that the generator writes into.
+     */
+    Path createTempDirectory() throws IOException {
+        return Files.createTempDirectory("gendto");
+    }
+
+    // the generator writes into a temporary directory, from which the DTOs are copied into the directory of their package
+    private void generateDto(Path packageDir) throws IOException {
+        final String code = "code";
+        // the DTOs of Spring Boot may use Spring (such as @DateTimeFormat); the others only Jackson and Jakarta, as a
+        // Camel Main project has no Spring (CAMEL-26933)
+        final boolean springBoot = RuntimeType.springBoot.equals(runtime);
+        final String generatorName = springBoot ? "java-camel" : "jaxrs-spec";
+        final String library = springBoot ? "spring-boot" : "quarkus";
+        File output = createTempDirectory().toFile();
+        try {
+            generateDto(code, generatorName, library, output);
+            Path generated = output.toPath().resolve(code).resolve(packageName.replace('.', File.separatorChar));
+            if (Files.isDirectory(generated)) {
+                copyDirectory(generated, packageDir);
+            } else {
+                printer().printWarn("No DTOs were generated: the specification " + input + " has no schemas");
+            }
+        } finally {
+            FileUtil.removeDir(output);
+        }
+    }
+
+    private void generateDto(String code, String generatorName, String library, File output) {
+        final CodegenConfigurator configurator = new CodegenConfigurator()
+                .setGeneratorName(generatorName)
+                .setLibrary(library)
+                .setInputSpec(input)
+                .setModelPackage(packageName)
+                // the DTOs compile with what a Camel 4 project has: Jakarta EE (not javax), no JsonNullable of
+                // jackson-databind-nullable, and no Swagger annotations (CAMEL-26933)
+                .setAdditionalProperties(
+                        Map.ofEntries(
+                                Map.entry(SERIALIZABLE_MODEL, "false"),
+                                Map.entry("useJakartaEe", "true"),
+                                Map.entry("useSwaggerAnnotations", "false"),
+                                Map.entry("documentationProvider", "none"),
+                                Map.entry("annotationLibrary", "none"),
+                                Map.entry("openApiNullable", "false"),
+                                Map.entry(GENERATE_MODELS, "true"),
+                                Map.entry("generatePom", "false"),
+                                Map.entry("generateApis", "false"),
+                                Map.entry("sourceFolder", code)))
+                // no banner of the generator on stdout, where the REST DSL is printed
+                .addGlobalProperty("quiet", "true")
+                .setOutputDir(output.getAbsolutePath());
+
+        final ClientOptInput clientOptInput = configurator.toClientOptInput();
+        new DefaultGenerator().opts(clientOptInput).generate();
+    }
+
+    /**
+     * Copies the files of the directory into the target directory, which it creates with its parents. A file of the
+     * target directory is replaced (such as the DTO of an earlier run), and the other files are kept.
+     */
+    static void copyDirectory(Path source, Path target) throws IOException {
+        try (Stream<Path> files = Files.walk(source)) {
+            for (Path file : (Iterable<Path>) files::iterator) {
+                Path copy = target.resolve(source.relativize(file).toString());
+                if (Files.isDirectory(file)) {
+                    Files.createDirectories(copy);
+                } else {
+                    Files.copy(file, copy, StandardCopyOption.REPLACE_EXISTING);
+                }
+            }
+        }
+    }
+}

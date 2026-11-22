@@ -1,0 +1,147 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.camel.coap;
+
+import java.util.Locale;
+
+import org.apache.camel.CamelExchangeException;
+import org.apache.camel.Exchange;
+import org.apache.camel.InvalidPayloadException;
+import org.apache.camel.Message;
+import org.apache.camel.support.DefaultProducer;
+import org.apache.camel.util.URISupport;
+import org.eclipse.californium.core.CoapClient;
+import org.eclipse.californium.core.CoapResponse;
+import org.eclipse.californium.core.coap.MediaTypeRegistry;
+import org.eclipse.californium.core.network.Endpoint;
+
+/**
+ * The CoAP producer.
+ */
+public class CoAPProducer extends DefaultProducer {
+    private final CoAPEndpoint endpoint;
+    // set by initClient under the lock, and set to null by doStop, which BaseService.stop runs under the same lock;
+    // volatile for the readers that do not take the lock (getClient)
+    private volatile CoapClient client;
+    private boolean shutdownClient;
+
+    public CoAPProducer(CoAPEndpoint endpoint) {
+        super(endpoint);
+        this.endpoint = endpoint;
+    }
+
+    public CoapClient getClient() {
+        return client;
+    }
+
+    public void setClient(CoapClient client) {
+        this.client = client;
+    }
+
+    @Override
+    public void process(Exchange exchange) throws Exception {
+        // doStop sets the client field to null, possibly while this request is in flight: take the client once, under
+        // the lock that doStop holds, so it cannot become null between initClient and this read
+        CoapClient coapClient;
+        lock.lock();
+        try {
+            initClient();
+            coapClient = client;
+        } finally {
+            lock.unlock();
+        }
+
+        String ct = exchange.getIn().getHeader(CoAPConstants.CONTENT_TYPE, String.class);
+        if (ct == null) {
+            // ?default?
+            ct = "application/octet-stream";
+        }
+        // the method header may be given in lower case
+        String method = CoAPHelper.getDefaultMethod(exchange, coapClient).toUpperCase(Locale.ROOT);
+        int mediaType = MediaTypeRegistry.parse(ct);
+        CoapResponse response = null;
+        boolean pingResponse = false;
+        switch (method) {
+            case CoAPConstants.METHOD_GET:
+                response = coapClient.get();
+                break;
+            case CoAPConstants.METHOD_DELETE:
+                response = coapClient.delete();
+                break;
+            case CoAPConstants.METHOD_POST:
+                response = coapClient.post(getPayload(exchange), mediaType);
+                break;
+            case CoAPConstants.METHOD_PUT:
+                response = coapClient.put(getPayload(exchange), mediaType);
+                break;
+            case CoAPConstants.METHOD_PING:
+                pingResponse = coapClient.ping();
+                break;
+            default:
+                throw new IllegalArgumentException("Unsupported CoAP method: " + method);
+        }
+
+        if (response != null) {
+            CoAPHelper.convertCoapResponseToMessage(response, exchange.getOut());
+        } else if (!method.equals(CoAPConstants.METHOD_PING)) {
+            // the client returns null when no response was received (timeout, rejected or cancelled request)
+            throw new CamelExchangeException(
+                    "No response received from CoAP server for " + method + ": " + URISupport.sanitizeUri(coapClient.getURI()),
+                    exchange);
+        }
+
+        if (method.equals(CoAPConstants.METHOD_PING)) {
+            Message resp = exchange.getOut();
+            resp.setBody(pingResponse);
+        }
+    }
+
+    private static byte[] getPayload(Exchange exchange) throws InvalidPayloadException {
+        Message in = exchange.getIn();
+        if (in.getBody() == null) {
+            return null;
+        }
+        // a body that cannot be converted fails the exchange, instead of being sent as an empty payload
+        return in.getMandatoryBody(byte[].class);
+    }
+
+    protected void initClient() throws Exception {
+        lock.lock();
+        try {
+            if (client == null) {
+                client = endpoint.createCoapClient(endpoint.getUri());
+                shutdownClient = true;
+            }
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    @Override
+    protected void doStop() throws Exception {
+        if (shutdownClient && client != null) {
+            // the client was created by this producer with its own endpoint (createCoapClient), which
+            // CoapClient.shutdown() does not release (bound socket and connector threads)
+            Endpoint clientEndpoint = client.getEndpoint();
+            client.shutdown();
+            if (clientEndpoint != null) {
+                clientEndpoint.destroy();
+            }
+            client = null;
+        }
+    }
+}

@@ -1,0 +1,283 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.camel.dsl.jbang.core.commands.action;
+
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Iterator;
+import java.util.List;
+
+import com.github.freva.asciitable.AsciiTable;
+import com.github.freva.asciitable.Column;
+import com.github.freva.asciitable.HorizontalAlign;
+import com.github.freva.asciitable.OverflowBehaviour;
+import org.aesh.command.CommandDefinition;
+import org.aesh.command.option.Argument;
+import org.aesh.command.option.Mixin;
+import org.aesh.command.option.Option;
+import org.aesh.command.option.OptionList;
+import org.apache.camel.dsl.jbang.core.common.CliException;
+import org.apache.camel.dsl.jbang.core.common.CompletionCandidates;
+import org.apache.camel.dsl.jbang.core.common.JsonOutput;
+import org.apache.camel.dsl.jbang.core.common.ProcessFinder.CamelProcess;
+import org.apache.camel.dsl.jbang.core.common.RowSort;
+import org.apache.camel.dsl.jbang.core.common.TerminalWidthHelper;
+import org.apache.camel.support.PatternHelper;
+import org.apache.camel.util.StringHelper;
+import org.apache.camel.util.json.JsonArray;
+import org.apache.camel.util.json.JsonObject;
+
+@CommandDefinition(name = "thread-dump", description = "List threads in a running Camel integration", generateHelp = true,
+                   footer = {
+                           "Examples:",
+                           "  camel cmd thread-dump",
+                           "  camel cmd thread-dump --trace",
+                           "  camel cmd thread-dump --json" })
+public class CamelThreadDump extends ActionWatchCommand {
+
+    private static final RowSort<Row> ORDER = new RowSort<Row>()
+            .numeric("id", r -> r.id)
+            .text("name", r -> r.name)
+            .text("state", r -> r.state);
+
+    public static class IdNameStateCompletionCandidates extends CompletionCandidates {
+
+        public IdNameStateCompletionCandidates() {
+        }
+
+        @Override
+        public Iterator<String> iterator() {
+            return List.of("id", "name", "state").iterator();
+        }
+
+    }
+
+    public static class StateCompletionCandidates extends CompletionCandidates {
+
+        public StateCompletionCandidates() {
+        }
+
+        @Override
+        public Iterator<String> iterator() {
+            return List.of("RUNNABLE", "BLOCKED", "WAITING", "TIMED_WAITING").iterator();
+        }
+
+    }
+
+    @Argument(description = "Name or pid of running Camel integration")
+    String name = "*";
+
+    @Option(name = "sort", description = "Sort by id, name or state", defaultValue = "id",
+            completer = IdNameStateCompletionCandidates.class)
+    String sort;
+
+    @OptionList(name = "filter", valueSeparator = OptionList.NO_SEPARATOR,
+                description = "Filter thread names/ids (use all to include all threads)", defaultValue = "Camel")
+    String[] filters;
+
+    @Option(name = "state", description = "To only show threads for a given state", completer = StateCompletionCandidates.class)
+    String state;
+
+    @Option(name = "trace", hasValue = false, description = "Include stack-traces", defaultValue = "false")
+    boolean trace;
+
+    @Option(name = "depth", description = "Max depth of stack-trace", defaultValue = "1")
+    int depth;
+
+    @Option(name = "json", hasValue = false, description = "Output in JSON Format")
+    boolean jsonOutput;
+
+    @Mixin
+    ActionTimeoutMixin timeoutOption;
+
+    private volatile long pid;
+
+    @Override
+    public Integer doWatchCall() throws Exception {
+        List<Row> rows = new ArrayList<>();
+
+        CamelProcess process = findOne(name);
+
+        // include stack-traces
+        if (trace && depth <= 1) {
+            depth = Integer.MAX_VALUE;
+        }
+
+        this.pid = process.pid();
+
+        JsonObject jo = executeAction(process, "thread-dump", null);
+        JsonArray arr = (JsonArray) jo.get("threads");
+        if (arr == null) {
+            throw CliException.failure("Thread dump data not available from the running integration");
+        }
+        for (int i = 0; i < arr.size(); i++) {
+            JsonObject jt = (JsonObject) arr.get(i);
+
+            Row row = new Row();
+            row.id = jt.getLong("id");
+            row.name = jt.getString("name");
+            row.state = jt.getString("state");
+
+            // filter
+            boolean match = false;
+            for (String filter : filters) {
+                match |= "all".equalsIgnoreCase(filter) || filter.equals("" + row.id)
+                        || StringHelper.containsIgnoreCase(row.name, filter)
+                        || PatternHelper.matchPattern(row.name, filter);
+            }
+            // state
+            if (state != null) {
+                match &= StringHelper.containsIgnoreCase(row.state, state);
+            }
+            if (!match) {
+                continue;
+            }
+
+            row.waited = jt.getLong("waitedCount");
+            row.waitedTime = jt.getLong("waitedTime");
+            row.blocked = jt.getLong("blockedCount");
+            row.blockedTime = jt.getLong("blockedTime");
+            row.lock = jt.getString("lockName");
+            row.stackTrace = jt.getCollection("stackTrace");
+            rows.add(row);
+        }
+
+        // sort rows
+        rows.sort(ORDER.comparator(sort));
+
+        int total = jo.getIntegerOrDefault("threadCount", 0);
+        int peak = jo.getIntegerOrDefault("peakThreadCount", 0);
+        if (jsonOutput) {
+            JsonObject answer = new JsonObject();
+            answer.put("pid", pid);
+            answer.put("threadCount", total);
+            answer.put("peakThreadCount", peak);
+            answer.put("threads", rows.stream().map(this::toJson).toList());
+            JsonOutput.print(printer(), answer);
+            return 0;
+        }
+        if (watch) {
+            clearScreen();
+        }
+        if (!rows.isEmpty()) {
+            printer().printf("PID: %s\tThreads: %d\tPeak: %d\t\tDisplay: %d/%d%n", pid, total, peak, rows.size(), total);
+
+            if (depth == 1) {
+                singleTable(rows);
+            } else {
+                tableAndStackTrace(rows);
+            }
+        }
+
+        return 0;
+    }
+
+    private JsonObject toJson(Row r) {
+        JsonObject jo = new JsonObject();
+        jo.put("id", r.id);
+        jo.put("name", r.name);
+        jo.put("state", r.state);
+        jo.put("waitedCount", r.waited);
+        jo.put("waitedTime", r.waitedTime);
+        jo.put("blockedCount", r.blocked);
+        jo.put("blockedTime", r.blockedTime);
+        if (r.lock != null) {
+            jo.put("lockName", r.lock);
+        }
+        if (r.stackTrace != null && !r.stackTrace.isEmpty()) {
+            // the top of the stack, or with --trace as deep as --depth
+            jo.put("stackTrace", r.stackTrace.subList(0, Math.min(depth, r.stackTrace.size())));
+        }
+        return jo;
+    }
+
+    protected void singleTable(List<Row> rows) {
+        int tw = terminalWidth();
+        int fixedWidth = 8 + 15 + 10 + 10; // ID + STATE + BLOCK + WAIT (approx)
+        int borderOverhead = TerminalWidthHelper.noBorderOverhead(6);
+        int nameWidth = TerminalWidthHelper.flexWidth(tw, fixedWidth + 70, borderOverhead, 20, 60);
+        int stackWidth = TerminalWidthHelper.flexWidth(tw, fixedWidth + nameWidth, borderOverhead, 20, 70);
+
+        printer().println(AsciiTable.getTable(AsciiTable.NO_BORDERS, rows, Arrays.asList(
+                new Column().header("ID").headerAlign(HorizontalAlign.CENTER).with(r -> Long.toString(r.id)),
+                new Column().header("NAME").dataAlign(HorizontalAlign.LEFT)
+                        .maxWidth(nameWidth, OverflowBehaviour.ELLIPSIS_RIGHT)
+                        .with(r -> r.name),
+                new Column().header("STATE").headerAlign(HorizontalAlign.RIGHT).with(r -> r.state),
+                new Column().header("BLOCK").with(this::getBlocked),
+                new Column().header("WAIT").with(this::getWaited),
+                new Column().header("STACKTRACE").headerAlign(HorizontalAlign.RIGHT)
+                        .maxWidth(stackWidth, OverflowBehaviour.ELLIPSIS_LEFT).with(this::getStackTrace))));
+    }
+
+    protected void tableAndStackTrace(List<Row> rows) {
+        int tw = terminalWidth();
+        int fixedWidth = 8 + 15 + 10 + 10; // ID + STATE + BLOCK + WAIT (approx)
+        int borderOverhead = TerminalWidthHelper.noBorderOverhead(5);
+        int nameWidth = TerminalWidthHelper.flexWidth(tw, fixedWidth, borderOverhead, 20, 60);
+
+        for (Row row : rows) {
+            printer().println(AsciiTable.getTable(AsciiTable.NO_BORDERS, List.of(row), Arrays.asList(
+                    new Column().header("ID").headerAlign(HorizontalAlign.CENTER).with(r -> Long.toString(r.id)),
+                    new Column().header("NAME").dataAlign(HorizontalAlign.LEFT)
+                            .maxWidth(nameWidth, OverflowBehaviour.ELLIPSIS_RIGHT)
+                            .with(r -> r.name),
+                    new Column().header("STATE").headerAlign(HorizontalAlign.RIGHT).with(r -> r.state),
+                    new Column().header("BLOCK").with(this::getBlocked),
+                    new Column().header("WAIT").with(this::getWaited))));
+            for (int i = 0; i < depth && i < row.stackTrace.size(); i++) {
+                printer().println("\t" + row.stackTrace.get(i));
+            }
+        }
+    }
+
+    private String getBlocked(Row r) {
+        if (r.blockedTime > 0) {
+            return r.blocked + "(" + r.blockedTime + "ms)";
+        } else {
+            return Long.toString(r.blocked);
+        }
+    }
+
+    private String getWaited(Row r) {
+        if (r.waitedTime > 0) {
+            return r.waited + "(" + r.waitedTime + "ms)";
+        } else {
+            return Long.toString(r.waited);
+        }
+    }
+
+    private String getStackTrace(Row r) {
+        if (r.stackTrace == null || r.stackTrace.isEmpty()) {
+            return "";
+        }
+        return r.stackTrace.get(0);
+    }
+
+    private static class Row {
+        long id;
+        String name;
+        String state;
+        long waited;
+        long waitedTime;
+        long blocked;
+        long blockedTime;
+        String lock;
+        List<String> stackTrace;
+    }
+
+}

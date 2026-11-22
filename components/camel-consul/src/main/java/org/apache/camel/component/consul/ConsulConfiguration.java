@@ -1,0 +1,108 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.camel.component.consul;
+
+import org.apache.camel.RuntimeCamelException;
+import org.apache.camel.spi.Metadata;
+import org.apache.camel.spi.UriParam;
+import org.apache.camel.spi.UriParams;
+import org.kiwiproject.consul.Consul;
+
+@UriParams
+public class ConsulConfiguration extends ConsulClientConfiguration {
+
+    @UriParam(label = "advanced")
+    @Metadata(autowired = true)
+    private Consul consulClient;
+    @UriParam
+    private String key;
+    @UriParam(label = "producer",
+              enums = "CHECKS,SERVICES,MEMBERS,AGENT,REGISTER,DEREGISTER,PUT,GET_VALUE,GET_VALUES,GET_KEYS,GET_SESSIONS,"
+                      + "DELETE_KEY,DELETE_KEYS,LOCK,UNLOCK,LIST_DATACENTERS,LIST_NODES,LIST_SERVICES,GET_SERVICE,GET_NODE,"
+                      + "NODE_CHECKS,SERVICE_CHECKS,SERVICE_INSTANCES,CREATE,DESTROY,INFO,LIST,RENEW,GET,EXECUTE,FIRE,"
+                      + "DATACENTERS,NODES,LEADER,PEERS")
+    private String action;
+    @UriParam
+    private boolean valueAsString;
+
+    public ConsulConfiguration() {
+    }
+
+    public String getAction() {
+        return action;
+    }
+
+    /**
+     * The default action. Can be overridden by CamelConsulAction. The actions depend on the API of the endpoint: agent
+     * has CHECKS, SERVICES, MEMBERS, AGENT, REGISTER and DEREGISTER; kv has PUT, GET_VALUE, GET_VALUES, GET_KEYS,
+     * GET_SESSIONS, DELETE_KEY, DELETE_KEYS, LOCK and UNLOCK; catalog has REGISTER, DEREGISTER, LIST_DATACENTERS,
+     * LIST_NODES, LIST_SERVICES, GET_SERVICE and GET_NODE; health has CHECKS, NODE_CHECKS, SERVICE_CHECKS and
+     * SERVICE_INSTANCES; session has CREATE, DESTROY, INFO, LIST and RENEW; preparedQuery has CREATE, GET and EXECUTE;
+     * event has FIRE and LIST; coordinates has DATACENTERS and NODES; status has LEADER and PEERS.
+     */
+    public void setAction(String action) {
+        this.action = action;
+    }
+
+    public boolean isValueAsString() {
+        return valueAsString;
+    }
+
+    /**
+     * Default to transform values retrieved from Consul i.e. on KV endpoint to string.
+     */
+    public void setValueAsString(boolean valueAsString) {
+        this.valueAsString = valueAsString;
+    }
+
+    public String getKey() {
+        return key;
+    }
+
+    /**
+     * The key (kv) or event name (event) that the consumer watches or that the producer acts on; the other APIs do not
+     * use it. In a producer, a CamelConsulKey header overrides it, unless the header still holds the key that a consul
+     * consumer received (the CamelConsulReceivedKey exchange property).
+     */
+    public void setKey(String key) {
+        this.key = key;
+    }
+
+    public Consul getConsulClient() {
+        return consulClient;
+    }
+
+    /**
+     * The consul client to use.
+     */
+    public void setConsulClient(Consul consulClient) {
+        this.consulClient = consulClient;
+    }
+
+    // ****************************************
+    // Copy
+    // ****************************************
+
+    @Override
+    public ConsulConfiguration copy() {
+        try {
+            return (ConsulConfiguration) super.clone();
+        } catch (CloneNotSupportedException e) {
+            throw new RuntimeCamelException(e);
+        }
+    }
+}

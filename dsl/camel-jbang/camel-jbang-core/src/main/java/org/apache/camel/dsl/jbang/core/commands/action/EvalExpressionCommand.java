@@ -1,0 +1,221 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.camel.dsl.jbang.core.commands.action;
+
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.List;
+
+import org.aesh.command.CommandDefinition;
+import org.aesh.command.option.Argument;
+import org.aesh.command.option.Mixin;
+import org.aesh.command.option.Option;
+import org.aesh.command.option.OptionList;
+import org.apache.camel.dsl.jbang.core.commands.MavenResolverMixin;
+import org.apache.camel.dsl.jbang.core.commands.Run;
+import org.apache.camel.dsl.jbang.core.common.ActionClient;
+import org.apache.camel.dsl.jbang.core.common.ActionClient.ActionResult;
+import org.apache.camel.dsl.jbang.core.common.CliException;
+import org.apache.camel.dsl.jbang.core.common.CommandLineHelper;
+import org.apache.camel.dsl.jbang.core.common.ProcessFinder;
+import org.apache.camel.dsl.jbang.core.common.ProcessFinder.CamelProcess;
+import org.apache.camel.dsl.jbang.core.common.TimeoutConverter;
+import org.apache.camel.dsl.jbang.run.common.PathUtils;
+import org.apache.camel.dsl.jbang.run.common.VersionHelper;
+import org.apache.camel.util.StringHelper;
+import org.apache.camel.util.json.JsonArray;
+import org.apache.camel.util.json.JsonObject;
+import org.apache.camel.util.json.Jsoner;
+
+@CommandDefinition(name = "expression", description = "Evaluates Camel expression", generateHelp = true,
+                   footer = {
+                           "Examples:",
+                           "  camel eval expression --language=simple --template='${body}' --body='Hello World'",
+                           "  camel eval expression myApp --language=simple --template='${header.foo}'" })
+public class EvalExpressionCommand extends ActionWatchCommand {
+
+    @Argument(description = "Name or pid of running Camel integration")
+    String name = "*";
+
+    @Option(name = "isolated", hasValue = false, description = "Whether to run evaluation isolated in local process",
+            defaultValue = "false")
+    boolean isolated;
+
+    @Option(name = "camel-version", description = "To run using a different Camel version than the default version.")
+    String camelVersion;
+
+    @Option(name = "language", description = "Language to use", defaultValue = "simple")
+    String language;
+
+    @Option(name = "predicate", hasValue = false, description = "Whether to force evaluating as predicate",
+            defaultValue = "false")
+    boolean predicate;
+
+    @Option(name = "template",
+            description = "The template to use for evaluating (prefix with file: to refer to loading template from file)",
+            required = true)
+    String template;
+
+    @Option(name = "body", description = "Message body (prefix with file: to refer to loading message body from file)")
+    String body;
+
+    @OptionList(name = "header", valueSeparator = OptionList.NO_SEPARATOR, description = "Message header (key=value)")
+    List<String> headers;
+
+    @OptionList(name = "variable", valueSeparator = OptionList.NO_SEPARATOR, description = "Exchange variable (key=value)")
+    List<String> variables;
+
+    @Option(name = "timeout", description = "Timeout waiting for evaluation to be done, in millis or as a duration such as 30s",
+            defaultValue = "10000", converter = TimeoutConverter.class)
+    long timeout = 10000;
+
+    @Option(name = "json", hasValue = false,
+            description = "Output in JSON Format: the result as {\"result\": ...}, and an error as the JSON of an error")
+    boolean jsonOutput;
+
+    @Mixin
+    MavenResolverMixin mavenResolver;
+
+    long pid;
+
+    @Override
+    public Integer doCall() throws Exception {
+        // as exceptions, so --json prints them as the JSON of an error
+        if (template == null || template.isBlank()) {
+            throw CliException.usage("Template is required");
+        }
+        if (template.startsWith("file:")) {
+            Path f = Path.of(template.substring(5));
+            if (!Files.exists(f)) {
+                throw CliException.fileNotFound("Template file does not exist: " + f);
+            }
+        }
+
+        Integer exit;
+        CamelProcess existing = null;
+        if (!isolated) {
+            if (name == null || "*".equals(name)) {
+                // without a name: the one running integration, else a new Camel
+                List<CamelProcess> processes = ProcessFinder.find("*");
+                existing = processes.size() == 1 ? processes.get(0) : null;
+            } else {
+                // a name or pid that matches no running integration, or more than one, is not found
+                existing = findOne(name);
+            }
+        }
+        if (existing != null) {
+            this.pid = existing.pid();
+            printer().printDiagnostic("Using existing running Camel integration to evaluate (pid: " + this.pid + ")");
+            exit = super.doCall();
+        } else {
+            try {
+                // start a new empty camel in the background
+                Run run = getMain().command(new Run());
+                // requires camel 4.3 onwards
+                if (camelVersion != null && VersionHelper.isLE(camelVersion, "4.2.0")) {
+                    throw CliException.usage("This requires Camel version 4.3 or newer");
+                }
+                exit = run.runTransformMessage(camelVersion, mavenResolver);
+                this.pid = run.spawnPid;
+                if (exit == 0) {
+                    exit = super.doCall();
+                }
+            } finally {
+                if (pid > 0) {
+                    // stop running camel as we are done
+                    Path parent = CommandLineHelper.getCamelDir();
+                    Path pidFile = parent.resolve(Long.toString(pid));
+                    if (Files.exists(pidFile)) {
+                        PathUtils.deleteFile(pidFile);
+                    }
+                }
+            }
+        }
+
+        return exit;
+    }
+
+    @Override
+    protected Integer doWatchCall() throws Exception {
+        JsonObject root = new JsonObject();
+        root.put("action", "eval");
+        root.put("language", language);
+        root.put("predicate", predicate);
+        // as they are: the action file is JSON, and the integration does not unescape them
+        root.put("template", template);
+        if (body != null) {
+            root.put("body", body);
+        }
+        if (headers != null) {
+            JsonArray arr = new JsonArray();
+            for (String h : headers) {
+                JsonObject jo = new JsonObject();
+                if (!h.contains("=")) {
+                    throw CliException.usage("Header must be in key=value format, was: " + h);
+                }
+                jo.put("key", StringHelper.before(h, "="));
+                jo.put("value", StringHelper.after(h, "="));
+                arr.add(jo);
+            }
+            root.put("headers", arr);
+        }
+        if (variables != null) {
+            JsonArray arr = new JsonArray();
+            for (String v : variables) {
+                JsonObject jo = new JsonObject();
+                if (!v.contains("=")) {
+                    throw CliException.usage("Variable must be in key=value format, was: " + v);
+                }
+                jo.put("key", StringHelper.before(v, "="));
+                jo.put("value", StringHelper.after(v, "="));
+                arr.add(jo);
+            }
+            root.put("variables", arr);
+        }
+
+        ActionResult answer = ActionClient.execute(pid, root, timeout);
+        JsonObject jo = answer.reply();
+        if (jo == null) {
+            throw new CliException(answer.exitCode(), "Evaluation timeout: " + answer.error());
+        }
+        String status = jo.getString("status");
+        if ("success".equals(status)) {
+            String result = jo.getString("result");
+            if (jsonOutput) {
+                JsonObject out = new JsonObject();
+                out.put("result", result);
+                printer().println(out.toJson());
+            } else {
+                printer().println(result);
+            }
+            return 0;
+        }
+        JsonObject cause = jo.getMap("exception");
+        String msg = cause != null ? cause.getString("message") : null;
+        if (msg == null) {
+            // the stack trace of the integration only when the error does not say what is wrong: the message of a
+            // syntax error shows the expression and where it is wrong, and the 30 lines of the stack trace before it
+            // hid that (CAMEL-26931)
+            String st = cause != null ? cause.getString("stackTrace") : null;
+            if (st != null) {
+                printer().printDiagnostic(Jsoner.unescape(st));
+            }
+        }
+        throw CliException.failure(msg != null ? Jsoner.unescape(msg) : "Evaluation failed: " + answer.error());
+    }
+
+}

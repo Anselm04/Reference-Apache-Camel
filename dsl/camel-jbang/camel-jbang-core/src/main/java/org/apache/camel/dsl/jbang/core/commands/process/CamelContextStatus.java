@@ -1,0 +1,367 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.camel.dsl.jbang.core.commands.process;
+
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.List;
+import java.util.Map;
+import java.util.Objects;
+import java.util.stream.Collectors;
+
+import com.github.freva.asciitable.AsciiTable;
+import com.github.freva.asciitable.Column;
+import com.github.freva.asciitable.HorizontalAlign;
+import com.github.freva.asciitable.OverflowBehaviour;
+import org.aesh.command.CommandDefinition;
+import org.aesh.command.option.Argument;
+import org.aesh.command.option.Option;
+import org.apache.camel.dsl.jbang.core.common.ListingFormat;
+import org.apache.camel.dsl.jbang.core.common.PidNameAgeCompletionCandidates;
+import org.apache.camel.dsl.jbang.core.common.ProcessHelper;
+import org.apache.camel.dsl.jbang.core.common.RowSort;
+import org.apache.camel.dsl.jbang.core.common.TerminalWidthHelper;
+import org.apache.camel.dsl.jbang.run.common.VersionHelper;
+import org.apache.camel.util.TimeUtils;
+import org.apache.camel.util.json.JsonArray;
+import org.apache.camel.util.json.JsonObject;
+import org.apache.camel.util.json.Jsoner;
+
+import static org.apache.camel.dsl.jbang.core.common.CamelCommandHelper.extractState;
+
+@CommandDefinition(name = "context", description = "Get status of Camel integrations", generateHelp = true,
+                   footer = {
+                           "Examples:",
+                           "  camel get context",
+                           "  camel get context myApp",
+                           "  camel get context --watch" })
+public class CamelContextStatus extends ProcessWatchCommand {
+
+    private static final RowSort<Row> ORDER = RowSort.<Row> integration(r -> r.pid, r -> r.name, r -> r.uptime);
+
+    @Argument(description = "Name or pid of running Camel integration")
+    String name = "*";
+
+    @Option(name = "sort", description = "Sort by pid, name or age", defaultValue = "pid",
+            completer = PidNameAgeCompletionCandidates.class)
+    String sort;
+
+    @Option(name = "remote", hasValue = false, description = "Break down counters into remote/total pairs")
+    boolean remote;
+
+    @Override
+    public Integer doProcessWatchCall() throws Exception {
+        List<Row> rows = new ArrayList<>();
+
+        forEachIntegration(name, (ph, root) -> {
+            // there must be a status file for the running Camel integration
+            Row row = new Row();
+            JsonObject context = (JsonObject) root.get("context");
+            if (context == null) {
+                return;
+            }
+            row.name = context.getString("name");
+            if ("CamelJBang".equals(row.name)) {
+                row.name = ProcessHelper.extractName(root, ph);
+            }
+            row.pid = Long.toString(ph.pid());
+            row.uptime = extractSince(ph);
+            row.age = TimeUtils.printSince(row.uptime);
+            JsonObject runtime = (JsonObject) root.get("runtime");
+            row.platform = extractPlatform(ph, runtime);
+            row.platformVersion = extractPlatformVersion(row.platform,
+                    runtime != null ? runtime.getString("platformVersion") : null);
+            row.state = context.getInteger("phase");
+            row.camelVersion = context.getString("version");
+            row.profile = context.getString("profile");
+            Map<String, ?> stats = context.getMap("statistics");
+            if (stats != null) {
+                Object thp = stats.get("exchangesThroughput");
+                if (thp != null) {
+                    row.throughput = thp.toString();
+                }
+                row.total = stats.get("exchangesTotal").toString();
+                Object num = stats.get("remoteExchangesTotal");
+                if (num != null) {
+                    row.totalRemote = num.toString();
+                }
+                row.failed = stats.get("exchangesFailed").toString();
+                num = stats.get("remoteExchangesFailed");
+                if (num != null) {
+                    row.failedRemote = num.toString();
+                }
+                row.inflight = stats.get("exchangesInflight").toString();
+                num = stats.get("remoteExchangesInflight");
+                if (num != null) {
+                    row.inflightRemote = num.toString();
+                }
+                Object last = stats.get("lastProcessingTime");
+                if (last != null) {
+                    row.last = last.toString();
+                }
+                last = stats.get("deltaProcessingTime");
+                if (last != null) {
+                    row.delta = last.toString();
+                }
+                last = stats.get("lastCreatedExchangeTimestamp");
+                if (last != null) {
+                    long time = Long.parseLong(last.toString());
+                    row.sinceLastStarted = TimeUtils.printSince(time);
+                }
+                last = stats.get("lastCompletedExchangeTimestamp");
+                if (last != null) {
+                    long time = Long.parseLong(last.toString());
+                    row.sinceLastCompleted = TimeUtils.printSince(time);
+                }
+                last = stats.get("lastFailedExchangeTimestamp");
+                if (last != null) {
+                    long time = Long.parseLong(last.toString());
+                    row.sinceLastFailed = TimeUtils.printSince(time);
+                }
+                row.reloaded = (String) stats.get("reloaded"); // backwards compatible
+                stats = (Map<String, ?>) stats.get("reload");
+                if (stats != null) {
+                    row.reloaded = stats.get("reloaded").toString();
+                    row.reloadedFailed = stats.get("failed").toString();
+                    stats = (Map<String, ?>) stats.get("lastError");
+                    if (stats != null) {
+                        row.reloadedError = Objects.toString(stats.get("message"), "");
+                    }
+                }
+            }
+            JsonArray array = (JsonArray) root.get("routes");
+            for (int i = 0; i < array.size(); i++) {
+                JsonObject o = (JsonObject) array.get(i);
+                String state = o.getString("state");
+                row.routeTotal++;
+                if ("Started".equals(state)) {
+                    row.routeStarted++;
+                }
+            }
+
+            JsonObject hc = (JsonObject) root.get("healthChecks");
+            boolean rdy = hc != null && hc.getBoolean("ready");
+            if (rdy) {
+                row.ready = "1/1";
+            } else {
+                row.ready = "0/1";
+            }
+            rows.add(row);
+        });
+
+        // sort rows
+        rows.sort(ORDER.comparator(sort));
+
+        if (!rows.isEmpty() || jsonOutput) {
+            if (jsonOutput) {
+                printer().println(Jsoner.serialize(rows.stream().map(r -> {
+                    JsonObject jo = new JsonObject();
+                    jo.put("pid", JsonValues.pid(r.pid));
+                    jo.put("name", r.name);
+                    jo.put("camelVersion", r.camelVersion);
+                    jo.put("platform", getPlatform(r));
+                    jo.put("profile", getProfile(r));
+                    jo.put("ready", "1/1".equals(r.ready));
+                    jo.put("status", getStatus(r));
+                    jo.put("reloaded", JsonValues.number(r.reloaded));
+                    jo.put("reloadFailed", JsonValues.number(r.reloadedFailed));
+                    jo.put("age", r.age);
+                    jo.put("uptime", r.uptime);
+                    jo.put("routesStarted", r.routeStarted);
+                    jo.put("routesTotal", r.routeTotal);
+                    jo.put("throughput", JsonValues.decimal(r.throughput));
+                    jo.put("total", JsonValues.number(r.total));
+                    jo.put("failed", JsonValues.number(r.failed));
+                    jo.put("inflight", JsonValues.number(r.inflight));
+                    // the exchanges that came from a remote endpoint
+                    jo.put("remoteTotal", JsonValues.number(r.totalRemote));
+                    jo.put("remoteFailed", JsonValues.number(r.failedRemote));
+                    jo.put("remoteInflight", JsonValues.number(r.inflightRemote));
+                    jo.put("last", JsonValues.number(r.last));
+                    jo.put("sinceLastStarted", JsonValues.text(r.sinceLastStarted));
+                    jo.put("sinceLastCompleted", JsonValues.text(r.sinceLastCompleted));
+                    jo.put("sinceLastFailed", JsonValues.text(r.sinceLastFailed));
+                    return jo;
+                }).collect(Collectors.toList())));
+            } else {
+                // Flexible column: error description (70)
+                // Fixed columns: PID(8)+NAME(30)+CAMEL(8)+PLATFORM(12)+PROFILE(8)+READY(5)+STATUS(8)+RELOAD(6)+AGE(8)+ROUTE(5)+MSG/S(5)+TOTAL(5)+FAIL(4)+INFLIGHT(8)+LAST(4)+SINCE-LAST(10) ~= 134
+                int tw = terminalWidth();
+                int errW = TerminalWidthHelper.flexWidth(tw, 134, TerminalWidthHelper.noBorderOverhead(17), 15, 70);
+                printer().println(AsciiTable.getTable(AsciiTable.NO_BORDERS, rows, Arrays.asList(
+                        new Column().header("PID").headerAlign(HorizontalAlign.CENTER).with(r -> r.pid),
+                        new Column().header("NAME").dataAlign(HorizontalAlign.LEFT)
+                                .maxWidth(30, OverflowBehaviour.ELLIPSIS_RIGHT)
+                                .with(r -> r.name),
+                        new Column().header("CAMEL").dataAlign(HorizontalAlign.LEFT).with(r -> r.camelVersion),
+                        new Column().header("PLATFORM").dataAlign(HorizontalAlign.LEFT).with(this::getPlatform),
+                        new Column().header("PROFILE").dataAlign(HorizontalAlign.LEFT).with(this::getProfile),
+                        new Column().header("READY").dataAlign(HorizontalAlign.CENTER).with(r -> r.ready),
+                        new Column().header("STATUS").headerAlign(HorizontalAlign.CENTER)
+                                .with(this::getStatus),
+                        new Column().header("RELOAD").with(this::getReloaded),
+                        new Column().header("AGE").headerAlign(HorizontalAlign.CENTER).with(r -> r.age),
+                        new Column().header("ROUTE").with(this::getRoutes),
+                        new Column().header("MSG/S").with(this::getThroughput),
+                        new Column().header("TOTAL").with(this::getTotal),
+                        new Column().header("FAIL").with(this::getFailed),
+                        new Column().header("INFLIGHT").with(this::getInflight),
+                        new Column().header("LAST").with(r -> r.last),
+                        new Column().header("SINCE-LAST").with(this::getSinceLast),
+                        new Column().header("") // empty header as we only show info when there is an error
+                                .headerAlign(HorizontalAlign.LEFT).dataAlign(HorizontalAlign.LEFT)
+                                .maxWidth(errW, OverflowBehaviour.NEWLINE)
+                                .with(this::getDescription))));
+            }
+        }
+
+        return 0;
+    }
+
+    private String extractPlatform(ProcessHandle ph, JsonObject runtime) {
+        String answer = runtime != null ? runtime.getString("platform") : null;
+        if ("Camel".equals(answer)) {
+            // generic camel, we need to check if we run in JBang
+            String cl = ProcessHelper.commandLineText(ph);
+            if (cl.contains("main.CamelJBang run")) {
+                answer = "JBang";
+            }
+        }
+        return answer;
+    }
+
+    private String extractPlatformVersion(String platform, String platformVersion) {
+        if (platformVersion == null) {
+            if ("JBang".equals(platform)) {
+                platformVersion = VersionHelper.getJBangVersion();
+            }
+        }
+        return platformVersion;
+    }
+
+    private String getStatus(Row r) {
+        if (r.reloadedError != null) {
+            return "Error";
+        }
+        return extractState(r.state);
+    }
+
+    private String getDescription(Row r) {
+        if (r.reloadedError != null) {
+            return "Reload failed due to: " + r.reloadedError;
+        }
+        return null;
+    }
+
+    private String getTotal(Row r) {
+        if (remote && r.totalRemote != null) {
+            return r.totalRemote + "/" + r.total;
+        }
+        return r.total;
+    }
+
+    private String getFailed(Row r) {
+        if (remote && r.failedRemote != null) {
+            return r.failedRemote + "/" + r.failed;
+        }
+        return r.failed;
+    }
+
+    private String getInflight(Row r) {
+        if (remote && r.inflightRemote != null) {
+            return r.inflightRemote + "/" + r.inflight;
+        }
+        return r.inflight;
+    }
+
+    private String getPlatform(Row r) {
+        if (r.platformVersion != null) {
+            return r.platform + " v" + r.platformVersion;
+        } else {
+            return r.platform;
+        }
+    }
+
+    protected String getProfile(Row r) {
+        String s = r.profile;
+        if (s == null || s.isEmpty()) {
+            s = "";
+        }
+        return s;
+    }
+
+    protected String getDelta(Row r) {
+        return ListingFormat.delta(r.delta);
+    }
+
+    protected String getSinceLast(Row r) {
+        return ListingFormat.sinceLast(r.sinceLastStarted, r.sinceLastCompleted, r.sinceLastFailed);
+    }
+
+    protected String getThroughput(Row r) {
+        String s = r.throughput;
+        if (s == null || s.isEmpty()) {
+            s = "";
+        }
+        return s;
+    }
+
+    protected String getReloaded(Row row) {
+        String r = row.reloaded;
+        String f = row.reloadedFailed;
+        if (r != null && f != null) {
+            return r + "/" + f;
+        } else {
+            return "";
+        }
+    }
+
+    protected String getRoutes(Row r) {
+        return r.routeStarted + "/" + r.routeTotal;
+    }
+
+    private static class Row {
+        String pid;
+        String platform;
+        String platformVersion;
+        String camelVersion;
+        String profile;
+        String name;
+        String ready;
+        int routeStarted;
+        int routeTotal;
+        int state;
+        String reloaded;
+        String reloadedFailed;
+        String reloadedError;
+        String age;
+        long uptime;
+        String throughput;
+        String total;
+        String totalRemote;
+        String failed;
+        String failedRemote;
+        String inflight;
+        String inflightRemote;
+        String last;
+        String delta;
+        String sinceLastStarted;
+        String sinceLastCompleted;
+        String sinceLastFailed;
+    }
+
+}

@@ -1,0 +1,310 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.camel.dsl.jbang.core.commands.tui;
+
+import java.util.ArrayList;
+import java.util.List;
+
+import dev.tamboui.layout.Constraint;
+import dev.tamboui.layout.Rect;
+import dev.tamboui.style.Style;
+import dev.tamboui.terminal.Frame;
+import dev.tamboui.text.Span;
+import dev.tamboui.tui.event.KeyCode;
+import dev.tamboui.tui.event.KeyEvent;
+import dev.tamboui.tui.event.MouseEvent;
+import dev.tamboui.widgets.block.Block;
+import dev.tamboui.widgets.block.BorderType;
+import dev.tamboui.widgets.block.Borders;
+import dev.tamboui.widgets.table.Cell;
+import dev.tamboui.widgets.table.Row;
+import dev.tamboui.widgets.table.Table;
+import org.apache.camel.util.json.JsonArray;
+import org.apache.camel.util.json.JsonObject;
+
+import static org.apache.camel.dsl.jbang.core.commands.tui.TuiHelper.*;
+
+class HealthTab extends AbstractTableTab {
+
+    private boolean showOnlyDown;
+    // the page (all good, or what is wrong) unless t asks for the checks one by one
+    private boolean table;
+
+    HealthTab(MonitorContext ctx) {
+        super(ctx, "group", "name", "status");
+        sortIndex = 1;
+        sort = "name";
+    }
+
+    @Override
+    public boolean handleMouseEvent(MouseEvent me, Rect area) {
+        return false;
+    }
+
+    @Override
+    protected int getRowCount() {
+        IntegrationInfo info = ctx.findSelectedIntegration();
+        return info != null ? getFilteredHealthChecks(info).size() : 0;
+    }
+
+    @Override
+    protected boolean handleTabKeyEvent(KeyEvent ke) {
+        if (ke.isKey(KeyCode.F8) && ke.hasShift()) {
+            askAiAboutChecksNotUp();
+            return true;
+        }
+        if (ke.isCharIgnoreCase('t')) {
+            table = !table;
+            return true;
+        }
+        if (table && ke.isCharIgnoreCase('d')) {
+            showOnlyDown = !showOnlyDown;
+            return true;
+        }
+        return false;
+    }
+
+    @Override
+    protected void renderContent(Frame frame, Rect area, IntegrationInfo info) {
+        if (!table) {
+            lastTableArea = null;
+            HealthPage.render(frame, area, info, ctx.healthHistory, System.currentTimeMillis());
+            return;
+        }
+        List<HealthCheckInfo> healthChecks = new ArrayList<>(getFilteredHealthChecks(info));
+        healthChecks.sort(this::sortHealth);
+
+        List<Row> rows = new ArrayList<>();
+        for (HealthCheckInfo hc : healthChecks) {
+            Style stateStyle;
+            String icon;
+            if ("UP".equals(hc.state)) {
+                stateStyle = Theme.success();
+                icon = TuiIcons.HEALTH_UP + " ";
+            } else if ("DOWN".equals(hc.state)) {
+                stateStyle = Theme.error();
+                icon = TuiIcons.HEALTH_DOWN + " ";
+            } else {
+                stateStyle = Theme.warning();
+                icon = TuiIcons.HEALTH_WARN + " ";
+            }
+
+            String kind = "";
+            if (hc.readiness) {
+                kind += "R";
+            }
+            if (hc.liveness) {
+                kind += kind.isEmpty() ? "L" : "/L";
+            }
+
+            rows.add(Row.from(
+                    Cell.from(Span.styled(" " + (hc.group != null ? hc.group : ""), Style.EMPTY.dim())),
+                    Cell.from(Span.styled(hc.name != null ? hc.name : "", Style.EMPTY.fg(Theme.accent()))),
+                    Cell.from(Span.styled(icon + hc.state, stateStyle)),
+                    Cell.from(kind),
+                    Cell.from(hc.message != null ? hc.message : "")));
+        }
+
+        if (rows.isEmpty()) {
+            rows.add(Row.from(
+                    Cell.from(""),
+                    Cell.from(Span.styled(showOnlyDown ? "No DOWN checks" : "No health checks registered",
+                            Style.EMPTY.dim())),
+                    Cell.from(""),
+                    Cell.from(""),
+                    Cell.from("")));
+        }
+
+        // KIND says what the check is for: R readiness (may take traffic), L liveness (is alive)
+        String title = showOnlyDown
+                ? " Health [DOWN only] "
+                : " Health ─ KIND: R readiness, L liveness ";
+
+        Table table = Table.builder()
+                .rows(rows)
+                .header(Row.from(
+                        Cell.from(Span.styled(" " + sortLabel("GROUP", "group"), sortStyle("group"))),
+                        Cell.from(Span.styled(sortLabel("NAME", "name"), sortStyle("name"))),
+                        Cell.from(Span.styled(sortLabel("STATUS", "status"), sortStyle("status"))),
+                        Cell.from(Span.styled("KIND", Style.EMPTY.bold())),
+                        Cell.from(Span.styled("MESSAGE", Style.EMPTY.bold()))))
+                .widths(
+                        Constraint.length(12),
+                        Constraint.length(25),
+                        Constraint.length(12),
+                        Constraint.length(6),
+                        Constraint.fill())
+                .highlightStyle(Theme.selectionBg())
+                .highlightSpacing(Table.HighlightSpacing.ALWAYS)
+                .block(Block.builder().borderType(BorderType.ROUNDED).borders(Borders.ALL).title(title).build())
+                .build();
+
+        lastTableArea = area;
+        frame.renderStatefulWidget(table, area, tableState);
+        renderScrollbar(frame, table, healthChecks.size());
+    }
+
+    @Override
+    public void renderFooter(List<Span> spans) {
+        if (table) {
+            super.renderFooter(spans);
+        } else {
+            // the page has nothing to sort
+            hint(spans, "Esc", "back");
+        }
+        hint(spans, "t", table ? "summary" : "all checks");
+        if (table) {
+            hint(spans, "d", showOnlyDown ? "show all" : "only DOWN");
+        }
+    }
+
+    @Override
+    public void renderFKeyHints(List<Span> spans) {
+        // with the global F-keys, as the AI key of a screen is an F-key of every screen that has one
+        IntegrationInfo info = ctx.findSelectedIntegration();
+        if (ctx.askAiCallback != null && info != null && !checksToAskAbout(info).isEmpty()) {
+            hint(spans, "Shift+F8", "fix with AI");
+        }
+    }
+
+    /**
+     * Fix with AI (Shift+F8, CAMEL-25362): the selected check in the table, or every check that is not UP on the page.
+     */
+    private void askAiAboutChecksNotUp() {
+        IntegrationInfo info = ctx.findSelectedIntegration();
+        if (info == null || ctx.askAiCallback == null) {
+            return;
+        }
+        List<HealthCheckInfo> checks = checksToAskAbout(info);
+        if (checks.isEmpty()) {
+            if (ctx.notificationCallback != null) {
+                ctx.notificationCallback.accept(table
+                        ? "The selected check is UP: select one that is DOWN, or ask the AI with F8"
+                        : "All checks are UP: ask the AI with F8", false);
+            }
+            return;
+        }
+        ctx.askAiCallback.ask(HealthAiPrompt.of(info, checks, System.currentTimeMillis()));
+    }
+
+    /** The checks Shift+F8 asks about: the selected one in the table when it is not UP, else all that are not UP. */
+    List<HealthCheckInfo> checksToAskAbout(IntegrationInfo info) {
+        if (table) {
+            List<HealthCheckInfo> checks = new ArrayList<>(getFilteredHealthChecks(info));
+            checks.sort(this::sortHealth);
+            Integer sel = tableState.selected();
+            if (sel == null || sel < 0 || sel >= checks.size() || "UP".equals(checks.get(sel).state)) {
+                return List.of();
+            }
+            return List.of(checks.get(sel));
+        }
+        return info.healthChecks.stream().filter(hc -> !"UP".equals(hc.state)).toList();
+    }
+
+    boolean isTable() {
+        return table;
+    }
+
+    boolean isShowOnlyDown() {
+        return showOnlyDown;
+    }
+
+    private int sortHealth(HealthCheckInfo a, HealthCheckInfo b) {
+        int result = switch (sort) {
+            case "name" -> compareStr(a.name, b.name);
+            case "status" -> compareStr(a.state, b.state);
+            default -> compareStr(a.group, b.group);
+        };
+        return sortReversed ? -result : result;
+    }
+
+    List<HealthCheckInfo> getFilteredHealthChecks(IntegrationInfo info) {
+        if (showOnlyDown) {
+            return info.healthChecks.stream().filter(hc -> "DOWN".equals(hc.state)).toList();
+        }
+        return info.healthChecks;
+    }
+
+    @Override
+    public SelectionContext getSelectionContext() {
+        IntegrationInfo info = ctx.findSelectedIntegration();
+        if (info == null) {
+            return null;
+        }
+        List<HealthCheckInfo> checks = new ArrayList<>(getFilteredHealthChecks(info));
+        if (checks.isEmpty()) {
+            return null;
+        }
+        checks.sort(this::sortHealth);
+        List<String> items = checks.stream().map(hc -> hc.name != null ? hc.name : "").toList();
+        Integer sel = tableState.selected();
+        return new SelectionContext("table", items, sel != null ? sel : -1, items.size(), "Health");
+    }
+
+    @Override
+    public String description() {
+        return "Health check status for readiness and liveness probes";
+    }
+
+    @Override
+    public String getHelpText() {
+        return DocHelper.loadHelpText("health");
+    }
+
+    @Override
+    public JsonObject getTableDataAsJson() {
+        IntegrationInfo info = ctx.findSelectedIntegration();
+        if (info == null) {
+            return null;
+        }
+        JsonObject result = new JsonObject();
+        result.put("tab", "Health");
+        if (info.healthReady != null) {
+            result.put("ready", info.healthReady);
+        }
+        if (info.healthLive != null) {
+            result.put("live", info.healthLive);
+        }
+        JsonArray rows = new JsonArray();
+        List<HealthCheckInfo> checks = new ArrayList<>(getFilteredHealthChecks(info));
+        checks.sort(this::sortHealth);
+        for (HealthCheckInfo hi : checks) {
+            JsonObject row = new JsonObject();
+            row.put("group", hi.group);
+            row.put("name", hi.name);
+            row.put("state", hi.state);
+            row.put("readiness", hi.readiness);
+            row.put("liveness", hi.liveness);
+            if (hi.message != null) {
+                row.put("message", hi.message);
+            }
+            row.put("builtIn", HealthPage.isBuiltIn(hi));
+            if (hi.since > 0) {
+                row.put("since", hi.since);
+            }
+            if (hi.failures > 0) {
+                row.put("failures", hi.failures);
+            }
+            rows.add(row);
+        }
+        result.put("rows", rows);
+        result.put("totalRows", info.healthChecks.size());
+        Integer sel = tableState.selected();
+        result.put("selectedIndex", sel != null ? sel : -1);
+        return result;
+    }
+}

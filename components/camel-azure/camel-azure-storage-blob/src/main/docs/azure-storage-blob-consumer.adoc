@@ -1,0 +1,320 @@
+= Azure Storage Blob - Consumer Examples
+:tabs-sync-option:
+
+xref:ROOT:azure-storage-blob-component.adoc[Back to Azure Storage Blob Component]
+
+== Consumer Examples
+
+To consume a blob into a file using the file component, this can be done like this:
+[tabs]
+====
+Java::
++
+[source,java]
+----
+from("azure-storage-blob://camelazure/container1?blobName=hello.txt&accountName=yourAccountName&accessKey=yourAccessKey")
+    .to("file://blobdirectory");
+----
+
+XML::
++
+[source,xml]
+----
+<route>
+    <from uri="azure-storage-blob://camelazure/container1?blobName=hello.txt&amp;accountName=yourAccountName&amp;accessKey=yourAccessKey"/>
+    <to uri="file://blobdirectory"/>
+</route>
+----
+
+YAML::
++
+[source,yaml]
+----
+- route:
+    from:
+      uri: azure-storage-blob://camelazure/container1
+      parameters:
+        blobName: hello.txt
+        accountName: yourAccountName
+        accessKey: yourAccessKey
+      steps:
+        - to:
+            uri: file://blobdirectory
+----
+====
+
+However, you can also write to file directly without using the file component, you will need to specify `fileDir` folder path to save your blob in your machine.
+
+[tabs]
+====
+Java::
++
+[source,java]
+----
+from("azure-storage-blob://camelazure/container1?blobName=hello.txt&accountName=yourAccountName&accessKey=yourAccessKey&fileDir=/var/to/awesome/dir")
+    .to("mock:results");
+----
+
+XML::
++
+[source,xml]
+----
+<route>
+    <from uri="azure-storage-blob://camelazure/container1?blobName=hello.txt&amp;accountName=yourAccountName&amp;accessKey=yourAccessKey&amp;fileDir=/var/to/awesome/dir"/>
+    <to uri="mock:results"/>
+</route>
+----
+
+YAML::
++
+[source,yaml]
+----
+- route:
+    from:
+      uri: azure-storage-blob://camelazure/container1
+      parameters:
+        blobName: hello.txt
+        accountName: yourAccountName
+        accessKey: yourAccessKey
+        fileDir: /var/to/awesome/dir
+      steps:
+        - to:
+            uri: mock:results
+----
+====
+
+Also, the component supports batch consumer, hence you can consume multiple blobs with only specifying the container name, the consumer will
+return multiple exchanges depending on the number of the blobs in the container. Example:
+
+[tabs]
+====
+Java::
++
+[source,java]
+----
+from("azure-storage-blob://camelazure/container1?accountName=yourAccountName&accessKey=yourAccessKey&fileDir=/var/to/awesome/dir")
+    .to("mock:results");
+----
+
+XML::
++
+[source,xml]
+----
+<route>
+    <from uri="azure-storage-blob://camelazure/container1?accountName=yourAccountName&amp;accessKey=yourAccessKey&amp;fileDir=/var/to/awesome/dir"/>
+    <to uri="mock:results"/>
+</route>
+----
+
+YAML::
++
+[source,yaml]
+----
+- route:
+    from:
+      uri: azure-storage-blob://camelazure/container1
+      parameters:
+        accountName: yourAccountName
+        accessKey: yourAccessKey
+        fileDir: /var/to/awesome/dir
+      steps:
+        - to:
+            uri: mock:results
+----
+====
+
+=== Limiting the Number of Blobs per Poll
+
+The consumer supports the `maxMessagesPerPoll` option to limit how many blobs are retrieved in one polling cycle:
+
+[tabs]
+====
+Java::
++
+[source,java]
+----
+from("azure-storage-blob://camelazure/container1?maxMessagesPerPoll=10&accessKey=RAW(yourAccessKey)")
+    .to("direct:processBlob");
+----
+
+YAML::
++
+[source,yaml]
+----
+- route:
+    from:
+      uri: azure-storage-blob://camelazure/container1
+      parameters:
+        maxMessagesPerPoll: 10
+        accessKey: "RAW(yourAccessKey)"
+      steps:
+        - to:
+            uri: direct:processBlob
+----
+====
+
+The default value is `0`, which means unlimited. A positive value limits the number of successfully retrieved blobs in each poll. Blobs skipped because they are already in progress, no longer exist, or cannot be retrieved do not count toward the limit.
+
+The consumer lists blobs page by page and retains unprocessed names from the current page for subsequent polls. The Azure continuation token advances across pages, and the listing wraps to the beginning after the last page. `maxResultsPerPage` independently controls the number of items in each Azure listing page.
+
+NOTE: The consumer prepares the complete batch before routing its first exchange. This bounded prefetch preserves the exact Camel `CamelBatchSize`, `CamelBatchIndex` and `CamelBatchComplete` properties. It is not strict just-in-time retrieval immediately before each route invocation.
+
+=== Delete After Read
+
+The consumer supports automatic deletion of blobs after they have been successfully processed. This is useful when you want to ensure that blobs are only processed once.
+
+[tabs]
+====
+Java::
++
+[source,java]
+----
+from("azure-storage-blob://camelazure/container1?deleteAfterRead=true&accessKey=RAW(yourAccessKey)")
+    .log("Processing blob: ${header.CamelAzureStorageBlobBlobName}")
+    .to("direct:processBlob");
+----
+
+XML::
++
+[source,xml]
+----
+<route>
+  <from uri="azure-storage-blob://camelazure/container1?deleteAfterRead=true&amp;accessKey=RAW(yourAccessKey)"/>
+  <log message="Processing blob: ${header.CamelAzureStorageBlobBlobName}"/>
+  <to uri="direct:processBlob"/>
+</route>
+----
+
+YAML::
++
+[source,yaml]
+----
+- route:
+    from:
+      uri: azure-storage-blob://camelazure/container1
+      parameters:
+        deleteAfterRead: true
+        accessKey: "RAW(yourAccessKey)"
+      steps:
+        - log:
+            message: "Processing blob: ${header.CamelAzureStorageBlobBlobName}"
+        - to:
+            uri: direct:processBlob
+----
+====
+
+IMPORTANT: The delete operation is only performed if the Exchange is successfully committed. If processing fails or a rollback occurs, the blob will not be deleted and can be reprocessed on the next poll.
+
+NOTE: When `deleteAfterRead` is set to `false` (the default), the same blobs will be retrieved repeatedly in subsequent polls. The Idempotent Consumer EIP can filter duplicate exchanges based on the `CamelAzureStorageBlobBlobName` header, but it runs after the consumer has retrieved the blob and therefore does not prevent the Azure read or download itself. Use `maxMessagesPerPoll` to bound the number of blobs retrieved during each poll.
+
+NOTE: A blob is not retrieved again while the exchange of a previous poll is still processing it, for example when the route continues asynchronously (such as `to("seda:...")`). It is retrieved again by a later poll once that exchange is done, unless it was deleted or moved. A blob that was deleted (for example by another consumer) between the listing and its download is skipped.
+
+=== Move After Read
+
+The consumer can move blobs to a different container after successful processing. This is useful for archiving processed blobs or implementing a processing pipeline across containers.
+
+[tabs]
+====
+Java::
++
+[source,java]
+----
+from("azure-storage-blob://camelazure/incoming?moveAfterRead=true&destinationContainer=archive&accessKey=RAW(yourAccessKey)")
+    .log("Processing blob: ${header.CamelAzureStorageBlobBlobName}")
+    .to("direct:processBlob");
+----
+
+XML::
++
+[source,xml]
+----
+<route>
+  <from uri="azure-storage-blob://camelazure/incoming?moveAfterRead=true&amp;destinationContainer=archive&amp;accessKey=RAW(yourAccessKey)"/>
+  <log message="Processing blob: ${header.CamelAzureStorageBlobBlobName}"/>
+  <to uri="direct:processBlob"/>
+</route>
+----
+
+YAML::
++
+[source,yaml]
+----
+- route:
+    from:
+      uri: azure-storage-blob://camelazure/incoming
+      parameters:
+        moveAfterRead: true
+        destinationContainer: archive
+        accessKey: "RAW(yourAccessKey)"
+      steps:
+        - log:
+            message: "Processing blob: ${header.CamelAzureStorageBlobBlobName}"
+        - to:
+            uri: direct:processBlob
+----
+====
+
+You can also customize the destination blob name by adding a prefix and/or suffix:
+
+[tabs]
+====
+Java::
++
+[source,java]
+----
+from("azure-storage-blob://camelazure/source?moveAfterRead=true&destinationContainer=archive&prefix=incoming/&removePrefixOnMove=true&destinationBlobPrefix=processed/&destinationBlobSuffix=.done&accessKey=RAW(yourAccessKey)")
+    .log("Processing: ${header.CamelAzureStorageBlobBlobName}")
+    .to("direct:processBlob");
+----
+
+XML::
++
+[source,xml]
+----
+<route>
+  <from uri="azure-storage-blob://camelazure/source?moveAfterRead=true&amp;destinationContainer=archive&amp;prefix=incoming/&amp;removePrefixOnMove=true&amp;destinationBlobPrefix=processed/&amp;destinationBlobSuffix=.done&amp;accessKey=RAW(yourAccessKey)"/>
+  <log message="Processing: ${header.CamelAzureStorageBlobBlobName}"/>
+  <to uri="direct:processBlob"/>
+</route>
+----
+
+YAML::
++
+[source,yaml]
+----
+- route:
+    from:
+      uri: azure-storage-blob://camelazure/source
+      parameters:
+        moveAfterRead: true
+        destinationContainer: archive
+        prefix: "incoming/"
+        removePrefixOnMove: true
+        destinationBlobPrefix: "processed/"
+        destinationBlobSuffix: ".done"
+        accessKey: "RAW(yourAccessKey)"
+      steps:
+        - log:
+            message: "Processing: ${header.CamelAzureStorageBlobBlobName}"
+        - to:
+            uri: direct:processBlob
+----
+====
+
+The move operation works as follows:
+
+1. The blob is copied to the destination container with the new name
+2. The original blob is deleted from the source container
+3. Both operations only occur after the Exchange is successfully committed
+
+The following options control the move behavior:
+
+[width="100%",cols="25%,75%",options="header",]
+|===
+|Option |Description
+|`moveAfterRead` |Enable moving blobs after successful processing
+|`destinationContainer` |Target container for moved blobs (required when `moveAfterRead=true`)
+|`destinationBlobPrefix` |Prefix to add to the blob name in the destination
+|`destinationBlobSuffix` |Suffix to add to the blob name in the destination
+|`removePrefixOnMove` |Remove the source prefix from the blob name before adding destination prefix
+|===

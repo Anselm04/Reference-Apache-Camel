@@ -1,0 +1,134 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.camel.component.pgvector;
+
+import javax.sql.DataSource;
+
+import org.apache.camel.Category;
+import org.apache.camel.Component;
+import org.apache.camel.Consumer;
+import org.apache.camel.Processor;
+import org.apache.camel.Producer;
+import org.apache.camel.spi.BodyType;
+import org.apache.camel.spi.BodyType.Carrier;
+import org.apache.camel.spi.BodyTypes;
+import org.apache.camel.spi.Metadata;
+import org.apache.camel.spi.UriEndpoint;
+import org.apache.camel.spi.UriParam;
+import org.apache.camel.spi.UriPath;
+import org.apache.camel.support.DefaultEndpoint;
+
+/**
+ * Perform operations on the PostgreSQL pgvector Vector Database.
+ */
+@UriEndpoint(
+             firstVersion = "4.19.0",
+             scheme = PgVector.SCHEME,
+             title = "PGVector",
+             syntax = "pgvector:collection",
+             producerOnly = true,
+             category = {
+                     Category.DATABASE,
+                     Category.AI
+             },
+             headersClass = PgVectorHeaders.class)
+@BodyTypes(producerIn = @BodyType(value = { Carrier.LIST, Carrier.NULL },
+                                  byOption = {
+                                          @BodyType.When(option = "action", value = "UPSERT", carriers = Carrier.LIST),
+                                          @BodyType.When(option = "action", value = "SIMILARITY_SEARCH",
+                                                         carriers = Carrier.LIST),
+                                          @BodyType.When(option = "action", value = "CREATE_TABLE", carriers = Carrier.ANY),
+                                          @BodyType.When(option = "action", value = "CREATE_INDEX", carriers = Carrier.ANY),
+                                          @BodyType.When(option = "action", value = "DROP_TABLE", carriers = Carrier.ANY),
+                                          @BodyType.When(option = "action", value = "DELETE", carriers = Carrier.ANY) },
+                                  description = "By the action in the action option or the CamelPgVectorAction header: the vector as a"
+                                                + " List of numbers, such as the List of Double a JSON array unmarshals to, or a float or"
+                                                + " double array for UPSERT and SIMILARITY_SEARCH, with the id, text and metadata of UPSERT"
+                                                + " in headers. CREATE_TABLE, CREATE_INDEX, DROP_TABLE and DELETE do not read the body,"
+                                                + " DELETE takes the id from the CamelPgVectorRecordId header. Another body fails: the"
+                                                + " pgvector:embeddings data type transformer builds the vector from the output of"
+                                                + " langchain4j-embeddings"),
+           producerOut = @BodyType(value = { Carrier.VALUE, Carrier.TEXT, Carrier.LIST },
+                                   byOption = {
+                                           @BodyType.When(option = "action", value = "CREATE_TABLE", carriers = Carrier.VALUE,
+                                                          javaType = "java.lang.Boolean"),
+                                           @BodyType.When(option = "action", value = "CREATE_INDEX", carriers = Carrier.VALUE,
+                                                          javaType = "java.lang.Boolean"),
+                                           @BodyType.When(option = "action", value = "DROP_TABLE", carriers = Carrier.VALUE,
+                                                          javaType = "java.lang.Boolean"),
+                                           @BodyType.When(option = "action", value = "DELETE", carriers = Carrier.VALUE,
+                                                          javaType = "java.lang.Boolean"),
+                                           @BodyType.When(option = "action", value = "UPSERT", carriers = Carrier.TEXT,
+                                                          javaType = "java.lang.String"),
+                                           @BodyType.When(option = "action", value = "SIMILARITY_SEARCH",
+                                                          carriers = Carrier.LIST,
+                                                          javaType = "java.util.List<java.util.Map<java.lang.String, java.lang.Object>>") },
+                                   description = "By the action: a Boolean for CREATE_TABLE, CREATE_INDEX, DROP_TABLE and DELETE (false"
+                                                 + " when no record had the id), the record id as a String for UPSERT, and a List of Map with"
+                                                 + " the keys id, text_content, metadata and distance for SIMILARITY_SEARCH"))
+public class PgVectorEndpoint extends DefaultEndpoint {
+
+    @Metadata(required = true)
+    @UriPath(description = "The collection (table) name")
+    private final String collection;
+
+    @UriParam
+    private PgVectorConfiguration configuration;
+
+    public PgVectorEndpoint(
+                            String endpointUri,
+                            Component component,
+                            String collection,
+                            PgVectorConfiguration configuration) {
+
+        super(endpointUri, component);
+
+        this.collection = collection;
+        this.configuration = configuration;
+    }
+
+    public PgVectorConfiguration getConfiguration() {
+        return configuration;
+    }
+
+    public String getCollection() {
+        return collection;
+    }
+
+    public DataSource getDataSource() {
+        return this.configuration.getDataSource();
+    }
+
+    @Override
+    public Producer createProducer() throws Exception {
+        return new PgVectorProducer(this);
+    }
+
+    @Override
+    public Consumer createConsumer(Processor processor) throws Exception {
+        throw new UnsupportedOperationException("Consumer is not implemented for this component");
+    }
+
+    @Override
+    public void doStart() throws Exception {
+        super.doStart();
+
+        if (configuration.getDataSource() == null) {
+            throw new IllegalArgumentException("DataSource must be configured on the pgvector component or endpoint");
+        }
+    }
+}

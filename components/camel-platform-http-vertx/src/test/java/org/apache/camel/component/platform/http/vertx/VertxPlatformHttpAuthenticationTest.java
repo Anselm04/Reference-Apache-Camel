@@ -1,0 +1,400 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.camel.component.platform.http.vertx;
+
+import io.restassured.RestAssured;
+import io.vertx.core.Future;
+import io.vertx.core.Vertx;
+import io.vertx.core.json.JsonObject;
+import io.vertx.ext.auth.JWTOptions;
+import io.vertx.ext.auth.PubSecKeyOptions;
+import io.vertx.ext.auth.User;
+import io.vertx.ext.auth.authentication.AuthenticationProvider;
+import io.vertx.ext.auth.authentication.UsernamePasswordCredentials;
+import io.vertx.ext.auth.jwt.JWTAuth;
+import io.vertx.ext.auth.jwt.JWTAuthOptions;
+import io.vertx.ext.auth.properties.PropertyFileAuthentication;
+import io.vertx.ext.web.handler.AuthenticationHandler;
+import io.vertx.ext.web.handler.BasicAuthHandler;
+import io.vertx.ext.web.handler.JWTAuthHandler;
+import org.apache.camel.CamelContext;
+import org.apache.camel.builder.RouteBuilder;
+import org.apache.camel.component.platform.http.vertx.auth.AuthenticationConfig;
+import org.apache.camel.component.platform.http.vertx.auth.AuthenticationConfig.AuthenticationConfigEntry;
+import org.apache.camel.component.platform.http.vertx.auth.AuthenticationConfig.AuthenticationHandlerFactory;
+import org.apache.camel.component.platform.http.vertx.auth.AuthenticationConfig.AuthenticationProviderFactory;
+import org.apache.camel.impl.DefaultCamelContext;
+import org.apache.camel.test.AvailablePortFinder;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.extension.RegisterExtension;
+
+import static io.restassured.RestAssured.given;
+import static org.hamcrest.Matchers.equalTo;
+
+public class VertxPlatformHttpAuthenticationTest {
+    @RegisterExtension
+    AvailablePortFinder.Port port = AvailablePortFinder.find();
+
+    @Test
+    public void testAuthenticationDisabled() throws Exception {
+        CamelContext context = createCamelContext(authenticationConfig -> {
+            //authentication disabled by default
+        });
+
+        context.addRoutes(new RouteBuilder() {
+            @Override
+            public void configure() {
+                from("platform-http:/disabledAuth")
+                        .setBody().constant("disabledAuth");
+            }
+        });
+
+        try {
+            context.start();
+
+            given()
+                    .when()
+                    .get("/disabledAuth")
+                    .then()
+                    .statusCode(200)
+                    .body(equalTo("disabledAuth"));
+        } finally {
+            context.stop();
+        }
+    }
+
+    @Test
+    public void testBasicAuthenticationConfig() throws Exception {
+        CamelContext context = createCamelContext(authenticationConfig -> {
+            authenticationConfig.setEnabled(true);
+            AuthenticationConfigEntry entry = new AuthenticationConfigEntry();
+            entry.setAuthenticationProviderFactory(
+                    vertx -> PropertyFileAuthentication.create(vertx, "camel-platform-http-vertx-auth.properties"));
+            entry.setAuthenticationHandlerFactory(BasicAuthHandler::create);
+            entry.setPath("/*");
+            authenticationConfig.getEntries().add(entry);
+        });
+
+        context.addRoutes(new RouteBuilder() {
+            @Override
+            public void configure() {
+                from("platform-http:/defaultAuth")
+                        .setBody().constant("defaultAuth");
+            }
+        });
+
+        try {
+            context.start();
+
+            given()
+                    .when()
+                    .get("/defaultAuth")
+                    .then()
+                    .statusCode(401)
+                    .body(equalTo("Unauthorized"));
+
+            given()
+                    .auth().basic("camel", "propertiesPass")
+                    .when()
+                    .get("/defaultAuth")
+                    .then()
+                    .statusCode(200)
+                    .body(equalTo("defaultAuth"));
+
+        } finally {
+            context.stop();
+        }
+    }
+
+    @Test
+    public void testAuthenticateSpecificPathOnly() throws Exception {
+        CamelContext context = createCamelContext(authenticationConfig -> {
+            authenticationConfig.setEnabled(true);
+            AuthenticationConfigEntry entry = new AuthenticationConfigEntry();
+            entry.setAuthenticationProviderFactory(
+                    vertx -> PropertyFileAuthentication.create(vertx, "camel-platform-http-vertx-auth.properties"));
+            entry.setAuthenticationHandlerFactory(BasicAuthHandler::create);
+            entry.setPath("/specific/path");
+            authenticationConfig.getEntries().add(entry);
+        });
+
+        context.addRoutes(new RouteBuilder() {
+            @Override
+            public void configure() {
+                from("platform-http:/specific/path")
+                        .setBody().constant("specificPath");
+
+                from("platform-http:/unprotected")
+                        .setBody().constant("unprotected");
+            }
+        });
+
+        try {
+            context.start();
+
+            given()
+                    .when()
+                    .get("/specific/path")
+                    .then()
+                    .statusCode(401)
+                    .body(equalTo("Unauthorized"));
+
+            given()
+                    .auth().basic("camel", "propertiesPass")
+                    .when()
+                    .get("/specific/path")
+                    .then()
+                    .statusCode(200)
+                    .body(equalTo("specificPath"));
+
+            given()
+                    .when()
+                    .get("/unprotected")
+                    .then()
+                    .statusCode(200)
+                    .body(equalTo("unprotected"));
+
+        } finally {
+            context.stop();
+        }
+    }
+
+    @Test
+    public void testAddingCustomAuthenticationProvider() throws Exception {
+        CamelContext context = createCamelContext(authenticationConfig -> {
+            authenticationConfig.setEnabled(true);
+            AuthenticationProviderFactory provider = createCustomProvider("CustomUser", "CustomPass");
+            AuthenticationHandlerFactory handler = BasicAuthHandler::create;
+            AuthenticationConfigEntry customEntry = new AuthenticationConfigEntry();
+            customEntry.setPath("/custom/provider");
+            customEntry.setAuthenticationProviderFactory(provider);
+            customEntry.setAuthenticationHandlerFactory(handler);
+            authenticationConfig.getEntries().add(customEntry);
+        });
+
+        context.addRoutes(new RouteBuilder() {
+            @Override
+            public void configure() {
+                from("platform-http:/custom/provider")
+                        .setBody().constant("customProvider");
+            }
+        });
+
+        try {
+            context.start();
+
+            given()
+                    .when()
+                    .get("/custom/provider")
+                    .then()
+                    .statusCode(401)
+                    .body(equalTo("Unauthorized"));
+
+            given()
+                    .auth().basic("CustomUser", "CustomPass")
+                    .when()
+                    .get("/custom/provider")
+                    .then()
+                    .statusCode(200)
+                    .body(equalTo("customProvider"));
+
+        } finally {
+            context.stop();
+        }
+    }
+
+    @Test
+    public void testAuthenticateSpecificPathWithCustomAuthenticationProvider() throws Exception {
+        CamelContext context = createCamelContext(authenticationConfig -> {
+            authenticationConfig.setEnabled(true);
+            AuthenticationProviderFactory provider = createCustomProvider("CustomUser", "CustomPass");
+            AuthenticationHandlerFactory handler = BasicAuthHandler::create;
+            AuthenticationConfigEntry customEntry = new AuthenticationConfigEntry();
+            customEntry.setPath("/customProvider");
+            customEntry.setAuthenticationProviderFactory(provider);
+            customEntry.setAuthenticationHandlerFactory(handler);
+            authenticationConfig.getEntries().add(customEntry);
+        });
+
+        context.addRoutes(new RouteBuilder() {
+            @Override
+            public void configure() {
+                from("platform-http:/customProvider")
+                        .setBody().constant("customProvider");
+            }
+        });
+
+        try {
+            context.start();
+
+            given()
+                    .when()
+                    .get("/customProvider")
+                    .then()
+                    .statusCode(401)
+                    .body(equalTo("Unauthorized"));
+
+            given()
+                    .auth().basic("CustomUser", "CustomPass")
+                    .when()
+                    .get("/customProvider")
+                    .then()
+                    .statusCode(200)
+                    .body(equalTo("customProvider"));
+
+        } finally {
+            context.stop();
+        }
+    }
+
+    @Test
+    public void testBasicAuthenticationRemovesAuthorizationHeader() throws Exception {
+        CamelContext context = createCamelContext(authenticationConfig -> {
+            authenticationConfig.setEnabled(true);
+            AuthenticationConfigEntry entry = new AuthenticationConfigEntry();
+            entry.setAuthenticationProviderFactory(
+                    vertx -> PropertyFileAuthentication.create(vertx, "camel-platform-http-vertx-auth.properties"));
+            entry.setAuthenticationHandlerFactory(BasicAuthHandler::create);
+            entry.setPath("/protected");
+            authenticationConfig.getEntries().add(entry);
+        });
+
+        context.addRoutes(new RouteBuilder() {
+            @Override
+            public void configure() {
+                from("platform-http:/protected")
+                        .setBody().simple("authorization=${header.Authorization}");
+
+                from("platform-http:/unprotected")
+                        .setBody().simple("authorization=${header.Authorization}");
+            }
+        });
+
+        try {
+            context.start();
+
+            // the credential checked by Camel is not passed on to the route
+            given()
+                    .auth().preemptive().basic("camel", "propertiesPass")
+                    .when()
+                    .get("/protected")
+                    .then()
+                    .statusCode(200)
+                    .body(equalTo("authorization="));
+
+            // a path without authentication keeps the header as is
+            given()
+                    .header("Authorization", "Basic Zm9vOmJhcg==")
+                    .when()
+                    .get("/unprotected")
+                    .then()
+                    .statusCode(200)
+                    .body(equalTo("authorization=Basic Zm9vOmJhcg=="));
+        } finally {
+            context.stop();
+        }
+    }
+
+    @Test
+    public void testJWTAuthenticationRemovesAuthorizationHeader() throws Exception {
+        JWTAuthOptions jwtAuthOptions = new JWTAuthOptions()
+                .addPubSecKey(new PubSecKeyOptions().setAlgorithm("HS256").setBuffer("test-secret-for-the-jwt-tokens"));
+
+        CamelContext context = createCamelContext(authenticationConfig -> {
+            authenticationConfig.setEnabled(true);
+            AuthenticationConfigEntry entry = new AuthenticationConfigEntry();
+            entry.setAuthenticationProviderFactory(vertx -> JWTAuth.create(vertx, jwtAuthOptions));
+            entry.setAuthenticationHandlerFactory(
+                    new AuthenticationHandlerFactory() {
+                        @Override
+                        public <T extends AuthenticationProvider> AuthenticationHandler createAuthenticationHandler(
+                                T authenticationProvider) {
+                            return JWTAuthHandler.create((JWTAuth) authenticationProvider);
+                        }
+                    });
+            entry.setPath("/*");
+            authenticationConfig.getEntries().add(entry);
+        });
+
+        context.addRoutes(new RouteBuilder() {
+            @Override
+            public void configure() {
+                from("platform-http:/jwt")
+                        .setBody().simple("authorization=${header.Authorization}");
+            }
+        });
+
+        Vertx tokenVertx = Vertx.vertx();
+        try {
+            context.start();
+
+            String token = JWTAuth.create(tokenVertx, jwtAuthOptions)
+                    .generateToken(new JsonObject().put("sub", "camel"), new JWTOptions().setAlgorithm("HS256"));
+
+            given()
+                    .when()
+                    .get("/jwt")
+                    .then()
+                    .statusCode(401);
+
+            given()
+                    .header("Authorization", "Bearer " + token)
+                    .when()
+                    .get("/jwt")
+                    .then()
+                    .statusCode(200)
+                    .body(equalTo("authorization="));
+        } finally {
+            context.stop();
+            tokenVertx.close();
+        }
+    }
+
+    private AuthenticationProviderFactory createCustomProvider(String username, String pass) {
+        return vertx -> credentials -> {
+            UsernamePasswordCredentials usernamePassword = (UsernamePasswordCredentials) credentials;
+            if (usernamePassword.getUsername().equals(username) && usernamePassword.getPassword().equals(pass)) {
+                return Future.succeededFuture(User.fromName(username));
+            }
+            return Future.failedFuture("Invalid username or password");
+        };
+    }
+
+    private CamelContext createCamelContext(AuthenticationConfigCustomizer customizer)
+            throws Exception {
+        RestAssured.port = port.getPort();
+        return createCamelContext(port.getPort(), customizer);
+    }
+
+    private CamelContext createCamelContext(int bindPort, AuthenticationConfigCustomizer customizer)
+            throws Exception {
+        VertxPlatformHttpServerConfiguration conf = new VertxPlatformHttpServerConfiguration();
+        conf.setBindPort(bindPort);
+
+        AuthenticationConfig authenticationConfig = new AuthenticationConfig();
+        customizer.customize(authenticationConfig);
+        conf.setAuthenticationConfig(authenticationConfig);
+
+        CamelContext camelContext = new DefaultCamelContext();
+        camelContext.addService(new VertxPlatformHttpServer(conf));
+        return camelContext;
+    }
+
+    interface AuthenticationConfigCustomizer {
+        void customize(AuthenticationConfig authenticationConfig);
+    }
+}

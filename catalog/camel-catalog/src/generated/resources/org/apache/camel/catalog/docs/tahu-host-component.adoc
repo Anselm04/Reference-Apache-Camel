@@ -1,0 +1,75 @@
+= Tahu Host Application Component
+:doctitle: Tahu Host Application
+:shortname: tahu-host
+:artifactid: camel-tahu
+:description: Sparkplug B Host Application support over MQTT using Eclipse Tahu
+:since: 4.8
+:supportlevel: Stable
+:tabs-sync-option:
+:component-header: Only consumer is supported
+//Manually maintained attributes
+:group: Tahu
+
+*Since Camel {since}*
+
+*{component-header}*
+
+== URI format
+
+.Host Application endpoints, where `hostId` is the Sparkplug Host Application ID
+-----
+tahu-host://hostId?options
+-----
+
+.Host Application Consumer for Host App 'BasicHostApp' using MQTT Client ID 'HostClient1'
+[caption="Example: "]
+------
+tahu-host:BasicHostApp?clientId=HostClient1
+------
+
+// component options: START
+include::partial$component-configure-options.adoc[]
+include::partial$component-endpoint-options.adoc[]
+include::partial$component-endpoint-headers.adoc[]
+// component options: END
+
+== Usage
+
+A Host Application consumer receives the Sparkplug messages of the Edge Nodes and Devices, and gives one exchange for
+each message, with the `CamelTahuMessageType` header. Each metric of a message is a header named `CamelTahuMetric.`
+followed by the name of the metric, and its value is a Tahu `Metric`.
+
+In addition, the consumer gives an exchange for each metric: each metric of a birth or data message, and each metric
+that turns stale when its Edge Node or Device dies. Such an exchange has the `CamelTahuEdgeNodeDescriptor` header and
+the header of its metric, but no `CamelTahuMessageType` header.
+
+The following route logs the temperature of the device in the xref:tahu-edge-component.adoc[Tahu Edge] example, once
+for each data message:
+
+[source,yaml]
+----
+- route:
+    from:
+      uri: tahu-host:BasicHostApp
+      parameters:
+        clientId: HostClient1
+        servers: "Mqtt:tcp://localhost:1883"
+      steps:
+        - filter:
+            expression:
+              simple:
+                expression: "${header.CamelTahuMessageType} == 'DDATA' && ${header[CamelTahuMetric.temperature]} != null"
+            steps:
+              - log:
+                  message: "Temperature: ${header[CamelTahuMetric.temperature].value}"
+----
+
+=== One Host Application consumer per JVM
+
+Define only one `tahu-host` route in a JVM, also across CamelContexts, and including routes that are not started
+(`autoStartup=false`): their consumer is created when the route is set up. Eclipse Tahu hands the Sparkplug messages of
+every Host Application in the JVM to one shared `SequenceReorderManager`, which gives them to the Host Application
+created last. With two consumers, all the Sparkplug messages the two receive go to the consumer created last, and the
+other one gets none of them.
+
+A route that is restarted, reloaded, or removed and added again is fine: its new consumer is the one created last.

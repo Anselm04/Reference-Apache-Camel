@@ -1,0 +1,185 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.camel.component.jte;
+
+import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
+import java.util.HexFormat;
+
+import gg.jte.TemplateEngine;
+import gg.jte.TemplateOutput;
+import gg.jte.output.StringOutput;
+import org.apache.camel.Category;
+import org.apache.camel.Component;
+import org.apache.camel.Exchange;
+import org.apache.camel.component.ResourceEndpoint;
+import org.apache.camel.spi.BodyType;
+import org.apache.camel.spi.BodyType.Carrier;
+import org.apache.camel.spi.BodyTypes;
+import org.apache.camel.spi.UriEndpoint;
+import org.apache.camel.spi.UriParam;
+import org.apache.camel.support.ExchangeHelper;
+import org.apache.camel.support.ResourceHelper;
+import org.apache.camel.util.ObjectHelper;
+import org.apache.camel.util.StringHelper;
+
+/**
+ * Transform messages using a Java based template engine (JTE).
+ */
+@UriEndpoint(firstVersion = "4.4.0", scheme = "jte", title = "JTE", syntax = "jte:resourceUri",
+             remote = false, producerOnly = true, category = { Category.TRANSFORMATION }, headersClass = JteConstants.class)
+@BodyTypes(producerIn = @BodyType(value = Carrier.ANY,
+                                  description = "The template takes an org.apache.camel.component.jte.Model: the body as it is"
+                                                + " in model.body, and converted to text by model.strBody(). With"
+                                                + " allowTemplateFromHeader=true the CamelJteDataModel header replaces the"
+                                                + " model"),
+           producerOut = @BodyType(value = Carrier.TEXT, javaType = "java.lang.String",
+                                   description = "The text the template writes, with leading and trailing whitespace trimmed."
+                                                 + " The headers are kept"))
+public class JteEndpoint extends ResourceEndpoint {
+
+    @UriParam
+    private boolean allowTemplateFromHeader;
+
+    public JteEndpoint() {
+    }
+
+    public JteEndpoint(String endpointUri, Component component, String resourceUri) {
+        super(endpointUri, component, resourceUri);
+    }
+
+    @Override
+    public boolean isRemote() {
+        return false;
+    }
+
+    @Override
+    public void clearContentCache() {
+        super.clearContentCache();
+        TemplateEngine template = getComponent().getTemplateEngine();
+        if (template != null) {
+            template.clearCache();
+            template.cleanAll();
+        }
+    }
+
+    @Override
+    public JteComponent getComponent() {
+        return (JteComponent) super.getComponent();
+    }
+
+    public boolean isAllowTemplateFromHeader() {
+        return allowTemplateFromHeader;
+    }
+
+    /**
+     * Whether to allow to use resource template from header or not (default false).
+     *
+     * Enabling this allows to specify dynamic templates via message header. However this can be seen as a potential
+     * security vulnerability if the header is coming from a malicious user, so use this with care.
+     */
+    public void setAllowTemplateFromHeader(boolean allowTemplateFromHeader) {
+        this.allowTemplateFromHeader = allowTemplateFromHeader;
+    }
+
+    public JteEndpoint findOrCreateEndpoint(String uri, String newResourceUri) {
+        String newUri = uri.replace(getResourceUri(), newResourceUri);
+        log.debug("Getting endpoint with URI: {}", newUri);
+        return getCamelContext().getEndpoint(newUri, JteEndpoint.class);
+    }
+
+    @Override
+    protected void onExchange(Exchange exchange) throws Exception {
+        String path = getResourceUri();
+        ObjectHelper.notNull(path, "resourceUri");
+
+        if (allowTemplateFromHeader) {
+            String newResourceUri = exchange.getIn().getHeader(JteConstants.JTE_RESOURCE_URI, String.class);
+            if (newResourceUri != null) {
+                exchange.getIn().removeHeader(JteConstants.JTE_RESOURCE_URI);
+                log.debug("{} set to {} creating new endpoint to handle exchange", JteConstants.JTE_RESOURCE_URI,
+                        newResourceUri);
+                JteEndpoint newEndpoint = findOrCreateEndpoint(getEndpointUri(), newResourceUri);
+                newEndpoint.onExchange(exchange);
+                return;
+            }
+        }
+
+        JteCodeResolver codeResolver = getComponent().getCodeResolver();
+        String name = getResourceUri();
+        String content;
+        if (allowTemplateFromHeader) {
+            content = exchange.getIn().getHeader(JteConstants.JTE_TEMPLATE, String.class);
+            if (content != null) {
+                // remove the header to avoid it being propagated in the routing
+                exchange.getIn().removeHeader(JteConstants.JTE_TEMPLATE);
+                // add template in code resolver so we can find it
+                if (codeResolver != null) {
+                    // named after its content: the engine compiles each template name into a class that it keeps,
+                    // so a name per exchange would compile the same template again for every exchange
+                    name = headerTemplateName(content);
+                    codeResolver.addTemplateFromHeader(name, content);
+                }
+            }
+        } else if (ResourceHelper.hasScheme(name)) {
+            // name should not include scheme
+            String uri = StringHelper.after(name, ":");
+            name = StringHelper.before(name, ":");
+            codeResolver.addPathMapping(name, uri);
+        }
+        Object dataModel = null;
+        if (allowTemplateFromHeader) {
+            dataModel = exchange.getIn().getHeader(JteConstants.JTE_DATA_MODEL, Object.class);
+        }
+        if (dataModel == null) {
+            Model model = new Model(getCamelContext());
+            model.body = exchange.getMessage().getBody();
+            model.headers = exchange.getMessage().getHeaders();
+            if (isAllowContextMapAll()) {
+                model.exchange = exchange;
+            }
+            dataModel = model;
+        }
+
+        // let JTE parse and generate the result in buffer
+        TemplateEngine template = getComponent().getTemplateEngine();
+
+        TemplateOutput buffer = new StringOutput();
+        template.render(name, dataModel, buffer);
+
+        // now lets store the result
+        String s = buffer.toString();
+        // trim leading and ending empty lines
+        s = s.trim();
+        ExchangeHelper.setInOutBodyPatternAware(exchange, s);
+    }
+
+    /**
+     * The name of a template given in the {@link JteConstants#JTE_TEMPLATE} header: the same for the same template
+     * content, and different for different contents.
+     */
+    static String headerTemplateName(String content) {
+        try {
+            MessageDigest digest = MessageDigest.getInstance("SHA-256");
+            return "header-" + HexFormat.of().formatHex(digest.digest(content.getBytes(StandardCharsets.UTF_8)));
+        } catch (NoSuchAlgorithmException e) {
+            // every Java platform supports SHA-256
+            throw new IllegalStateException(e);
+        }
+    }
+}

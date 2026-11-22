@@ -1,0 +1,201 @@
+= JOLT Component
+:doctitle: JOLT
+:shortname: jolt
+:artifactid: camel-jolt
+:description: JSON to JSON transformation using JOLT.
+:since: 2.16
+:supportlevel: Stable
+:tabs-sync-option:
+:component-header: Only producer is supported
+
+*Since Camel {since}*
+
+*{component-header}*
+
+The Jolt component allows you to process a JSON messages using a
+https://github.com/jolt-community/jolt-community[JOLT] specification. This can be
+ideal when doing JSON to JSON transformation.
+
+Maven users will need to add the following dependency to
+their `pom.xml` for this component:
+
+[source,xml]
+------------------------------------------------------------
+<dependency>
+    <groupId>org.apache.camel</groupId>
+    <artifactId>camel-jolt</artifactId>
+    <version>x.x.x</version>
+    <!-- use the same version as your Camel core version -->
+</dependency>
+------------------------------------------------------------
+
+
+== URI format
+
+-----------------------
+jolt:specName[?options]
+-----------------------
+
+Where `specName` is the classpath-local URI of the specification to
+invoke; or the complete URL of the remote specification
+(e.g.: `\file://folder/myfile.vm`).
+
+
+// component options: START
+include::partial$component-configure-options.adoc[]
+include::partial$component-endpoint-options.adoc[]
+include::partial$component-endpoint-headers.adoc[]
+// component options: END
+
+== Usage
+
+=== Input and output types
+
+With the default `inputType`, `Hydrated`, the body can be:
+
+* JSON text (a `String` or other text whose first non-whitespace character is `{` or `[`), which is parsed as JSON;
+* bytes, an `InputStream` (including a stream cache) or a file (`java.io.File`, `java.nio.file.Path` or the file of the
+xref:file-component.adoc[File] component), which is parsed as JSON. The text is decoded in the charset of the
+exchange (`Exchange.CHARSET_NAME`) when one is set; otherwise the JSON parser detects the encoding;
+* a Jackson `JsonNode` (Jackson 3 or Jackson 2), such as the body of the `application-x-struct` data type or of the
+JSON data format with `unmarshalType` set to `JsonNode`, which is converted to a `Map` or a `List` from its JSON text;
+* a `Map` or a `List` (hydrated JSON), which is used as it is.
+
+Text that does not start with `{` or `[` is passed to the specification as it is. Text that starts with `{` or `[`
+but is not valid JSON fails with the parse error.
+
+With `inputType=JsonString`, the body is always parsed as JSON, and a Jackson `JsonNode` is converted the same way.
+
+The output is hydrated JSON (a `Map` or a `List`) by default; set `outputType=JsonString` to get a JSON `String`.
+
+== Examples
+
+For example, you could use something like
+
+The messages of the queue are JSON text, so the examples set `inputType` and `outputType` to `JsonString`: the body is always parsed as JSON, and the result is JSON text. With the default, `Hydrated`, the result is parsed JSON (a Map or a List).
+
+[tabs]
+====
+Java::
++
+[source,java]
+----
+from("activemq:My.Queue")
+    .to("jolt:com/acme/MyResponse.json?inputType=JsonString&outputType=JsonString");
+----
+
+XML::
++
+[source,xml]
+----
+<route>
+  <from uri="activemq:My.Queue"/>
+  <to uri="jolt:com/acme/MyResponse.json?inputType=JsonString&amp;outputType=JsonString"/>
+</route>
+----
+
+YAML::
++
+[source,yaml]
+----
+- route:
+    from:
+      uri: activemq:My.Queue
+      steps:
+        - to:
+            uri: jolt:com/acme/MyResponse.json
+            parameters:
+              inputType: JsonString
+              outputType: JsonString
+----
+====
+
+And a file-based resource:
+
+[tabs]
+====
+Java::
++
+[source,java]
+----
+from("activemq:My.Queue")
+    .to("jolt:file://myfolder/MyResponse.json?contentCache=true&inputType=JsonString&outputType=JsonString")
+    .to("activemq:Another.Queue");
+----
+
+XML::
++
+[source,xml]
+----
+<route>
+  <from uri="activemq:My.Queue"/>
+  <to uri="jolt:file://myfolder/MyResponse.json?contentCache=true&amp;inputType=JsonString&amp;outputType=JsonString"/>
+  <to uri="activemq:Another.Queue"/>
+</route>
+----
+
+YAML::
++
+[source,yaml]
+----
+- route:
+    from:
+      uri: activemq:My.Queue
+      steps:
+        - to:
+            uri: jolt:file://myfolder/MyResponse.json
+            parameters:
+              contentCache: true
+              inputType: JsonString
+              outputType: JsonString
+        - to:
+            uri: activemq:Another.Queue
+----
+====
+
+You can also specify what specification the component should use
+dynamically via a header, so, for example:
+
+[tabs]
+====
+Java::
++
+[source,java]
+----
+from("direct:in")
+    .setHeader("CamelJoltResourceUri").constant("path/to/my/spec.json")
+    .to("jolt:dummy?allowTemplateFromHeader=true");
+----
+
+XML::
++
+[source,xml]
+----
+<route>
+  <from uri="direct:in"/>
+  <setHeader name="CamelJoltResourceUri">
+    <constant>path/to/my/spec.json</constant>
+  </setHeader>
+  <to uri="jolt:dummy?allowTemplateFromHeader=true"/>
+</route>
+----
+
+YAML::
++
+[source,yaml]
+----
+- route:
+    from:
+      uri: direct:in
+      steps:
+        - setHeader:
+            name: CamelJoltResourceUri
+            expression:
+              constant:
+                expression: path/to/my/spec.json
+        - to:
+            uri: jolt:dummy
+            parameters:
+              allowTemplateFromHeader: true
+----
+====

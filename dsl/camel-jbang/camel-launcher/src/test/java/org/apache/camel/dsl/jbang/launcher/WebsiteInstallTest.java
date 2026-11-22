@@ -1,0 +1,2050 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.camel.dsl.jbang.launcher;
+
+import java.io.File;
+import java.io.IOException;
+import java.io.OutputStream;
+import java.net.InetAddress;
+import java.net.ServerSocket;
+import java.net.Socket;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
+import java.security.MessageDigest;
+import java.time.Duration;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.HexFormat;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.UUID;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
+import java.util.stream.Collectors;
+import java.util.stream.Stream;
+
+import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.Nested;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.condition.DisabledOnOs;
+import org.junit.jupiter.api.condition.EnabledOnOs;
+import org.junit.jupiter.api.condition.OS;
+import org.junit.jupiter.api.io.TempDir;
+import org.junit.jupiter.api.parallel.Execution;
+import org.junit.jupiter.api.parallel.ExecutionMode;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.Arguments;
+import org.junit.jupiter.params.provider.MethodSource;
+
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotEquals;
+import static org.junit.jupiter.api.Assertions.assertTrue;
+
+/**
+ * Contract suite for the canonical website installers (install.sh for POSIX, install.ps1 for Windows). Every scenario
+ * runs the script against a loopback {@link WebsiteInstallerFixture} HTTPS server so no production endpoint is ever
+ * contacted. Platform-specific tests live in the {@link PosixShell} and {@link WindowsPowerShell} nested classes.
+ */
+class WebsiteInstallTest {
+
+    // A representative ASF license header (as WebsiteManifestGenerator now prepends), including '##'
+    // lines and a bare '##' line, used to verify the installers skip comment lines in a manifest.
+    static final String MANIFEST_LICENSE_HEADER
+            = "## ---------------------------------------------------------------------------\n"
+              + "## Licensed to the Apache Software Foundation (ASF) under one or more\n"
+              + "## contributor license agreements.  See the NOTICE file distributed with\n"
+              + "##\n"
+              + "## limitations under the License.\n"
+              + "## ---------------------------------------------------------------------------\n";
+
+    static void publishLatest(WebsiteInstallerFixture fixture, String version) throws Exception {
+        Path tar = fixture.safeTar(version);
+        Path zip = fixture.safeZip(version);
+        publishRelease(fixture, version, tar, zip);
+        fixture.publishManifest("/camel-cli/releases/latest.properties", version, tar, zip);
+    }
+
+    static void publishVersion(WebsiteInstallerFixture fixture, String version) throws Exception {
+        Path tar = fixture.safeTar(version);
+        Path zip = fixture.safeZip(version);
+        publishRelease(fixture, version, tar, zip);
+        fixture.publishManifest("/camel-cli/releases/" + version + ".properties", version, tar, zip);
+    }
+
+    /**
+     * Publishes release {@code version} (archives and its {@code X.Y.Z.properties}) and points alias {@code alias}
+     * ({@code lts} or {@code X.Y}) at it.
+     */
+    static void publishAlias(WebsiteInstallerFixture fixture, String alias, String version) throws Exception {
+        Path tar = fixture.safeTar(version);
+        Path zip = fixture.safeZip(version);
+        publishRelease(fixture, version, tar, zip);
+        fixture.publishManifest("/camel-cli/releases/" + version + ".properties", version, tar, zip);
+        fixture.publishAlias(alias, version, tar, zip);
+    }
+
+    static Stream<String> malformedSelectors() {
+        return Stream.of("2", "2.", ".2", "2..1", "1.2.3.4", "1.2.3-snapshot", "v2.1", "latest", "LTS2", "lt", "2.x");
+    }
+
+    // install.sh only: install.ps1 does not install nightly builds yet.
+    static Stream<String> malformedNightlySelectors() {
+        return Stream.of("1.2.3-SNAPSHOT1", "1.2-SNAPSHOT", "SNAPSHOTS", "1.2.3-20261108.143653", "1.2.3-20261108-24",
+                "1.2.3-20261108.143653-x", "1.2.3-20261108.143653-24/..", "1.2.3-20261108.143653-1234567890");
+    }
+
+    static final String NIGHTLY = "9.9.0-20261108.143653-24";
+
+    /**
+     * Publishes nightly build {@code build} of {@code snapshotVersion} as the Apache snapshot repository does: the
+     * archive (which unpacks to camel-launcher-X.Y.Z-SNAPSHOT), its {@code .sha1}, and the version metadata naming it
+     * as the newest build. {@code sha1} overrides the published checksum when not null.
+     */
+    static void publishNightly(
+            WebsiteInstallerFixture fixture, String snapshotVersion, String build, String sha1)
+            throws Exception {
+        Path tar = fixture.safeTar(snapshotVersion);
+        String base = "/snapshots/org/apache/camel/camel-launcher/" + snapshotVersion;
+        fixture.publish(base + "/camel-launcher-" + build + "-bin.tar.gz", Files.readAllBytes(tar));
+        String checksum = sha1 != null
+                ? sha1 : HexFormat.of().formatHex(MessageDigest.getInstance("SHA-1").digest(Files.readAllBytes(tar)));
+        fixture.publish(base + "/camel-launcher-" + build + "-bin.tar.gz.sha1", checksum.getBytes(StandardCharsets.UTF_8));
+        String metadata = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
+                          + "<metadata modelVersion=\"1.1.0\">\n"
+                          + "  <version>" + snapshotVersion + "</version>\n"
+                          + "  <versioning>\n"
+                          + "    <snapshotVersions>\n"
+                          + "      <snapshotVersion>\n"
+                          + "        <extension>pom</extension>\n"
+                          + "        <value>" + build + "</value>\n"
+                          + "      </snapshotVersion>\n"
+                          + "      <snapshotVersion>\n"
+                          + "        <classifier>bin</classifier>\n"
+                          + "        <extension>tar.gz</extension>\n"
+                          + "        <value>" + build + "</value>\n"
+                          + "      </snapshotVersion>\n"
+                          + "    </snapshotVersions>\n"
+                          + "  </versioning>\n"
+                          + "</metadata>\n";
+        fixture.publish(base + "/maven-metadata.xml", metadata.getBytes(StandardCharsets.UTF_8));
+    }
+
+    /** Publishes the root metadata of the snapshot repository, listing these snapshot versions. */
+    static void publishSnapshotVersions(WebsiteInstallerFixture fixture, String... snapshotVersions) {
+        StringBuilder metadata = new StringBuilder("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<metadata>\n  <versioning>\n");
+        // <latest> names the last deploy, which is not the highest version
+        metadata.append("    <latest>").append(snapshotVersions[snapshotVersions.length - 1]).append("</latest>\n");
+        metadata.append("    <versions>\n");
+        for (String version : snapshotVersions) {
+            metadata.append("      <version>").append(version).append("</version>\n");
+        }
+        metadata.append("    </versions>\n  </versioning>\n</metadata>\n");
+        fixture.publish("/snapshots/org/apache/camel/camel-launcher/maven-metadata.xml",
+                metadata.toString().getBytes(StandardCharsets.UTF_8));
+    }
+
+    static void publishRelease(WebsiteInstallerFixture fixture, String version, Path tar, Path zip) throws Exception {
+        fixture.publish("/maven2/org/apache/camel/camel-launcher/" + version + "/camel-launcher-" + version + "-bin.tar.gz",
+                Files.readAllBytes(tar));
+        fixture.publish("/maven2/org/apache/camel/camel-launcher/" + version + "/camel-launcher-" + version + "-bin.zip",
+                Files.readAllBytes(zip));
+    }
+
+    static void serveTruncatedThenClose(ServerSocket rawServer, byte[] fullBody) {
+        try (Socket client = rawServer.accept()) {
+            String headers = "HTTP/1.1 200 OK\r\nContent-Length: " + fullBody.length + "\r\nConnection: close\r\n\r\n";
+            OutputStream out = client.getOutputStream();
+            out.write(headers.getBytes(StandardCharsets.US_ASCII));
+            out.write(fullBody, 0, fullBody.length / 2);
+            out.flush();
+        } catch (IOException ignored) {
+        }
+    }
+
+    // the headers and half of the body, and then nothing more, while the connection stays open
+    static void serveHalfThenStall(ServerSocket rawServer, byte[] fullBody, CountDownLatch release) {
+        try (Socket client = rawServer.accept()) {
+            String headers = "HTTP/1.1 200 OK\r\nContent-Length: " + fullBody.length + "\r\nConnection: close\r\n\r\n";
+            OutputStream out = client.getOutputStream();
+            out.write(headers.getBytes(StandardCharsets.US_ASCII));
+            out.write(fullBody, 0, fullBody.length / 2);
+            out.flush();
+            release.await(60, TimeUnit.SECONDS);
+        } catch (IOException ignored) {
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+    }
+
+    static Stream<Arguments> invalidManifests() {
+        String hash = "a".repeat(64);
+        return Stream.of(
+                Arguments.of("missing-key", "format=1\nversion=1.0.0\ntar_sha256=" + hash + "\n"),
+                Arguments.of("duplicate-key",
+                        "format=1\nformat=1\nversion=1.0.0\ntar_sha256=" + hash + "\nzip_sha256=" + hash + "\n"),
+                Arguments.of("blank-line",
+                        "format=1\n\nversion=1.0.0\ntar_sha256=" + hash + "\nzip_sha256=" + hash + "\n"),
+                Arguments.of("unknown-key",
+                        "format=1\nversion=1.0.0\ntar_sha256=" + hash + "\nzip_sha256=" + hash + "\nextra=1\n"),
+                Arguments.of("bad-format",
+                        "format=2\nversion=1.0.0\ntar_sha256=" + hash + "\nzip_sha256=" + hash + "\n"),
+                Arguments.of("bad-version",
+                        "format=1\nversion=1.0\ntar_sha256=" + hash + "\nzip_sha256=" + hash + "\n"),
+                Arguments.of("bad-tar-hash",
+                        "format=1\nversion=1.0.0\ntar_sha256=not-hex\nzip_sha256=" + hash + "\n"),
+                Arguments.of("bad-zip-hash",
+                        "format=1\nversion=1.0.0\ntar_sha256=" + hash + "\nzip_sha256=short\n"));
+    }
+
+    interface MaliciousArchive {
+        Path build(WebsiteInstallerFixture fixture) throws Exception;
+    }
+
+    // POSIX (install.sh)
+
+    @Nested
+    @DisabledOnOs(OS.WINDOWS)
+    @Execution(ExecutionMode.CONCURRENT)
+    class PosixShell {
+
+        private static final Path SCRIPT = Paths.get("src/install/install.sh").toAbsolutePath();
+
+        private static WebsiteInstallerFixture.Result install(
+                WebsiteInstallerFixture fixture, Path home, String version)
+                throws Exception {
+            List<String> command = new ArrayList<>(List.of("/bin/sh", SCRIPT.toString()));
+            if (version != null) {
+                command.add("--version");
+                command.add(version);
+            }
+            return fixture.run(command, fixture.environment(home));
+        }
+
+        private static void assertVersionInstalled(Path home, String version) throws Exception {
+            Path shim = home.resolve(".local/bin/camel");
+            assertTrue(Files.isSymbolicLink(shim), "expected a symlink at " + shim);
+            Path versionDir = home.resolve(".local/share/camel-cli/versions/" + version);
+            assertTrue(Files.isDirectory(versionDir), "expected version directory " + versionDir);
+
+            String output = WebsiteInstallerFixture.execute(
+                    new ProcessBuilder("/bin/sh", shim.toString(), "version").redirectErrorStream(true)).stdout();
+            assertTrue(output.contains("Camel " + version), output);
+        }
+
+        private void assertMaliciousTarRejected(Path temp, MaliciousArchive archiveBuilder) throws Exception {
+            try (WebsiteInstallerFixture fixture = WebsiteInstallerFixture.start(temp.resolve("fixture"))) {
+                Path home = Files.createDirectory(temp.resolve("home"));
+                Path tar = archiveBuilder.build(fixture);
+                Path zip = fixture.safeZip("9.9.9");
+                publishRelease(fixture, "9.9.9", tar, zip);
+                fixture.publishManifest("/camel-cli/releases/9.9.9.properties", "9.9.9", tar, zip);
+
+                WebsiteInstallerFixture.Result r = install(fixture, home, "9.9.9");
+
+                assertNotEquals(0, r.exit());
+                assertFalse(Files.exists(home.resolve(".local/bin/camel")));
+            }
+        }
+
+        @Test
+        void installsLatestVersion(@TempDir Path temp) throws Exception {
+            try (WebsiteInstallerFixture fixture = WebsiteInstallerFixture.start(temp.resolve("fixture"))) {
+                Path home = Files.createDirectory(temp.resolve("home"));
+                publishLatest(fixture, "1.2.3");
+
+                WebsiteInstallerFixture.Result r = install(fixture, home, null);
+
+                assertEquals(0, r.exit(), r.stderr());
+                assertVersionInstalled(home, "1.2.3");
+            }
+        }
+
+        @Test
+        void installsExactVersion(@TempDir Path temp) throws Exception {
+            try (WebsiteInstallerFixture fixture = WebsiteInstallerFixture.start(temp.resolve("fixture"))) {
+                Path home = Files.createDirectory(temp.resolve("home"));
+                publishVersion(fixture, "2.5.0");
+
+                WebsiteInstallerFixture.Result r = install(fixture, home, "2.5.0");
+
+                assertEquals(0, r.exit(), r.stderr());
+                assertVersionInstalled(home, "2.5.0");
+            }
+        }
+
+        @Test
+        void installsWhenManifestCarriesLicenseHeader(@TempDir Path temp) throws Exception {
+            // The website's manifest generator prepends an ASF license header; install.sh must skip
+            // those comment lines and still install successfully.
+            try (WebsiteInstallerFixture fixture = WebsiteInstallerFixture.start(temp.resolve("fixture"))) {
+                Path home = Files.createDirectory(temp.resolve("home"));
+                Path tar = fixture.safeTar("1.2.3");
+                Path zip = fixture.safeZip("1.2.3");
+                publishRelease(fixture, "1.2.3", tar, zip);
+                fixture.publishManifest("/camel-cli/releases/latest.properties", "1.2.3", tar, zip,
+                        MANIFEST_LICENSE_HEADER);
+
+                WebsiteInstallerFixture.Result r = install(fixture, home, null);
+
+                assertEquals(0, r.exit(), r.stderr());
+                assertVersionInstalled(home, "1.2.3");
+            }
+        }
+
+        @Test
+        void honorsCustomXdgDataHome(@TempDir Path temp) throws Exception {
+            try (WebsiteInstallerFixture fixture = WebsiteInstallerFixture.start(temp.resolve("fixture"))) {
+                Path home = Files.createDirectory(temp.resolve("home"));
+                Path xdg = Files.createDirectory(temp.resolve("xdg-data"));
+                publishLatest(fixture, "1.0.0");
+
+                Map<String, String> env = new HashMap<>(fixture.environment(home));
+                env.put("XDG_DATA_HOME", xdg.toString());
+                WebsiteInstallerFixture.Result r = fixture.run(List.of("/bin/sh", SCRIPT.toString()), env);
+
+                assertEquals(0, r.exit(), r.stderr());
+                assertTrue(Files.isDirectory(xdg.resolve("camel-cli/versions/1.0.0")), r.stdout());
+                assertTrue(Files.isSymbolicLink(home.resolve(".local/bin/camel")));
+            }
+        }
+
+        @Test
+        void handlesSpacesAndUnicodeInHome(@TempDir Path temp) throws Exception {
+            try (WebsiteInstallerFixture fixture = WebsiteInstallerFixture.start(temp.resolve("fixture"))) {
+                Path home = Files.createDirectories(temp.resolve("home dir/über"));
+                publishLatest(fixture, "1.0.0");
+
+                WebsiteInstallerFixture.Result r = install(fixture, home, null);
+
+                assertEquals(0, r.exit(), r.stderr());
+                assertVersionInstalled(home, "1.0.0");
+            }
+        }
+
+        @Test
+        void upgradeKeepsPreviousVersionDirectory(@TempDir Path temp) throws Exception {
+            try (WebsiteInstallerFixture fixture = WebsiteInstallerFixture.start(temp.resolve("fixture"))) {
+                Path home = Files.createDirectory(temp.resolve("home"));
+                publishVersion(fixture, "1.0.0");
+                assertEquals(0, install(fixture, home, "1.0.0").exit());
+
+                publishVersion(fixture, "2.0.0");
+                WebsiteInstallerFixture.Result r = install(fixture, home, "2.0.0");
+
+                assertEquals(0, r.exit(), r.stderr());
+                assertVersionInstalled(home, "2.0.0");
+                assertTrue(Files.isDirectory(home.resolve(".local/share/camel-cli/versions/1.0.0")),
+                        "old version dir removed");
+            }
+        }
+
+        @Test
+        void downgradeToExplicitOlderVersionSucceeds(@TempDir Path temp) throws Exception {
+            try (WebsiteInstallerFixture fixture = WebsiteInstallerFixture.start(temp.resolve("fixture"))) {
+                Path home = Files.createDirectory(temp.resolve("home"));
+                publishVersion(fixture, "1.0.0");
+                assertEquals(0, install(fixture, home, "1.0.0").exit());
+                publishVersion(fixture, "2.0.0");
+                assertEquals(0, install(fixture, home, "2.0.0").exit());
+
+                WebsiteInstallerFixture.Result r = install(fixture, home, "1.0.0");
+
+                assertEquals(0, r.exit(), r.stderr());
+                assertVersionInstalled(home, "1.0.0");
+                assertTrue(Files.isDirectory(home.resolve(".local/share/camel-cli/versions/2.0.0")));
+            }
+        }
+
+        @Test
+        void reinstallingSameVersionSucceeds(@TempDir Path temp) throws Exception {
+            try (WebsiteInstallerFixture fixture = WebsiteInstallerFixture.start(temp.resolve("fixture"))) {
+                Path home = Files.createDirectory(temp.resolve("home"));
+                publishVersion(fixture, "1.0.0");
+
+                assertEquals(0, install(fixture, home, "1.0.0").exit());
+                WebsiteInstallerFixture.Result r = install(fixture, home, "1.0.0");
+
+                assertEquals(0, r.exit(), r.stderr());
+                assertVersionInstalled(home, "1.0.0");
+            }
+        }
+
+        private static Path pinnedVersionFile(Path home) {
+            return home.resolve(".local/share/camel-cli/pinned-version");
+        }
+
+        @Test
+        void pinsVersionWhenInstalledExplicitly(@TempDir Path temp) throws Exception {
+            try (WebsiteInstallerFixture fixture = WebsiteInstallerFixture.start(temp.resolve("fixture"))) {
+                Path home = Files.createDirectory(temp.resolve("home"));
+                publishVersion(fixture, "1.0.0");
+
+                WebsiteInstallerFixture.Result r = install(fixture, home, "1.0.0");
+
+                assertEquals(0, r.exit(), r.stderr());
+                assertThat(pinnedVersionFile(home)).hasContent("1.0.0");
+            }
+        }
+
+        @Test
+        void doesNotPinWhenInstallingLatest(@TempDir Path temp) throws Exception {
+            try (WebsiteInstallerFixture fixture = WebsiteInstallerFixture.start(temp.resolve("fixture"))) {
+                Path home = Files.createDirectory(temp.resolve("home"));
+                publishLatest(fixture, "1.0.0");
+
+                WebsiteInstallerFixture.Result r = install(fixture, home, null);
+
+                assertEquals(0, r.exit(), r.stderr());
+                assertThat(pinnedVersionFile(home)).doesNotExist();
+            }
+        }
+
+        @Test
+        void reinstallingLatestClearsAnExistingPin(@TempDir Path temp) throws Exception {
+            try (WebsiteInstallerFixture fixture = WebsiteInstallerFixture.start(temp.resolve("fixture"))) {
+                Path home = Files.createDirectory(temp.resolve("home"));
+                publishVersion(fixture, "1.0.0");
+                assertEquals(0, install(fixture, home, "1.0.0").exit());
+                assertThat(pinnedVersionFile(home)).exists();
+                publishLatest(fixture, "2.0.0");
+
+                WebsiteInstallerFixture.Result r = install(fixture, home, null);
+
+                assertEquals(0, r.exit(), r.stderr());
+                assertThat(pinnedVersionFile(home)).doesNotExist();
+            }
+        }
+
+        // Guards against a real self-lockout bug: SelfUpdateCommand always passes --version (the version it
+        // resolved, for TOCTOU-safety), even for a bare `camel self-update`. Without CAMEL_INSTALL_SELF_UPDATE
+        // suppressing the pin write, every self-update run would pin itself on the way out, and the very next
+        // self-update would then refuse to run at all (see SelfUpdateCommand's pinned-version refusal).
+        @Test
+        void selfUpdateInternalFlagNeverWritesAPin(@TempDir Path temp) throws Exception {
+            try (WebsiteInstallerFixture fixture = WebsiteInstallerFixture.start(temp.resolve("fixture"))) {
+                Path home = Files.createDirectory(temp.resolve("home"));
+                publishVersion(fixture, "1.0.0");
+                Map<String, String> env = new HashMap<>(fixture.environment(home));
+                env.put("CAMEL_INSTALL_SELF_UPDATE", "true");
+
+                WebsiteInstallerFixture.Result r = fixture.run(
+                        List.of("/bin/sh", SCRIPT.toString(), "--version", "1.0.0"), env);
+
+                assertEquals(0, r.exit(), r.stderr());
+                assertThat(pinnedVersionFile(home)).doesNotExist();
+            }
+        }
+
+        // A pre-existing pin must also survive an internal self-update run untouched (not just "never created").
+        @Test
+        void selfUpdateInternalFlagLeavesAnExistingPinUntouched(@TempDir Path temp) throws Exception {
+            try (WebsiteInstallerFixture fixture = WebsiteInstallerFixture.start(temp.resolve("fixture"))) {
+                Path home = Files.createDirectory(temp.resolve("home"));
+                publishVersion(fixture, "1.0.0");
+                assertEquals(0, install(fixture, home, "1.0.0").exit());
+                assertThat(pinnedVersionFile(home)).hasContent("1.0.0");
+
+                publishVersion(fixture, "2.0.0");
+                Map<String, String> env = new HashMap<>(fixture.environment(home));
+                env.put("CAMEL_INSTALL_SELF_UPDATE", "true");
+                WebsiteInstallerFixture.Result r = fixture.run(
+                        List.of("/bin/sh", SCRIPT.toString(), "--version", "2.0.0"), env);
+
+                assertEquals(0, r.exit(), r.stderr());
+                assertThat(pinnedVersionFile(home)).hasContent("1.0.0");
+            }
+        }
+
+        @Test
+        void installsNewestLtsWithLtsSelectorAndPinsTheSelector(@TempDir Path temp) throws Exception {
+            try (WebsiteInstallerFixture fixture = WebsiteInstallerFixture.start(temp.resolve("fixture"))) {
+                Path home = Files.createDirectory(temp.resolve("home"));
+                publishAlias(fixture, "lts", "2.1.3");
+                publishLatest(fixture, "3.0.0");
+
+                // Case-insensitive, normalised to LTS in the pin file.
+                WebsiteInstallerFixture.Result r = install(fixture, home, "lts");
+
+                assertEquals(0, r.exit(), r.stderr());
+                assertVersionInstalled(home, "2.1.3");
+                assertThat(pinnedVersionFile(home)).hasContent("LTS");
+            }
+        }
+
+        @Test
+        void installsNewestPatchOfReleaseLineAndPinsTheLine(@TempDir Path temp) throws Exception {
+            try (WebsiteInstallerFixture fixture = WebsiteInstallerFixture.start(temp.resolve("fixture"))) {
+                Path home = Files.createDirectory(temp.resolve("home"));
+                publishAlias(fixture, "2.1", "2.1.4");
+
+                WebsiteInstallerFixture.Result r = install(fixture, home, "2.1");
+
+                assertEquals(0, r.exit(), r.stderr());
+                assertVersionInstalled(home, "2.1.4");
+                assertThat(pinnedVersionFile(home)).hasContent("2.1");
+            }
+        }
+
+        // A trailing-zero line must be compared as a whole component: 4.20 is not 4.2, and 4.2 accepts neither
+        // 4.20.0 nor 4.22.0.
+        @Test
+        void trailingZeroReleaseLineIsNotReadAsAShorterLine(@TempDir Path temp) throws Exception {
+            try (WebsiteInstallerFixture fixture = WebsiteInstallerFixture.start(temp.resolve("fixture"))) {
+                Path home = Files.createDirectory(temp.resolve("home"));
+                publishAlias(fixture, "4.20", "4.20.3");
+
+                WebsiteInstallerFixture.Result r = install(fixture, home, "4.20");
+
+                assertEquals(0, r.exit(), r.stderr());
+                assertVersionInstalled(home, "4.20.3");
+                assertThat(pinnedVersionFile(home)).hasContent("4.20");
+
+                publishAlias(fixture, "4.2", "4.20.0");
+                WebsiteInstallerFixture.Result twenty = install(fixture, home, "4.2");
+                publishAlias(fixture, "4.2", "4.22.0");
+                WebsiteInstallerFixture.Result twentyTwo = install(fixture, home, "4.2");
+
+                assertNotEquals(0, twenty.exit());
+                assertThat(twenty.stderr()).contains("manifest version (4.20.0) is not in the requested release line (4.2)");
+                assertNotEquals(0, twentyTwo.exit());
+                assertThat(twentyTwo.stderr()).contains("manifest version (4.22.0) is not in the requested release line (4.2)");
+                assertVersionInstalled(home, "4.20.3");
+                assertThat(pinnedVersionFile(home)).hasContent("4.20");
+            }
+        }
+
+        @Test
+        void rejectsReleaseLineManifestOutsideTheLine(@TempDir Path temp) throws Exception {
+            try (WebsiteInstallerFixture fixture = WebsiteInstallerFixture.start(temp.resolve("fixture"))) {
+                Path home = Files.createDirectory(temp.resolve("home"));
+                // 2.10.0 shares the "2.1" prefix but not the "2.1." line.
+                publishAlias(fixture, "2.1", "2.10.0");
+
+                WebsiteInstallerFixture.Result r = install(fixture, home, "2.1");
+
+                assertNotEquals(0, r.exit());
+                assertThat(r.stderr()).contains("not in the requested release line (2.1)");
+                assertFalse(Files.exists(home.resolve(".local/bin/camel")));
+                assertFalse(Files.exists(home.resolve(".local/share/camel-cli/versions/2.10.0")));
+                assertThat(pinnedVersionFile(home)).doesNotExist();
+            }
+        }
+
+        @Test
+        void reportsMissingAliasClearly(@TempDir Path temp) throws Exception {
+            try (WebsiteInstallerFixture fixture = WebsiteInstallerFixture.start(temp.resolve("fixture"))) {
+                Path home = Files.createDirectory(temp.resolve("home"));
+                publishLatest(fixture, "3.0.0");
+
+                WebsiteInstallerFixture.Result lts = install(fixture, home, "LTS");
+                WebsiteInstallerFixture.Result line = install(fixture, home, "2.1");
+
+                assertNotEquals(0, lts.exit());
+                assertThat(lts.stderr()).contains("no manifest for LTS at").contains("lts.properties")
+                        .contains("may not publish aliases yet");
+                assertNotEquals(0, line.exit());
+                assertThat(line.stderr()).contains("no manifest for 2.1 at").contains("2.1.properties");
+                assertFalse(Files.exists(home.resolve(".local/bin/camel")));
+            }
+        }
+
+        @ParameterizedTest(name = "{0}")
+        @MethodSource("org.apache.camel.dsl.jbang.launcher.WebsiteInstallTest#malformedSelectors")
+        void rejectsMalformedSelector(String selector, @TempDir Path temp) throws Exception {
+            try (WebsiteInstallerFixture fixture = WebsiteInstallerFixture.start(temp.resolve("fixture"))) {
+                Path home = Files.createDirectory(temp.resolve("home"));
+                publishLatest(fixture, "3.0.0");
+
+                WebsiteInstallerFixture.Result r = install(fixture, home, selector);
+
+                assertNotEquals(0, r.exit());
+                assertThat(r.stderr()).contains("invalid --version value");
+                assertFalse(Files.exists(home.resolve(".local/bin/camel")));
+            }
+        }
+
+        private static void assertPin(Path home, String expected) throws Exception {
+            Path file = pinnedVersionFile(home);
+            if (expected == null) {
+                assertFalse(Files.exists(file), "expected no pin at " + file);
+            } else {
+                assertEquals(expected, Files.readString(file).strip());
+            }
+        }
+
+        private static Set<String> installedVersions(Path home) throws Exception {
+            try (Stream<Path> listing = Files.list(home.resolve(".local/share/camel-cli/versions"))) {
+                return listing.map(d -> d.getFileName().toString()).collect(Collectors.toSet());
+            }
+        }
+
+        private static void assertNightlyInstalled(Path home, String build, String snapshotVersion) throws Exception {
+            Path shim = home.resolve(".local/bin/camel");
+            Path versionDir = home.resolve(".local/share/camel-cli/versions/" + build);
+            assertTrue(Files.isSymbolicLink(shim), "expected a symlink at " + shim);
+            assertEquals(versionDir.resolve("bin/camel.sh"), Files.readSymbolicLink(shim));
+            String output = WebsiteInstallerFixture.execute(
+                    new ProcessBuilder("/bin/sh", shim.toString(), "version").redirectErrorStream(true)).stdout();
+            assertTrue(output.contains("Camel " + snapshotVersion), output);
+        }
+
+        @Test
+        void installsNewestNightlyOfMainAndPinsSnapshot(@TempDir Path temp) throws Exception {
+            try (WebsiteInstallerFixture fixture = WebsiteInstallerFixture.start(temp.resolve("fixture"))) {
+                Path home = Files.createDirectory(temp.resolve("home"));
+                // main is the highest snapshot version, not the one deployed last
+                publishSnapshotVersions(fixture, "9.9.0-SNAPSHOT", "9.8.1-SNAPSHOT");
+                publishNightly(fixture, "9.9.0-SNAPSHOT", NIGHTLY, null);
+
+                WebsiteInstallerFixture.Result r = install(fixture, home, "snapshot");
+
+                assertEquals(0, r.exit(), r.stderr());
+                assertTrue(r.stdout().contains("is a nightly development build of Apache Camel"), r.stdout());
+                assertTrue(r.stdout().contains("Installed Camel CLI " + NIGHTLY + " (a nightly build of 9.9.0-SNAPSHOT)"),
+                        r.stdout());
+                assertNightlyInstalled(home, NIGHTLY, "9.9.0-SNAPSHOT");
+                assertPin(home, "SNAPSHOT");
+            }
+        }
+
+        @Test
+        void installsNewestNightlyOfSnapshotVersionAndPinsIt(@TempDir Path temp) throws Exception {
+            try (WebsiteInstallerFixture fixture = WebsiteInstallerFixture.start(temp.resolve("fixture"))) {
+                Path home = Files.createDirectory(temp.resolve("home"));
+                publishNightly(fixture, "9.8.1-SNAPSHOT", "9.8.1-20261107.010203-7", null);
+
+                WebsiteInstallerFixture.Result r = install(fixture, home, "9.8.1-SNAPSHOT");
+
+                assertEquals(0, r.exit(), r.stderr());
+                assertNightlyInstalled(home, "9.8.1-20261107.010203-7", "9.8.1-SNAPSHOT");
+                assertPin(home, "9.8.1-SNAPSHOT");
+            }
+        }
+
+        // what camel self-update passes on, after resolving the newest build itself
+        @Test
+        void installsOneNightlyBuild(@TempDir Path temp) throws Exception {
+            try (WebsiteInstallerFixture fixture = WebsiteInstallerFixture.start(temp.resolve("fixture"))) {
+                Path home = Files.createDirectory(temp.resolve("home"));
+                publishNightly(fixture, "9.9.0-SNAPSHOT", NIGHTLY, null);
+
+                WebsiteInstallerFixture.Result r = install(fixture, home, NIGHTLY);
+
+                assertEquals(0, r.exit(), r.stderr());
+                assertNightlyInstalled(home, NIGHTLY, "9.9.0-SNAPSHOT");
+                assertPin(home, NIGHTLY);
+            }
+        }
+
+        // Nexus 2 serves Maven 2 metadata to a client it does not take for Maven 3 (wget, for one)
+        @Test
+        void installsNightlyFromMaven2Metadata(@TempDir Path temp) throws Exception {
+            try (WebsiteInstallerFixture fixture = WebsiteInstallerFixture.start(temp.resolve("fixture"))) {
+                Path home = Files.createDirectory(temp.resolve("home"));
+                publishNightly(fixture, "9.9.0-SNAPSHOT", NIGHTLY, null);
+                String metadata = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
+                                  + "<metadata>\n"
+                                  + "  <version>9.9.0-SNAPSHOT</version>\n"
+                                  + "  <versioning>\n"
+                                  + "    <snapshot>\n"
+                                  + "      <timestamp>20261108.143653</timestamp>\n"
+                                  + "      <buildNumber>24</buildNumber>\n"
+                                  + "    </snapshot>\n"
+                                  + "    <lastUpdated>20261108143653</lastUpdated>\n"
+                                  + "  </versioning>\n"
+                                  + "</metadata>\n";
+                fixture.publish("/snapshots/org/apache/camel/camel-launcher/9.9.0-SNAPSHOT/maven-metadata.xml",
+                        metadata.getBytes(StandardCharsets.UTF_8));
+
+                WebsiteInstallerFixture.Result r = install(fixture, home, "9.9.0-SNAPSHOT");
+
+                assertEquals(0, r.exit(), r.stderr());
+                assertNightlyInstalled(home, NIGHTLY, "9.9.0-SNAPSHOT");
+            }
+        }
+
+        @Test
+        void rejectsNightlyWithWrongSha1(@TempDir Path temp) throws Exception {
+            try (WebsiteInstallerFixture fixture = WebsiteInstallerFixture.start(temp.resolve("fixture"))) {
+                Path home = Files.createDirectory(temp.resolve("home"));
+                publishNightly(fixture, "9.9.0-SNAPSHOT", NIGHTLY, "0".repeat(40));
+
+                WebsiteInstallerFixture.Result r = install(fixture, home, "9.9.0-SNAPSHOT");
+
+                assertNotEquals(0, r.exit());
+                assertTrue(r.stderr().contains("checksum mismatch for downloaded archive"), r.stderr());
+                assertFalse(Files.exists(home.resolve(".local/bin/camel")));
+                assertFalse(Files.exists(home.resolve(".local/share/camel-cli/versions/" + NIGHTLY)));
+                assertPin(home, null);
+            }
+        }
+
+        @ParameterizedTest(name = "{0}")
+        @MethodSource("org.apache.camel.dsl.jbang.launcher.WebsiteInstallTest#malformedNightlySelectors")
+        void rejectsMalformedNightlySelector(String selector, @TempDir Path temp) throws Exception {
+            try (WebsiteInstallerFixture fixture = WebsiteInstallerFixture.start(temp.resolve("fixture"))) {
+                Path home = Files.createDirectory(temp.resolve("home"));
+
+                WebsiteInstallerFixture.Result r = install(fixture, home, selector);
+
+                assertNotEquals(0, r.exit());
+                assertTrue(r.stderr().contains("invalid --version value"), r.stderr());
+                assertFalse(Files.exists(home.resolve(".local/bin/camel")));
+            }
+        }
+
+        // The build name from the metadata becomes a directory name and a URL: anything else than a nightly build of
+        // the requested snapshot version is refused before downloading.
+        @ParameterizedTest(name = "{0}")
+        @MethodSource("org.apache.camel.dsl.jbang.launcher.WebsiteInstallTest#malformedNightlySelectors")
+        void rejectsMalformedBuildInMetadata(String build, @TempDir Path temp) throws Exception {
+            try (WebsiteInstallerFixture fixture = WebsiteInstallerFixture.start(temp.resolve("fixture"))) {
+                Path home = Files.createDirectory(temp.resolve("home"));
+                publishNightly(fixture, "9.9.0-SNAPSHOT", build, null);
+
+                WebsiteInstallerFixture.Result r = install(fixture, home, "9.9.0-SNAPSHOT");
+
+                assertNotEquals(0, r.exit());
+                assertTrue(r.stderr().contains("the snapshot metadata names an invalid nightly build of 9.9.0-SNAPSHOT"),
+                        r.stderr());
+                assertFalse(Files.exists(home.resolve(".local/bin/camel")));
+            }
+        }
+
+        @Test
+        void rejectsBuildOfAnotherSnapshotVersionInMetadata(@TempDir Path temp) throws Exception {
+            try (WebsiteInstallerFixture fixture = WebsiteInstallerFixture.start(temp.resolve("fixture"))) {
+                Path home = Files.createDirectory(temp.resolve("home"));
+                publishNightly(fixture, "9.9.0-SNAPSHOT", "9.8.1-20261107.010203-7", null);
+
+                WebsiteInstallerFixture.Result r = install(fixture, home, "9.9.0-SNAPSHOT");
+
+                assertNotEquals(0, r.exit());
+                assertTrue(r.stderr().contains("invalid nightly build of 9.9.0-SNAPSHOT: 9.8.1-20261107.010203-7"), r.stderr());
+            }
+        }
+
+        @Test
+        void keepsTheNewestThreeNightliesAndEveryRelease(@TempDir Path temp) throws Exception {
+            try (WebsiteInstallerFixture fixture = WebsiteInstallerFixture.start(temp.resolve("fixture"))) {
+                Path home = Files.createDirectory(temp.resolve("home"));
+                publishVersion(fixture, "1.2.3");
+                assertEquals(0, install(fixture, home, "1.2.3").exit());
+                List<String> builds = List.of("9.9.0-20261101.010000-1", "9.9.0-20261102.010000-2",
+                        "9.9.0-20261103.010000-3", "9.9.0-20261104.010000-4", "9.9.0-20261105.010000-5");
+                for (String build : builds) {
+                    publishNightly(fixture, "9.9.0-SNAPSHOT", build, null);
+                    WebsiteInstallerFixture.Result r = install(fixture, home, "9.9.0-SNAPSHOT");
+                    assertEquals(0, r.exit(), r.stderr());
+                }
+
+                assertEquals(Set.of("1.2.3", "9.9.0-20261103.010000-3", "9.9.0-20261104.010000-4", "9.9.0-20261105.010000-5"),
+                        installedVersions(home));
+                assertNightlyInstalled(home, "9.9.0-20261105.010000-5", "9.9.0-SNAPSHOT");
+            }
+        }
+
+        // builds deployed in the same second differ only in the build number, which is compared as a number
+        @Test
+        void keepsTheNewestThreeNightliesByBuildNumber(@TempDir Path temp) throws Exception {
+            try (WebsiteInstallerFixture fixture = WebsiteInstallerFixture.start(temp.resolve("fixture"))) {
+                Path home = Files.createDirectory(temp.resolve("home"));
+                List<String> builds = List.of("9.9.0-20261101.010000-8", "9.9.0-20261101.010000-9",
+                        "9.9.0-20261101.010000-10", "9.9.0-20261101.010000-24");
+                for (String build : builds) {
+                    publishNightly(fixture, "9.9.0-SNAPSHOT", build, null);
+                    WebsiteInstallerFixture.Result r = install(fixture, home, "9.9.0-SNAPSHOT");
+                    assertEquals(0, r.exit(), r.stderr());
+                }
+
+                assertEquals(Set.of("9.9.0-20261101.010000-9", "9.9.0-20261101.010000-10", "9.9.0-20261101.010000-24"),
+                        installedVersions(home));
+            }
+        }
+
+        // the new build is already active when the old ones are pruned, so a build that cannot be removed only warns
+        @Test
+        void aNightlyThatCannotBeRemovedDoesNotFailTheInstall(@TempDir Path temp) throws Exception {
+            try (WebsiteInstallerFixture fixture = WebsiteInstallerFixture.start(temp.resolve("fixture"))) {
+                Path home = Files.createDirectory(temp.resolve("home"));
+                List<String> builds = List.of("9.9.0-20261101.010000-1", "9.9.0-20261102.010000-2",
+                        "9.9.0-20261103.010000-3");
+                for (String build : builds) {
+                    publishNightly(fixture, "9.9.0-SNAPSHOT", build, null);
+                    assertEquals(0, install(fixture, home, "9.9.0-SNAPSHOT").exit());
+                }
+                // a directory without write permission keeps rm from removing its files
+                Path locked = Files.createDirectories(
+                        home.resolve(".local/share/camel-cli/versions/9.9.0-20261101.010000-1/locked"));
+                Files.writeString(locked.resolve("file"), "x");
+                assertTrue(locked.toFile().setWritable(false, false));
+                try {
+                    publishNightly(fixture, "9.9.0-SNAPSHOT", "9.9.0-20261104.010000-4", null);
+
+                    WebsiteInstallerFixture.Result r = install(fixture, home, "9.9.0-SNAPSHOT");
+
+                    assertEquals(0, r.exit(), r.stderr());
+                    assertNightlyInstalled(home, "9.9.0-20261104.010000-4", "9.9.0-SNAPSHOT");
+                } finally {
+                    locked.toFile().setWritable(true, false);
+                }
+            }
+        }
+
+        @Test
+        void releaseAfterNightlyReplacesTheSnapshotPin(@TempDir Path temp) throws Exception {
+            try (WebsiteInstallerFixture fixture = WebsiteInstallerFixture.start(temp.resolve("fixture"))) {
+                Path home = Files.createDirectory(temp.resolve("home"));
+                publishNightly(fixture, "9.9.0-SNAPSHOT", NIGHTLY, null);
+                publishLatest(fixture, "1.2.3");
+                assertEquals(0, install(fixture, home, "9.9.0-SNAPSHOT").exit());
+
+                WebsiteInstallerFixture.Result r = install(fixture, home, null);
+
+                assertEquals(0, r.exit(), r.stderr());
+                assertVersionInstalled(home, "1.2.3");
+                assertPin(home, null);
+            }
+        }
+
+        // an exported nightly=... must not stand in for the newest build in the metadata
+        @Test
+        void nightlyFromTheEnvironmentIsIgnored(@TempDir Path temp) throws Exception {
+            try (WebsiteInstallerFixture fixture = WebsiteInstallerFixture.start(temp.resolve("fixture"))) {
+                Path home = Files.createDirectory(temp.resolve("home"));
+                publishNightly(fixture, "9.9.0-SNAPSHOT", "9.9.0-20261101.010000-1", null);
+                publishNightly(fixture, "9.9.0-SNAPSHOT", NIGHTLY, null);
+                Map<String, String> env = new HashMap<>(fixture.environment(home));
+                env.put("nightly", "9.9.0-20261101.010000-1");
+
+                WebsiteInstallerFixture.Result r
+                        = fixture.run(List.of("/bin/sh", SCRIPT.toString(), "--version", "9.9.0-SNAPSHOT"), env);
+
+                assertEquals(0, r.exit(), r.stderr());
+                assertNightlyInstalled(home, NIGHTLY, "9.9.0-SNAPSHOT");
+                assertEquals(Set.of(NIGHTLY), installedVersions(home));
+            }
+        }
+
+        // the newest three by deploy, whatever their snapshot version
+        @Test
+        void keepsTheNewestThreeNightliesAcrossSnapshotVersions(@TempDir Path temp) throws Exception {
+            try (WebsiteInstallerFixture fixture = WebsiteInstallerFixture.start(temp.resolve("fixture"))) {
+                Path home = Files.createDirectory(temp.resolve("home"));
+                List<String[]> builds = List.of(new String[] { "9.9.0-SNAPSHOT", "9.9.0-20261101.010000-1" },
+                        new String[] { "9.8.1-SNAPSHOT", "9.8.1-20261102.010000-1" },
+                        new String[] { "9.9.0-SNAPSHOT", "9.9.0-20261103.010000-2" },
+                        new String[] { "9.8.1-SNAPSHOT", "9.8.1-20261104.010000-2" });
+                for (String[] build : builds) {
+                    publishNightly(fixture, build[0], build[1], null);
+                    WebsiteInstallerFixture.Result r = install(fixture, home, build[0]);
+                    assertEquals(0, r.exit(), r.stderr());
+                }
+
+                assertEquals(Set.of("9.8.1-20261102.010000-1", "9.9.0-20261103.010000-2", "9.8.1-20261104.010000-2"),
+                        installedVersions(home));
+            }
+        }
+
+        // an older build installed on purpose is not pruned right away, though it is not one of the newest three
+        @Test
+        void keepsAnOlderNightlyJustInstalled(@TempDir Path temp) throws Exception {
+            try (WebsiteInstallerFixture fixture = WebsiteInstallerFixture.start(temp.resolve("fixture"))) {
+                Path home = Files.createDirectory(temp.resolve("home"));
+                List<String> builds = List.of("9.9.0-20261102.010000-2", "9.9.0-20261103.010000-3",
+                        "9.9.0-20261104.010000-4");
+                for (String build : builds) {
+                    publishNightly(fixture, "9.9.0-SNAPSHOT", build, null);
+                    assertEquals(0, install(fixture, home, "9.9.0-SNAPSHOT").exit());
+                }
+                publishNightly(fixture, "9.9.0-SNAPSHOT", "9.9.0-20261101.010000-1", null);
+
+                WebsiteInstallerFixture.Result r = install(fixture, home, "9.9.0-20261101.010000-1");
+
+                assertEquals(0, r.exit(), r.stderr());
+                assertNightlyInstalled(home, "9.9.0-20261101.010000-1", "9.9.0-SNAPSHOT");
+                assertEquals(Set.of("9.9.0-20261101.010000-1", "9.9.0-20261102.010000-2", "9.9.0-20261103.010000-3",
+                        "9.9.0-20261104.010000-4"), installedVersions(home));
+                assertPin(home, "9.9.0-20261101.010000-1");
+            }
+        }
+
+        // the Camel CLI of a maintenance branch cannot update its nightly builds with camel self-update
+        @Test
+        void maintenanceBranchNightlySaysToReRunTheInstaller(@TempDir Path temp) throws Exception {
+            try (WebsiteInstallerFixture fixture = WebsiteInstallerFixture.start(temp.resolve("fixture"))) {
+                Path home = Files.createDirectory(temp.resolve("home"));
+                publishSnapshotVersions(fixture, "9.9.0-SNAPSHOT", "9.8.1-SNAPSHOT");
+                publishNightly(fixture, "9.8.1-SNAPSHOT", "9.8.1-20261107.010203-7", null);
+                publishNightly(fixture, "9.9.0-SNAPSHOT", NIGHTLY, null);
+
+                WebsiteInstallerFixture.Result maintenance = install(fixture, home, "9.8.1-SNAPSHOT");
+                WebsiteInstallerFixture.Result main = install(fixture, home, "9.9.0-SNAPSHOT");
+
+                assertEquals(0, maintenance.exit(), maintenance.stderr());
+                assertTrue(maintenance.stdout().contains("Note: 9.8.1-SNAPSHOT is a maintenance branch, whose Camel CLI"
+                                                         + " cannot update its nightly builds with camel self-update - to"
+                                                         + " update it, re-run this installer with --version"
+                                                         + " 9.8.1-SNAPSHOT"),
+                        maintenance.stdout());
+                assertEquals(0, main.exit(), main.stderr());
+                assertFalse(main.stdout().contains("maintenance branch"), main.stdout());
+            }
+        }
+
+        @Test
+        void failedSelectorInstallPreservesExistingInstallAndPin(@TempDir Path temp) throws Exception {
+            try (WebsiteInstallerFixture fixture = WebsiteInstallerFixture.start(temp.resolve("fixture"))) {
+                Path home = Files.createDirectory(temp.resolve("home"));
+                publishVersion(fixture, "1.0.0");
+                assertEquals(0, install(fixture, home, "1.0.0").exit());
+
+                // Missing alias, an alias outside its line, and an alias whose archive fails verification.
+                WebsiteInstallerFixture.Result missing = install(fixture, home, "LTS");
+                publishAlias(fixture, "2.1", "2.2.0");
+                WebsiteInstallerFixture.Result mismatch = install(fixture, home, "2.1");
+                String bogusHash = "0".repeat(64);
+                publishRelease(fixture, "3.0.1", fixture.safeTar("3.0.1"), fixture.safeZip("3.0.1"));
+                fixture.publish("/camel-cli/releases/3.0.properties",
+                        ("format=1\nversion=3.0.1\ntar_sha256=" + bogusHash + "\nzip_sha256=" + bogusHash + "\n")
+                                .getBytes(StandardCharsets.UTF_8));
+                WebsiteInstallerFixture.Result badChecksum = install(fixture, home, "3.0");
+
+                assertNotEquals(0, missing.exit());
+                assertNotEquals(0, mismatch.exit());
+                assertNotEquals(0, badChecksum.exit());
+                assertThat(badChecksum.stderr()).contains("checksum mismatch");
+                assertVersionInstalled(home, "1.0.0");
+                assertFalse(Files.exists(home.resolve(".local/share/camel-cli/versions/2.2.0")));
+                assertFalse(Files.exists(home.resolve(".local/share/camel-cli/versions/3.0.1")));
+                assertThat(pinnedVersionFile(home)).hasContent("1.0.0");
+            }
+        }
+
+        @Test
+        void selfUpdateInternalFlagLeavesASelectorPinUntouched(@TempDir Path temp) throws Exception {
+            try (WebsiteInstallerFixture fixture = WebsiteInstallerFixture.start(temp.resolve("fixture"))) {
+                Path home = Files.createDirectory(temp.resolve("home"));
+                publishAlias(fixture, "lts", "1.0.0");
+                assertEquals(0, install(fixture, home, "LTS").exit());
+                assertThat(pinnedVersionFile(home)).hasContent("LTS");
+
+                publishAlias(fixture, "lts", "1.0.1");
+                Map<String, String> env = new HashMap<>(fixture.environment(home));
+                env.put("CAMEL_INSTALL_SELF_UPDATE", "true");
+                WebsiteInstallerFixture.Result r = fixture.run(
+                        List.of("/bin/sh", SCRIPT.toString(), "--version", "1.0.1"), env);
+
+                assertEquals(0, r.exit(), r.stderr());
+                assertVersionInstalled(home, "1.0.1");
+                assertThat(pinnedVersionFile(home)).hasContent("LTS");
+            }
+        }
+
+        @Test
+        void printsPathGuidanceWhenBinDirMissingFromPath(@TempDir Path temp) throws Exception {
+            try (WebsiteInstallerFixture fixture = WebsiteInstallerFixture.start(temp.resolve("fixture"))) {
+                Path home = Files.createDirectory(temp.resolve("home"));
+                publishLatest(fixture, "1.0.0");
+
+                WebsiteInstallerFixture.Result r = install(fixture, home, null);
+
+                assertEquals(0, r.exit(), r.stderr());
+                assertTrue(r.stdout().contains(".local/bin"), r.stdout());
+                assertTrue(r.stdout().toUpperCase().contains("PATH"), r.stdout());
+            }
+        }
+
+        @Test
+        void neverWritesShellProfileFiles(@TempDir Path temp) throws Exception {
+            try (WebsiteInstallerFixture fixture = WebsiteInstallerFixture.start(temp.resolve("fixture"))) {
+                Path home = Files.createDirectory(temp.resolve("home"));
+                publishLatest(fixture, "1.0.0");
+
+                assertEquals(0, install(fixture, home, null).exit());
+
+                for (String profile : List.of(".bashrc", ".profile", ".bash_profile", ".zshrc")) {
+                    assertFalse(Files.exists(home.resolve(profile)), profile + " must not be created");
+                }
+            }
+        }
+
+        @Test
+        void preservesActiveInstallWhenLaterInstallFails(@TempDir Path temp) throws Exception {
+            try (WebsiteInstallerFixture fixture = WebsiteInstallerFixture.start(temp.resolve("fixture"))) {
+                Path home = Files.createDirectory(temp.resolve("home"));
+                publishVersion(fixture, "1.0.0");
+                assertEquals(0, install(fixture, home, "1.0.0").exit());
+
+                Path badTar = fixture.safeTar("2.0.0");
+                Path badZip = fixture.safeZip("2.0.0");
+                fixture.publish("/maven2/org/apache/camel/camel-launcher/2.0.0/camel-launcher-2.0.0-bin.tar.gz",
+                        Files.readAllBytes(badTar));
+                fixture.publish("/maven2/org/apache/camel/camel-launcher/2.0.0/camel-launcher-2.0.0-bin.zip",
+                        Files.readAllBytes(badZip));
+                String bogusHash = "0".repeat(64);
+                fixture.publish("/camel-cli/releases/2.0.0.properties",
+                        ("format=1\nversion=2.0.0\ntar_sha256=" + bogusHash + "\nzip_sha256=" + bogusHash + "\n")
+                                .getBytes(StandardCharsets.UTF_8));
+
+                WebsiteInstallerFixture.Result r = install(fixture, home, "2.0.0");
+
+                assertNotEquals(0, r.exit());
+                assertVersionInstalled(home, "1.0.0");
+                assertFalse(Files.exists(home.resolve(".local/share/camel-cli/versions/2.0.0")));
+            }
+        }
+
+        @Test
+        void rejectsUnknownFlag(@TempDir Path temp) throws Exception {
+            try (WebsiteInstallerFixture fixture = WebsiteInstallerFixture.start(temp.resolve("fixture"))) {
+                Path home = Files.createDirectory(temp.resolve("home"));
+                WebsiteInstallerFixture.Result r = fixture.run(
+                        List.of("/bin/sh", SCRIPT.toString(), "--bogus"), fixture.environment(home));
+
+                assertNotEquals(0, r.exit());
+            }
+        }
+
+        @Test
+        void rejectsMissingVersionValue(@TempDir Path temp) throws Exception {
+            try (WebsiteInstallerFixture fixture = WebsiteInstallerFixture.start(temp.resolve("fixture"))) {
+                Path home = Files.createDirectory(temp.resolve("home"));
+                WebsiteInstallerFixture.Result r = fixture.run(
+                        List.of("/bin/sh", SCRIPT.toString(), "--version"), fixture.environment(home));
+
+                assertNotEquals(0, r.exit());
+            }
+        }
+
+        @Test
+        void rejectsMalformedVersionArgument(@TempDir Path temp) throws Exception {
+            try (WebsiteInstallerFixture fixture = WebsiteInstallerFixture.start(temp.resolve("fixture"))) {
+                Path home = Files.createDirectory(temp.resolve("home"));
+                WebsiteInstallerFixture.Result r = install(fixture, home, "1.2.3-SNAPSHOT");
+
+                assertNotEquals(0, r.exit());
+                assertFalse(Files.exists(home.resolve(".local/bin/camel")));
+            }
+        }
+
+        @ParameterizedTest(name = "{0}")
+        @MethodSource("org.apache.camel.dsl.jbang.launcher.WebsiteInstallTest#invalidManifests")
+        void rejectsInvalidManifest(String name, String manifestBody, @TempDir Path temp) throws Exception {
+            try (WebsiteInstallerFixture fixture = WebsiteInstallerFixture.start(temp.resolve("fixture"))) {
+                Path home = Files.createDirectory(temp.resolve("home"));
+                fixture.publish("/camel-cli/releases/latest.properties",
+                        manifestBody.getBytes(StandardCharsets.UTF_8));
+
+                WebsiteInstallerFixture.Result r = install(fixture, home, null);
+
+                assertNotEquals(0, r.exit(), name);
+                assertFalse(Files.exists(home.resolve(".local/bin/camel")), name);
+            }
+        }
+
+        @Test
+        void manifestInjectionNeverExecutesShellCode(@TempDir Path temp) throws Exception {
+            try (WebsiteInstallerFixture fixture = WebsiteInstallerFixture.start(temp.resolve("fixture"))) {
+                Path home = Files.createDirectory(temp.resolve("home"));
+                String hash = "a".repeat(64);
+                String manifest
+                        = "format=1\nversion=$(touch owned)\ntar_sha256=" + hash + "\nzip_sha256=" + hash + "\n";
+                fixture.publish("/camel-cli/releases/latest.properties",
+                        manifest.getBytes(StandardCharsets.UTF_8));
+
+                WebsiteInstallerFixture.Result r = install(fixture, home, null);
+
+                assertNotEquals(0, r.exit());
+                assertFalse(Files.exists(home.resolve("owned")), "manifest value must never be executed");
+            }
+        }
+
+        @Test
+        void rejectsChecksumMismatch(@TempDir Path temp) throws Exception {
+            try (WebsiteInstallerFixture fixture = WebsiteInstallerFixture.start(temp.resolve("fixture"))) {
+                Path home = Files.createDirectory(temp.resolve("home"));
+                Path tar = fixture.safeTar("1.0.0");
+                Path zip = fixture.safeZip("1.0.0");
+                publishRelease(fixture, "1.0.0", tar, zip);
+                String bogusHash = "0".repeat(64);
+                fixture.publish("/camel-cli/releases/latest.properties",
+                        ("format=1\nversion=1.0.0\ntar_sha256=" + bogusHash + "\nzip_sha256=" + bogusHash + "\n")
+                                .getBytes(StandardCharsets.UTF_8));
+
+                WebsiteInstallerFixture.Result r = install(fixture, home, null);
+
+                assertNotEquals(0, r.exit());
+                assertFalse(Files.exists(home.resolve(".local/bin/camel")));
+            }
+        }
+
+        @Test
+        void rejectsInterruptedDownload(@TempDir Path temp) throws Exception {
+            try (WebsiteInstallerFixture fixture = WebsiteInstallerFixture.start(temp.resolve("fixture"));
+                 ServerSocket rawServer = new ServerSocket(0, 1, InetAddress.getLoopbackAddress())) {
+                Path home = Files.createDirectory(temp.resolve("home"));
+                Path tar = fixture.safeTar("1.0.0");
+                Path zip = fixture.safeZip("1.0.0");
+                fixture.publishManifest("/camel-cli/releases/latest.properties", "1.0.0", tar, zip);
+
+                byte[] tarBytes = Files.readAllBytes(tar);
+                Thread server = new Thread(() -> serveTruncatedThenClose(rawServer, tarBytes));
+                server.setDaemon(true);
+                server.start();
+
+                Map<String, String> env = new HashMap<>(fixture.environment(home));
+                env.put("CAMEL_INSTALL_MAVEN_BASE_URL", "http://127.0.0.1:" + rawServer.getLocalPort());
+
+                WebsiteInstallerFixture.Result r = fixture.run(List.of("/bin/sh", SCRIPT.toString()), env);
+
+                assertNotEquals(0, r.exit());
+                assertFalse(Files.exists(home.resolve(".local/bin/camel")));
+            }
+        }
+
+        @Test
+        void givesUpOnAStalledDownload(@TempDir Path temp) throws Exception {
+            CountDownLatch release = new CountDownLatch(1);
+            try (WebsiteInstallerFixture fixture = WebsiteInstallerFixture.start(temp.resolve("fixture"));
+                 ServerSocket rawServer = new ServerSocket(0, 1, InetAddress.getLoopbackAddress())) {
+                Path home = Files.createDirectory(temp.resolve("home"));
+                Path tar = fixture.safeTar("1.0.0");
+                Path zip = fixture.safeZip("1.0.0");
+                fixture.publishManifest("/camel-cli/releases/latest.properties", "1.0.0", tar, zip);
+
+                byte[] tarBytes = Files.readAllBytes(tar);
+                Thread server = new Thread(() -> serveHalfThenStall(rawServer, tarBytes, release));
+                server.setDaemon(true);
+                server.start();
+
+                Map<String, String> env = new HashMap<>(fixture.environment(home));
+                env.put("CAMEL_INSTALL_MAVEN_BASE_URL", "http://127.0.0.1:" + rawServer.getLocalPort());
+                // the download gives up after 2 seconds without data, instead of 60
+                env.put("CAMEL_INSTALL_STALL_TIMEOUT", "2");
+
+                long start = System.nanoTime();
+                WebsiteInstallerFixture.Result r = fixture.run(List.of("/bin/sh", SCRIPT.toString()), env);
+
+                // CAMEL-27004: curl waited for the rest of the body for as long as the server kept the connection open
+                assertNotEquals(0, r.exit());
+                assertTrue(Duration.ofNanos(System.nanoTime() - start).compareTo(Duration.ofSeconds(30)) < 0,
+                        "the installer gave up on the stalled download");
+                assertFalse(Files.exists(home.resolve(".local/bin/camel")));
+            } finally {
+                release.countDown();
+            }
+        }
+
+        @Test
+        void rejectsWhenChecksumToolMissing(@TempDir Path temp) throws Exception {
+            try (WebsiteInstallerFixture fixture = WebsiteInstallerFixture.start(temp.resolve("fixture"))) {
+                Path home = Files.createDirectory(temp.resolve("home"));
+                publishLatest(fixture, "1.0.0");
+
+                Map<String, String> env = new HashMap<>(fixture.environment(home));
+                env.put("PATH",
+                        pathWithout(temp.resolve("restricted-path"), "sha256sum", "shasum", "openssl").toString());
+
+                WebsiteInstallerFixture.Result r = fixture.run(List.of("/bin/sh", SCRIPT.toString()), env);
+
+                assertNotEquals(0, r.exit());
+                assertFalse(Files.exists(home.resolve(".local/bin/camel")));
+            }
+        }
+
+        @Test
+        void rejectsAbsolutePathEntry(@TempDir Path temp) throws Exception {
+            assertMaliciousTarRejected(temp, fixture -> fixture.maliciousTar("/etc/passwd"));
+        }
+
+        @Test
+        void rejectsTraversalEntry(@TempDir Path temp) throws Exception {
+            assertMaliciousTarRejected(temp, fixture -> fixture.maliciousTar("../escape"));
+        }
+
+        @Test
+        void rejectsMultipleTopLevelRoots(@TempDir Path temp) throws Exception {
+            assertMaliciousTarRejected(temp, fixture -> fixture.maliciousTar("evil-root/payload"));
+        }
+
+        @Test
+        void rejectsEscapingSymlinkEntry(@TempDir Path temp) throws Exception {
+            assertMaliciousTarRejected(temp,
+                    fixture -> fixture.maliciousTarSymlink("camel-launcher-9.9.9/escape-link", "../../outside"));
+        }
+
+        @Test
+        void rejectsArchiveMissingCamelSh(@TempDir Path temp) throws Exception {
+            try (WebsiteInstallerFixture fixture = WebsiteInstallerFixture.start(temp.resolve("fixture"))) {
+                Path home = Files.createDirectory(temp.resolve("home"));
+                Path tar = fixture.safeTarMissingCamelSh("9.9.9");
+                Path zip = fixture.safeZip("9.9.9");
+                publishRelease(fixture, "9.9.9", tar, zip);
+                fixture.publishManifest("/camel-cli/releases/9.9.9.properties", "9.9.9", tar, zip);
+
+                WebsiteInstallerFixture.Result r = install(fixture, home, "9.9.9");
+
+                assertNotEquals(0, r.exit());
+                assertFalse(Files.exists(home.resolve(".local/bin/camel")));
+            }
+        }
+
+        @Test
+        void rejectsWhenStagedLauncherFails(@TempDir Path temp) throws Exception {
+            try (WebsiteInstallerFixture fixture = WebsiteInstallerFixture.start(temp.resolve("fixture"))) {
+                Path home = Files.createDirectory(temp.resolve("home"));
+                Path tar = fixture.safeTarWithFailingLauncher("9.9.9");
+                Path zip = fixture.safeZip("9.9.9");
+                publishRelease(fixture, "9.9.9", tar, zip);
+                fixture.publishManifest("/camel-cli/releases/9.9.9.properties", "9.9.9", tar, zip);
+
+                WebsiteInstallerFixture.Result r = install(fixture, home, "9.9.9");
+
+                assertNotEquals(0, r.exit());
+                assertFalse(Files.exists(home.resolve(".local/bin/camel")));
+                assertFalse(Files.exists(home.resolve(".local/share/camel-cli/versions/9.9.9")));
+            }
+        }
+
+        private static Path pathWithout(Path scratch, String... blockedNames) throws Exception {
+            Set<String> blocked = new HashSet<>(List.of(blockedNames));
+            Path bin = Files.createDirectories(scratch.resolve("bin-" + UUID.randomUUID()));
+            Set<String> seen = new HashSet<>();
+            String realPath = System.getenv("PATH");
+            for (String dir : realPath.split(File.pathSeparator)) {
+                Path dirPath = Paths.get(dir);
+                if (!Files.isDirectory(dirPath)) {
+                    continue;
+                }
+                try (var stream = Files.list(dirPath)) {
+                    for (Path entry : (Iterable<Path>) stream::iterator) {
+                        String name = entry.getFileName().toString();
+                        if (blocked.contains(name) || !seen.add(name) || !Files.isExecutable(entry)) {
+                            continue;
+                        }
+                        Files.createSymbolicLink(bin.resolve(name), entry.toAbsolutePath());
+                    }
+                } catch (Exception ignored) {
+                }
+            }
+            return bin;
+        }
+    }
+
+    // Windows (install.ps1)
+
+    @Nested
+    @EnabledOnOs(OS.WINDOWS)
+    class WindowsPowerShell {
+
+        private static final Path SCRIPT = Paths.get("src/install/install.ps1").toAbsolutePath();
+
+        private final List<String> binDirsForCleanup = new ArrayList<>();
+
+        @AfterEach
+        void restoreUserPath() throws Exception {
+            if (binDirsForCleanup.isEmpty()) {
+                return;
+            }
+            StringBuilder script = new StringBuilder("$dirs = @(");
+            for (int i = 0; i < binDirsForCleanup.size(); i++) {
+                if (i > 0) {
+                    script.append(',');
+                }
+                script.append('\'').append(binDirsForCleanup.get(i).replace("'", "''")).append('\'');
+            }
+            // Read and write the user PATH raw (DoNotExpandEnvironmentNames, preserving the value kind) so
+            // the cleanup never flattens existing %VAR% references, mirroring install.ps1's Add-UserPath.
+            script.append("); $k = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey('Environment', $true); "
+                          + "if ($k) { $path = $k.GetValue('Path', '', "
+                          + "[Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames); "
+                          + "if ($path) { $kind = $k.GetValueKind('Path'); "
+                          + "$kept = ($path -split ';') | Where-Object { $_ -and (-not ($dirs -icontains $_)) }; "
+                          + "$k.SetValue('Path', ($kept -join ';'), $kind) } $k.Close() }");
+            WebsiteInstallerFixture.execute(
+                    new ProcessBuilder("powershell", "-NoProfile", "-Command", script.toString()).redirectErrorStream(true));
+        }
+
+        private WebsiteInstallerFixture.Result install(
+                WebsiteInstallerFixture fixture, Path home, String version)
+                throws Exception {
+            binDirsForCleanup.add(expectedBinDir(home).toString());
+            List<String> command = new ArrayList<>(
+                    List.of("powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", SCRIPT.toString()));
+            if (version != null) {
+                command.add("-Version");
+                command.add(version);
+            }
+            return fixture.run(command, fixture.environment(home));
+        }
+
+        private static Path expectedBinDir(Path home) {
+            return home.resolve("AppData").resolve("Local").resolve("Apache Camel").resolve("bin");
+        }
+
+        private static Path versionDir(Path home, String version) {
+            return home.resolve("AppData").resolve("Local").resolve("Apache Camel").resolve("cli").resolve("versions")
+                    .resolve(version);
+        }
+
+        // Runs the installed 'camel' shim by name, resolved through PATH+PATHEXT with binDir prepended,
+        // the way an end user invokes it after install. See forwardsArgumentsAndExitCodeThroughShim for
+        // why a bare command name is used rather than the shim's absolute path.
+        private static ProcessBuilder shimProcess(Path binDir, String... args) {
+            List<String> command = new ArrayList<>(List.of("cmd.exe", "/c", "camel"));
+            command.addAll(Arrays.asList(args));
+            ProcessBuilder pb = new ProcessBuilder(command).redirectErrorStream(true);
+            pb.environment().put("PATH", binDir + File.pathSeparator + System.getenv("PATH"));
+            return pb;
+        }
+
+        private static void assertVersionInstalled(Path home, String version) throws Exception {
+            Path shim = expectedBinDir(home).resolve("camel.cmd");
+            assertTrue(Files.isRegularFile(shim), "expected shim at " + shim);
+            assertTrue(Files.isDirectory(versionDir(home, version)),
+                    "expected version directory " + versionDir(home, version));
+
+            String output = WebsiteInstallerFixture.execute(
+                    new ProcessBuilder("cmd.exe", "/c", shim.toString(), "version").redirectErrorStream(true)).stdout();
+            assertTrue(output.contains("Camel " + version), output);
+        }
+
+        private void assertMaliciousZipRejected(Path temp, MaliciousArchive archiveBuilder) throws Exception {
+            try (WebsiteInstallerFixture fixture = WebsiteInstallerFixture.start(temp.resolve("fixture"))) {
+                Path home = Files.createDirectory(temp.resolve("home"));
+                Path zip = archiveBuilder.build(fixture);
+                Path tar = fixture.safeTar("9.9.9");
+                publishRelease(fixture, "9.9.9", tar, zip);
+                fixture.publishManifest("/camel-cli/releases/9.9.9.properties", "9.9.9", tar, zip);
+
+                WebsiteInstallerFixture.Result r = install(fixture, home, "9.9.9");
+
+                assertNotEquals(0, r.exit());
+                assertFalse(Files.exists(expectedBinDir(home).resolve("camel.cmd")));
+            }
+        }
+
+        private static String queryEnvironmentPath(String scope) throws Exception {
+            return WebsiteInstallerFixture.execute(new ProcessBuilder(
+                    "powershell", "-NoProfile", "-Command",
+                    "[Environment]::GetEnvironmentVariable('Path','" + scope + "')")
+                    .redirectErrorStream(true)).stdout().trim();
+        }
+
+        private static long countOccurrencesCaseInsensitive(String path, String dir) {
+            if (path == null || path.isEmpty()) {
+                return 0;
+            }
+            return Arrays.stream(path.split(";"))
+                    .filter(entry -> entry.equalsIgnoreCase(dir))
+                    .count();
+        }
+
+        // Reads HKCU\Environment\Path without expanding %VAR% references, returning "" when unset.
+        private static String readUserPathRaw() throws Exception {
+            return WebsiteInstallerFixture.execute(new ProcessBuilder(
+                    "powershell", "-NoProfile", "-Command",
+                    "$k = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey('Environment'); "
+                                                            + "if ($k) { [Console]::Out.Write($k.GetValue('Path', '', "
+                                                            + "[Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)); $k.Close() }"))
+                    .stdout();
+        }
+
+        // Writes HKCU\Environment\Path as a REG_EXPAND_SZ value; the value is passed via the environment
+        // to avoid any quoting or injection in the PowerShell command line.
+        private static void writeUserPathExpandable(String value) throws Exception {
+            ProcessBuilder pb = new ProcessBuilder(
+                    "powershell", "-NoProfile", "-Command",
+                    "$k = [Microsoft.Win32.Registry]::CurrentUser.CreateSubKey('Environment'); "
+                                                            + "$k.SetValue('Path', $env:CAMEL_TEST_USERPATH, "
+                                                            + "[Microsoft.Win32.RegistryValueKind]::ExpandString); $k.Close()")
+                    .redirectErrorStream(true);
+            pb.environment().put("CAMEL_TEST_USERPATH", value);
+            WebsiteInstallerFixture.Result r = WebsiteInstallerFixture.execute(pb);
+            if (r.exit() != 0) {
+                throw new IllegalStateException("failed to seed user PATH: " + r.stdout());
+            }
+        }
+
+        private static void deleteUserPath() throws Exception {
+            WebsiteInstallerFixture.execute(new ProcessBuilder(
+                    "powershell", "-NoProfile", "-Command",
+                    "$k = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey('Environment', $true); "
+                                                            + "if ($k) { $k.DeleteValue('Path', $false); $k.Close() }")
+                    .redirectErrorStream(true));
+        }
+
+        @Test
+        void installsLatestVersion(@TempDir Path temp) throws Exception {
+            try (WebsiteInstallerFixture fixture = WebsiteInstallerFixture.start(temp.resolve("fixture"))) {
+                Path home = Files.createDirectory(temp.resolve("home"));
+                publishLatest(fixture, "1.2.3");
+
+                WebsiteInstallerFixture.Result r = install(fixture, home, null);
+
+                assertEquals(0, r.exit(), r.stderr());
+                assertVersionInstalled(home, "1.2.3");
+            }
+        }
+
+        @Test
+        void installsExactVersion(@TempDir Path temp) throws Exception {
+            try (WebsiteInstallerFixture fixture = WebsiteInstallerFixture.start(temp.resolve("fixture"))) {
+                Path home = Files.createDirectory(temp.resolve("home"));
+                publishVersion(fixture, "2.5.0");
+
+                WebsiteInstallerFixture.Result r = install(fixture, home, "2.5.0");
+
+                assertEquals(0, r.exit(), r.stderr());
+                assertVersionInstalled(home, "2.5.0");
+            }
+        }
+
+        @Test
+        void installsWhenManifestCarriesLicenseHeader(@TempDir Path temp) throws Exception {
+            // The website's manifest generator prepends an ASF license header; install.ps1 must skip
+            // those comment lines and still install successfully.
+            try (WebsiteInstallerFixture fixture = WebsiteInstallerFixture.start(temp.resolve("fixture"))) {
+                Path home = Files.createDirectory(temp.resolve("home"));
+                Path tar = fixture.safeTar("1.2.3");
+                Path zip = fixture.safeZip("1.2.3");
+                publishRelease(fixture, "1.2.3", tar, zip);
+                fixture.publishManifest("/camel-cli/releases/latest.properties", "1.2.3", tar, zip,
+                        MANIFEST_LICENSE_HEADER);
+
+                WebsiteInstallerFixture.Result r = install(fixture, home, null);
+
+                assertEquals(0, r.exit(), r.stderr());
+                assertVersionInstalled(home, "1.2.3");
+            }
+        }
+
+        private static Path pinnedVersionFile(Path home) {
+            return home.resolve("AppData").resolve("Local").resolve("Apache Camel").resolve("cli")
+                    .resolve("pinned-version");
+        }
+
+        @Test
+        void pinsVersionWhenInstalledExplicitly(@TempDir Path temp) throws Exception {
+            try (WebsiteInstallerFixture fixture = WebsiteInstallerFixture.start(temp.resolve("fixture"))) {
+                Path home = Files.createDirectory(temp.resolve("home"));
+                publishVersion(fixture, "1.0.0");
+
+                WebsiteInstallerFixture.Result r = install(fixture, home, "1.0.0");
+
+                assertEquals(0, r.exit(), r.stderr());
+                assertThat(pinnedVersionFile(home)).hasContent("1.0.0");
+            }
+        }
+
+        @Test
+        void doesNotPinWhenInstallingLatest(@TempDir Path temp) throws Exception {
+            try (WebsiteInstallerFixture fixture = WebsiteInstallerFixture.start(temp.resolve("fixture"))) {
+                Path home = Files.createDirectory(temp.resolve("home"));
+                publishLatest(fixture, "1.0.0");
+
+                WebsiteInstallerFixture.Result r = install(fixture, home, null);
+
+                assertEquals(0, r.exit(), r.stderr());
+                assertThat(pinnedVersionFile(home)).doesNotExist();
+            }
+        }
+
+        @Test
+        void reinstallingLatestClearsAnExistingPin(@TempDir Path temp) throws Exception {
+            try (WebsiteInstallerFixture fixture = WebsiteInstallerFixture.start(temp.resolve("fixture"))) {
+                Path home = Files.createDirectory(temp.resolve("home"));
+                publishVersion(fixture, "1.0.0");
+                assertEquals(0, install(fixture, home, "1.0.0").exit());
+                assertThat(pinnedVersionFile(home)).exists();
+                publishLatest(fixture, "2.0.0");
+
+                WebsiteInstallerFixture.Result r = install(fixture, home, null);
+
+                assertEquals(0, r.exit(), r.stderr());
+                assertThat(pinnedVersionFile(home)).doesNotExist();
+            }
+        }
+
+        // Guards against a real self-lockout bug: SelfUpdateCommand always passes -Version (the version it
+        // resolved, for TOCTOU-safety), even for a bare `camel self-update`. Without CAMEL_INSTALL_SELF_UPDATE
+        // suppressing the pin write, every self-update run would pin itself on the way out, and the very next
+        // self-update would then refuse to run at all (see SelfUpdateCommand's pinned-version refusal).
+        @Test
+        void selfUpdateInternalFlagNeverWritesAPin(@TempDir Path temp) throws Exception {
+            try (WebsiteInstallerFixture fixture = WebsiteInstallerFixture.start(temp.resolve("fixture"))) {
+                Path home = Files.createDirectory(temp.resolve("home"));
+                publishVersion(fixture, "1.0.0");
+                binDirsForCleanup.add(expectedBinDir(home).toString());
+                Map<String, String> env = new HashMap<>(fixture.environment(home));
+                env.put("CAMEL_INSTALL_SELF_UPDATE", "true");
+
+                WebsiteInstallerFixture.Result r = fixture.run(
+                        List.of("powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", SCRIPT.toString(),
+                                "-Version", "1.0.0"),
+                        env);
+
+                assertEquals(0, r.exit(), r.stderr());
+                assertThat(pinnedVersionFile(home)).doesNotExist();
+            }
+        }
+
+        // A pre-existing pin must also survive an internal self-update run untouched (not just "never created").
+        @Test
+        void selfUpdateInternalFlagLeavesAnExistingPinUntouched(@TempDir Path temp) throws Exception {
+            try (WebsiteInstallerFixture fixture = WebsiteInstallerFixture.start(temp.resolve("fixture"))) {
+                Path home = Files.createDirectory(temp.resolve("home"));
+                publishVersion(fixture, "1.0.0");
+                assertEquals(0, install(fixture, home, "1.0.0").exit());
+                assertThat(pinnedVersionFile(home)).hasContent("1.0.0");
+
+                publishVersion(fixture, "2.0.0");
+                Map<String, String> env = new HashMap<>(fixture.environment(home));
+                env.put("CAMEL_INSTALL_SELF_UPDATE", "true");
+                WebsiteInstallerFixture.Result r = fixture.run(
+                        List.of("powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", SCRIPT.toString(),
+                                "-Version", "2.0.0"),
+                        env);
+
+                assertEquals(0, r.exit(), r.stderr());
+                assertThat(pinnedVersionFile(home)).hasContent("1.0.0");
+            }
+        }
+
+        @Test
+        void installsNewestLtsWithLtsSelectorAndPinsTheSelector(@TempDir Path temp) throws Exception {
+            try (WebsiteInstallerFixture fixture = WebsiteInstallerFixture.start(temp.resolve("fixture"))) {
+                Path home = Files.createDirectory(temp.resolve("home"));
+                publishAlias(fixture, "lts", "2.1.3");
+                publishLatest(fixture, "3.0.0");
+
+                // Case-insensitive, normalised to LTS in the pin file.
+                WebsiteInstallerFixture.Result r = install(fixture, home, "lts");
+
+                assertEquals(0, r.exit(), r.stderr());
+                assertVersionInstalled(home, "2.1.3");
+                assertThat(pinnedVersionFile(home)).hasContent("LTS");
+            }
+        }
+
+        @Test
+        void installsNewestPatchOfReleaseLineAndPinsTheLine(@TempDir Path temp) throws Exception {
+            try (WebsiteInstallerFixture fixture = WebsiteInstallerFixture.start(temp.resolve("fixture"))) {
+                Path home = Files.createDirectory(temp.resolve("home"));
+                publishAlias(fixture, "2.1", "2.1.4");
+
+                WebsiteInstallerFixture.Result r = install(fixture, home, "2.1");
+
+                assertEquals(0, r.exit(), r.stderr());
+                assertVersionInstalled(home, "2.1.4");
+                assertThat(pinnedVersionFile(home)).hasContent("2.1");
+            }
+        }
+
+        // A trailing-zero line must be compared as a whole component: 4.20 is not 4.2, and 4.2 accepts neither
+        // 4.20.0 nor 4.22.0.
+        @Test
+        void trailingZeroReleaseLineIsNotReadAsAShorterLine(@TempDir Path temp) throws Exception {
+            try (WebsiteInstallerFixture fixture = WebsiteInstallerFixture.start(temp.resolve("fixture"))) {
+                Path home = Files.createDirectory(temp.resolve("home"));
+                publishAlias(fixture, "4.20", "4.20.3");
+
+                WebsiteInstallerFixture.Result r = install(fixture, home, "4.20");
+
+                assertEquals(0, r.exit(), r.stderr());
+                assertVersionInstalled(home, "4.20.3");
+                assertThat(pinnedVersionFile(home)).hasContent("4.20");
+
+                publishAlias(fixture, "4.2", "4.20.0");
+                WebsiteInstallerFixture.Result twenty = install(fixture, home, "4.2");
+                publishAlias(fixture, "4.2", "4.22.0");
+                WebsiteInstallerFixture.Result twentyTwo = install(fixture, home, "4.2");
+
+                assertNotEquals(0, twenty.exit());
+                assertThat(twenty.stderr()).contains("manifest version (4.20.0) is not in the requested release line (4.2)");
+                assertNotEquals(0, twentyTwo.exit());
+                assertThat(twentyTwo.stderr()).contains("manifest version (4.22.0) is not in the requested release line (4.2)");
+                assertVersionInstalled(home, "4.20.3");
+                assertThat(pinnedVersionFile(home)).hasContent("4.20");
+            }
+        }
+
+        @Test
+        void rejectsReleaseLineManifestOutsideTheLine(@TempDir Path temp) throws Exception {
+            try (WebsiteInstallerFixture fixture = WebsiteInstallerFixture.start(temp.resolve("fixture"))) {
+                Path home = Files.createDirectory(temp.resolve("home"));
+                // 2.10.0 shares the "2.1" prefix but not the "2.1." line.
+                publishAlias(fixture, "2.1", "2.10.0");
+
+                WebsiteInstallerFixture.Result r = install(fixture, home, "2.1");
+
+                assertNotEquals(0, r.exit());
+                assertThat(r.stderr()).contains("not in the requested release line (2.1)");
+                assertFalse(Files.exists(expectedBinDir(home).resolve("camel.cmd")));
+                assertFalse(Files.exists(versionDir(home, "2.10.0")));
+                assertThat(pinnedVersionFile(home)).doesNotExist();
+            }
+        }
+
+        @Test
+        void reportsMissingAliasClearly(@TempDir Path temp) throws Exception {
+            try (WebsiteInstallerFixture fixture = WebsiteInstallerFixture.start(temp.resolve("fixture"))) {
+                Path home = Files.createDirectory(temp.resolve("home"));
+                publishLatest(fixture, "3.0.0");
+
+                WebsiteInstallerFixture.Result lts = install(fixture, home, "LTS");
+                WebsiteInstallerFixture.Result line = install(fixture, home, "2.1");
+
+                assertNotEquals(0, lts.exit());
+                assertThat(lts.stderr()).contains("no manifest for LTS at").contains("lts.properties")
+                        .contains("may not publish aliases yet");
+                assertNotEquals(0, line.exit());
+                assertThat(line.stderr()).contains("no manifest for 2.1 at").contains("2.1.properties");
+                assertFalse(Files.exists(expectedBinDir(home).resolve("camel.cmd")));
+            }
+        }
+
+        @ParameterizedTest(name = "{0}")
+        @MethodSource("org.apache.camel.dsl.jbang.launcher.WebsiteInstallTest#malformedSelectors")
+        void rejectsMalformedSelector(String selector, @TempDir Path temp) throws Exception {
+            try (WebsiteInstallerFixture fixture = WebsiteInstallerFixture.start(temp.resolve("fixture"))) {
+                Path home = Files.createDirectory(temp.resolve("home"));
+                publishLatest(fixture, "3.0.0");
+
+                WebsiteInstallerFixture.Result r = install(fixture, home, selector);
+
+                assertNotEquals(0, r.exit());
+                assertThat(r.stderr()).contains("invalid -Version value");
+                assertFalse(Files.exists(expectedBinDir(home).resolve("camel.cmd")));
+            }
+        }
+
+        @Test
+        void failedSelectorInstallPreservesExistingInstallAndPin(@TempDir Path temp) throws Exception {
+            try (WebsiteInstallerFixture fixture = WebsiteInstallerFixture.start(temp.resolve("fixture"))) {
+                Path home = Files.createDirectory(temp.resolve("home"));
+                publishVersion(fixture, "1.0.0");
+                assertEquals(0, install(fixture, home, "1.0.0").exit());
+
+                // Missing alias, an alias outside its line, and an alias whose archive fails verification.
+                WebsiteInstallerFixture.Result missing = install(fixture, home, "LTS");
+                publishAlias(fixture, "2.1", "2.2.0");
+                WebsiteInstallerFixture.Result mismatch = install(fixture, home, "2.1");
+                String bogusHash = "0".repeat(64);
+                publishRelease(fixture, "3.0.1", fixture.safeTar("3.0.1"), fixture.safeZip("3.0.1"));
+                fixture.publish("/camel-cli/releases/3.0.properties",
+                        ("format=1\nversion=3.0.1\ntar_sha256=" + bogusHash + "\nzip_sha256=" + bogusHash + "\n")
+                                .getBytes(StandardCharsets.UTF_8));
+                WebsiteInstallerFixture.Result badChecksum = install(fixture, home, "3.0");
+
+                assertNotEquals(0, missing.exit());
+                assertNotEquals(0, mismatch.exit());
+                assertNotEquals(0, badChecksum.exit());
+                assertThat(badChecksum.stderr()).contains("checksum mismatch");
+                assertVersionInstalled(home, "1.0.0");
+                assertFalse(Files.exists(versionDir(home, "2.2.0")));
+                assertFalse(Files.exists(versionDir(home, "3.0.1")));
+                assertThat(pinnedVersionFile(home)).hasContent("1.0.0");
+            }
+        }
+
+        @Test
+        void selfUpdateInternalFlagLeavesASelectorPinUntouched(@TempDir Path temp) throws Exception {
+            try (WebsiteInstallerFixture fixture = WebsiteInstallerFixture.start(temp.resolve("fixture"))) {
+                Path home = Files.createDirectory(temp.resolve("home"));
+                publishAlias(fixture, "lts", "1.0.0");
+                assertEquals(0, install(fixture, home, "LTS").exit());
+                assertThat(pinnedVersionFile(home)).hasContent("LTS");
+
+                publishAlias(fixture, "lts", "1.0.1");
+                Map<String, String> env = new HashMap<>(fixture.environment(home));
+                env.put("CAMEL_INSTALL_SELF_UPDATE", "true");
+                WebsiteInstallerFixture.Result r = fixture.run(
+                        List.of("powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", SCRIPT.toString(),
+                                "-Version", "1.0.1"),
+                        env);
+
+                assertEquals(0, r.exit(), r.stderr());
+                assertVersionInstalled(home, "1.0.1");
+                assertThat(pinnedVersionFile(home)).hasContent("LTS");
+            }
+        }
+
+        @Test
+        void handlesSpacesAndUnicodeInLocalAppData(@TempDir Path temp) throws Exception {
+            try (WebsiteInstallerFixture fixture = WebsiteInstallerFixture.start(temp.resolve("fixture"))) {
+                Path home = Files.createDirectories(temp.resolve("home dir/über"));
+                publishLatest(fixture, "1.0.0");
+
+                WebsiteInstallerFixture.Result r = install(fixture, home, null);
+
+                assertEquals(0, r.exit(), r.stderr());
+                assertVersionInstalled(home, "1.0.0");
+            }
+        }
+
+        @Test
+        void upgradeKeepsPreviousVersionDirectory(@TempDir Path temp) throws Exception {
+            try (WebsiteInstallerFixture fixture = WebsiteInstallerFixture.start(temp.resolve("fixture"))) {
+                Path home = Files.createDirectory(temp.resolve("home"));
+                publishVersion(fixture, "1.0.0");
+                assertEquals(0, install(fixture, home, "1.0.0").exit());
+
+                publishVersion(fixture, "2.0.0");
+                WebsiteInstallerFixture.Result r = install(fixture, home, "2.0.0");
+
+                assertEquals(0, r.exit(), r.stderr());
+                assertVersionInstalled(home, "2.0.0");
+                assertTrue(Files.isDirectory(versionDir(home, "1.0.0")), "old version dir removed");
+            }
+        }
+
+        @Test
+        void downgradeToExplicitOlderVersionSucceeds(@TempDir Path temp) throws Exception {
+            try (WebsiteInstallerFixture fixture = WebsiteInstallerFixture.start(temp.resolve("fixture"))) {
+                Path home = Files.createDirectory(temp.resolve("home"));
+                publishVersion(fixture, "1.0.0");
+                assertEquals(0, install(fixture, home, "1.0.0").exit());
+                publishVersion(fixture, "2.0.0");
+                assertEquals(0, install(fixture, home, "2.0.0").exit());
+
+                WebsiteInstallerFixture.Result r = install(fixture, home, "1.0.0");
+
+                assertEquals(0, r.exit(), r.stderr());
+                assertVersionInstalled(home, "1.0.0");
+                assertTrue(Files.isDirectory(versionDir(home, "2.0.0")));
+            }
+        }
+
+        @Test
+        void reinstallingSameVersionSucceeds(@TempDir Path temp) throws Exception {
+            try (WebsiteInstallerFixture fixture = WebsiteInstallerFixture.start(temp.resolve("fixture"))) {
+                Path home = Files.createDirectory(temp.resolve("home"));
+                publishVersion(fixture, "1.0.0");
+
+                assertEquals(0, install(fixture, home, "1.0.0").exit());
+                WebsiteInstallerFixture.Result r = install(fixture, home, "1.0.0");
+
+                assertEquals(0, r.exit(), r.stderr());
+                assertVersionInstalled(home, "1.0.0");
+            }
+        }
+
+        @Test
+        void addsUserPathOnceAndIsIdempotent(@TempDir Path temp) throws Exception {
+            try (WebsiteInstallerFixture fixture = WebsiteInstallerFixture.start(temp.resolve("fixture"))) {
+                Path home = Files.createDirectory(temp.resolve("home"));
+                publishLatest(fixture, "1.0.0");
+                String binDir = expectedBinDir(home).toString();
+
+                assertEquals(0, install(fixture, home, null).exit());
+                assertEquals(1, countOccurrencesCaseInsensitive(queryEnvironmentPath("User"), binDir));
+
+                assertEquals(0, install(fixture, home, null).exit());
+                assertEquals(1, countOccurrencesCaseInsensitive(queryEnvironmentPath("User"), binDir));
+            }
+        }
+
+        @Test
+        void neverWritesMachinePath(@TempDir Path temp) throws Exception {
+            try (WebsiteInstallerFixture fixture = WebsiteInstallerFixture.start(temp.resolve("fixture"))) {
+                Path home = Files.createDirectory(temp.resolve("home"));
+                publishLatest(fixture, "1.0.0");
+                String before = queryEnvironmentPath("Machine");
+
+                WebsiteInstallerFixture.Result r = install(fixture, home, null);
+
+                assertEquals(0, r.exit(), r.stderr());
+                assertEquals(before, queryEnvironmentPath("Machine"), "machine PATH must never be modified");
+            }
+        }
+
+        @Test
+        void forwardsArgumentsAndExitCodeThroughShim(@TempDir Path temp) throws Exception {
+            try (WebsiteInstallerFixture fixture = WebsiteInstallerFixture.start(temp.resolve("fixture"))) {
+                Path home = Files.createDirectory(temp.resolve("home"));
+                publishLatest(fixture, "1.0.0");
+                assertEquals(0, install(fixture, home, null).exit());
+
+                Path binDir = expectedBinDir(home);
+                assertTrue(Files.isRegularFile(binDir.resolve("camel.cmd")), "expected shim in " + binDir);
+
+                // Invoke the shim by name via PATH, exactly as an end user would after install adds bin to
+                // PATH. Passing the shim's absolute path to `cmd /c` together with a second quoted argument
+                // ("bar baz") trips cmd.exe's quote-stripping rule (it only preserves quotes when there are
+                // exactly two), which would unquote the space in "Apache Camel" and break the call. A bare
+                // command name resolved through PATH+PATHEXT avoids that quirk and mirrors real usage.
+                String argsOut = WebsiteInstallerFixture.execute(shimProcess(binDir, "echo-args", "foo", "bar baz"))
+                        .stdout();
+                assertTrue(argsOut.contains("foo") && argsOut.contains("bar baz"), argsOut);
+
+                assertEquals(7, WebsiteInstallerFixture.execute(shimProcess(binDir, "exit-code", "7")).exit());
+            }
+        }
+
+        @Test
+        void preservesActiveInstallWhenLaterInstallFails(@TempDir Path temp) throws Exception {
+            try (WebsiteInstallerFixture fixture = WebsiteInstallerFixture.start(temp.resolve("fixture"))) {
+                Path home = Files.createDirectory(temp.resolve("home"));
+                publishVersion(fixture, "1.0.0");
+                assertEquals(0, install(fixture, home, "1.0.0").exit());
+
+                Path badTar = fixture.safeTar("2.0.0");
+                Path badZip = fixture.safeZip("2.0.0");
+                fixture.publish("/maven2/org/apache/camel/camel-launcher/2.0.0/camel-launcher-2.0.0-bin.tar.gz",
+                        Files.readAllBytes(badTar));
+                fixture.publish("/maven2/org/apache/camel/camel-launcher/2.0.0/camel-launcher-2.0.0-bin.zip",
+                        Files.readAllBytes(badZip));
+                String bogusHash = "0".repeat(64);
+                fixture.publish("/camel-cli/releases/2.0.0.properties",
+                        ("format=1\nversion=2.0.0\ntar_sha256=" + bogusHash + "\nzip_sha256=" + bogusHash + "\n")
+                                .getBytes(StandardCharsets.UTF_8));
+
+                WebsiteInstallerFixture.Result r = install(fixture, home, "2.0.0");
+
+                assertNotEquals(0, r.exit());
+                assertVersionInstalled(home, "1.0.0");
+                assertFalse(Files.exists(versionDir(home, "2.0.0")));
+            }
+        }
+
+        @Test
+        void rejectsUnknownParameter(@TempDir Path temp) throws Exception {
+            try (WebsiteInstallerFixture fixture = WebsiteInstallerFixture.start(temp.resolve("fixture"))) {
+                Path home = Files.createDirectory(temp.resolve("home"));
+                WebsiteInstallerFixture.Result r = fixture.run(
+                        List.of("powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", SCRIPT.toString(),
+                                "-Bogus", "value"),
+                        fixture.environment(home));
+
+                assertNotEquals(0, r.exit());
+            }
+        }
+
+        @Test
+        void rejectsMissingVersionValue(@TempDir Path temp) throws Exception {
+            try (WebsiteInstallerFixture fixture = WebsiteInstallerFixture.start(temp.resolve("fixture"))) {
+                Path home = Files.createDirectory(temp.resolve("home"));
+                WebsiteInstallerFixture.Result r = fixture.run(
+                        List.of("powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", SCRIPT.toString(),
+                                "-Version"),
+                        fixture.environment(home));
+
+                assertNotEquals(0, r.exit());
+            }
+        }
+
+        @Test
+        void rejectsMalformedVersionArgument(@TempDir Path temp) throws Exception {
+            try (WebsiteInstallerFixture fixture = WebsiteInstallerFixture.start(temp.resolve("fixture"))) {
+                Path home = Files.createDirectory(temp.resolve("home"));
+                WebsiteInstallerFixture.Result r = install(fixture, home, "1.2.3-SNAPSHOT");
+
+                assertNotEquals(0, r.exit());
+                assertFalse(Files.exists(expectedBinDir(home).resolve("camel.cmd")));
+            }
+        }
+
+        @ParameterizedTest(name = "{0}")
+        @MethodSource("org.apache.camel.dsl.jbang.launcher.WebsiteInstallTest#invalidManifests")
+        void rejectsInvalidManifest(String name, String manifestBody, @TempDir Path temp) throws Exception {
+            try (WebsiteInstallerFixture fixture = WebsiteInstallerFixture.start(temp.resolve("fixture"))) {
+                Path home = Files.createDirectory(temp.resolve("home"));
+                fixture.publish("/camel-cli/releases/latest.properties",
+                        manifestBody.getBytes(StandardCharsets.UTF_8));
+
+                WebsiteInstallerFixture.Result r = install(fixture, home, null);
+
+                assertNotEquals(0, r.exit(), name);
+                assertFalse(Files.exists(expectedBinDir(home).resolve("camel.cmd")), name);
+            }
+        }
+
+        @Test
+        void manifestInjectionNeverExecutesCode(@TempDir Path temp) throws Exception {
+            try (WebsiteInstallerFixture fixture = WebsiteInstallerFixture.start(temp.resolve("fixture"))) {
+                Path home = Files.createDirectory(temp.resolve("home"));
+                String hash = "a".repeat(64);
+                String manifest = "format=1\nversion=$(New-Item owned)\ntar_sha256=" + hash + "\nzip_sha256=" + hash
+                                  + "\n";
+                fixture.publish("/camel-cli/releases/latest.properties",
+                        manifest.getBytes(StandardCharsets.UTF_8));
+
+                WebsiteInstallerFixture.Result r = install(fixture, home, null);
+
+                assertNotEquals(0, r.exit());
+                assertFalse(Files.exists(home.resolve("owned")), "manifest value must never be executed");
+            }
+        }
+
+        @Test
+        void rejectsChecksumMismatch(@TempDir Path temp) throws Exception {
+            try (WebsiteInstallerFixture fixture = WebsiteInstallerFixture.start(temp.resolve("fixture"))) {
+                Path home = Files.createDirectory(temp.resolve("home"));
+                Path tar = fixture.safeTar("1.0.0");
+                Path zip = fixture.safeZip("1.0.0");
+                publishRelease(fixture, "1.0.0", tar, zip);
+                String bogusHash = "0".repeat(64);
+                fixture.publish("/camel-cli/releases/latest.properties",
+                        ("format=1\nversion=1.0.0\ntar_sha256=" + bogusHash + "\nzip_sha256=" + bogusHash + "\n")
+                                .getBytes(StandardCharsets.UTF_8));
+
+                WebsiteInstallerFixture.Result r = install(fixture, home, null);
+
+                assertNotEquals(0, r.exit());
+                assertFalse(Files.exists(expectedBinDir(home).resolve("camel.cmd")));
+            }
+        }
+
+        @Test
+        void rejectsInterruptedDownload(@TempDir Path temp) throws Exception {
+            try (WebsiteInstallerFixture fixture = WebsiteInstallerFixture.start(temp.resolve("fixture"));
+                 ServerSocket rawServer = new ServerSocket(0, 1, InetAddress.getLoopbackAddress())) {
+                Path home = Files.createDirectory(temp.resolve("home"));
+                Path tar = fixture.safeTar("1.0.0");
+                Path zip = fixture.safeZip("1.0.0");
+                fixture.publishManifest("/camel-cli/releases/latest.properties", "1.0.0", tar, zip);
+
+                byte[] zipBytes = Files.readAllBytes(zip);
+                Thread server = new Thread(() -> serveTruncatedThenClose(rawServer, zipBytes));
+                server.setDaemon(true);
+                server.start();
+
+                Map<String, String> env = new HashMap<>(fixture.environment(home));
+                env.put("CAMEL_INSTALL_MAVEN_BASE_URL", "http://127.0.0.1:" + rawServer.getLocalPort());
+
+                WebsiteInstallerFixture.Result r = fixture.run(
+                        List.of("powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", SCRIPT.toString()),
+                        env);
+
+                assertNotEquals(0, r.exit());
+                assertFalse(Files.exists(expectedBinDir(home).resolve("camel.cmd")));
+            }
+        }
+
+        @Test
+        void rejectsAbsolutePathEntry(@TempDir Path temp) throws Exception {
+            assertMaliciousZipRejected(temp, fixture -> fixture.maliciousZip("/etc/passwd"));
+        }
+
+        @Test
+        void rejectsTraversalEntry(@TempDir Path temp) throws Exception {
+            assertMaliciousZipRejected(temp, fixture -> fixture.maliciousZip("../escape"));
+        }
+
+        @Test
+        void rejectsMultipleTopLevelRoots(@TempDir Path temp) throws Exception {
+            assertMaliciousZipRejected(temp, fixture -> fixture.maliciousZip("evil-root/payload"));
+        }
+
+        @Test
+        void rejectsEscapingReparsePointEntry(@TempDir Path temp) throws Exception {
+            assertMaliciousZipRejected(temp,
+                    fixture -> fixture.maliciousZipSymlink("camel-launcher-9.9.9/escape-link", "../../outside"));
+        }
+
+        @Test
+        void rejectsArchiveMissingCamelBat(@TempDir Path temp) throws Exception {
+            try (WebsiteInstallerFixture fixture = WebsiteInstallerFixture.start(temp.resolve("fixture"))) {
+                Path home = Files.createDirectory(temp.resolve("home"));
+                Path zip = fixture.safeZipMissingCamelBat("9.9.9");
+                Path tar = fixture.safeTar("9.9.9");
+                publishRelease(fixture, "9.9.9", tar, zip);
+                fixture.publishManifest("/camel-cli/releases/9.9.9.properties", "9.9.9", tar, zip);
+
+                WebsiteInstallerFixture.Result r = install(fixture, home, "9.9.9");
+
+                assertNotEquals(0, r.exit());
+                assertFalse(Files.exists(expectedBinDir(home).resolve("camel.cmd")));
+            }
+        }
+
+        @Test
+        void rejectsWhenStagedLauncherFails(@TempDir Path temp) throws Exception {
+            try (WebsiteInstallerFixture fixture = WebsiteInstallerFixture.start(temp.resolve("fixture"))) {
+                Path home = Files.createDirectory(temp.resolve("home"));
+                Path zip = fixture.safeZipWithFailingLauncher("9.9.9");
+                Path tar = fixture.safeTar("9.9.9");
+                publishRelease(fixture, "9.9.9", tar, zip);
+                fixture.publishManifest("/camel-cli/releases/9.9.9.properties", "9.9.9", tar, zip);
+
+                WebsiteInstallerFixture.Result r = install(fixture, home, "9.9.9");
+
+                assertNotEquals(0, r.exit());
+                assertFalse(Files.exists(expectedBinDir(home).resolve("camel.cmd")));
+                assertFalse(Files.exists(versionDir(home, "9.9.9")));
+            }
+        }
+
+        @Test
+        void shimIsWrittenWithoutByteOrderMark(@TempDir Path temp) throws Exception {
+            try (WebsiteInstallerFixture fixture = WebsiteInstallerFixture.start(temp.resolve("fixture"))) {
+                Path home = Files.createDirectory(temp.resolve("home"));
+                publishLatest(fixture, "1.0.0");
+                assertEquals(0, install(fixture, home, null).exit());
+
+                byte[] shim = Files.readAllBytes(expectedBinDir(home).resolve("camel.cmd"));
+                // A UTF-8 BOM (EF BB BF) prefix makes cmd.exe mis-parse the '@echo off' line and emit a stray
+                // error on every 'camel' invocation, so the generated shim must be written BOM-free.
+                boolean hasBom = shim.length >= 3 && (shim[0] & 0xFF) == 0xEF
+                        && (shim[1] & 0xFF) == 0xBB && (shim[2] & 0xFF) == 0xBF;
+                assertFalse(hasBom, "camel.cmd must not start with a UTF-8 BOM");
+                assertTrue(new String(shim, StandardCharsets.UTF_8).startsWith("@echo off"),
+                        "camel.cmd must start with '@echo off'");
+            }
+        }
+
+        @Test
+        void addUserPathPreservesExistingExpandableReferences(@TempDir Path temp) throws Exception {
+            try (WebsiteInstallerFixture fixture = WebsiteInstallerFixture.start(temp.resolve("fixture"))) {
+                Path home = Files.createDirectory(temp.resolve("home"));
+                publishLatest(fixture, "1.0.0");
+                String binDir = expectedBinDir(home).toString();
+
+                // Seed the user's PATH with a REG_EXPAND_SZ entry referencing an environment variable, and
+                // snapshot the raw value so it can be restored verbatim afterwards.
+                String sentinel = "%SystemRoot%\\camel-userpath-test";
+                String originalRaw = readUserPathRaw();
+                writeUserPathExpandable(originalRaw.isEmpty() ? sentinel : originalRaw + ";" + sentinel);
+                try {
+                    assertEquals(0, install(fixture, home, null).exit());
+
+                    String afterRaw = readUserPathRaw();
+                    // The installer must append its bin dir without expanding pre-existing %VAR% references.
+                    assertTrue(Arrays.asList(afterRaw.split(";")).contains(sentinel),
+                            "existing %VAR% reference must be preserved unexpanded, was: " + afterRaw);
+                    assertTrue(Arrays.stream(afterRaw.split(";")).anyMatch(e -> e.equalsIgnoreCase(binDir)),
+                            "installer bin dir must be appended to the user PATH");
+                } finally {
+                    if (originalRaw.isEmpty()) {
+                        deleteUserPath();
+                    } else {
+                        writeUserPathExpandable(originalRaw);
+                    }
+                }
+            }
+        }
+    }
+}

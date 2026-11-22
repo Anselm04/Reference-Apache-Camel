@@ -1,0 +1,328 @@
+= AWS S3 Vectors Component
+:doctitle: AWS S3 Vectors
+:shortname: aws2-s3-vectors
+:artifactid: camel-aws2-s3-vectors
+:description: Store and query vector embeddings using AWS S3 Vectors with similarity search.
+:since: 4.17
+:supportlevel: Stable
+:tabs-sync-option:
+:component-header: Both producer and consumer are supported
+//Manually maintained attributes
+:group: AWS
+
+*Since Camel {since}*
+
+*{component-header}*
+
+The AWS S3 Vectors component stores and queries vector embeddings using https://aws.amazon.com/s3/features/vectors/[Amazon S3 Vectors].
+
+Prerequisites
+
+You need an AWS account with access to S3 Vectors. See https://aws.amazon.com/s3/features/vectors/[Amazon S3 Vectors].
+
+== URI Format
+
+------------------------------
+aws2-s3-vectors://vectorBucketName[?options]
+------------------------------
+
+You can append query options to the URI:
+
+`?option1=value&option2=value&...`
+
+
+// component options: START
+include::partial$component-configure-options.adoc[]
+include::partial$component-endpoint-options.adoc[]
+include::partial$component-endpoint-headers.adoc[]
+// component options: END
+
+
+== Usage
+
+=== Producer Operations
+
+* `putVectors` - Insert vectors
+* `queryVectors` - Search similar vectors
+* `deleteVectors` - Delete vectors
+* `getVectors` - Retrieve vectors by ID
+* `createVectorBucket` - Create bucket
+* `deleteVectorBucket` - Delete bucket
+* `listVectorBuckets` - List buckets (the first page of the result only)
+* `describeVectorBucket` - Get bucket info
+* `createVectorIndex` - Create index
+* `deleteVectorIndex` - Delete index
+* `listVectorIndexes` - List indexes (the first page of the result only)
+* `describeVectorIndex` - Get index info
+
+`listVectorBuckets` and `listVectorIndexes` send a single request, so they return the first page of the buckets or
+indexes that S3 Vectors returns, not all of them.
+
+=== Bucket and index of an operation
+
+Each operation uses the vector bucket of the endpoint URI and the `vectorIndexName` option. The
+`CamelAwsS3VectorsVectorBucketName` and `CamelAwsS3VectorsVectorIndexName` headers override them for a single
+message. These headers are inputs only: neither the producer nor the consumer sets them, so a route that reads from one
+bucket and writes to another one does not write back into the bucket it reads from.
+
+=== Vector keys
+
+`putVectors` puts the vector under the key of the `CamelAwsS3VectorsVectorId` header, or under the exchange id when the
+header is not set, and sets the header to the key it used.
+
+`getVectors` and `deleteVectors` take their keys from the message body when the body holds keys: a `String`, or a
+`Collection` or an array whose elements are all Strings. Otherwise they take the keys from the
+`CamelAwsS3VectorsVectorId` header (a `String` or a list of Strings). Keys that are not Strings, such as a list of
+numbers, fail with an `IllegalArgumentException`. As the body comes first, a `getVectors` after a `putVectors` in the
+same route gets the keys of its body, not the key that the `putVectors` left in the header.
+
+`getVectors` returns the vectors with their data and their metadata.
+
+=== Vector data and metadata
+
+The vector of `putVectors` and `queryVectors` is a `List` of numbers, a `float[]` or a `double[]`. A `null` element
+fails with an `IllegalArgumentException` that names its position.
+
+The `CamelAwsS3VectorsVectorMetadata` header of `putVectors` is a `Map` whose values may be Strings, numbers, booleans,
+or lists of these. Any other value fails with an `IllegalArgumentException` that names its key.
+
+=== Metadata filter and distance
+
+The `CamelAwsS3VectorsMetadataFilter` header of `queryVectors` and the `consumerMetadataFilter` option of the consumer
+are JSON objects with the
+https://docs.aws.amazon.com/AmazonS3/latest/userguide/s3-vectors-metadata-filtering.html[filter operators of S3 Vectors],
+such as `{"genre": {"$eq": "drama"}}` or `{"$and": [{"genre": "drama"}, {"year": {"$gte": 2020}}]}`. Only the vectors
+whose metadata match the filter are returned. A filter that is not a valid JSON object fails with an
+`IllegalArgumentException`: the producer fails the exchange, and the consumer does not start.
+
+`queryVectors` and the consumer return the vectors with their metadata and their distance from the query vector. The
+distance is computed with the distance metric of the index (`cosine` or `euclidean`): the lower, the closer. S3 Vectors
+has no similarity threshold, so the `similarityThreshold` option and the `CamelAwsS3VectorsSimilarityThreshold` and
+`CamelAwsS3VectorsSimilarityScore` headers are deprecated and do nothing. To keep only the close vectors, filter on the
+distance, such as `.filter(simple("${header.CamelAwsS3VectorsDistance} < 0.3"))` after the consumer.
+
+=== Index data type and distance metric
+
+The `dataType` option of `createVectorIndex` is `float32`, the only data type of S3 Vectors. The `distanceMetric`
+option is `cosine` (the default) or `euclidean`.
+
+=== Consumer
+
+The consumer polls for vectors using similarity search. It tracks processed vector IDs to avoid duplicates.
+
+Each consumed vector is a `QueryOutputVector` in the message body, with its metadata. The consumer sets the
+`CamelAwsS3VectorsVectorId` header to the key of the vector and the `CamelAwsS3VectorsDistance` header to its distance
+from the `consumerQueryVector`.
+
+== Examples
+
+The vector in the message body is a `List` of numbers, a `float[]` or a `double[]`.
+The YAML DSL has no way to write such a list as a constant, so the YAML examples build it with a Groovy expression
+and need `camel-groovy` on the classpath.
+
+=== Insert Vectors
+
+[tabs]
+====
+Java::
++
+[source,java]
+----
+from("direct:insert")
+    .setHeader(AWS2S3VectorsConstants.VECTOR_ID, constant("doc-001"))
+    .setBody(constant(Arrays.asList(0.1f, 0.2f, 0.3f)))
+    .to("aws2-s3-vectors://my-bucket?operation=putVectors&vectorIndexName=my-index");
+----
+
+YAML::
++
+[source,yaml]
+----
+- route:
+    from:
+      uri: direct:insert
+      steps:
+        - setHeader:
+            name: CamelAwsS3VectorsVectorId
+            constant: doc-001
+        - setBody:
+            groovy: "[0.1, 0.2, 0.3]"
+        - to:
+            uri: aws2-s3-vectors://my-bucket
+            parameters:
+              operation: putVectors
+              vectorIndexName: my-index
+----
+====
+
+=== Query Similar Vectors
+
+[tabs]
+====
+Java::
++
+[source,java]
+----
+from("direct:search")
+    .setBody(constant(Arrays.asList(0.15f, 0.25f, 0.35f)))
+    .setHeader(AWS2S3VectorsConstants.TOP_K, constant(5))
+    .to("aws2-s3-vectors://my-bucket?operation=queryVectors&vectorIndexName=my-index")
+    .log("Found ${body.size} similar vectors");
+----
+
+YAML::
++
+[source,yaml]
+----
+- route:
+    from:
+      uri: direct:search
+      steps:
+        - setBody:
+            groovy: "[0.15, 0.25, 0.35]"
+        - setHeader:
+            name: CamelAwsS3VectorsTopK
+            constant: 5
+        - to:
+            uri: aws2-s3-vectors://my-bucket
+            parameters:
+              operation: queryVectors
+              vectorIndexName: my-index
+        - log:
+            message: "Found ${body.size} similar vectors"
+----
+====
+
+=== Consumer Polling
+
+[tabs]
+====
+Java::
++
+[source,java]
+----
+from("aws2-s3-vectors://my-bucket?"
+    + "vectorIndexName=my-index"
+    + "&consumerQueryVector=0.1,0.2,0.3"
+    + "&delay=5000"
+    + "&maxMessagesPerPoll=10")
+    .log("Vector ID: ${header.CamelAwsS3VectorsVectorId}")
+    .to("direct:process");
+----
+
+YAML::
++
+[source,yaml]
+----
+- route:
+    from:
+      uri: aws2-s3-vectors://my-bucket
+      parameters:
+        vectorIndexName: my-index
+        consumerQueryVector: "0.1,0.2,0.3"
+        delay: 5000
+        maxMessagesPerPoll: 10
+      steps:
+        - log:
+            message: "Vector ID: ${header.CamelAwsS3VectorsVectorId}"
+        - to:
+            uri: direct:process
+----
+====
+
+=== Query with a Metadata Filter
+
+[tabs]
+====
+Java::
++
+[source,java]
+----
+from("direct:search")
+    .setBody(constant(Arrays.asList(0.15f, 0.25f, 0.35f)))
+    .setHeader(AWS2S3VectorsConstants.METADATA_FILTER, constant("{\"genre\": {\"$eq\": \"drama\"}}"))
+    .to("aws2-s3-vectors://my-bucket?operation=queryVectors&vectorIndexName=my-index")
+    .log("Found ${body.size} similar drama vectors");
+----
+
+YAML::
++
+[source,yaml]
+----
+- route:
+    from:
+      uri: direct:search
+      steps:
+        - setBody:
+            groovy: "[0.15, 0.25, 0.35]"
+        - setHeader:
+            name: CamelAwsS3VectorsMetadataFilter
+            constant: '{"genre": {"$eq": "drama"}}'
+        - to:
+            uri: aws2-s3-vectors://my-bucket
+            parameters:
+              operation: queryVectors
+              vectorIndexName: my-index
+        - log:
+            message: "Found ${body.size} similar drama vectors"
+----
+====
+
+=== Create Index
+
+[tabs]
+====
+Java::
++
+[source,java]
+----
+from("direct:createIndex")
+    .setHeader(AWS2S3VectorsConstants.VECTOR_DIMENSIONS, constant(1536))
+    .setHeader(AWS2S3VectorsConstants.DATA_TYPE, constant("float32"))
+    .setHeader(AWS2S3VectorsConstants.DISTANCE_METRIC, constant("cosine"))
+    .to("aws2-s3-vectors://my-bucket?operation=createVectorIndex&vectorIndexName=my-index");
+----
+
+YAML::
++
+[source,yaml]
+----
+- route:
+    from:
+      uri: direct:createIndex
+      steps:
+        - setHeader:
+            name: CamelAwsS3VectorsVectorDimensions
+            constant: 1536
+        - setHeader:
+            name: CamelAwsS3VectorsDataType
+            constant: float32
+        - setHeader:
+            name: CamelAwsS3VectorsDistanceMetric
+            constant: cosine
+        - to:
+            uri: aws2-s3-vectors://my-bucket
+            parameters:
+              operation: createVectorIndex
+              vectorIndexName: my-index
+----
+====
+
+== Dependencies
+
+Maven users will need to add the following dependency to their `pom.xml`.
+
+*pom.xml*
+
+[source,xml]
+----
+<dependency>
+    <groupId>org.apache.camel</groupId>
+    <artifactId>camel-aws2-s3-vectors</artifactId>
+    <version>x.x.x</version>
+    <!-- use the same version as your Camel core version -->
+</dependency>
+----
+
+where `x.x.x` is the version number of the latest Camel release.
+

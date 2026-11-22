@@ -1,0 +1,143 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.camel.component.google.secret.manager;
+
+import com.google.cloud.secretmanager.v1.SecretManagerServiceClient;
+import org.apache.camel.Category;
+import org.apache.camel.Consumer;
+import org.apache.camel.Processor;
+import org.apache.camel.Producer;
+import org.apache.camel.spi.BodyType;
+import org.apache.camel.spi.BodyType.Carrier;
+import org.apache.camel.spi.BodyTypes;
+import org.apache.camel.spi.EndpointServiceLocation;
+import org.apache.camel.spi.Metadata;
+import org.apache.camel.spi.UriEndpoint;
+import org.apache.camel.spi.UriParam;
+import org.apache.camel.support.DefaultEndpoint;
+import org.apache.camel.util.ObjectHelper;
+
+/**
+ * Manage Google Secret Manager Secrets
+ *
+ * Google Secret Manager Endpoint.
+ */
+@UriEndpoint(firstVersion = "3.16.0", scheme = "google-secret-manager", title = "Google Secret Manager",
+             syntax = "google-secret-manager:project", category = {
+                     Category.CLOUD },
+             producerOnly = true, headersClass = GoogleSecretManagerConstants.class)
+@Metadata(annotations = {
+        "vault=google-secret-manager",
+})
+@BodyTypes(producerIn = @BodyType(value = { Carrier.TEXT, Carrier.BYTES, Carrier.STREAM, Carrier.FILE },
+                                  byOption = {
+                                          @BodyType.When(option = "operation", value = "getSecretVersion",
+                                                         carriers = Carrier.ANY),
+                                          @BodyType.When(option = "operation", value = "deleteSecret", carriers = Carrier.ANY),
+                                          @BodyType.When(option = "operation", value = "listSecrets", carriers = Carrier.ANY),
+                                          @BodyType.When(option = "pojoRequest", value = "true", carriers = Carrier.POJO) },
+                                  description = "The value of the secret for createSecret, the default operation, as text: bytes,"
+                                                + " a stream or a file are read as text, a Map or a POJO is stored as its"
+                                                + " toString(), so marshal it first, and no body fails before the secret is"
+                                                + " created. The other operations take the secret id from the"
+                                                + " CamelGoogleSecretManagerSecretId header. With pojoRequest=true the body is the"
+                                                + " request of the Google SDK for the operation: for createSecret a"
+                                                + " CreateSecretRequest, which creates the secret without a version, or an"
+                                                + " AddSecretVersionRequest, which adds a version to a secret that exists"),
+           producerOut = @BodyType(value = Carrier.POJO,
+                                   byOption = {
+                                           @BodyType.When(option = "operation", value = "getSecretVersion",
+                                                          carriers = Carrier.TEXT, javaType = "java.lang.String"),
+                                           @BodyType.When(option = "operation", value = "deleteSecret",
+                                                          carriers = Carrier.UNCHANGED),
+                                           @BodyType.When(option = "operation", value = "listSecrets",
+                                                          carriers = Carrier.POJO) },
+                                   description = "The SecretVersion of the Google SDK that createSecret added, or with"
+                                                 + " pojoRequest=true and a CreateSecretRequest the Secret it created. The value of"
+                                                 + " the secret as text for getSecretVersion: unmarshal a JSON secret to read its"
+                                                 + " fields. A ListSecretsPagedResponse for listSecrets, whose iterateAll() gives"
+                                                 + " the Secrets; deleteSecret leaves the body unchanged"))
+public class GoogleSecretManagerEndpoint extends DefaultEndpoint implements EndpointServiceLocation {
+
+    @UriParam
+    private GoogleSecretManagerConfiguration configuration;
+
+    private SecretManagerServiceClient secretManagerServiceClient;
+
+    public GoogleSecretManagerEndpoint(String uri, GoogleSecretManagerComponent component,
+                                       GoogleSecretManagerConfiguration configuration) {
+        super(uri, component);
+        this.configuration = configuration;
+    }
+
+    public Producer createProducer() throws Exception {
+        return new GoogleSecretManagerProducer(this);
+    }
+
+    public Consumer createConsumer(Processor processor) throws Exception {
+        throw new UnsupportedOperationException(
+                "Cannot consume from the google-secret-manager endpoint: " + getEndpointUri());
+    }
+
+    public GoogleSecretManagerConfiguration getConfiguration() {
+        return configuration;
+    }
+
+    /**
+     * Setup configuration
+     */
+    public void setConfiguration(GoogleSecretManagerConfiguration configuration) {
+        this.configuration = configuration;
+    }
+
+    @Override
+    protected void doStart() throws Exception {
+        super.doStart();
+        if (configuration.getClient() != null) {
+            secretManagerServiceClient = configuration.getClient();
+        } else {
+            secretManagerServiceClient = GoogleSecretManagerClientFactory.create(this.getCamelContext(), configuration);
+        }
+    }
+
+    @Override
+    protected void doStop() throws Exception {
+        super.doStop();
+        if (configuration.getClient() == null && secretManagerServiceClient != null) {
+            secretManagerServiceClient.close();
+        }
+    }
+
+    public SecretManagerServiceClient getClient() {
+        return secretManagerServiceClient;
+    }
+
+    @Override
+    public String getServiceUrl() {
+        if (ObjectHelper.isNotEmpty(
+                ObjectHelper.isNotEmpty(configuration.getProject()) && ObjectHelper.isNotEmpty(configuration.getClient()))) {
+            return getServiceProtocol() + ":" + configuration.getProject() + ":" + configuration.getClient();
+        }
+        return null;
+    }
+
+    @Override
+    public String getServiceProtocol() {
+        return "secrets-manager";
+    }
+
+}

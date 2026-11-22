@@ -1,0 +1,222 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.camel.dsl.jbang.core.commands.process;
+
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Iterator;
+import java.util.List;
+import java.util.stream.Collectors;
+
+import com.github.freva.asciitable.AsciiTable;
+import com.github.freva.asciitable.Column;
+import com.github.freva.asciitable.HorizontalAlign;
+import com.github.freva.asciitable.OverflowBehaviour;
+import org.aesh.command.CommandDefinition;
+import org.aesh.command.option.Argument;
+import org.aesh.command.option.Option;
+import org.apache.camel.dsl.jbang.core.common.CompletionCandidates;
+import org.apache.camel.dsl.jbang.core.common.CopyableRow;
+import org.apache.camel.dsl.jbang.core.common.ProcessHelper;
+import org.apache.camel.dsl.jbang.core.common.RowSort;
+import org.apache.camel.dsl.jbang.core.common.TerminalWidthHelper;
+import org.apache.camel.util.SensitiveUtils;
+import org.apache.camel.util.StringHelper;
+import org.apache.camel.util.json.JsonArray;
+import org.apache.camel.util.json.JsonObject;
+import org.apache.camel.util.json.Jsoner;
+
+@CommandDefinition(name = "properties", description = "List configuration properties", generateHelp = true,
+                   footer = {
+                           "Examples:",
+                           "  camel get properties",
+                           "  camel get properties --verbose" })
+public class ListProperties extends ProcessWatchCommand {
+
+    private static final RowSort<Row> ORDER = new RowSort<Row>()
+            .number("pid", r -> r.pid)
+            .text("name", r -> r.name)
+            .text("key", r -> r.key);
+
+    public static class PidNameKeyCompletionCandidates extends CompletionCandidates {
+
+        public PidNameKeyCompletionCandidates() {
+        }
+
+        @Override
+        public Iterator<String> iterator() {
+            return List.of("pid", "name", "key").iterator();
+        }
+
+    }
+
+    @Argument(description = "Name or pid of running Camel integration")
+    String name = "*";
+
+    @Option(name = "sort", description = "Sort by pid, name or key", defaultValue = "pid",
+            completer = PidNameKeyCompletionCandidates.class)
+    String sort;
+
+    @Option(name = "startup", hasValue = false, description = "List only startup configuration")
+    boolean startup;
+
+    @Option(name = "verbose", hasValue = false, description = "Whether to include more details")
+    boolean verbose;
+
+    @Option(name = "internal", hasValue = false, description = "Whether to include internal configuration")
+    boolean internal;
+
+    @Option(name = "mask", hasValue = false,
+            description = "Whether to mask configuration values to avoid printing sensitive information such as password or access keys",
+            defaultValue = "true")
+    boolean mask = true;
+
+    @Override
+    public Integer doProcessWatchCall() throws Exception {
+        List<Row> rows = new ArrayList<>();
+
+        forEachIntegration(name, (ph, root) -> {
+            // there must be a status file for the running Camel integration
+            Row row = new Row();
+            JsonObject context = (JsonObject) root.get("context");
+            if (context == null) {
+                return;
+            }
+            row.name = context.getString("name");
+            if ("CamelJBang".equals(row.name)) {
+                row.name = ProcessHelper.extractName(root, ph);
+            }
+            row.pid = Long.toString(ph.pid());
+
+            JsonArray arr;
+            if (startup) {
+                JsonObject jv = (JsonObject) root.get("main-configuration");
+                arr = jv.getCollectionOrDefault("configurations", null);
+            } else {
+                JsonObject jv = (JsonObject) root.get("properties");
+                arr = jv.getCollectionOrDefault("properties", null);
+            }
+            for (int i = 0; arr != null && i < arr.size(); i++) {
+                row = row.copy();
+                JsonObject jo = (JsonObject) arr.get(i);
+                row.key = jo.getString("key");
+                String value = jo.getString("value");
+                if (mask && SensitiveUtils.containsSensitive(row.key)) {
+                    value = "xxxxxx";
+                }
+                row.value = value;
+                value = jo.getString("originalValue");
+                if (mask && SensitiveUtils.containsSensitive(row.key)) {
+                    value = "xxxxxx";
+                }
+                row.originalValue = value;
+                row.internalLoc = jo.getBooleanOrDefault("internal", false);
+                row.source = jo.getString("source");
+                row.loc = sanitizeLocation(jo.getString("location"));
+                boolean accept = internal || !row.internalLoc;
+                if (accept) {
+                    rows.add(row);
+                }
+            }
+        });
+
+        // sort rows
+        rows.sort(ORDER.comparator(sort));
+
+        if (!rows.isEmpty() || jsonOutput) {
+            if (jsonOutput) {
+                printer().println(Jsoner.serialize(rows.stream().map(r -> {
+                    JsonObject jo = new JsonObject();
+                    jo.put("pid", JsonValues.pid(r.pid));
+                    jo.put("name", r.name);
+                    jo.put("location", r.loc);
+                    jo.put("key", r.key);
+                    jo.put("value", "" + r.value);
+                    jo.put("function", getFunction(r));
+                    jo.put("originalValue", "" + r.originalValue);
+                    return jo;
+                }).collect(Collectors.toList())));
+            } else {
+                // Flexible columns: LOCATION (80), KEY (50), VALUE (80), FUNCTION (50), ORIGINAL VALUE (80)
+                // Fixed columns: PID(8)+NAME(30) ~= 38
+                int tw = terminalWidth();
+                int locW = TerminalWidthHelper.flexWidth(tw, 38 + 50 + 80, TerminalWidthHelper.noBorderOverhead(7), 20, 80);
+                int keyW = TerminalWidthHelper.flexWidth(tw, 38 + 80 + 80, TerminalWidthHelper.noBorderOverhead(7), 15, 50);
+                int valW = TerminalWidthHelper.flexWidth(tw, 38 + 80 + 50, TerminalWidthHelper.noBorderOverhead(7), 20, 80);
+                int funcW = TerminalWidthHelper.flexWidth(tw, 38 + 80 + 50 + 80 + 80, TerminalWidthHelper.noBorderOverhead(7),
+                        15, 50);
+                int origW = TerminalWidthHelper.flexWidth(tw, 38 + 80 + 50 + 80 + 50, TerminalWidthHelper.noBorderOverhead(7),
+                        20, 80);
+                printer().println(AsciiTable.getTable(AsciiTable.NO_BORDERS, rows, Arrays.asList(
+                        new Column().header("PID").headerAlign(HorizontalAlign.CENTER).with(r -> r.pid),
+                        new Column().header("NAME").dataAlign(HorizontalAlign.LEFT)
+                                .maxWidth(30, OverflowBehaviour.ELLIPSIS_RIGHT)
+                                .with(r -> r.name),
+                        new Column().header("LOCATION").dataAlign(HorizontalAlign.LEFT)
+                                .maxWidth(locW, OverflowBehaviour.NEWLINE)
+                                .with(r -> r.loc),
+                        new Column().header("KEY").dataAlign(HorizontalAlign.LEFT)
+                                .maxWidth(keyW, OverflowBehaviour.ELLIPSIS_RIGHT)
+                                .with(r -> r.key),
+                        new Column().header("VALUE").dataAlign(HorizontalAlign.LEFT)
+                                .maxWidth(valW, OverflowBehaviour.NEWLINE)
+                                .with(r -> "" + r.value),
+                        new Column().header("FUNCTION").visible(verbose).dataAlign(HorizontalAlign.LEFT)
+                                .maxWidth(funcW, OverflowBehaviour.ELLIPSIS_RIGHT)
+                                .with(this::getFunction),
+                        new Column().header("ORIGINAL VALUE").visible(verbose).dataAlign(HorizontalAlign.LEFT)
+                                .maxWidth(origW, OverflowBehaviour.NEWLINE)
+                                .with(r -> "" + r.originalValue))));
+            }
+        }
+
+        return 0;
+    }
+
+    protected String getFunction(Row r) {
+        return StringHelper.before(r.source, ":", r.source);
+    }
+
+    private static class Row extends CopyableRow<Row> {
+        String pid;
+        String name;
+        String key;
+        Object value;
+        Object originalValue;
+        String source;
+        String loc;
+        boolean internalLoc;
+    }
+
+    /**
+     * A readable name of where a property comes from, such as application.properties or OS Environment Variable.
+     */
+    public static String sanitizeLocation(String loc) {
+        if (loc == null) {
+            return "";
+        }
+        return switch (loc) {
+            case "initial", "override" -> "camel-main";
+            case "SYS" -> "JVM System Property";
+            case "ENV", "env" -> "OS Environment Variable";
+            case "arguments", "CLI" -> "Command Line";
+            // a properties file, such as application.properties
+            default -> loc;
+        };
+    }
+
+}

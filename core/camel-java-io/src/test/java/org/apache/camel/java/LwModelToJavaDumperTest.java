@@ -1,0 +1,207 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.camel.java;
+
+import java.io.IOException;
+
+import org.apache.camel.builder.RouteBuilder;
+import org.apache.camel.builder.RouteConfigurationBuilder;
+import org.apache.camel.impl.DefaultCamelContext;
+import org.apache.camel.java.out.JavaDslModelWriter;
+import org.apache.camel.model.Model;
+import org.apache.camel.model.RouteConfigurationDefinition;
+import org.apache.camel.model.RouteTemplateDefinition;
+import org.apache.camel.model.ThrowExceptionDefinition;
+import org.apache.camel.model.rest.RestBindingMode;
+import org.apache.camel.model.rest.RestConfigurationDefinition;
+import org.apache.camel.model.rest.RestDefinition;
+import org.apache.camel.xml.LwModelToXMLDumper;
+import org.junit.jupiter.api.Test;
+
+import static org.assertj.core.api.Assertions.assertThat;
+
+public class LwModelToJavaDumperTest {
+
+    @Test
+    public void testDumpRouteTemplateRestAndRouteConfiguration() throws Exception {
+        try (DefaultCamelContext context = new DefaultCamelContext()) {
+            context.addRoutes(new RouteBuilder() {
+                @Override
+                public void configure() {
+                    routeTemplate("tpl").templateParameter("name").from("direct:{{name}}").to("mock:result");
+
+                    rest("/api").get("/hello").to("direct:hello");
+                }
+            });
+            context.addRoutes(new RouteConfigurationBuilder() {
+                @Override
+                public void configuration() {
+                    routeConfiguration("cfg").onException(IllegalArgumentException.class).handled(true);
+                }
+            });
+            Model model = context.getCamelContextExtension().getContextPlugin(Model.class);
+            LwModelToJavaDumper dumper = new LwModelToJavaDumper();
+
+            RouteTemplateDefinition template = model.getRouteTemplateDefinition("tpl");
+            assertThat(dumper.dumpModelAsJava(context, template)).startsWith("routeTemplate(\"tpl\")");
+
+            RestDefinition rest = model.getRestDefinitions().get(0);
+            assertThat(dumper.dumpModelAsJava(context, rest)).startsWith("rest(\"/api\")");
+
+            RouteConfigurationDefinition config = model.getRouteConfigurationDefinitions().get(0);
+            assertThat(dumper.dumpModelAsJava(context, config)).startsWith("routeConfiguration(\"cfg\")");
+        }
+    }
+
+    @Test
+    public void testDumpRestKeepsSkipBindingOnErrorCodeFalse() throws Exception {
+        // skipBindingOnErrorCode defaults to true, so false set explicitly must be kept
+        try (DefaultCamelContext context = new DefaultCamelContext()) {
+            context.addRoutes(new RouteBuilder() {
+                @Override
+                public void configure() {
+                    rest("/api").skipBindingOnErrorCode(false)
+                            .get("/hello").skipBindingOnErrorCode(false).to("direct:hello");
+                }
+            });
+            Model model = context.getCamelContextExtension().getContextPlugin(Model.class);
+            RestDefinition rest = model.getRestDefinitions().get(0);
+
+            String java = new LwModelToJavaDumper().dumpModelAsJava(context, rest);
+            assertThat(java.split("\\.skipBindingOnErrorCode\\(false\\)", -1)).as(java).hasSize(3);
+
+            String xml = new LwModelToXMLDumper().dumpModelAsXml(context, rest);
+            assertThat(xml.split("skipBindingOnErrorCode=\"false\"", -1)).as(xml).hasSize(3);
+
+            RestConfigurationDefinition config = new RestConfigurationDefinition().skipBindingOnErrorCode(false);
+            assertThat(new JavaDslModelWriter().writeRestConfiguration(config)).contains(".skipBindingOnErrorCode(false)");
+        }
+    }
+
+    @Test
+    public void testDumpRestVerbApiDocsTrueUnderRestApiDocsFalse() throws Exception {
+        // a verb whose apiDocs is not set takes the value of its rest, so apiDocs(true) set on the verb must be kept
+        try (DefaultCamelContext context = new DefaultCamelContext()) {
+            context.addRoutes(new RouteBuilder() {
+                @Override
+                public void configure() {
+                    rest("/api").apiDocs(false)
+                            .get("/documented").apiDocs(true).to("direct:documented");
+                }
+            });
+            Model model = context.getCamelContextExtension().getContextPlugin(Model.class);
+            RestDefinition rest = model.getRestDefinitions().get(0);
+
+            String java = new LwModelToJavaDumper().dumpModelAsJava(context, rest);
+            // once for the rest and once for the verb
+            assertThat(java.split("\\.apiDocs\\(", -1)).as(java).hasSize(3);
+        }
+    }
+
+    @Test
+    public void testDumpMultiLineExpression() throws Exception {
+        try (DefaultCamelContext context = new DefaultCamelContext()) {
+            context.addRoutes(new RouteBuilder() {
+                @Override
+                public void configure() {
+                    from("direct:start").routeId("myRoute").setBody(simple("Hello\n  ${body}")).to("mock:result");
+                }
+            });
+            String java = new LwModelToJavaDumper().dumpModelAsJava(context, context.getRouteDefinition("myRoute"));
+            assertThat(java).contains("\"Hello\\n  ${body}\"");
+        }
+    }
+
+    /**
+     * A route built in Java keeps expression clauses, classes and arrays the XML DSL does not have: they are written as
+     * Java DSL, without changing the model (CAMEL-25157).
+     */
+    @Test
+    public void testDumpRouteBuiltInJava() throws Exception {
+        try (DefaultCamelContext context = new DefaultCamelContext()) {
+            context.addRoutes(new RouteBuilder() {
+                @Override
+                public void configure() {
+                    from("direct:start").routeId("javaBuilt")
+                            .setProperty("p").constant("v")
+                            .throwException(IllegalArgumentException.class, "Forced")
+                            .loadBalance().failover(IOException.class).to("mock:x").end()
+                            .removeHeaders("*", "Keep*")
+                            .to("mock:result");
+                }
+            });
+            String java = new LwModelToJavaDumper().dumpModelAsJava(context, context.getRouteDefinition("javaBuilt"));
+            assertThat(java).contains(
+                    ".setProperty(\"p\", constant(\"v\"))",
+                    ".throwException(IllegalArgumentException.class, \"Forced\")",
+                    ".failover(java.io.IOException.class)",
+                    ".removeHeaders(\"*\", \"Keep*\")");
+            // the model was not changed
+            assertThat(((ThrowExceptionDefinition) context.getRouteDefinition("javaBuilt").getOutputs().get(1))
+                    .getExceptionType()).isNull();
+        }
+    }
+
+    /**
+     * The exclude patterns given in Java are written as arguments again, not as the single excludePattern that holds
+     * them for XML and YAML.
+     */
+    @Test
+    public void testDumpSeveralExcludePatterns() throws Exception {
+        try (DefaultCamelContext context = new DefaultCamelContext()) {
+            context.addRoutes(new RouteBuilder() {
+                @Override
+                public void configure() {
+                    from("direct:start").routeId("excludes")
+                            .removeHeaders("*", "header1", "Camel*", "{{keep}}")
+                            .removeProperties("p*", "p1", "p3")
+                            .to("mock:result");
+                }
+            });
+            String java = new LwModelToJavaDumper().dumpModelAsJava(context, context.getRouteDefinition("excludes"));
+            assertThat(java).contains(
+                    ".removeHeaders(\"*\", \"header1\", \"Camel*\", \"{{keep}}\")",
+                    ".removeProperties(\"p*\", \"p1\", \"p3\")");
+        }
+    }
+
+    /**
+     * An option set to its documented default value is written: when it is not set, the option takes the value of a
+     * parent level (the rest configuration for a verb, the error handler for the redelivery of an onException).
+     */
+    @Test
+    public void testDumpOptionsSetToTheirDefaultValue() throws Exception {
+        try (DefaultCamelContext context = new DefaultCamelContext()) {
+            context.addRoutes(new RouteBuilder() {
+                @Override
+                public void configure() {
+                    rest("/api").get("/raw").bindingMode(RestBindingMode.off).to("direct:raw");
+
+                    from("direct:start").routeId("redelivery")
+                            .onException(IllegalStateException.class).maximumRedeliveries(1).redeliveryDelay(1000).end()
+                            .to("mock:result");
+                }
+            });
+            Model model = context.getCamelContextExtension().getContextPlugin(Model.class);
+            LwModelToJavaDumper dumper = new LwModelToJavaDumper();
+
+            assertThat(dumper.dumpModelAsJava(context, model.getRestDefinitions().get(0))).contains(".bindingMode(\"off\")");
+            assertThat(dumper.dumpModelAsJava(context, context.getRouteDefinition("redelivery")))
+                    .contains(".redeliveryDelay(\"1000\")");
+        }
+    }
+}

@@ -1,0 +1,167 @@
+= Camel CLI - Testing Plugin
+
+Write and run automated tests for Camel integrations using the https://citrusframework.org/[Citrus] test framework.
+
+Enable the plugin:
+
+[source,bash]
+----
+camel plugin add test
+----
+
+TIP: Run `camel test --help` to see all available subcommands.
+
+== Initialize tests
+
+Create a test file as a starting point:
+
+[source,bash]
+----
+camel test init orders.citrus.it.yaml
+----
+
+The test is created as `test/orders.citrus.it.yaml`: tests go in a `test` folder, apart from the routes.
+
+The end of the file name says that the file is a test, and in which language:
+`orders.citrus.it.yaml` (YAML), `orders.citrus.it.xml` (XML), `OrdersIT.java` (Java) or `orders.feature` (Cucumber).
+`camel test run` only runs a file whose name ends like that.
+
+== Run tests
+
+Run a test from the project folder. It runs with JUnit Jupiter, and needs no project setup:
+
+[source,bash]
+----
+camel test run test/orders.citrus.it.yaml
+----
+
+`camel run` does not run a test: `camel run test/orders.citrus.it.yaml` exits with code `2` and says to use
+`camel test run`, and a test given with routes is skipped. A test usually starts the integration itself, see
+<<_running_the_camel_integration,Running the Camel integration>>.
+
+== Project export
+
+When you export a project, the test plugin automatically includes test resources as test-scoped Maven dependencies in `src/test/java` and `src/test/resources`:
+
+[source,bash]
+----
+camel export route.yaml --dir my-export --runtime quarkus
+cd my-export
+./mvnw verify
+----
+
+TIP: The export creates a JUnit Jupiter test class in `src/test/java` that you can also run from your IDE.
+
+== Dependency management
+
+Basic Citrus dependencies are included out of the box.
+Additional Citrus modules (e.g. `citrus-sql`, `citrus-kafka`) and Camel test infrastructure dependencies (e.g. `camel-test-infra-kafka`) are auto-detected from YAML, XML and Groovy test sources during project export.
+
+For Java test sources or dependencies that cannot be auto-detected, add them in a `jbang.properties` file next to the test source:
+
+.jbang.properties
+[source,properties]
+----
+run.deps=org.citrusframework:citrus-camel:4.7.0,\
+org.citrusframework:citrus-kafka:4.7.0,\
+org.citrusframework:citrus-testcontainers:4.7.0,\
+org.apache.camel:camel-endpointdsl:4.13.0,\
+org.apache.camel:camel-aws2-s3:4.13.0
+
+run.D=citrus.camel.jbang.dump.integration.output=true
+----
+
+TIP: Dependencies from `jbang.properties` and auto-detected dependencies are both added as test-scoped dependencies during project export.
+
+== Writing tests with Citrus
+
+The test plugin uses https://citrusframework.org/[Citrus] as the underlying test framework. A typical test:
+
+1. Starts infrastructure (Kafka, database, etc.)
+2. Launches the Camel integration with test configuration
+3. Sends messages to trigger route logic
+4. Verifies the outcome
+
+For full details, see the https://citrusframework.org/citrus/reference/html/[Citrus documentation].
+
+=== Using infrastructure services
+
+Start Camel infra services or Testcontainers as part of the test:
+
+[source,yaml]
+----
+actions:
+  - camel:
+      infra:
+        run:
+          service: postgres
+  - testcontainers:
+      start:
+        kafka: {}
+----
+
+Connection settings are exposed as test variables (`CITRUS_CAMEL_INFRA_SERVICE_<NAME>_<PROP>` or `CITRUS_TESTCONTAINERS_<NAME>_<PROP>`) for use in `application.properties`:
+
+[source,properties]
+----
+camel.database.url=${CITRUS_CAMEL_INFRA_POSTGRES_SERVICE_ADDRESS}
+camel.kafka.bootstrapServers=${CITRUS_TESTCONTAINERS_KAFKA_BOOTSTRAP_SERVERS}
+----
+
+See https://citrusframework.org/citrus/reference/html/#camel-infra[Camel infra] and https://citrusframework.org/citrus/reference/html/#testcontainers[Testcontainers] in the Citrus docs.
+
+=== Running the Camel integration
+
+Launch a Camel integration as a separate process with test-specific configuration:
+
+[source,yaml]
+----
+actions:
+  - camel:
+      cli:
+        run:
+          integration:
+            file: "../route.yaml"
+            systemProperties:
+              file: "application.test.properties"
+----
+
+TIP: The path uses `../` because tests are in the `test` subfolder.
+
+See https://citrusframework.org/citrus/reference/html/#apache-camel[Camel CLI support in Citrus].
+
+=== Sending and receiving messages
+
+Citrus supports Kafka, HTTP, SOAP, FTP, JMS, and many more transports:
+
+.Send to Kafka
+[source,yaml]
+----
+actions:
+  - send:
+      endpoint: "kafka:bookings"
+      message:
+        body:
+          data: |
+            { "client": "camel-batch", "product": "Orange", "amount": 200, "price": 1.0, "status": "APPROVAL_REQUIRED" }
+        headers:
+          - name: "citrus_kafka_messageKey"
+            value: "bookings.csv_0"
+----
+
+.Verify received message
+[source,yaml]
+----
+actions:
+  - receive:
+      endpoint: "kafka:reports"
+      message:
+        body:
+          data: |
+            { "bookings": { "completed": 1, "errors": 0 } }
+----
+
+You can also use any Camel endpoint URI directly (e.g., `camel:aws2-s3:my-bucket?amazonS3Client=#s3Client`).
+Bean references (`#beanName`) and Citrus test variables work in endpoint URIs.
+
+See https://citrusframework.org/citrus/reference/html/#actions-send[send/receive actions] and https://citrusframework.org/citrus/reference/html/#endpoints[message endpoints] in the Citrus docs.

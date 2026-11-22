@@ -1,0 +1,628 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.camel.dsl.jbang.core.commands.ai;
+
+import java.io.IOException;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.time.LocalDateTime;
+import java.time.ZoneId;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+
+import org.apache.camel.dsl.jbang.core.common.CommandLineHelper;
+import org.apache.camel.util.json.JsonArray;
+import org.apache.camel.util.json.JsonObject;
+import org.apache.camel.util.json.Jsoner;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
+
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
+
+/**
+ * The neutral authoring tools (CAMEL-24695): defined once, exposed by camel-jbang-mcp and the TUI under the same camel_
+ * names, self-contained over a project directory argument.
+ */
+class AuthoringToolsTest {
+
+    private static final String VALID_ROUTE = """
+            - route:
+                id: timer-log
+                from:
+                  uri: timer:tick
+                  parameters:
+                    period: 1000
+                  steps:
+                    - log:
+                        message: "${body}"
+                        loggingLevel: WARN
+            """;
+
+    private static final String INVALID_ROUTE = VALID_ROUTE.replace("loggingLevel", "logLevel");
+
+    private static JsonObject call(String tool, ToolContext ctx, Map<String, Object> args) {
+        Map<String, String> stringArgs = new HashMap<>();
+        args.forEach((k, v) -> stringArgs.put(k, String.valueOf(v)));
+        Object result = ToolRegistry.execute(tool, ctx, stringArgs);
+        try {
+            return (JsonObject) Jsoner.deserialize(String.valueOf(result));
+        } catch (Exception e) {
+            throw new IllegalStateException("Not JSON: " + result, e);
+        }
+    }
+
+    @Test
+    void theSharedSetHasNeutralNamesAndFlags() {
+        List<ToolDescriptor> shared = ToolRegistry.authoringTools();
+        List<String> names = shared.stream().map(ToolDescriptor::name).toList();
+        assertEquals(List.of("camel_catalog_doc", "camel_catalog_find", "camel_catalog_sample", "camel_validate_source",
+                "camel_get_files",
+                "camel_write_file", "camel_edit_file", "camel_run", "camel_control", "camel_get_log", "camel_get_errors",
+                "camel_eval_expression", "camel_dependency_for_class", "camel_project_overview",
+                "camel_save_project_summary"), names);
+        for (ToolDescriptor td : shared) {
+            assertTrue(td.name().startsWith("camel_"), td.name());
+            assertFalse(td.description().isBlank(), td.name());
+            assertNotNull(td.executor(), td.name());
+        }
+        // what changes something is not read-only, so an access filter or a permission handler can tell
+        for (String mutating : List.of("camel_write_file", "camel_run", "camel_control", "camel_save_project_summary")) {
+            assertFalse(ToolRegistry.findTool(mutating).isReadOnly(), mutating);
+        }
+        for (String reading : List.of("camel_catalog_doc", "camel_catalog_sample", "camel_get_files", "camel_get_log",
+                "camel_get_errors",
+                "camel_eval_expression", "camel_dependency_for_class", "camel_validate_source",
+                "camel_project_overview")) {
+            assertTrue(ToolRegistry.findTool(reading).isReadOnly(), reading);
+        }
+        assertTrue(ToolRegistry.findTool("camel_control").isDestructive());
+        // the core subset is what a local model gets: find turns a product or protocol into a component, the first
+        // question of most tasks (CAMEL-24760); starting an integration is the TUI's own run form there
+        assertTrue(ToolRegistry.findTool("camel_catalog_find").isCore(), "a local model asks for mqtt, not paho-mqtt5");
+        assertTrue(ToolRegistry.findTool("camel_write_file").isCore());
+        assertFalse(ToolRegistry.findTool("camel_run").isCore(), "not needed by a small model");
+    }
+
+    @Test
+    void inputSchemaListsTheParametersWithTypesAndTheRequiredOnes() {
+        JsonObject schema = ToolRegistry.findTool("camel_write_file").inputSchema();
+        assertEquals("object", schema.getString("type"));
+        JsonObject properties = schema.getMap("properties");
+        JsonObject file = properties.getMap("file");
+        assertEquals("string", file.getString("type"));
+        // no validate switch: the write always validates (CAMEL-24897)
+        assertEquals(null, properties.get("validate"));
+        assertEquals(List.of("file", "content"), List.copyOf(schema.getCollection("required")));
+        JsonObject logProperties = ToolRegistry.findTool("camel_get_log").inputSchema().getMap("properties");
+        JsonObject limit = logProperties.getMap("limit");
+        assertEquals("integer", limit.getString("type"));
+    }
+
+    @Test
+    void filesAreListedAndReadFromTheDirectoryArgument(@TempDir Path dir) throws IOException {
+        Files.writeString(dir.resolve("demo.camel.yaml"), VALID_ROUTE);
+        Files.writeString(dir.resolve("application.properties"), "camel.main.name=demo\n");
+        Files.createDirectory(dir.resolve("sub"));
+        JsonObject list = call("camel_get_files", new ToolContext(), Map.of("directory", dir.toString()));
+        assertEquals(2, list.getInteger("totalFiles"), "directories are not listed");
+        assertEquals("flat", list.getString("layout"));
+        assertEquals(List.of("demo.camel.yaml"), list.getCollection("routeFiles"));
+        assertEquals(List.of("application.properties"), list.getCollection("configFiles"));
+        JsonObject first = (JsonObject) list.getCollection("files").iterator().next();
+        assertEquals("application.properties", first.getString("name"));
+        assertEquals("properties", first.getString("type"));
+        assertEquals("config", first.getString("kind"));
+        JsonObject file = call("camel_get_files", new ToolContext(),
+                Map.of("directory", dir.toString(), "file", "demo.camel.yaml"));
+        assertEquals(VALID_ROUTE, file.getString("content"));
+        assertEquals("yaml", file.getString("type"));
+        // the TUI fills the directory in from its selection; a server without one requires it
+        ToolContext selected = new ToolContext();
+        selected.setDefaultDirectory(dir);
+        assertEquals(2, call("camel_get_files", selected, Map.of()).getInteger("totalFiles"));
+        ToolExecutionException e = assertThrows(ToolExecutionException.class,
+                () -> ToolRegistry.execute("camel_get_files", new ToolContext(), Map.of()));
+        assertTrue(e.getMessage().contains("directory is required"), e.getMessage());
+        assertThrows(ToolExecutionException.class, () -> ToolRegistry.execute("camel_get_files", new ToolContext(),
+                Map.of("directory", dir.toString(), "file", "missing.yaml")));
+    }
+
+    @Test
+    void aLargeFileIsReadInParts(@TempDir Path dir) throws IOException {
+        // a 3.6 MB file was an answer of 4.5 MB, about a million tokens (CAMEL-26932)
+        StringBuilder sb = new StringBuilder();
+        for (int i = 1; i <= 5000; i++) {
+            sb.append("line ").append(i).append('\n');
+        }
+        Files.writeString(dir.resolve("big.log"), sb.toString());
+
+        JsonObject first = call("camel_get_files", new ToolContext(), Map.of("directory", dir.toString(), "file", "big.log"));
+        assertTrue(first.getString("content").startsWith("line 1\nline 2\n"));
+        assertTrue(first.getString("content").endsWith("line 2000\n"));
+        assertEquals(5000, first.getInteger("lines"));
+        assertEquals(1, first.getInteger("from"));
+        assertEquals(2000, first.getInteger("to"));
+        assertEquals("The content is lines 1 to 2000 of 5000; call camel_get_files with offset=2001 for the next lines",
+                first.getString("message"));
+
+        JsonObject part = call("camel_get_files", new ToolContext(),
+                Map.of("directory", dir.toString(), "file", "big.log", "offset", 4999, "limit", 10));
+        assertEquals("line 4999\nline 5000\n", part.getString("content"));
+        assertEquals("The content is lines 4999 to 5000 of 5000", part.getString("message"));
+
+        JsonObject past = call("camel_get_files", new ToolContext(),
+                Map.of("directory", dir.toString(), "file", "big.log", "offset", 6000));
+        assertEquals("", past.getString("content"));
+        assertEquals("The file has 5000 lines, so there are none from line 6000", past.getString("message"));
+
+        assertThrows(ToolExecutionException.class, () -> ToolRegistry.execute("camel_get_files", new ToolContext(),
+                Map.of("directory", dir.toString(), "file", "big.log", "offset", "ten")));
+    }
+
+    @Test
+    void aSmallFileIsReadAsItIs(@TempDir Path dir) throws IOException {
+        // line endings and no newline at the end, as they are in the file
+        Files.writeString(dir.resolve("crlf.properties"), "a=1\r\nb=2");
+
+        JsonObject file = call("camel_get_files", new ToolContext(),
+                Map.of("directory", dir.toString(), "file", "crlf.properties"));
+
+        assertEquals("a=1\r\nb=2", file.getString("content"));
+        assertNull(file.get("message"));
+        assertNull(file.get("lines"));
+    }
+
+    @Test
+    void aLineLongerThanAnAnswerIsCut(@TempDir Path dir) throws IOException {
+        Files.writeString(dir.resolve("one.json"), "x".repeat(AuthoringTools.READ_CHARS + 10) + "\nsecond\n");
+
+        JsonObject file = call("camel_get_files", new ToolContext(), Map.of("directory", dir.toString(), "file", "one.json"));
+
+        assertEquals(AuthoringTools.READ_CHARS + 1, file.getString("content").length());
+        assertEquals("The content is lines 1 to 1 of 2 (line 1 is cut after " + AuthoringTools.READ_CHARS
+                     + " characters); call camel_get_files with offset=2 for the next lines",
+                file.getString("message"));
+    }
+
+    /** A file consumer moves the files it read into .camel, which the listing skips: the folder looked empty. */
+    @Test
+    void filesAFileConsumerMovedIntoDotCamelAreCounted(@TempDir Path dir) throws IOException {
+        Files.createDirectories(dir.resolve("customers/.camel"));
+        Files.writeString(dir.resolve("customers/.camel/C-482.json"), "{}");
+        Files.writeString(dir.resolve("customers/.camel/C-483.json"), "{}");
+        JsonObject list = call("camel_get_files", new ToolContext(), Map.of("directory", dir.toString()));
+        assertEquals(0, list.getInteger("totalFiles"));
+        JsonObject consumed = list.getMap("consumedFiles");
+        assertEquals(1, consumed.size(), consumed.toJson());
+        assertEquals(2, consumed.getInteger("customers/.camel"));
+        assertEquals("The directory has no files, but customers/.camel holds 2 files that a file consumer moved there"
+                     + " after reading (noop=true leaves the files where they are)",
+                list.getString("message"));
+
+        Files.writeString(dir.resolve("demo.camel.yaml"), VALID_ROUTE);
+        list = call("camel_get_files", new ToolContext(), Map.of("directory", dir.toString()));
+        assertEquals(1, list.getInteger("totalFiles"));
+        assertTrue(list.getString("note").startsWith("customers/.camel holds 2 files"), list.toJson());
+        assertFalse(list.containsKey("message"), list.toJson());
+    }
+
+    @Test
+    void noDotCamelFolderNoNote(@TempDir Path dir) throws IOException {
+        Files.writeString(dir.resolve("demo.camel.yaml"), VALID_ROUTE);
+        Files.createDirectories(dir.resolve("customers/.camel"));
+        JsonObject list = call("camel_get_files", new ToolContext(), Map.of("directory", dir.toString()));
+        assertFalse(list.containsKey("consumedFiles"), "an empty .camel folder is not named");
+        assertFalse(list.containsKey("note"), list.toJson());
+    }
+
+    /** The errors are kept until the integration restarts: those from before the last reload are marked. */
+    @Test
+    void theErrorsFromBeforeTheLastReloadAreMarked() {
+        LocalDateTime now = LocalDateTime.of(2026, 10, 20, 8, 30);
+        JsonObject errors = errorsAt(now.withHour(8).withMinute(10), LocalDateTime.of(2026, 10, 20, 8, 18, 9, 500_000_000),
+                now.withHour(8).withMinute(20));
+
+        AuthoringTools.markBefore(errors, "08:18:09.731", now);
+
+        List<JsonObject> entries = entries(errors);
+        assertEquals(Boolean.TRUE, entries.get(0).get("beforeLastReload"));
+        assertFalse(entries.get(1).containsKey("beforeLastReload"), "within a second of the reload: maybe the new routes");
+        assertFalse(entries.get(2).containsKey("beforeLastReload"), "after the reload");
+        assertEquals("1 exchange failed before the routes were last reloaded (at 08:18:09.731), so on an earlier version"
+                     + " of the routes (beforeLastReload), 2 since; the errors are kept until the integration restarts",
+                errors.getString("note"));
+        assertEquals("note", errors.keySet().iterator().next(), "the note comes before the errors and their stack traces");
+    }
+
+    /** camel_get_log marks the records from before the last reload, with a note first in the answer. */
+    @Test
+    void theLogRecordsFromBeforeTheLastReloadAreMarked() {
+        JsonObject log = new JsonObject();
+        JsonArray lines = new JsonArray();
+        for (String time : new String[] { "08:20:00.000", "08:18:09.500", "08:10:00.000" }) {
+            JsonObject r = new JsonObject();
+            r.put("time", time);
+            r.put("level", "ERROR");
+            lines.add(r);
+        }
+        log.put("lines", lines);
+        log.put("returnedLines", 3);
+
+        AuthoringTools.markLogBefore(log, "08:18:09.731");
+
+        List<JsonObject> rows = entries(log, "lines");
+        assertFalse(rows.get(0).containsKey("beforeLastReload"), "after the reload");
+        assertFalse(rows.get(1).containsKey("beforeLastReload"), "within a second of the reload: maybe the new routes");
+        assertEquals(Boolean.TRUE, rows.get(2).get("beforeLastReload"));
+        assertEquals("reloadNote", log.keySet().iterator().next());
+        assertEquals("1 record is from before the routes were last reloaded (at 08:18:09.731), so from an earlier version"
+                     + " of the routes (beforeLastReload)",
+                log.getString("reloadNote"));
+
+        // a log that runs past midnight: 23:59:50 is before a reload at 00:00:30, and 00:00:40 is after it
+        JsonObject night = new JsonObject();
+        JsonArray nightLines = new JsonArray();
+        for (String time : new String[] { "00:00:40.000", "23:59:50.000" }) {
+            JsonObject r = new JsonObject();
+            r.put("time", time);
+            nightLines.add(r);
+        }
+        night.put("lines", nightLines);
+        AuthoringTools.markLogBefore(night, "00:00:30.000");
+        List<JsonObject> nightRows = entries(night, "lines");
+        assertFalse(nightRows.get(0).containsKey("beforeLastReload"));
+        assertEquals(Boolean.TRUE, nightRows.get(1).get("beforeLastReload"));
+
+        // no record before the reload: no note
+        JsonObject fresh = new JsonObject();
+        fresh.put("lines", new JsonArray(List.of(new JsonObject(Map.of("time", "08:20:00.000")))));
+        AuthoringTools.markLogBefore(fresh, "08:18:09.731");
+        assertFalse(fresh.containsKey("reloadNote"));
+    }
+
+    @SuppressWarnings("unchecked")
+    private static List<JsonObject> entries(JsonObject answer, String key) {
+        return List.copyOf((java.util.Collection<JsonObject>) answer.get(key));
+    }
+
+    @Test
+    void aReloadLaterInTheDayThanNowWasYesterday() {
+        LocalDateTime now = LocalDateTime.of(2026, 10, 20, 0, 5);
+        JsonObject errors = errorsAt(LocalDateTime.of(2026, 10, 19, 23, 50), LocalDateTime.of(2026, 10, 20, 0, 1));
+
+        AuthoringTools.markBefore(errors, "23:59:00.000", now);
+
+        List<JsonObject> entries = entries(errors);
+        assertEquals(Boolean.TRUE, entries.get(0).get("beforeLastReload"));
+        assertFalse(entries.get(1).containsKey("beforeLastReload"));
+    }
+
+    @Test
+    void noErrorBeforeTheReloadNoNote() {
+        LocalDateTime now = LocalDateTime.of(2026, 10, 20, 8, 30);
+        JsonObject errors = errorsAt(now.withMinute(20));
+        AuthoringTools.markBefore(errors, "08:18:09.731", now);
+        assertFalse(errors.containsKey("note"));
+        assertFalse(entries(errors).get(0).containsKey("beforeLastReload"));
+        // a time the log did not have leaves the errors as they are
+        AuthoringTools.markBefore(errors, "", now);
+        assertFalse(errors.containsKey("note"));
+    }
+
+    private static JsonObject errorsAt(LocalDateTime... times) {
+        JsonArray list = new JsonArray();
+        for (LocalDateTime t : times) {
+            JsonObject e = new JsonObject();
+            e.put("timestamp", t.atZone(ZoneId.systemDefault()).toInstant().toEpochMilli());
+            list.add(e);
+        }
+        JsonObject errors = new JsonObject();
+        errors.put("errors", list);
+        return errors;
+    }
+
+    @SuppressWarnings("unchecked")
+    private static List<JsonObject> entries(JsonObject errors) {
+        return (List<JsonObject>) (List<?>) errors.getCollection("errors");
+    }
+
+    /** A script or template the routes load: dev mode reloads the routes when it changes, so its write waits. */
+    @Test
+    void aWriteOfAFileTheRoutesLoadWaitsForTheReload() {
+        assertTrue(AuthoringTools.reloadsWithRoutes("shipment-mapping.groovy"));
+        assertTrue(AuthoringTools.reloadsWithRoutes("templates/letter.FTL"));
+        assertFalse(AuthoringTools.reloadsWithRoutes("orders/order-1001.json"), "a data file is not loaded by a route");
+        assertFalse(AuthoringTools.reloadsWithRoutes("README.md"));
+    }
+
+    /**
+     * Started with its own files, an integration watches only those, not a template or script beside them: its write is
+     * answered at once, not after waiting for a reload that does not come.
+     */
+    @Test
+    void aWriteOfATemplateTheIntegrationDoesNotWatchIsAnsweredAtOnce(@TempDir Path dir) {
+        ToolContext ctx = new ToolContext();
+        // this JVM: its command line has no --source-dir and not the template
+        ctx.selectProcess(ProcessHandle.current().pid());
+        JsonObject written = call("camel_write_file", ctx,
+                Map.of("directory", dir.toString(), "file", "letter.ftl", "content", "Dear ${body}"));
+        assertEquals("created", written.getString("status"));
+        assertNull(written.get("reload"), written.toJson());
+        assertTrue(written.getString("message").contains("was started with its own files and does not reload"),
+                written.toJson());
+    }
+
+    @Test
+    void writeValidatesFirstAndRefusesInvalidContent(@TempDir Path dir) throws IOException {
+        Files.writeString(dir.resolve("demo.camel.yaml"), "- route: {}\n");
+        // a misspelling no repair reads (a write repairs logLevel to loggingLevel, CAMEL-25532)
+        JsonObject invalid = call("camel_write_file", new ToolContext(),
+                Map.of("directory", dir.toString(), "file", "demo.camel.yaml", "content",
+                        VALID_ROUTE.replace("loggingLevel", "loggingLevl")));
+        assertEquals("invalid", invalid.getString("status"));
+        assertTrue(invalid.getCollection("errors").stream().anyMatch(m -> m.toString().contains("loggingLevl")),
+                invalid.toJson());
+        assertEquals("- route: {}\n", Files.readString(dir.resolve("demo.camel.yaml"), StandardCharsets.UTF_8));
+
+        JsonObject written = call("camel_write_file", new ToolContext(),
+                Map.of("directory", dir.toString(), "file", "demo.camel.yaml", "content", VALID_ROUTE));
+        assertEquals("overwritten", written.getString("status"));
+        assertEquals(VALID_ROUTE, Files.readString(dir.resolve("demo.camel.yaml"), StandardCharsets.UTF_8));
+        assertEquals(10, written.getInteger("lines"));
+
+        JsonObject created = call("camel_write_file", new ToolContext(),
+                Map.of("directory", dir.toString(), "file", "notes.txt", "content", "logLevel"));
+        assertEquals("created", created.getString("status"), "other file types are not validated");
+        // a properties file is validated too, and validation cannot be switched off (CAMEL-24897)
+        assertEquals("invalid", call("camel_write_file", new ToolContext(), Map.of("directory", dir.toString(),
+                "file", "application.properties", "content", "camel.main.nme=x")).getString("status"));
+        assertEquals("invalid", call("camel_write_file", new ToolContext(), Map.of("directory", dir.toString(),
+                "file", "application.properties", "content", "camel.main.nme=x", "validate", false))
+                .getString("status"));
+    }
+
+    @Test
+    void aMissingConsumerIsReportedButDoesNotRefuseTheWrite(@TempDir Path dir) throws IOException {
+        // the route that consumes direct:lookup is often the next file the agent writes (CAMEL-24955)
+        String caller = """
+                - route:
+                    from:
+                      uri: timer:tick
+                      steps:
+                        - to: direct:lookup
+                """;
+        JsonObject validated = call("camel_validate_source", new ToolContext(),
+                Map.of("directory", dir.toString(), "file", "main.camel.yaml", "content", caller));
+        assertFalse(validated.getBoolean("valid"), validated.toJson());
+        assertTrue(validated.getCollection("errors").stream().anyMatch(m -> m.toString().contains("direct:lookup")),
+                validated.toJson());
+
+        JsonObject written = call("camel_write_file", new ToolContext(),
+                Map.of("directory", dir.toString(), "file", "main.camel.yaml", "content", caller));
+        assertEquals("created", written.getString("status"), written.toJson());
+        assertEquals(caller, Files.readString(dir.resolve("main.camel.yaml"), StandardCharsets.UTF_8));
+    }
+
+    @Test
+    void filePathsStayInsideTheDirectoryButMayNameASubdirectory(@TempDir Path dir) throws IOException {
+        for (String bad : List.of("../etc/passwd", "/tmp/x.yaml", "sub/../../x.yaml")) {
+            ToolExecutionException e = assertThrows(ToolExecutionException.class,
+                    () -> ToolRegistry.execute("camel_write_file", new ToolContext(),
+                            Map.of("directory", dir.toString(), "file", bad, "content", "x")));
+            assertTrue(e.getMessage().contains("inside the directory") || e.getMessage().contains("relative to"),
+                    bad + ": " + e.getMessage());
+        }
+        // a relative path is fine, and its directories are created
+        JsonObject written = call("camel_write_file", new ToolContext(),
+                Map.of("directory", dir.toString(), "file", "src/main/resources/camel/x.camel.yaml", "content",
+                        VALID_ROUTE));
+        assertEquals("created", written.getString("status"));
+        assertEquals(VALID_ROUTE, Files.readString(dir.resolve("src/main/resources/camel/x.camel.yaml")));
+    }
+
+    @Test
+    void aBeansFileIsListedWithTheRouteFiles(@TempDir Path dir) throws IOException {
+        // beans.yaml has no route, yet camel run loads it with the routes: a model that did not see it among the route
+        // files took the beans it declares for missing
+        Files.writeString(dir.resolve("demo.camel.yaml"), VALID_ROUTE);
+        Files.createDirectories(dir.resolve("src/main/resources"));
+        Files.writeString(dir.resolve("src/main/resources/beans.yaml"), """
+                - beans:
+                    - name: orderNumber
+                      type: camel.example.OrderNumber
+                """);
+        JsonObject list = call("camel_get_files", new ToolContext(), Map.of("directory", dir.toString()));
+        assertEquals(List.of("demo.camel.yaml", "src/main/resources/beans.yaml"), list.getCollection("routeFiles"));
+    }
+
+    @Test
+    void aMavenProjectListsItsRouteFilesFirstAndReadsByRelativePath(@TempDir Path dir) throws IOException {
+        Files.writeString(dir.resolve("pom.xml"), "<project/>");
+        Files.createDirectories(dir.resolve("src/main/resources/camel"));
+        Files.createDirectories(dir.resolve("src/main/java/org/acme"));
+        Files.createDirectories(dir.resolve("target/classes/camel"));
+        Files.createDirectories(dir.resolve(".mvn"));
+        Files.writeString(dir.resolve("src/main/resources/camel/timer-log.camel.yaml"), VALID_ROUTE);
+        Files.writeString(dir.resolve("src/main/resources/application.properties"), "camel.main.name=timer-log\n");
+        Files.writeString(dir.resolve("src/main/resources/log4j2.properties"), "rootLogger.level=info\n");
+        Files.writeString(dir.resolve("src/main/java/org/acme/MyRoute.java"),
+                "package org.acme;\nimport org.apache.camel.builder.RouteBuilder;\n"
+                                                                              + "public class MyRoute extends RouteBuilder { public void configure() { } }\n");
+        Files.writeString(dir.resolve("src/main/java/org/acme/Helper.java"), "package org.acme;\nclass Helper { }\n");
+        Files.writeString(dir.resolve("target/classes/camel/timer-log.camel.yaml"), VALID_ROUTE);
+        Files.writeString(dir.resolve(".mvn/maven.config"), "-T1\n");
+        Files.writeString(dir.resolve("README.md"), "# demo\n");
+
+        JsonObject list = call("camel_get_files", new ToolContext(), Map.of("directory", dir.toString()));
+        assertEquals("maven", list.getString("layout"));
+        assertEquals(List.of("src/main/java/org/acme/MyRoute.java", "src/main/resources/camel/timer-log.camel.yaml"),
+                list.getCollection("routeFiles"));
+        assertEquals(List.of("src/main/resources/application.properties"), list.getCollection("configFiles"));
+        assertEquals(7, list.getInteger("totalFiles"), "target and .mvn are skipped");
+        assertTrue(list.getString("hint").contains("src/main/resources/camel"), list.getString("hint"));
+        List<String> names = new ArrayList<>();
+        for (Object o : list.getCollection("files")) {
+            names.add(((JsonObject) o).getString("name"));
+        }
+        assertTrue(names.contains("pom.xml") && names.contains("src/main/resources/log4j2.properties"), names.toString());
+        assertTrue(names.stream().noneMatch(n -> n.startsWith("target/") || n.startsWith(".mvn/")), names.toString());
+
+        JsonObject file = call("camel_get_files", new ToolContext(),
+                Map.of("directory", dir.toString(), "file", "src/main/resources/camel/timer-log.camel.yaml"));
+        assertEquals(VALID_ROUTE, file.getString("content"));
+        ToolExecutionException e = assertThrows(ToolExecutionException.class,
+                () -> ToolRegistry.execute("camel_get_files", new ToolContext(),
+                        Map.of("directory", dir.toString(), "file", "camel/timer-log.camel.yaml")));
+        // the error names the file of that name the project has (CAMEL-26398)
+        assertTrue(e.getMessage().endsWith("; src/main/resources/camel/timer-log.camel.yaml exists: pass file"
+                                           + " src/main/resources/camel/timer-log.camel.yaml"),
+                "the error says how to find the file: " + e.getMessage());
+        e = assertThrows(ToolExecutionException.class,
+                () -> ToolRegistry.execute("camel_get_files", new ToolContext(),
+                        Map.of("directory", dir.toString(), "file", "camel/no-such.camel.yaml")));
+        assertTrue(e.getMessage().contains("routeFiles"), "the error says how to find the file: " + e.getMessage());
+    }
+
+    @Test
+    void routeSourcesMapTheRuntimesLocationsOntoProjectFiles(@TempDir Path dir) throws IOException {
+        Files.createDirectories(dir.resolve("src/main/resources/camel"));
+        Files.createDirectories(dir.resolve("src/main/java/org/acme"));
+        Files.writeString(dir.resolve("src/main/resources/camel/timer-log.camel.yaml"), VALID_ROUTE);
+        Files.writeString(dir.resolve("src/main/java/org/acme/MyRoute.java"), "class MyRoute {}");
+        Files.writeString(dir.resolve("flat.camel.yaml"), VALID_ROUTE);
+
+        // Spring Boot fat jar, Quarkus / classpath, a plain file, a Java class, a moved file and an unknown one
+        List<Map<String, String>> routes = List.of(
+                Map.of("routeId", "boot", "source", "nested:" + dir + "/target/app-1.0.jar/!BOOT-INF/classes/!/camel/"
+                                                    + "timer-log.camel.yaml:4"),
+                Map.of("routeId", "cp", "source", "classpath:camel/timer-log.camel.yaml:7"),
+                Map.of("routeId", "abs", "source", "file:" + dir.resolve("flat.camel.yaml") + ":1"),
+                Map.of("routeId", "java", "source", "org.acme.MyRoute:12"),
+                Map.of("routeId", "moved", "source", "file:old/place/flat.camel.yaml"),
+                Map.of("routeId", "gone", "source", "classpath:camel/nowhere.yaml:3"));
+        JsonArray mapped = AuthoringTools.routeSources(routes, dir);
+
+        assertEquals(6, mapped.size());
+        JsonObject boot = (JsonObject) mapped.get(0);
+        assertEquals("src/main/resources/camel/timer-log.camel.yaml", boot.getString("file"));
+        assertEquals(4, boot.getInteger("line"));
+        assertEquals(null, boot.get("missing"));
+        assertEquals("src/main/resources/camel/timer-log.camel.yaml", ((JsonObject) mapped.get(1)).getString("file"));
+        assertEquals("flat.camel.yaml", ((JsonObject) mapped.get(2)).getString("file"));
+        assertEquals("src/main/java/org/acme/MyRoute.java", ((JsonObject) mapped.get(3)).getString("file"));
+        assertEquals(12, ((JsonObject) mapped.get(3)).getInteger("line"));
+        assertEquals("flat.camel.yaml", ((JsonObject) mapped.get(4)).getString("file"), "found by name");
+        JsonObject gone = (JsonObject) mapped.get(5);
+        assertEquals("camel/nowhere.yaml", gone.getString("file"));
+        assertEquals(Boolean.TRUE, gone.get("missing"));
+        assertTrue(AuthoringTools.routeSources(null, dir).isEmpty());
+        // a route without an id is listed by its file alone, not as "null"
+        JsonObject anonymous = (JsonObject) AuthoringTools.routeSources(
+                List.of(Map.of("source", "file:" + dir.resolve("flat.camel.yaml"))), dir).get(0);
+        assertEquals("flat.camel.yaml", anonymous.getString("file"));
+        assertFalse(anonymous.containsKey("routeId"));
+        // a digit suffix too long for a line number is not one: no exception, no line
+        JsonObject overflow = (JsonObject) AuthoringTools.routeSources(
+                List.of(Map.of("routeId", "big", "source", "file:flat.camel.yaml:2147483648")), dir).get(0);
+        assertEquals("flat.camel.yaml:2147483648", overflow.getString("file"));
+        assertFalse(overflow.containsKey("line"));
+        assertEquals(Boolean.TRUE, overflow.get("missing"));
+    }
+
+    @Test
+    void validateSourceChecksContentOrAnExistingFile(@TempDir Path dir) throws IOException {
+        JsonObject content = call("camel_validate_source", new ToolContext(),
+                Map.of("file", "new.camel.yaml", "content", INVALID_ROUTE));
+        assertFalse(content.getBoolean("valid"));
+        assertEquals(1, content.getCollection("errors").size());
+        assertTrue(call("camel_validate_source", new ToolContext(),
+                Map.of("file", "new.camel.yaml", "content", VALID_ROUTE)).getBoolean("valid"));
+
+        Files.writeString(dir.resolve("demo.camel.yaml"), INVALID_ROUTE);
+        JsonObject file = call("camel_validate_source", new ToolContext(),
+                Map.of("directory", dir.toString(), "file", "demo.camel.yaml"));
+        assertFalse(file.getBoolean("valid"), "the file is read when no content is given");
+
+        ToolExecutionException e = assertThrows(ToolExecutionException.class,
+                () -> ToolRegistry.execute("camel_validate_source", new ToolContext(),
+                        Map.of("file", "notes.txt", "content", "x")));
+        assertTrue(e.getMessage().contains("No validation for notes.txt"), e.getMessage());
+    }
+
+    @Test
+    void catalogFindAnswersAProtocolOrProductName() {
+        JsonObject result = call("camel_catalog_find", new ToolContext(), Map.of("term", "mqtt", "kind", "component"));
+        assertTrue(result.getInteger("count") > 0);
+        JsonObject first = (JsonObject) result.getCollection("matches").iterator().next();
+        assertEquals("component", first.getString("kind"));
+        assertTrue(first.getString("name").contains("mqtt"), first.toJson());
+        assertNotNull(first.get("syntax"));
+    }
+
+    @Test
+    void runtimeToolsSayWhatToDoWithoutAnIntegration(@TempDir Path home) {
+        // a home of its own: the tools look for the previous run of an integration that is not running
+        Path previousHome = CommandLineHelper.getHomeDir();
+        CommandLineHelper.useHomeDir(home.toString());
+        try {
+            ToolExecutionException e = assertThrows(ToolExecutionException.class,
+                    () -> ToolRegistry.execute("camel_get_errors", new ToolContext(), Map.of("name", "no-such-app-xyz")));
+            assertTrue(e.getMessage().contains("no-such-app-xyz"), e.getMessage());
+            e = assertThrows(ToolExecutionException.class,
+                    () -> ToolRegistry.execute("camel_control", new ToolContext(), Map.of("action", "stop", "name",
+                            "no-such-app-xyz")));
+            assertTrue(e.getMessage().contains("no-such-app-xyz"), e.getMessage());
+        } finally {
+            CommandLineHelper.useHomeDir(previousHome.toString());
+        }
+    }
+
+    @Test
+    void theErrorsGiveTheBodyAsTheAppSentIt() throws Exception {
+        // MessageHelper escapes the body value, as a dev console sends it
+        JsonObject errors = (JsonObject) Jsoner.deserialize("""
+                {"errors":[{"routeId":"checkout","message":{"body":{"type":"String",
+                "value":"{\\\\\\\"orderId\\\\\\\":\\\\\\\"ORD-1003\\\\\\\"}"}}}]}""");
+        String json = AuthoringTools.unescapeBodies(errors).toJson();
+        JsonObject body = (JsonObject) ((JsonObject) ((JsonObject) ((JsonArray) ((JsonObject) Jsoner.deserialize(json))
+                .get("errors")).get(0)).get("message")).get("body");
+        assertEquals("{\"orderId\":\"ORD-1003\"}", body.getString("value"));
+    }
+
+    /** CAMEL-25371: validating content that is the file on disk says the edit is not in it. */
+    @Test
+    void validatingTheFileAsItIsSaysSo(@TempDir Path dir) throws Exception {
+        Files.writeString(dir.resolve("route.camel.yaml"), VALID_ROUTE);
+        JsonObject same = call("camel_validate_source", new ToolContext(),
+                Map.of("directory", dir.toString(), "file", "route.camel.yaml", "content", VALID_ROUTE));
+        assertTrue(Boolean.TRUE.equals(same.get("sameAsFile")), same.toJson());
+        assertTrue(same.getString("note").contains("if you meant to change the file, that change is not in this content"),
+                same.toJson());
+
+        JsonObject changed = call("camel_validate_source", new ToolContext(),
+                Map.of("directory", dir.toString(), "file", "route.camel.yaml", "content", INVALID_ROUTE));
+        assertFalse(changed.containsKey("sameAsFile"), changed.toJson());
+    }
+}

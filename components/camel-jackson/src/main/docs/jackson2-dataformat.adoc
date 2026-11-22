@@ -1,0 +1,141 @@
+= JSON Jackson 2 DataFormat
+:doctitle: JSON Jackson 2
+:shortname: jackson2
+:artifactid: camel-jackson
+:description: Marshal POJOs to JSON and back using Jackson.
+:since: 2.0
+:supportlevel: Stable
+:tabs-sync-option:
+
+*Since Camel {since}*
+
+Jackson is a Data Format that uses the
+https://github.com/FasterXML/jackson-core[Jackson Library]
+
+[tabs]
+====
+Java::
++
+[source,java]
+----
+from("activemq:My.Queue")
+    .marshal().json(JsonLibrary.Jackson)
+    .to("mqseries:Another.Queue");
+----
+
+XML::
++
+[source,xml]
+----
+<route>
+  <from uri="activemq:My.Queue"/>
+  <marshal><json library="Jackson"/></marshal>
+  <to uri="mqseries:Another.Queue"/>
+</route>
+----
+
+YAML::
++
+[source,yaml]
+----
+- route:
+    from:
+      uri: activemq:My.Queue
+      steps:
+        - marshal:
+            json:
+              library: Jackson
+        - to:
+            uri: mqseries:Another.Queue
+----
+====
+
+== Jackson Options
+
+
+// dataformat options: START
+include::partial$dataformat-options.adoc[]
+// dataformat options: END
+
+== Usage
+
+=== 2 and 4 bytes characters
+
+Jackson by default outputs 4-byte characters (in languages such as Japanese) as surrogate pair, escaped. This is
+compliant with Json specification. This can however frustrate users, because it garbles regular output, such as
+names and texts with Unicode escapes. To avoid this, users commonly use 4-bytes would need to turn on `combineUnicodeSurrogates=true`
+in the Camel dataformat.
+
+=== A body that is already JSON
+
+A body that already is the JSON text is written as it is, not serialized as a Java object: a file from a consumer
+such as file or ftp, an `InputStream`, a `byte[]`, and a `String` whose text is a JSON object or array (it starts
+with `{` and ends with `}`, or `[` and `]`). So `marshal: json` after reading a JSON file, or after building the
+JSON with a template or a Simple expression, sends that JSON unchanged. Any other `String` is written as a JSON
+string, and POJOs, maps and lists are marshalled as usual. The Jackson, Gson, Jsonb and Fastjson JSON data formats
+do the same.
+
+=== Using custom ObjectMapper
+
+You can configure `JacksonDataFormat` to use a custom `ObjectMapper` in case you need more control of the mapping configuration.
+
+Refer to your `ObjectMapper` with the `objectMapper` option, such as `objectMapper=#myMapper`.
+
+By default, the data format does not look up an `ObjectMapper` in the registry. To look one up, set
+`autoDiscoverObjectMapper=true` (and leave `useDefaultObjectMapper` at its default, `true`). The data format then uses
+the `ObjectMapper` only when there is exactly one `com.fasterxml.jackson.databind.ObjectMapper` in the registry, and
+otherwise creates its own. Subclasses such as `XmlMapper` count too: for example, Spring Boot can provide an
+`ObjectMapper` bean, and an `XmlMapper` bean next to it makes two, so neither is used. Camel logs the `ObjectMapper` it
+found at `DEBUG` level.
+
+Camel uses an `ObjectMapper` from the registry as it is: the options of the data format that configure the mapper, such
+as `include`, `prettyPrint`, `enableFeatures`, `disableFeatures`, `moduleClassNames`, `timezone` and `namingStrategy`,
+are not applied to it.
+
+=== Using Jackson for automatic type conversion
+
+The `camel-jackson` module allows integrating Jackson as a xref:manual::type-converter.adoc[Type Converter].
+
+This gives a set of out-of-the-box converters to/from the Jackson type `JSonNode`, such as converting
+from `JSonNode` to `String` or vice versa.
+
+The type converter does not use the options of the data format. Its `JsonNode` converters, and the POJO conversion
+below, use the `ObjectMapper` in the registry when there is exactly one (subclasses such as `XmlMapper` count too),
+without `autoDiscoverObjectMapper`. Otherwise, the type converter creates its own `ObjectMapper`.
+
+==== Enabling more type converters and support for POJOs
+
+To enable POJO conversion support for `camel-jackson` then this must be enabled,
+which is done by setting the following options on the `CamelContext` global options, as shown:
+
+._Java-only: enabling Jackson POJO type conversion on the CamelContext_
+[source,java]
+----
+// Enable Jackson JSON type converter for more types.
+camelContext.getGlobalOptions().put("CamelJacksonEnableTypeConverter", "true");
+// Allow Jackson JSON to convert to pojo types also
+// (by default, Jackson only converts to String and other simple types)
+getContext().getGlobalOptions().put("CamelJacksonTypeConverterToPojo", "true");
+----
+
+The `camel-jackson` type converter integrates with xref:dataformats:jaxb-dataformat.adoc[JAXB]
+which means you can annotate POJO class with `JAXB` annotations that Jackson can use.
+You can also use Jackson's own annotations in your POJO classes.
+
+== Dependencies
+
+To use Jackson in your Camel routes, you need to add the dependency
+on *camel-jackson*, which implements this data format.
+
+If you use Maven, you could add the following to your `pom.xml`,
+substituting the version number for the latest & greatest release:
+
+[source,xml]
+----
+<dependency>
+  <groupId>org.apache.camel</groupId>
+  <artifactId>camel-jackson</artifactId>
+  <version>x.x.x</version>
+  <!-- use the same version as your Camel core version -->
+</dependency>
+----

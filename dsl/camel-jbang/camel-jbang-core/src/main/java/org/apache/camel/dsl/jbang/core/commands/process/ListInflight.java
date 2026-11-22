@@ -1,0 +1,168 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.camel.dsl.jbang.core.commands.process;
+
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.List;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.stream.Collectors;
+
+import com.github.freva.asciitable.AsciiTable;
+import com.github.freva.asciitable.Column;
+import com.github.freva.asciitable.HorizontalAlign;
+import com.github.freva.asciitable.OverflowBehaviour;
+import org.aesh.command.CommandDefinition;
+import org.aesh.command.option.Argument;
+import org.aesh.command.option.Option;
+import org.apache.camel.dsl.jbang.core.common.CopyableRow;
+import org.apache.camel.dsl.jbang.core.common.PidNameAgeCompletionCandidates;
+import org.apache.camel.dsl.jbang.core.common.ProcessHelper;
+import org.apache.camel.dsl.jbang.core.common.RowSort;
+import org.apache.camel.util.TimeUtils;
+import org.apache.camel.util.json.JsonArray;
+import org.apache.camel.util.json.JsonObject;
+import org.apache.camel.util.json.Jsoner;
+
+@CommandDefinition(name = "inflight", description = "Get inflight messages of Camel integrations", generateHelp = true,
+                   footer = {
+                           "Examples:",
+                           "  camel get inflight",
+                           "  camel get inflight --watch" })
+public class ListInflight extends ProcessWatchCommand {
+
+    private static final RowSort<Row> ORDER = RowSort.<Row> integration(r -> r.pid, r -> r.name, r -> r.uptime);
+
+    @Argument(description = "Name or pid of running Camel integration")
+    String name = "*";
+
+    @Option(name = "sort", description = "Sort by pid, name or age", defaultValue = "pid",
+            completer = PidNameAgeCompletionCandidates.class)
+    String sort;
+
+    @Override
+    public Integer doProcessWatchCall() throws Exception {
+        List<Row> rows = new ArrayList<>();
+
+        AtomicBoolean remoteVisible = new AtomicBoolean();
+        forEachIntegration(name, (ph, root) -> {
+            // there must be a status file for the running Camel integration
+            Row row = new Row();
+            JsonObject context = (JsonObject) root.get("context");
+            if (context == null) {
+                return;
+            }
+            row.name = context.getString("name");
+            if ("CamelJBang".equals(row.name)) {
+                row.name = ProcessHelper.extractName(root, ph);
+            }
+            row.pid = Long.toString(ph.pid());
+            row.uptime = extractSince(ph);
+            row.age = TimeUtils.printSince(row.uptime);
+
+            JsonObject jo = (JsonObject) root.get("inflight");
+            if (jo != null) {
+                JsonArray arr = (JsonArray) jo.get("exchanges");
+                if (arr != null) {
+                    for (int i = 0; i < arr.size(); i++) {
+                        row = row.copy();
+                        jo = (JsonObject) arr.get(i);
+                        row.exchangeId = jo.getString("exchangeId");
+                        row.fromRouteId = jo.getString("fromRouteId");
+                        Boolean bool = jo.getBoolean("fromRemoteEndpoint");
+                        if (bool != null) {
+                            // older camel versions does not include this information
+                            remoteVisible.set(true);
+                            row.fromRemoteEndpoint = bool;
+                        }
+                        row.atRouteId = jo.getString("atRouteId");
+                        row.nodeId = jo.getString("nodeId");
+                        row.elapsed = jo.getLong("elapsed");
+                        row.duration = jo.getLong("duration");
+                        rows.add(row);
+                    }
+                }
+            }
+        });
+
+        // sort rows
+        rows.sort(ORDER.comparator(sort));
+
+        if (!rows.isEmpty() || jsonOutput) {
+            if (jsonOutput) {
+                printer().println(Jsoner.serialize(rows.stream().map(r -> {
+                    JsonObject jo = new JsonObject();
+                    jo.put("pid", JsonValues.pid(r.pid));
+                    jo.put("name", r.name);
+                    jo.put("exchangeId", r.exchangeId);
+                    jo.put("remote", r.fromRemoteEndpoint);
+                    jo.put("routeId", r.atRouteId);
+                    jo.put("id", r.nodeId);
+                    jo.put("elapsed", r.elapsed);
+                    jo.put("duration", r.duration);
+                    return jo;
+                }).collect(Collectors.toList())));
+            } else {
+                printer().println(AsciiTable.getTable(AsciiTable.NO_BORDERS, rows, Arrays.asList(
+                        new Column().header("PID").headerAlign(HorizontalAlign.CENTER).with(r -> r.pid),
+                        new Column().header("NAME").dataAlign(HorizontalAlign.LEFT)
+                                .maxWidth(30, OverflowBehaviour.ELLIPSIS_RIGHT)
+                                .with(r -> r.name),
+                        new Column().header("EXCHANGE-ID").dataAlign(HorizontalAlign.LEFT).with(r -> r.exchangeId),
+                        new Column().header("REMOTE").visible(remoteVisible.get()).dataAlign(HorizontalAlign.CENTER)
+                                .with(this::getRemote),
+                        new Column().header("ROUTE").dataAlign(HorizontalAlign.LEFT)
+                                .maxWidth(25, OverflowBehaviour.ELLIPSIS_RIGHT)
+                                .with(r -> r.atRouteId),
+                        new Column().header("ID").dataAlign(HorizontalAlign.LEFT)
+                                .maxWidth(25, OverflowBehaviour.ELLIPSIS_RIGHT)
+                                .with(r -> r.nodeId),
+                        new Column().header("ELAPSED").dataAlign(HorizontalAlign.RIGHT).with(this::getElapsed),
+                        new Column().header("DURATION").dataAlign(HorizontalAlign.RIGHT).with(this::getDuration))));
+            }
+        }
+
+        return 0;
+    }
+
+    private String getDuration(Row r) {
+        return TimeUtils.printDuration(r.duration);
+    }
+
+    private String getElapsed(Row r) {
+        return TimeUtils.printDuration(r.elapsed);
+    }
+
+    private String getRemote(Row r) {
+        return r.fromRemoteEndpoint ? "x" : "";
+    }
+
+    private static class Row extends CopyableRow<Row> {
+        String pid;
+        String name;
+        String age;
+        long uptime;
+        String exchangeId;
+        String fromRouteId;
+        boolean fromRemoteEndpoint;
+        String atRouteId;
+        String nodeId;
+        long elapsed;
+        long duration;
+    }
+
+}

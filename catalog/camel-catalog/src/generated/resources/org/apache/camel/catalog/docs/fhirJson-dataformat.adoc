@@ -1,0 +1,42 @@
+= FHIR JSon DataFormat
+:doctitle: FHIR JSon
+:shortname: fhirJson
+:artifactid: camel-fhir
+:description: Marshall and unmarshall FHIR objects to/from JSON
+:since: 2.21
+:supportlevel: Stable
+:tabs-sync-option:
+
+*Since Camel {since}*
+
+The FHIR-JSON Data Format leverages
+https://github.com/jamesagnew/hapi-fhir/blob/master/hapi-fhir-base/src/main/java/ca/uhn/fhir/parser/JsonParser.java[HAPI-FHIR's]
+JSON parser to parse to/from JSON format to/from a HAPI-FHIR's `IBaseResource`.
+
+== FHIR JSON Format Options
+
+// dataformat options: START
+include::partial$dataformat-options.adoc[]
+// dataformat options: END
+
+== Usage
+
+The following route parses a FHIR resource from JSON and writes it as XML.
+The `fhirVersion` must match the version of the resources (R4 is the default):
+
+[source,yaml]
+----
+- route:
+    from:
+      uri: direct:patient
+      steps:
+        - unmarshal:
+            fhirJson:
+              fhirVersion: R4
+        - marshal:
+            fhirXml:
+              fhirVersion: R4
+              prettyPrint: true
+        - to:
+            uri: mock:result
+----

@@ -1,0 +1,157 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.camel.dsl.jbang.core.commands.plugin;
+
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.List;
+
+import com.github.freva.asciitable.AsciiTable;
+import com.github.freva.asciitable.Column;
+import com.github.freva.asciitable.HorizontalAlign;
+import com.github.freva.asciitable.OverflowBehaviour;
+import org.aesh.command.CommandDefinition;
+import org.aesh.command.option.Option;
+import org.aesh.command.option.OptionVisibility;
+import org.apache.camel.dsl.jbang.core.common.JsonOutput;
+import org.apache.camel.dsl.jbang.core.common.PluginHelper;
+import org.apache.camel.dsl.jbang.core.common.PluginType;
+import org.apache.camel.util.json.JsonObject;
+
+@CommandDefinition(name = "get", description = "Get installed plugins", generateHelp = true,
+                   footer = {
+                           "Examples:",
+                           "  camel plugin get",
+                           "  camel plugin get --json" })
+public class PluginGet extends PluginBaseCommand {
+
+    @Deprecated
+    @Option(name = "all", hasValue = false, description = "DEPRECATED: use 'camel plugin list' instead", defaultValue = "false",
+            visibility = OptionVisibility.HIDDEN)
+    public boolean all;
+
+    @Option(name = "repos", hasValue = false, description = "Display maven repository column", defaultValue = "false")
+    public boolean repos;
+
+    @Option(name = "json", hasValue = false, description = "Output in JSON Format")
+    public boolean jsonOutput;
+
+    @Override
+    public Integer doCall() throws Exception {
+        if (all) {
+            PluginList delegate = getMain().command(new PluginList());
+            delegate.repos = this.repos;
+            delegate.jsonOutput = this.jsonOutput;
+            return delegate.doCall();
+        }
+
+        List<Row> rows = installedRows();
+        if (jsonOutput) {
+            printJson(rows, "installed");
+            return 0;
+        }
+
+        if (rows.isEmpty()) {
+            // it printed nothing (CAMEL-26931)
+            printer().printDiagnostic("No plugins installed (camel plugin list lists the plugins that can be added)");
+            return 0;
+        }
+        printer().println("Installed plugins:");
+        printer().println();
+        printRows(rows);
+
+        return 0;
+    }
+
+    /**
+     * The plugins in the plugin configuration of the user.
+     */
+    List<Row> installedRows() {
+        List<Row> rows = new ArrayList<>();
+
+        JsonObject plugins = loadConfig().getMap("plugins");
+        plugins.forEach((key, value) -> {
+            JsonObject details = (JsonObject) value;
+
+            String name = details.getStringOrDefault("name", key);
+            String command = details.getStringOrDefault("command", name);
+            String dependency = details.getStringOrDefault("dependency",
+                    "org.apache.camel:camel-jbang-plugin-%s".formatted(command));
+            String description
+                    = details.getStringOrDefault("description", "Plugin %s called with command %s".formatted(name, command));
+            String repos = details.getString("repos");
+
+            String vendor = resolveVendor(name);
+            rows.add(new Row(name, command, dependency, description, repos, vendor));
+        });
+        return rows;
+    }
+
+    /**
+     * Prints the plugins as a JSON array.
+     *
+     * @param rows   the plugins
+     * @param status installed, or available when not installed
+     */
+    protected void printJson(List<Row> rows, String status) {
+        JsonOutput.printList(printer(), rows.stream().map(r -> toJson(r, status)).toList());
+    }
+
+    protected static JsonObject toJson(Row r, String status) {
+        JsonObject jo = new JsonObject();
+        jo.put("name", r.name);
+        jo.put("command", r.command);
+        jo.put("status", status);
+        jo.put("vendor", r.vendor);
+        jo.put("dependency", r.dependency);
+        if (r.repos != null) {
+            jo.put("repos", r.repos);
+        }
+        jo.put("description", r.description);
+        return jo;
+    }
+
+    private String resolveVendor(String name) {
+        return PluginType.findByName(name)
+                .map(PluginType::getVendor)
+                .or(() -> PluginHelper.findKnownPlugin(name).map(kp -> kp.getStringOrDefault("vendor", "Community")))
+                .orElse("");
+    }
+
+    protected void printRows(List<Row> rows) {
+        if (!rows.isEmpty()) {
+            printer().println(AsciiTable.getTable(AsciiTable.NO_BORDERS, rows, Arrays.asList(
+                    new Column().header("NAME").headerAlign(HorizontalAlign.LEFT).dataAlign(HorizontalAlign.LEFT)
+                            .with(r -> r.name),
+                    new Column().header("COMMAND").headerAlign(HorizontalAlign.LEFT).dataAlign(HorizontalAlign.LEFT)
+                            .with(r -> r.command),
+                    new Column().header("VENDOR").headerAlign(HorizontalAlign.LEFT).dataAlign(HorizontalAlign.LEFT)
+                            .with(r -> r.vendor != null ? r.vendor : ""),
+                    new Column().header("DEPENDENCY").headerAlign(HorizontalAlign.LEFT).dataAlign(HorizontalAlign.LEFT)
+                            .with(r -> r.dependency),
+                    new Column().visible(repos).header("REPOSITORY").headerAlign(HorizontalAlign.LEFT)
+                            .dataAlign(HorizontalAlign.LEFT)
+                            .with(r -> r.repos),
+                    new Column().header("DESCRIPTION").headerAlign(HorizontalAlign.LEFT).dataAlign(HorizontalAlign.LEFT)
+                            .maxWidth(80, OverflowBehaviour.ELLIPSIS_RIGHT)
+                            .with(r -> r.description))));
+        }
+    }
+
+    record Row(String name, String command, String dependency, String description, String repos, String vendor) {
+    }
+}

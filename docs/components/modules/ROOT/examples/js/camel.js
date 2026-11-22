@@ -1,0 +1,153 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+module.exports = {
+  extractConstantDisplayName: (name) => {
+    return name.split('#').pop().split('@').join('.')
+  },
+
+  extractConstantName: (name) => {
+    return name.split('#').pop().split('@').shift()
+  },
+
+  extractHeadersClass: (name) => {
+    return name.split('#').shift()
+  },
+
+  constantLink: (artifactId, name) => {
+      try {
+        return `https://javadoc.io/doc/org.apache.camel/${artifactId}/latest/`
+          + module.exports.extractHeadersClass(name).split('.').join('/') + '.html#'
+          + module.exports.extractConstantName(name)
+          + '[`' + module.exports.extractConstantDisplayName(name) + '`]'
+      } catch (e) {
+        console.log('error', e)
+        return e.msg()
+      }
+  },
+
+  // the body types of the catalog (CAMEL-24961, CAMEL-25928): one row per side of the bodyTypes section
+  bodySide: (side) => {
+    const sides = {
+      consumerOut: 'Consumer',
+      consumerReply: 'Consumer reply',
+      producerIn: 'Producer input',
+      producerOut: 'Producer output',
+      marshalIn: 'Marshal input',
+      marshalOut: 'Marshal output',
+      unmarshalIn: 'Unmarshal input',
+      unmarshalOut: 'Unmarshal output',
+      expressionIn: 'Expression input',
+      expressionOut: 'Expression result',
+      transformerIn: 'Transformer input',
+      transformerOut: 'Transformer output',
+      eipIn: 'EIP input',
+      eipOut: 'EIP output',
+      eipSteps: 'Steps',
+    }
+    return `*${sides[side] || side}*`
+  },
+
+  // text, bytes or stream, with the Java type when the body is always of that type; or the side of another model an
+  // EIP takes its body from
+  bodyCarriers: (value) => {
+    const from = {
+      expressionIn: 'what its expression reads',
+      expressionOut: 'the result of its expression',
+      marshalIn: 'what its data format marshals',
+      marshalOut: 'what its data format marshals to',
+      unmarshalIn: 'what its data format unmarshals',
+      unmarshalOut: 'what its data format unmarshals to',
+      producerIn: 'what the producer of its endpoint sends',
+      producerOut: 'what the producer of its endpoint leaves',
+      consumerOut: 'what the consumer of its endpoint receives',
+      transformerIn: 'what its data type transformer transforms',
+      transformerOut: 'what its data type transformer makes',
+      steps: 'what its steps end with',
+    }
+    if (value.from) {
+      return from[value.from] || value.from
+    }
+    const carriers = (value.carriers || []).map((carrier) => '`' + carrier + '`')
+    const words = carriers.length === 0 ? '`unknown`'
+      : carriers.length === 1 ? carriers[0]
+        : carriers.slice(0, -1).join(', ') + ' or ' + carriers[carriers.length - 1]
+    return words + (value.javaType ? ' (`' + value.javaType + '`)' : '') + (value.format ? ', as ' + value.format : '')
+  },
+
+  // the description, the option that names the class of the body, the bodies for other values of an option, and the
+  // options the body depends on
+  bodyDescription: (value) => {
+    // only what reads as an attribute reference ({body}, not {header.foo}, which keeps a backslash), and the cell separator
+    const escape = (text) => text.replace(/\{(\w[\w-]*)\}/g, '\\{$1}').split('|').join('\\|')
+    const parts = []
+    if (value.description) {
+      parts.push(escape(value.description) + (value.description.endsWith('.') ? '' : '.'))
+    }
+    if (value.javaTypeOption) {
+      parts.push(`With \`${value.javaTypeOption}\` set: an object of the class it names, or null.`)
+    }
+    if (value.byOption && value.byOption.length) {
+      // the value * is any value of the option
+      parts.push(value.byOption.map((option) => (option.value === '*'
+        ? `* With \`${option.option}\` set: `
+        : `* With \`${option.option}=${option.value}\`: `)
+        + module.exports.bodyCarriers(option)
+        + (option.javaTypeOption ? `, or an object of the class \`${option.javaTypeOption}\` names when it is set` : ''))
+        .join('\n'))
+    }
+    if (value.dependsOn && value.dependsOn.length) {
+      parts.push('Not known when ' + value.dependsOn.map((option) => '`' + option + '`').join(' or ') + ' is set.')
+    }
+    return parts.join('\n\n')
+  },
+
+  // the fake worlds of the deterministic simulation tests (CAMEL-26438, CAMEL-26609): one row per world of the
+  // dstWorlds section. The world is a test class in no JAR, so it is shown by its simple name, not linked.
+  dstWorld: (name, value) => {
+    const parts = ['`' + name + '`']
+    if (value.fake) {
+      parts.push('Fake: ' + module.exports.dstEscape(value.fake))
+    }
+    if (value.tests && value.tests.length) {
+      parts.push('Tests: ' + value.tests.map((test) => '`' + test + '`').join(', '))
+    }
+    return parts.join('\n\n')
+  },
+
+  // what the world covers, the faults it injects and the invariants it checks, each as a list
+  dstChecks: (value) => {
+    const list = (title, items) => (items && items.length)
+      ? `*${title}:*\n\n` + items.map((item) => '* ' + module.exports.dstEscape(item)).join('\n')
+      : ''
+    return [list('Covers', value.covers), list('Faults', value.faults), list('Invariants', value.invariants)]
+      .filter((part) => part)
+      .join('\n\n')
+  },
+
+  // the JIRA issues of the world, as links
+  dstIssues: (value) => {
+    return (value.issues || [])
+      .map((issue) => `https://issues.apache.org/jira/browse/${issue}[${issue}]`)
+      .join('\n\n')
+  },
+
+  // what reads as an attribute reference ({name}), and the cell separator
+  dstEscape: (text) => {
+    return text.replace(/\{(\w[\w-]*)\}/g, '\\{$1}').split('|').join('\\|')
+  },
+}

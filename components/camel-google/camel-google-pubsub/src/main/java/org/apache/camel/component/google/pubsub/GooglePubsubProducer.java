@@ -1,0 +1,178 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.camel.component.google.pubsub;
+
+import java.util.List;
+import java.util.Map;
+import java.util.concurrent.ExecutionException;
+
+import com.google.api.core.ApiFuture;
+import com.google.cloud.pubsub.v1.Publisher;
+import com.google.common.base.Strings;
+import com.google.protobuf.ByteString;
+import com.google.pubsub.v1.PubsubMessage;
+import org.apache.camel.Exchange;
+import org.apache.camel.InvalidPayloadException;
+import org.apache.camel.spi.HeaderFilterStrategy;
+import org.apache.camel.support.DefaultProducer;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import static org.apache.camel.component.google.pubsub.GooglePubsubConstants.ATTRIBUTES;
+import static org.apache.camel.component.google.pubsub.GooglePubsubConstants.ORDERING_KEY;
+import static org.apache.camel.component.google.pubsub.GooglePubsubConstants.RESERVED_GOOGLE_CLIENT_ATTRIBUTE_PREFIX;
+
+/**
+ * Generic PubSub Producer
+ */
+public class GooglePubsubProducer extends DefaultProducer {
+
+    public Logger logger;
+    private final HeaderFilterStrategy headerFilterStrategy;
+
+    public GooglePubsubProducer(GooglePubsubEndpoint endpoint) {
+        super(endpoint);
+
+        String loggerId = endpoint.getLoggerId();
+
+        if (Strings.isNullOrEmpty(loggerId)) {
+            loggerId = this.getClass().getName();
+        }
+
+        logger = LoggerFactory.getLogger(loggerId);
+        headerFilterStrategy = endpoint.getHeaderFilterStrategy();
+    }
+
+    /**
+     * The incoming message is expected to be either - a List of Exchanges (aggregated) - an Exchange
+     */
+    @Override
+    public void process(Exchange exchange) throws Exception {
+
+        if (logger.isDebugEnabled()) {
+            logger.debug("uploader thread/id: {} / {}. api call completed.", Thread.currentThread().threadId(),
+                    exchange.getExchangeId());
+        }
+
+        if (exchange.getIn().getBody() instanceof List) {
+            List<?> bodies = exchange.getIn().getBody(List.class);
+            long exchanges = bodies.stream().filter(Exchange.class::isInstance).count();
+            if (exchanges == 0) {
+                // not an aggregated list: the list itself is the payload of a single message
+                send(exchange);
+            } else if (exchanges == bodies.size()) {
+                for (Object body : bodies) {
+                    send((Exchange) body);
+                }
+            } else {
+                // a list holding both exchanges and plain payloads used to publish only the exchanges and
+                // drop the rest without a word
+                throw new IllegalArgumentException(
+                        "The body is a list mixing " + exchanges + " exchange(s) with " + (bodies.size() - exchanges)
+                                                   + " other element(s). Send either an aggregated list of exchanges or a single payload.");
+            }
+        } else {
+            send(exchange);
+        }
+    }
+
+    private void send(Exchange exchange) throws Exception {
+
+        GooglePubsubEndpoint endpoint = (GooglePubsubEndpoint) getEndpoint();
+        String topicName = String.format("projects/%s/topics/%s", endpoint.getProjectId(), endpoint.getDestinationName());
+
+        Publisher publisher = endpoint.getComponent().getPublisher(topicName, endpoint);
+
+        ByteString byteString = toByteString(exchange, endpoint);
+
+        PubsubMessage.Builder messageBuilder = PubsubMessage.newBuilder().setData(byteString);
+
+        // Deprecated: start
+        // Replaced by headerFilterStrategy
+        Map<String, String> attributes = exchange.getIn().getHeader(ATTRIBUTES, Map.class);
+        if (attributes != null) {
+            for (Map.Entry<String, String> attribute : attributes.entrySet()) {
+                if (!attribute.getKey().startsWith(RESERVED_GOOGLE_CLIENT_ATTRIBUTE_PREFIX)) {
+                    messageBuilder.putAttributes(attribute.getKey(), attribute.getValue());
+                }
+            }
+        }
+        // Deprecated: end
+
+        String orderingKey = exchange.getIn().getHeader(ORDERING_KEY, String.class);
+        if (orderingKey != null) {
+            messageBuilder.setOrderingKey(orderingKey);
+        }
+
+        // Inherit the rest of headers
+        for (String camelHeader : exchange.getIn().getHeaders().keySet()) {
+            String value = exchange.getIn().getHeader(camelHeader, String.class);
+            if (headerFilterStrategy != null
+                    && headerFilterStrategy.applyFilterToCamelHeaders(camelHeader, value, exchange)) {
+                continue;
+            }
+            if (value == null) {
+                // a pubsub attribute cannot be null, and a header that does not convert to a string is not
+                // one the message can carry
+                logger.debug("Skipping header {} as it has no string value to send as a message attribute",
+                        camelHeader);
+                continue;
+            }
+            messageBuilder.putAttributes(camelHeader, value);
+        }
+
+        PubsubMessage message = messageBuilder.build();
+
+        ApiFuture<String> messageIdFuture = publisher.publish(message);
+        try {
+            exchange.getIn().setHeader(GooglePubsubConstants.MESSAGE_ID, messageIdFuture.get());
+        } catch (ExecutionException e) {
+            if (orderingKey != null && endpoint.isMessageOrderingEnabled()) {
+                // the publisher pauses an ordering key after a failed publish, so a redelivery and the later messages
+                // with that key would fail at once
+                try {
+                    publisher.resumePublish(orderingKey);
+                } catch (RuntimeException resumeException) {
+                    // keep the failure of the publish as the cause
+                    e.addSuppressed(resumeException);
+                }
+            }
+            throw e;
+        }
+    }
+
+    private static ByteString toByteString(Exchange exchange, GooglePubsubEndpoint endpoint) throws Exception {
+        Object body = exchange.getIn().getBody();
+        if (body == null) {
+            // a serialized null is not a message anybody can use
+            throw new InvalidPayloadException(exchange, byte[].class);
+        }
+        if (body instanceof String text) {
+            return ByteString.copyFromUtf8(text);
+        }
+        if (body instanceof byte[] bytes) {
+            return ByteString.copyFrom(bytes);
+        }
+        // convert before serializing: a stream, a stream cache or a file is sent as its content, and a
+        // java.io.File, although it is Serializable, must not be sent as a serialized File object
+        byte[] bytes = exchange.getContext().getTypeConverter().tryConvertTo(byte[].class, exchange, body);
+        if (bytes != null) {
+            return ByteString.copyFrom(bytes);
+        }
+        return ByteString.copyFrom(endpoint.getSerializer().serialize(body));
+    }
+}

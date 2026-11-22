@@ -1,0 +1,179 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.camel.component.google.secret.manager;
+
+import com.google.cloud.secretmanager.v1.AccessSecretVersionRequest;
+import com.google.cloud.secretmanager.v1.AccessSecretVersionResponse;
+import com.google.cloud.secretmanager.v1.AddSecretVersionRequest;
+import com.google.cloud.secretmanager.v1.CreateSecretRequest;
+import com.google.cloud.secretmanager.v1.DeleteSecretRequest;
+import com.google.cloud.secretmanager.v1.ListSecretsRequest;
+import com.google.cloud.secretmanager.v1.ProjectName;
+import com.google.cloud.secretmanager.v1.Replication;
+import com.google.cloud.secretmanager.v1.Secret;
+import com.google.cloud.secretmanager.v1.SecretManagerServiceClient;
+import com.google.cloud.secretmanager.v1.SecretName;
+import com.google.cloud.secretmanager.v1.SecretPayload;
+import com.google.cloud.secretmanager.v1.SecretVersionName;
+import com.google.protobuf.ByteString;
+import org.apache.camel.Exchange;
+import org.apache.camel.InvalidPayloadException;
+import org.apache.camel.Message;
+import org.apache.camel.support.DefaultProducer;
+
+/**
+ * The Google Secret Manager producer.
+ */
+public class GoogleSecretManagerProducer extends DefaultProducer {
+
+    private static final String CREATE_SECRET_POJO_REQUEST_HINT
+            = "createSecret with pojoRequest=true takes a CreateSecretRequest, to create the secret, or an"
+              + " AddSecretVersionRequest, to add a version to a secret that exists";
+
+    private static final String CREATE_SECRET_EMPTY_VALUE_HINT
+            = "createSecret takes the value of the secret as the message body, and the value must not be empty";
+
+    private GoogleSecretManagerEndpoint endpoint;
+
+    public GoogleSecretManagerProducer(GoogleSecretManagerEndpoint endpoint) {
+        super(endpoint);
+        this.endpoint = endpoint;
+    }
+
+    @Override
+    public void process(final Exchange exchange) throws Exception {
+        switch (determineOperation(exchange)) {
+            case createSecret:
+                createSecret(endpoint.getClient(), exchange);
+                break;
+            case getSecretVersion:
+                getSecretVersion(endpoint.getClient(), exchange);
+                break;
+            case deleteSecret:
+                deleteSecret(endpoint.getClient(), exchange);
+                break;
+            case listSecrets:
+                listSecrets(endpoint.getClient(), exchange);
+                break;
+            default:
+                throw new IllegalArgumentException("Unsupported operation");
+        }
+    }
+
+    private void createSecret(SecretManagerServiceClient client, Exchange exchange) throws InvalidPayloadException {
+        Object response;
+        if (getConfiguration().isPojoRequest()) {
+            if (exchange.getIn().getBody() instanceof CreateSecretRequest request) {
+                // creates the secret without a version, as the request has no payload
+                response = client.createSecret(request);
+            } else {
+                AddSecretVersionRequest request = exchange.getIn().getBody(AddSecretVersionRequest.class);
+                if (request == null) {
+                    throw new InvalidPayloadException(
+                            exchange, AddSecretVersionRequest.class, exchange.getIn(), CREATE_SECRET_POJO_REQUEST_HINT);
+                }
+                response = client.addSecretVersion(request);
+            }
+        } else {
+            String secretId = exchange.getMessage().getHeader(GoogleSecretManagerConstants.SECRET_ID, String.class);
+            // read the value first: a message without a body then fails before the secret is created, instead of
+            // leaving a secret without a version behind
+            String secretValue = exchange.getMessage().getMandatoryBody(String.class);
+            // Secret Manager rejects an empty payload, so an empty value would create the secret and then fail
+            // to add the version, again leaving a secret without a version behind: fail before creating it
+            if (secretValue.isEmpty()) {
+                throw new InvalidPayloadException(
+                        exchange, String.class, exchange.getMessage(), CREATE_SECRET_EMPTY_VALUE_HINT);
+            }
+            SecretPayload payload = SecretPayload.newBuilder()
+                    .setData(ByteString.copyFromUtf8(secretValue)).build();
+            Secret secret = Secret.newBuilder()
+                    .setReplication(
+                            Replication.newBuilder()
+                                    .setAutomatic(Replication.Automatic.newBuilder().build())
+                                    .build())
+                    .build();
+
+            Secret createdSecret = client.createSecret(ProjectName.of(getConfiguration().getProject()), secretId, secret);
+
+            response = client.addSecretVersion(createdSecret.getName(), payload);
+        }
+        Message message = getMessageForResponse(exchange);
+        message.setBody(response);
+    }
+
+    private void getSecretVersion(SecretManagerServiceClient client, Exchange exchange) throws InvalidPayloadException {
+        final String defaultVersion = "latest";
+        AccessSecretVersionResponse response;
+        if (getConfiguration().isPojoRequest()) {
+            AccessSecretVersionRequest request = exchange.getIn().getMandatoryBody(AccessSecretVersionRequest.class);
+            response = client.accessSecretVersion(request);
+        } else {
+            String secretId = exchange.getMessage().getHeader(GoogleSecretManagerConstants.SECRET_ID, String.class);
+            String versionId
+                    = exchange.getMessage().getHeader(GoogleSecretManagerConstants.VERSION_ID, defaultVersion, String.class);
+            String projectId = getConfiguration().getProject();
+            SecretVersionName secretVersionName = SecretVersionName.of(projectId, secretId, versionId);
+            response = client.accessSecretVersion(secretVersionName);
+        }
+        Message message = getMessageForResponse(exchange);
+        message.setBody(response.getPayload().getData().toStringUtf8());
+    }
+
+    private void deleteSecret(SecretManagerServiceClient client, Exchange exchange) throws InvalidPayloadException {
+        if (getConfiguration().isPojoRequest()) {
+            DeleteSecretRequest request = exchange.getIn().getMandatoryBody(DeleteSecretRequest.class);
+            client.deleteSecret(request);
+        } else {
+            String secretId = exchange.getMessage().getHeader(GoogleSecretManagerConstants.SECRET_ID, String.class);
+            client.deleteSecret(SecretName.of(getConfiguration().getProject(), secretId));
+        }
+    }
+
+    private void listSecrets(SecretManagerServiceClient client, Exchange exchange) throws InvalidPayloadException {
+        SecretManagerServiceClient.ListSecretsPagedResponse response;
+        if (getConfiguration().isPojoRequest()) {
+            ListSecretsRequest request = exchange.getIn().getMandatoryBody(ListSecretsRequest.class);
+            response = client.listSecrets(request);
+        } else {
+            String projectId = getConfiguration().getProject();
+            response = client.listSecrets(ProjectName.of(projectId));
+        }
+        Message message = getMessageForResponse(exchange);
+        message.setBody(response);
+    }
+
+    private GoogleSecretManagerOperations determineOperation(Exchange exchange) {
+        GoogleSecretManagerOperations operation = exchange.getIn().getHeader(GoogleSecretManagerConstants.OPERATION,
+                GoogleSecretManagerOperations.class);
+        if (operation == null) {
+            operation = getConfiguration().getOperation() == null
+                    ? GoogleSecretManagerOperations.createSecret
+                    : getConfiguration().getOperation();
+        }
+        return operation;
+    }
+
+    public static Message getMessageForResponse(final Exchange exchange) {
+        return exchange.getMessage();
+    }
+
+    private GoogleSecretManagerConfiguration getConfiguration() {
+        return this.endpoint.getConfiguration();
+    }
+
+}

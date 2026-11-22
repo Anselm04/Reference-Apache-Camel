@@ -1,0 +1,961 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.camel.component.openai;
+
+import java.io.InputStream;
+import java.util.ArrayList;
+import java.util.Iterator;
+import java.util.List;
+import java.util.Map;
+import java.util.concurrent.atomic.AtomicReference;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+import java.util.stream.Collectors;
+
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.openai.core.JsonField;
+import com.openai.core.JsonValue;
+import com.openai.core.http.StreamResponse;
+import com.openai.models.ResponseFormatJsonSchema;
+import com.openai.models.chat.completions.ChatCompletion;
+import com.openai.models.chat.completions.ChatCompletionAssistantMessageParam;
+import com.openai.models.chat.completions.ChatCompletionChunk;
+import com.openai.models.chat.completions.ChatCompletionCreateParams;
+import com.openai.models.chat.completions.ChatCompletionDeveloperMessageParam;
+import com.openai.models.chat.completions.ChatCompletionFunctionTool;
+import com.openai.models.chat.completions.ChatCompletionMessage;
+import com.openai.models.chat.completions.ChatCompletionMessageParam;
+import com.openai.models.chat.completions.ChatCompletionMessageToolCall;
+import com.openai.models.chat.completions.ChatCompletionStreamOptions;
+import com.openai.models.chat.completions.ChatCompletionSystemMessageParam;
+import com.openai.models.chat.completions.ChatCompletionToolMessageParam;
+import com.openai.models.completions.CompletionUsage;
+import org.apache.camel.AsyncCallback;
+import org.apache.camel.CamelExchangeException;
+import org.apache.camel.Exchange;
+import org.apache.camel.Message;
+import org.apache.camel.component.ai.observability.GenAiErrorSupport;
+import org.apache.camel.component.ai.observability.GenAiMessages;
+import org.apache.camel.component.ai.observability.GenAiObservability;
+import org.apache.camel.component.ai.observability.GenAiObservabilityLevel;
+import org.apache.camel.component.ai.observability.GenAiObservation;
+import org.apache.camel.component.ai.observability.GenAiObservationContext;
+import org.apache.camel.component.ai.observability.GenAiOperationName;
+import org.apache.camel.component.ai.observability.GenAiUsage;
+import org.apache.camel.component.ai.tool.AiToolSearchSession;
+import org.apache.camel.spi.Synchronization;
+import org.apache.camel.support.DefaultAsyncProducer;
+import org.apache.camel.support.ExchangeHelper;
+import org.apache.camel.support.ResourceHelper;
+import org.apache.camel.support.service.ServiceHelper;
+import org.apache.camel.util.ObjectHelper;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+/**
+ * OpenAI producer for chat completion.
+ */
+public class OpenAIProducer extends DefaultAsyncProducer {
+
+    private static final Logger LOG = LoggerFactory.getLogger(OpenAIProducer.class);
+    private static final ObjectMapper OBJECT_MAPPER = new ObjectMapper();
+    private static final Pattern THINK_PATTERN = Pattern.compile("^\\s*<think>(.*?)</think>\\s*", Pattern.DOTALL);
+    private static final String PENDING_USER_MESSAGE = "CamelOpenAIPendingUserMessage";
+
+    private Class<?> outputClassResolved;
+    private McpToolCallExecutor toolCallExecutor;
+    private final OpenAIToolSearch toolSearch;
+
+    public OpenAIProducer(OpenAIEndpoint endpoint) {
+        super(endpoint);
+        this.toolSearch = new OpenAIToolSearch(endpoint.getToolSearchSessions());
+    }
+
+    @Override
+    protected void doStart() throws Exception {
+        OpenAIConfiguration config = getEndpoint().getConfiguration();
+
+        toolCallExecutor = new McpToolCallExecutor(getEndpoint());
+        ServiceHelper.startService(toolCallExecutor);
+
+        if (ObjectHelper.isNotEmpty(config.getOutputClass())) {
+            outputClassResolved = getEndpoint().getCamelContext().getClassResolver()
+                    .resolveMandatoryClass(config.getOutputClass());
+        }
+
+        if (ObjectHelper.isNotEmpty(config.getJsonSchema())) {
+            String resolved = getEndpoint().getCamelContext().resolvePropertyPlaceholders(config.getJsonSchema());
+            String content = resolveResourceContent(resolved);
+            if (content != null) {
+                config.setJsonSchema(content);
+            } else {
+                config.setJsonSchema(resolved);
+            }
+        }
+
+        super.doStart();
+    }
+
+    @Override
+    protected void doStop() throws Exception {
+        ServiceHelper.stopService(toolCallExecutor);
+        super.doStop();
+    }
+
+    private String resolveResourceContent(String property) {
+        try (InputStream is = ResourceHelper.resolveResourceAsInputStream(getEndpoint().getCamelContext(), property)) {
+            if (is != null) {
+                return getEndpoint().getCamelContext().getTypeConverter().convertTo(String.class, is);
+            }
+        } catch (Exception e) {
+            // ignore and treat the value as inline content
+        }
+        return null;
+    }
+
+    @Override
+    public OpenAIEndpoint getEndpoint() {
+        return (OpenAIEndpoint) super.getEndpoint();
+    }
+
+    @Override
+    public boolean process(Exchange exchange, AsyncCallback callback) {
+        try {
+            processInternal(exchange);
+            callback.done(true);
+            return true;
+        } catch (Exception e) {
+            GenAiErrorSupport.apply(exchange, e);
+            exchange.setException(e);
+            callback.done(true);
+            return true;
+        }
+    }
+
+    private void processInternal(Exchange exchange) throws Exception {
+        OpenAIConfiguration config = getEndpoint().getConfiguration();
+        Message in = exchange.getIn();
+
+        // Resolve parameters from headers or configuration
+        String model = resolveParameter(in, OpenAIConstants.MODEL, config.getModel(), String.class);
+        if (model == null) {
+            throw new IllegalArgumentException("Model must be specified via model parameter or CamelOpenAIModel header");
+        }
+        Double temperature = resolveParameter(in, OpenAIConstants.TEMPERATURE, config.getTemperature(), Double.class);
+        Double topP = resolveParameter(in, OpenAIConstants.TOP_P, config.getTopP(), Double.class);
+        Integer maxTokens = resolveParameter(in, OpenAIConstants.MAX_TOKENS, config.getMaxTokens(), Integer.class);
+        Boolean streaming = resolveParameter(in, OpenAIConstants.STREAMING, config.isStreaming(), Boolean.class);
+        String outputClass = resolveParameter(in, OpenAIConstants.OUTPUT_CLASS, config.getOutputClass(), String.class);
+        String jsonSchema = resolveParameter(in, OpenAIConstants.JSON_SCHEMA, config.getJsonSchema(), String.class);
+
+        List<ChatCompletionMessageParam> messages = buildMessages(exchange, config);
+
+        ChatCompletionCreateParams.Builder paramsBuilder = ChatCompletionCreateParams.builder()
+                .model(model);
+
+        for (ChatCompletionMessageParam message : messages) {
+            paramsBuilder.addMessage(message);
+        }
+
+        if (temperature != null) {
+            paramsBuilder.temperature(temperature);
+        }
+        if (topP != null) {
+            paramsBuilder.topP(topP);
+        }
+        if (maxTokens != null) {
+            paramsBuilder.maxCompletionTokens(maxTokens.longValue());
+        }
+
+        // Structured output handling
+        if (ObjectHelper.isNotEmpty(outputClass)) {
+            Class<?> responseClass;
+            String headerOutputClass = in.getHeader(OpenAIConstants.OUTPUT_CLASS, String.class);
+            if (ObjectHelper.isNotEmpty(headerOutputClass)) {
+                responseClass = getEndpoint().getCamelContext().getClassResolver()
+                        .resolveMandatoryClass(headerOutputClass);
+            } else {
+                responseClass = outputClassResolved;
+            }
+            paramsBuilder.responseFormat(responseClass);
+        } else if (ObjectHelper.isNotEmpty(jsonSchema)) {
+            // Build OpenAI JSON schema response format from provided schema string
+            try {
+                ResponseFormatJsonSchema.JsonSchema.Schema schema = buildSchemaFromJson(jsonSchema);
+                ResponseFormatJsonSchema.JsonSchema jsonSchemaObj = ResponseFormatJsonSchema.JsonSchema.builder()
+                        .name("camel_schema")
+                        .schema(schema)
+                        .build();
+                paramsBuilder.responseFormat(
+                        ResponseFormatJsonSchema.builder()
+                                .jsonSchema(jsonSchemaObj)
+                                .build());
+            } catch (Exception e) {
+                throw new IllegalArgumentException("Invalid JSON schema content provided in header/option", e);
+            }
+        }
+
+        applyAdditionalBodyProperties(paramsBuilder, config);
+
+        // Add tools to the request. Search keeps the catalogue snapshot unchanged and only changes which definitions
+        // are advertised. MCP tools/list still ran when the snapshot was built.
+        List<ChatCompletionFunctionTool> mcpTools = getEndpoint().getMcpToolState().tools();
+        boolean hasMcpTools = mcpTools != null && !mcpTools.isEmpty();
+        boolean toolSearchEnabled = config.isToolSearch();
+        AiToolSearchSession previousSession = toolSearchEnabled
+                ? exchange.getProperty(OpenAIToolSearch.SESSION_PROPERTY, AiToolSearchSession.class)
+                : null;
+        if (toolSearchEnabled) {
+            toolSearch.openSession(exchange, config);
+        }
+        try {
+            if (toolSearchEnabled) {
+                AiToolSearchSession session = exchange.getProperty(
+                        OpenAIToolSearch.SESSION_PROPERTY, AiToolSearchSession.class);
+                for (ChatCompletionFunctionTool tool : OpenAIToolSearch.select(
+                        config, getEndpoint().getMcpToolState(), session)) {
+                    paramsBuilder.addTool(tool);
+                }
+            } else if (hasMcpTools) {
+                for (ChatCompletionFunctionTool tool : mcpTools) {
+                    paramsBuilder.addTool(tool);
+                }
+            }
+
+            ChatCompletionCreateParams params = paramsBuilder.build();
+
+            // Search installs a synthetic tool even when every real tool is omitted, so the agentic loop still runs.
+            boolean agenticTools = toolSearchEnabled || hasMcpTools;
+            if (Boolean.TRUE.equals(streaming) && agenticTools && config.isAutoToolExecution()) {
+                LOG.info("Streaming with MCP tools is not supported; falling back to non-streaming for the agentic loop");
+                processNonStreaming(exchange, params, config);
+            } else if (Boolean.TRUE.equals(streaming)) {
+                processStreaming(exchange, params);
+            } else {
+                processNonStreaming(exchange, params, config);
+            }
+        } finally {
+            if (toolSearchEnabled) {
+                if (previousSession != null) {
+                    // openSession may replace an exchange-local session with one from the shared registry.
+                    exchange.setProperty(OpenAIToolSearch.SESSION_PROPERTY, previousSession);
+                } else {
+                    toolSearch.closeSession(exchange, config);
+                }
+            }
+        }
+    }
+
+    private List<ChatCompletionMessageParam> buildMessages(Exchange exchange, OpenAIConfiguration config)
+            throws Exception {
+        Message in = exchange.getIn();
+        List<ChatCompletionMessageParam> messages = new ArrayList<>();
+
+        exchange.removeProperty(PENDING_USER_MESSAGE);
+
+        // If a system message is configured and conversation memory is enabled, reset
+        // history
+        if (ObjectHelper.isNotEmpty(config.getSystemMessage()) && config.isConversationMemory()) {
+            exchange.removeProperty(config.getConversationHistoryProperty());
+        }
+
+        String systemPrompt = in.getHeader(OpenAIConstants.SYSTEM_MESSAGE, String.class);
+        String developerPrompt = in.getHeader(OpenAIConstants.DEVELOPER_MESSAGE, String.class);
+        if ((systemPrompt == null || systemPrompt.isEmpty()) && ObjectHelper.isNotEmpty(config.getSystemMessage())) {
+            systemPrompt = config.getSystemMessage();
+        }
+        if ((developerPrompt == null || developerPrompt.isEmpty())
+                && ObjectHelper.isNotEmpty(config.getDeveloperMessage())) {
+            developerPrompt = config.getDeveloperMessage();
+        }
+
+        // Prepend system and developer messages when configured
+        if (ObjectHelper.isNotEmpty(systemPrompt)) {
+            messages.add(createSystemMessage(systemPrompt));
+        }
+        if (ObjectHelper.isNotEmpty(developerPrompt)) {
+            messages.add(createDeveloperMessage(developerPrompt));
+        }
+
+        addConversationHistory(messages, in, config);
+
+        ChatCompletionMessageParam userMessage = buildUserMessage(in, config);
+        if (userMessage != null) {
+            messages.add(userMessage);
+            if (config.isConversationMemory()) {
+                exchange.setProperty(PENDING_USER_MESSAGE, userMessage);
+            }
+        }
+
+        if (messages.isEmpty()) {
+            throw new IllegalArgumentException(
+                    "No input provided to LLM. At least one message (user, system, or developer) must be provided");
+        }
+
+        return messages;
+    }
+
+    private void addConversationHistory(
+            List<ChatCompletionMessageParam> messages, Message in,
+            OpenAIConfiguration config) {
+        if (!config.isConversationMemory()) {
+            return;
+        }
+
+        Exchange exchange = in.getExchange();
+        List<ChatCompletionMessageParam> history = exchange.getProperty(
+                config.getConversationHistoryProperty(),
+                List.class);
+        if (history != null) {
+            List<ChatCompletionMessageParam> trimmed = OpenAIConversationHistoryTrimmer.trim(history, config);
+            if (trimmed.size() != history.size()) {
+                exchange.setProperty(config.getConversationHistoryProperty(), trimmed);
+            }
+            messages.addAll(trimmed);
+        }
+    }
+
+    private ChatCompletionMessageParam buildUserMessage(Message in, OpenAIConfiguration config) throws Exception {
+        String userPrompt = in.getHeader(OpenAIConstants.USER_MESSAGE, String.class);
+        if ((userPrompt == null || userPrompt.isEmpty()) && ObjectHelper.isNotEmpty(config.getUserMessage())) {
+            userPrompt = config.getUserMessage();
+        }
+        return OpenAIChatCompletionMultimodalSupport.buildUserMessage(in, userPrompt);
+    }
+
+    private ChatCompletionMessageParam createSystemMessage(String text) {
+        return ChatCompletionMessageParam.ofSystem(
+                ChatCompletionSystemMessageParam.builder()
+                        .content(ChatCompletionSystemMessageParam.Content.ofText(text))
+                        .build());
+    }
+
+    private ChatCompletionMessageParam createDeveloperMessage(String text) {
+        return ChatCompletionMessageParam.ofDeveloper(
+                ChatCompletionDeveloperMessageParam.builder()
+                        .content(ChatCompletionDeveloperMessageParam.Content.ofText(text))
+                        .build());
+    }
+
+    private void processNonStreaming(Exchange exchange, ChatCompletionCreateParams params, OpenAIConfiguration config)
+            throws Exception {
+        List<ChatCompletionFunctionTool> mcpTools = getEndpoint().getMcpToolState().tools();
+        boolean hasMcpTools = mcpTools != null && !mcpTools.isEmpty();
+        boolean agenticTools = config.isToolSearch() || hasMcpTools;
+
+        if (!agenticTools || !config.isAutoToolExecution()) {
+            // Path A: No tools, or auto-execution disabled. Searchable tools are already omitted from params.
+            processNonStreamingSimple(exchange, params, config);
+        } else if (GenAiObservability.isLevel(exchange.getContext(), GenAiObservabilityLevel.DETAILED)) {
+            // Path B, observed as an agent run: each model call and tool call nests under one invoke_agent span
+            processObservedAgentic(exchange, params, config);
+        } else {
+            // Path B: tools with agentic loop, including a request whose only initial tool is tool search
+            processNonStreamingAgentic(exchange, params, config);
+        }
+    }
+
+    private void processObservedAgentic(
+            Exchange exchange, ChatCompletionCreateParams params, OpenAIConfiguration config)
+            throws Exception {
+        String routeId = ExchangeHelper.getAtRouteId(exchange);
+        GenAiObservation agentRun = GenAiObservability.start(exchange, GenAiObservationContext.builder()
+                .operationName(GenAiOperationName.INVOKE_AGENT)
+                .agentName(routeId != null ? routeId : "openai")
+                .system("openai")
+                .requestModel(params.model().toString())
+                .conversationId(exchange.getMessage().getHeader(OpenAIConstants.CONVERSATION_ID))
+                .componentScheme("openai")
+                .build());
+        agentRun.recordInputMessages(() -> OpenAIGenAiMessages.input(params));
+        try {
+            processNonStreamingAgentic(exchange, params, config);
+            // the model calls carry the token usage; repeating it on the run would count it twice
+            agentRun.recordSuccess(GenAiUsage.of((Long) null, null,
+                    exchange.getMessage().getHeader(OpenAIConstants.FINISH_REASON, String.class), null));
+            agentRun.recordOutputMessages(() -> new GenAiMessages().text(GenAiMessages.ASSISTANT,
+                    exchange.getMessage().getBody(String.class)));
+        } catch (Exception e) {
+            agentRun.recordError(e);
+            throw e;
+        } finally {
+            agentRun.close();
+        }
+    }
+
+    private void processNonStreamingSimple(
+            Exchange exchange, ChatCompletionCreateParams params, OpenAIConfiguration config)
+            throws Exception {
+        ChatCompletion response = createChatCompletion(exchange, params);
+        if (config.isStoreFullResponse()) {
+            exchange.setProperty(OpenAIConstants.RESPONSE, response);
+        }
+
+        ChatCompletion.Choice choice = requireFirstChoice(exchange, response);
+        if (isToolCallsFinishReason(choice)) {
+            exchange.getMessage().setBody(choice.message().toolCalls());
+        } else {
+            String content = choice.message().content().orElse("");
+            content = processThinkingContent(exchange, content, config);
+            exchange.getMessage().setBody(content);
+            extractReasoningContent(exchange, choice.message());
+            extractAdditionalResponseHeaders(exchange, choice.message());
+        }
+        setResponseHeaders(exchange.getMessage(), response);
+        updateConversationHistory(exchange, params, response);
+    }
+
+    private void processNonStreamingAgentic(
+            Exchange exchange, ChatCompletionCreateParams params, OpenAIConfiguration config)
+            throws Exception {
+
+        int maxIterations = config.getMaxToolIterations();
+        LOG.debug("Starting agentic loop with maxToolIterations={}, available tools: {}", maxIterations,
+                getEndpoint().getMcpToolState().knownToolNames());
+
+        // Rebuild the builder from the immutable params so we can accumulate messages
+        ChatCompletionCreateParams.Builder paramsBuilder = params.toBuilder();
+
+        List<ChatCompletionMessageParam> agenticMessages = new ArrayList<>();
+        List<String> toolCallsLog = new ArrayList<>();
+        OpenAIAgenticTokenTracker tokenTracker = new OpenAIAgenticTokenTracker();
+        OpenAIAgenticObservability observability = new OpenAIAgenticObservability(exchange);
+        observability.onLoopStarted(getEndpoint().getMcpToolState().knownToolNames().size(), maxIterations);
+        int iteration = 0;
+        int modelCall = 0;
+        String stopReason = "unknown";
+
+        try {
+            while (iteration < maxIterations) {
+                modelCall++;
+                long iterationStartNanos = System.nanoTime();
+                OpenAIAgenticTokenTracker.Snapshot tokensBefore = tokenTracker.snapshot();
+
+                if (config.isToolSearch()) {
+                    AiToolSearchSession session = exchange.getProperty(
+                            OpenAIToolSearch.SESSION_PROPERTY, AiToolSearchSession.class);
+                    if (session == null) {
+                        session = toolSearch.openSession(exchange, config);
+                    }
+                    paramsBuilder.tools(toolSearch.toolsFor(getEndpoint(), session));
+                }
+
+                ChatCompletion response = createChatCompletion(exchange, paramsBuilder.build());
+                tokenTracker.addUsage(response);
+                tokenTracker.setHeaders(exchange.getMessage());
+
+                long iterationPromptTokens = tokenTracker.promptTokensSince(tokensBefore);
+                long iterationCompletionTokens = tokenTracker.completionTokensSince(tokensBefore);
+
+                ChatCompletion.Choice choice = requireFirstChoice(exchange, response);
+
+                if (!isToolCallsFinishReason(choice)) {
+                    // Final LLM response
+                    LOG.debug("Agentic loop completed after {} iterations, finish reason: {}", iteration,
+                            getFinishReasonString(choice));
+                    stopReason = getFinishReasonString(choice);
+                    observability.recordFinalIteration(
+                            modelCall, iterationStartNanos, iterationPromptTokens, iterationCompletionTokens);
+                    observability.onLoopCompleted(iteration, tokenTracker, stopReason);
+                    String content = choice.message().content().orElse("");
+                    content = processThinkingContent(exchange, content, config);
+                    exchange.getMessage().setBody(content);
+                    extractReasoningContent(exchange, choice.message());
+                    extractAdditionalResponseHeaders(exchange, choice.message());
+                    setResponseHeaders(exchange.getMessage(), response);
+                    exchange.getMessage().setHeader(OpenAIConstants.TOOL_ITERATIONS, iteration);
+                    exchange.getMessage().setHeader(OpenAIConstants.MCP_TOOL_CALLS, toolCallsLog);
+                    exchange.getMessage().setHeader(OpenAIConstants.MCP_RETURN_DIRECT, false);
+                    if (config.isStoreFullResponse()) {
+                        exchange.setProperty(OpenAIConstants.RESPONSE, response);
+                    }
+                    updateConversationHistory(exchange, agenticMessages, response);
+                    return;
+                }
+
+                if (tokenTracker.exceedsBudget(config.getMaxAgenticTokens())) {
+                    observability.recordFinalIteration(
+                            modelCall, iterationStartNanos, iterationPromptTokens, iterationCompletionTokens);
+                    stopReason = "token_budget_exceeded";
+                    throw new IllegalStateException(
+                            "Max agentic tokens (%d) exceeded at iteration %d. Cumulative usage: prompt=%d, completion=%d, total=%d"
+                                    .formatted(config.getMaxAgenticTokens(), iteration, tokenTracker.getPromptTokens(),
+                                            tokenTracker.getCompletionTokens(), tokenTracker.getTotalTokens()));
+                }
+
+                iteration++;
+                LOG.debug("Iteration {}: model requested {} tool call(s)", iteration,
+                        choice.message().toolCalls().map(List::size).orElse(0));
+
+                // Add assistant message with tool_calls to conversation
+                ChatCompletionMessage assistantMsg = choice.message();
+                List<ChatCompletionMessageToolCall> toolCalls = assistantMsg.toolCalls().orElse(List.of());
+                ChatCompletionMessageParam assistantParam = ChatCompletionMessageParam.ofAssistant(
+                        ChatCompletionAssistantMessageParam.builder()
+                                .toolCalls(toolCalls)
+                                .build());
+                paramsBuilder.addMessage(assistantParam);
+                agenticMessages.add(assistantParam);
+
+                // Record the requested tools up front so the log keeps the model's ordering regardless of
+                // whether the batch is executed sequentially or in parallel
+                for (ChatCompletionMessageToolCall toolCall : toolCalls) {
+                    toolCallsLog.add(toolCall.asFunction().function().name());
+                }
+
+                // Execute all tool calls in this batch
+                List<McpToolCallExecutor.ToolResult> batchResults = config.isToolSearch()
+                        ? toolCallExecutor.execute(toolCalls, exchange,
+                                call -> toolSearch.execute(getEndpoint(), call, exchange),
+                                null)
+                        : toolCallExecutor.execute(toolCalls, exchange);
+                observability.recordIteration(
+                        modelCall, iterationStartNanos, iterationPromptTokens, iterationCompletionTokens, toolCalls,
+                        batchResults);
+                boolean allReturnDirect = batchResults.stream().allMatch(McpToolCallExecutor.ToolResult::returnDirect);
+
+                // returnDirect check: if ALL tools in this batch are returnDirect, short-circuit
+                if (allReturnDirect && !batchResults.isEmpty()) {
+                    LOG.debug("All tools in batch have returnDirect=true, short-circuiting agentic loop");
+                    String directResult = batchResults.stream()
+                            .map(McpToolCallExecutor.ToolResult::content)
+                            .collect(Collectors.joining("\n"));
+
+                    exchange.getMessage().setBody(directResult);
+                    setResponseHeaders(exchange.getMessage(), response);
+                    exchange.getMessage().setHeader(OpenAIConstants.TOOL_ITERATIONS, iteration);
+                    exchange.getMessage().setHeader(OpenAIConstants.MCP_TOOL_CALLS, toolCallsLog);
+                    exchange.getMessage().setHeader(OpenAIConstants.MCP_RETURN_DIRECT, true);
+                    stopReason = "return_direct";
+                    observability.onLoopCompleted(iteration, tokenTracker, stopReason);
+                    updateConversationHistory(exchange, agenticMessages, directResult);
+                    return;
+                }
+
+                // Normal path: feed tool results back to LLM
+                LOG.debug("Feeding {} tool result(s) back to the model", batchResults.size());
+                for (McpToolCallExecutor.ToolResult entry : batchResults) {
+                    ChatCompletionMessageParam toolMsg = ChatCompletionMessageParam.ofTool(
+                            ChatCompletionToolMessageParam.builder()
+                                    .toolCallId(entry.toolCallId())
+                                    .content(entry.content())
+                                    .build());
+                    paramsBuilder.addMessage(toolMsg);
+                    agenticMessages.add(toolMsg);
+                }
+            }
+
+            stopReason = "max_iterations_exceeded";
+            observability.onLoopCompleted(maxIterations, tokenTracker, stopReason);
+            throw new IllegalStateException(
+                    "Max tool iterations (%d) exceeded. Tools called: %s".formatted(maxIterations, toolCallsLog));
+        } catch (IllegalStateException e) {
+            if ("unknown".equals(stopReason)) {
+                stopReason = "error";
+            }
+            throw e;
+        } catch (Exception e) {
+            stopReason = "error";
+            throw e;
+        } finally {
+            observability.finalizeObservability(tokenTracker, iteration, stopReason);
+        }
+    }
+
+    private void processStreaming(Exchange exchange, ChatCompletionCreateParams params) {
+        String requestModel = params.model().toString();
+        ChatCompletionCreateParams.Builder streamingBuilder = params.toBuilder();
+        if (GenAiObservability.isEnabled(exchange.getContext())) {
+            streamingBuilder.streamOptions(ChatCompletionStreamOptions.builder().includeUsage(true).build());
+        }
+        ChatCompletionCreateParams streamingParams = streamingBuilder.build();
+        GenAiObservationContext observationContext = GenAiObservationContext.builder()
+                .operationName(GenAiOperationName.CHAT)
+                .system("openai")
+                .requestModel(requestModel)
+                .componentScheme("openai")
+                .tracedByFramework(OpenAIClientTracing.tracedByOpenTelemetry(exchange.getContext(), getEndpoint().getClient()))
+                .build();
+        GenAiObservation observation = GenAiObservability.start(exchange, observationContext);
+
+        StreamResponse<ChatCompletionChunk> streamResponse;
+        try {
+            // NOTE: the stream is going to be closed after the exchange completes.
+            streamResponse = getEndpoint().getClient().chat().completions() // NOSONAR
+                    .createStreaming(streamingParams);
+        } catch (RuntimeException e) {
+            GenAiErrorSupport.apply(exchange, e);
+            observation.recordError(e);
+            observation.close();
+            throw e;
+        }
+
+        AtomicReference<CompletionUsage> usageRef = new AtomicReference<>();
+        AtomicReference<String> responseModelRef = new AtomicReference<>();
+        Iterator<ChatCompletionChunk> delegate = streamResponse.stream().iterator();
+        Iterator<ChatCompletionChunk> it = new Iterator<>() {
+            @Override
+            public boolean hasNext() {
+                try {
+                    return delegate.hasNext();
+                } catch (RuntimeException e) {
+                    GenAiErrorSupport.apply(exchange, e);
+                    throw e;
+                }
+            }
+
+            @Override
+            public ChatCompletionChunk next() {
+                try {
+                    ChatCompletionChunk chunk = delegate.next();
+                    chunk.usage().ifPresent(usageRef::set);
+                    if (chunk.model() != null && !chunk.model().isBlank()) {
+                        responseModelRef.set(chunk.model());
+                    }
+                    return chunk;
+                } catch (RuntimeException e) {
+                    GenAiErrorSupport.apply(exchange, e);
+                    throw e;
+                }
+            }
+        };
+
+        // hand Camel an Iterator for streaming EIPs (split, recipientList, etc.)
+        exchange.getMessage().setBody(it);
+
+        // ensure resp.close() after the Exchange completes (success or failure)
+        exchange.getUnitOfWork().addSynchronization(new Synchronization() {
+            @Override
+            public void onComplete(Exchange e) {
+                CompletionUsage usage = usageRef.get();
+                String responseModel = responseModelRef.get() != null ? responseModelRef.get() : requestModel;
+                observation.recordSuccess(GenAiUsage.of(
+                        usage != null ? usage.promptTokens() : null,
+                        usage != null ? usage.completionTokens() : null,
+                        null,
+                        responseModel));
+                observation.close();
+                safeClose();
+            }
+
+            @Override
+            public void onFailure(Exchange e) {
+                if (e.getException() != null) {
+                    GenAiErrorSupport.apply(e, e.getException());
+                    observation.recordError(e.getException());
+                }
+                observation.close();
+                safeClose();
+            }
+
+            private void safeClose() {
+                try {
+                    streamResponse.close();
+                } catch (Exception ignore) {
+                    LOG.warn("An error happened while processing streaming: ignoring", ignore);
+                }
+            }
+        });
+
+    }
+
+    private static ChatCompletion.Choice requireFirstChoice(Exchange exchange, ChatCompletion response)
+            throws CamelExchangeException {
+        if (response.choices().isEmpty()) {
+            throw new CamelExchangeException("OpenAI response contained no choices", exchange);
+        }
+        return response.choices().get(0);
+    }
+
+    private static boolean isToolCallsFinishReason(ChatCompletion.Choice choice) {
+        JsonField<ChatCompletion.Choice.FinishReason> field = choice._finishReason();
+        return field.asKnown()
+                .map(r -> r.equals(ChatCompletion.Choice.FinishReason.TOOL_CALLS))
+                .orElse(false);
+    }
+
+    private static String getFinishReasonString(ChatCompletion.Choice choice) {
+        JsonField<ChatCompletion.Choice.FinishReason> field = choice._finishReason();
+        return field.asKnown()
+                .map(ChatCompletion.Choice.FinishReason::toString)
+                .orElse("stop");
+    }
+
+    private ChatCompletion createChatCompletion(Exchange exchange, ChatCompletionCreateParams params) {
+        String requestModel = params.model().toString();
+        GenAiObservationContext observationContext = GenAiObservationContext.builder()
+                .operationName(GenAiOperationName.CHAT)
+                .system("openai")
+                .requestModel(requestModel)
+                .componentScheme("openai")
+                .conversationId(exchange.getMessage().getHeader(OpenAIConstants.CONVERSATION_ID))
+                .requestParameter("temperature", params.temperature().orElse(null))
+                .requestParameter("top_p", params.topP().orElse(null))
+                .requestParameter("max_tokens", params.maxCompletionTokens().orElse(null))
+                .tracedByFramework(OpenAIClientTracing.tracedByOpenTelemetry(exchange.getContext(), getEndpoint().getClient()))
+                .build();
+        GenAiObservation observation = GenAiObservability.start(exchange, observationContext);
+        observation.recordInputMessages(() -> OpenAIGenAiMessages.input(params));
+        observation.recordToolDefinitions(() -> OpenAIGenAiMessages.toolDefinitions(params));
+        try {
+            ChatCompletion response = getEndpoint().getClient().chat().completions().create(params);
+            CompletionUsage usage = response.usage().orElse(null);
+            String finishReason = response.choices().isEmpty() ? null : getFinishReasonString(response.choices().get(0));
+            observation.recordSuccess(GenAiUsage.of(
+                    usage != null ? usage.promptTokens() : null,
+                    usage != null ? usage.completionTokens() : null,
+                    finishReason,
+                    response.model()));
+            if (usage != null) {
+                observation.recordCachedInputTokens(
+                        usage.promptTokensDetails().flatMap(CompletionUsage.PromptTokensDetails::cachedTokens).orElse(null));
+            }
+            observation.recordOutputMessages(() -> OpenAIGenAiMessages.output(response, finishReason));
+            return response;
+        } catch (RuntimeException e) {
+            GenAiErrorSupport.apply(exchange, e);
+            observation.recordError(e);
+            throw e;
+        } finally {
+            observation.close();
+        }
+    }
+
+    private void setResponseHeaders(Message message, ChatCompletion response) {
+        message.setHeader(OpenAIConstants.RESPONSE_ID, response.id());
+        message.setHeader(OpenAIConstants.RESPONSE_MODEL, response.model());
+
+        if (!response.choices().isEmpty()) {
+            ChatCompletion.Choice choice = response.choices().get(0);
+            message.setHeader(OpenAIConstants.FINISH_REASON, getFinishReasonString(choice));
+        }
+
+        if (response.usage().isPresent()) {
+            CompletionUsage usage = response.usage().get();
+            message.setHeader(OpenAIConstants.PROMPT_TOKENS, usage.promptTokens());
+            message.setHeader(OpenAIConstants.COMPLETION_TOKENS, usage.completionTokens());
+            message.setHeader(OpenAIConstants.TOTAL_TOKENS, usage.totalTokens());
+        }
+    }
+
+    private void appendPendingUserMessageToHistory(Exchange exchange, List<ChatCompletionMessageParam> history) {
+        ChatCompletionMessageParam pendingUserMessage
+                = exchange.getProperty(PENDING_USER_MESSAGE, ChatCompletionMessageParam.class);
+        if (pendingUserMessage != null) {
+            history.add(pendingUserMessage);
+            exchange.removeProperty(PENDING_USER_MESSAGE);
+        }
+    }
+
+    private void updateConversationHistory(
+            Exchange exchange, ChatCompletionCreateParams params,
+            ChatCompletion response) {
+        OpenAIConfiguration config = getEndpoint().getConfiguration();
+        if (!config.isConversationMemory()) {
+            return;
+        }
+
+        List<ChatCompletionMessageParam> history = exchange.getProperty(
+                config.getConversationHistoryProperty(),
+                List.class);
+
+        if (history == null) {
+            history = new ArrayList<>();
+        }
+
+        appendPendingUserMessageToHistory(exchange, history);
+
+        // Add assistant response to history
+        String assistantContent = response.choices().get(0).message().content().orElse("");
+        ChatCompletionMessageParam assistantMessage = ChatCompletionMessageParam.ofAssistant(
+                ChatCompletionAssistantMessageParam.builder()
+                        .content(ChatCompletionAssistantMessageParam.Content.ofText(assistantContent))
+                        .build());
+
+        history.add(assistantMessage);
+        exchange.setProperty(config.getConversationHistoryProperty(),
+                OpenAIConversationHistoryTrimmer.trim(history, config));
+    }
+
+    private void updateConversationHistory(
+            Exchange exchange, List<ChatCompletionMessageParam> agenticMessages,
+            ChatCompletion response) {
+        OpenAIConfiguration config = getEndpoint().getConfiguration();
+        if (!config.isConversationMemory()) {
+            return;
+        }
+
+        List<ChatCompletionMessageParam> history = exchange.getProperty(
+                config.getConversationHistoryProperty(),
+                List.class);
+
+        if (history == null) {
+            history = new ArrayList<>();
+        }
+
+        appendPendingUserMessageToHistory(exchange, history);
+
+        // Add all intermediate agentic messages (assistant+toolCalls, tool responses)
+        history.addAll(agenticMessages);
+
+        // Add final assistant response
+        String assistantContent = response.choices().get(0).message().content().orElse("");
+        ChatCompletionMessageParam assistantMessage = ChatCompletionMessageParam.ofAssistant(
+                ChatCompletionAssistantMessageParam.builder()
+                        .content(ChatCompletionAssistantMessageParam.Content.ofText(assistantContent))
+                        .build());
+        history.add(assistantMessage);
+
+        List<ChatCompletionMessageParam> trimmed = OpenAIConversationHistoryTrimmer.trim(history, config);
+        exchange.setProperty(config.getConversationHistoryProperty(), trimmed);
+        LOG.debug("Updated conversation history with {} agentic messages + final response, total entries: {}",
+                agenticMessages.size(), trimmed.size());
+    }
+
+    private void updateConversationHistory(
+            Exchange exchange, List<ChatCompletionMessageParam> agenticMessages,
+            String directResult) {
+        OpenAIConfiguration config = getEndpoint().getConfiguration();
+        if (!config.isConversationMemory()) {
+            return;
+        }
+
+        List<ChatCompletionMessageParam> history = exchange.getProperty(
+                config.getConversationHistoryProperty(),
+                List.class);
+
+        if (history == null) {
+            history = new ArrayList<>();
+        }
+
+        appendPendingUserMessageToHistory(exchange, history);
+
+        // Add all intermediate agentic messages
+        history.addAll(agenticMessages);
+
+        // Add a synthetic assistant message with the direct tool result
+        ChatCompletionMessageParam assistantMessage = ChatCompletionMessageParam.ofAssistant(
+                ChatCompletionAssistantMessageParam.builder()
+                        .content(ChatCompletionAssistantMessageParam.Content.ofText(directResult))
+                        .build());
+        history.add(assistantMessage);
+
+        List<ChatCompletionMessageParam> trimmed = OpenAIConversationHistoryTrimmer.trim(history, config);
+        exchange.setProperty(config.getConversationHistoryProperty(), trimmed);
+        LOG.debug("Updated conversation history with {} agentic messages + returnDirect result, total entries: {}",
+                agenticMessages.size(), trimmed.size());
+    }
+
+    private ResponseFormatJsonSchema.JsonSchema.Schema buildSchemaFromJson(String jsonSchemaString) throws Exception {
+        Map<String, Object> root = OBJECT_MAPPER.readValue(jsonSchemaString, Map.class);
+        if (root == null) {
+            throw new IllegalArgumentException("JSON schema string parsed to null");
+        }
+        if (!(root instanceof Map)) {
+            throw new IllegalArgumentException("JSON schema must be a JSON object at the root");
+        }
+        ResponseFormatJsonSchema.JsonSchema.Schema.Builder sb = ResponseFormatJsonSchema.JsonSchema.Schema.builder();
+        for (Map.Entry<String, Object> e : root.entrySet()) {
+            sb.putAdditionalProperty(e.getKey(), JsonValue.from(e.getValue()));
+        }
+        return sb.build();
+    }
+
+    private void applyAdditionalBodyProperties(ChatCompletionCreateParams.Builder paramsBuilder, OpenAIConfiguration config) {
+        Map<String, Object> additional = config.getAdditionalBodyProperty();
+        if (additional == null || additional.isEmpty()) {
+            return;
+        }
+
+        for (Map.Entry<String, Object> e : additional.entrySet()) {
+            String key = e.getKey();
+            Object rawValue = e.getValue();
+            Object valueToUse = rawValue;
+            if (rawValue instanceof String s) {
+                valueToUse = parseJsonOrString(s);
+            }
+
+            paramsBuilder.putAdditionalBodyProperty(key, JsonValue.from((Object) valueToUse));
+        }
+    }
+
+    private Object parseJsonOrString(String value) {
+        try {
+            return OBJECT_MAPPER.readValue(value, Object.class);
+        } catch (Exception e) {
+            // treat as literal string
+            return value;
+        }
+    }
+
+    private void extractReasoningContent(Exchange exchange, ChatCompletionMessage message) {
+        Map<String, JsonValue> additional = message._additionalProperties();
+        JsonValue reasoningValue = additional.get("reasoning_content");
+        if (reasoningValue != null) {
+            String reasoning = (String) reasoningValue.asString().orElse(null);
+            if (reasoning != null && !reasoning.isEmpty()) {
+                exchange.getMessage().setHeader(OpenAIConstants.REASONING_CONTENT, reasoning);
+            }
+        }
+    }
+
+    private void extractAdditionalResponseHeaders(Exchange exchange, ChatCompletionMessage message) {
+        OpenAIConfiguration config = getEndpoint().getConfiguration();
+        Map<String, Object> mapping = config.getAdditionalResponseHeader();
+        if (mapping == null || mapping.isEmpty()) {
+            return;
+        }
+
+        Map<String, JsonValue> additional = message._additionalProperties();
+        for (Map.Entry<String, Object> entry : mapping.entrySet()) {
+            String responseField = entry.getKey();
+            String headerName = String.valueOf(entry.getValue());
+            JsonValue value = additional.get(responseField);
+            if (value != null) {
+                String strValue = (String) value.asString().orElse(null);
+                if (strValue != null) {
+                    exchange.getMessage().setHeader(headerName, strValue);
+                } else {
+                    exchange.getMessage().setHeader(headerName, value.toString());
+                }
+            }
+        }
+    }
+
+    private String processThinkingContent(Exchange exchange, String content, OpenAIConfiguration config) {
+        Boolean strip = resolveParameter(
+                exchange.getIn(), OpenAIConstants.STRIP_THINKING, config.isStripThinking(), Boolean.class);
+        if (!Boolean.TRUE.equals(strip)) {
+            return content;
+        }
+        Matcher matcher = THINK_PATTERN.matcher(content);
+        if (matcher.find()) {
+            String thinking = matcher.group(1).trim();
+            if (!thinking.isEmpty()) {
+                exchange.getMessage().setHeader(OpenAIConstants.THINKING_CONTENT, thinking);
+            }
+            return matcher.replaceFirst("").trim();
+        }
+        return content;
+    }
+
+    private <T> T resolveParameter(Message message, String headerName, T defaultValue, Class<T> type) {
+        T headerValue = message.getHeader(headerName, type);
+        return ObjectHelper.isNotEmpty(headerValue) ? headerValue : defaultValue;
+    }
+
+}

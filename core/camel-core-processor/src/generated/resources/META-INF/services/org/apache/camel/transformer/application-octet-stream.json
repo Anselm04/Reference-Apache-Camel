@@ -1,0 +1,34 @@
+{
+  "transformer": {
+    "kind": "transformer",
+    "name": "application-octet-stream",
+    "title": "Application Octet Stream",
+    "deprecated": false,
+    "javaType": "org.apache.camel.processor.transformer.ByteArrayDataTypeTransformer",
+    "groupId": "org.apache.camel",
+    "artifactId": "camel-core-processor",
+    "version": "4.24.0-SNAPSHOT"
+  },
+  "bodyTypes": {
+    "transformerIn": {
+      "carriers": [
+        "text",
+        "bytes",
+        "stream",
+        "file",
+        "null"
+      ],
+      "description": "A body Camel can convert to a byte array: a number fails, and a null body stays null"
+    },
+    "transformerOut": {
+      "carriers": [
+        "bytes",
+        "stream",
+        "file",
+        "null"
+      ],
+      "description": "A stream cache or a file body is kept as it is and a null body stays null; any other body becomes a byte array"
+    }
+  }
+}
+

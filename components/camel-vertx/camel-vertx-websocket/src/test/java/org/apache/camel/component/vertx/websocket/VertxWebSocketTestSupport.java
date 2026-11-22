@@ -1,0 +1,178 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.camel.component.vertx.websocket;
+
+import java.util.Map;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
+import java.util.function.Consumer;
+
+import io.vertx.core.Handler;
+import io.vertx.core.Vertx;
+import io.vertx.core.VertxException;
+import io.vertx.core.VertxOptions;
+import io.vertx.core.http.ServerWebSocket;
+import io.vertx.core.http.WebSocket;
+import io.vertx.core.http.WebSocketClient;
+import io.vertx.core.internal.VertxInternal;
+import io.vertx.core.internal.threadchecker.BlockedThreadEvent;
+import io.vertx.ext.web.Route;
+import io.vertx.ext.web.Router;
+import io.vertx.ext.web.RoutingContext;
+import org.apache.camel.test.AvailablePortFinder;
+import org.apache.camel.test.junit6.CamelTestSupport;
+import org.junit.jupiter.api.Order;
+import org.junit.jupiter.api.extension.AfterEachCallback;
+import org.junit.jupiter.api.extension.RegisterExtension;
+
+import static org.awaitility.Awaitility.await;
+import static org.junit.jupiter.api.Assertions.assertEquals;
+
+public class VertxWebSocketTestSupport extends CamelTestSupport {
+
+    @RegisterExtension
+    AvailablePortFinder.Port port = AvailablePortFinder.find();
+    @RegisterExtension
+    AvailablePortFinder.Port port2 = AvailablePortFinder.find();
+
+    // Registered before the extension that stops the CamelContext (order 1), so that its after each callback runs once
+    // the CamelContext is stopped: the routes may use a router created with the client Vert.x
+    @RegisterExtension
+    @Order(0)
+    AfterEachCallback clientVertxCloser = extensionContext -> closeClientVertx();
+
+    private Vertx clientVertx;
+    private WebSocketClient webSocketClient;
+
+    /**
+     * Returns the randomized port used for the Vert.x server if no port was provided to the consumer.
+     */
+    public int getVertxServerRandomPort() {
+        VertxWebsocketComponent component = context.getComponent("vertx-websocket", VertxWebsocketComponent.class);
+        Map<VertxWebsocketHostKey, VertxWebsocketHost> registry = component.getVertxHostRegistry();
+        return registry.values()
+                .stream()
+                .filter(wsHost -> wsHost.getPort() != port.getPort())
+                .filter(wsHost -> wsHost.getPort() != port2.getPort())
+                .findFirst()
+                .get()
+                .getPort();
+    }
+
+    public WebSocket openWebSocketConnection(String host, int port, String path, Consumer<String> handler) throws Exception {
+        CompletableFuture<WebSocket> future = getWebSocketClient().connect(port, host, path)
+                .toCompletionStage()
+                .toCompletableFuture();
+        WebSocket webSocket = future.get(5, TimeUnit.SECONDS);
+        webSocket.textMessageHandler(handler::accept);
+        return webSocket;
+    }
+
+    /**
+     * The Vert.x instance used by the test for its clients and routers, closed at the end of the test.
+     */
+    private synchronized Vertx getClientVertx() {
+        if (clientVertx == null) {
+            clientVertx = Vertx.vertx();
+        }
+        return clientVertx;
+    }
+
+    /**
+     * The client is kept until the end of the test, as a Vert.x WebSocket client that is garbage collected closes its
+     * WebSockets.
+     */
+    private synchronized WebSocketClient getWebSocketClient() {
+        if (webSocketClient == null) {
+            webSocketClient = getClientVertx().createWebSocketClient();
+        }
+        return webSocketClient;
+    }
+
+    private synchronized void closeClientVertx() throws Exception {
+        if (clientVertx != null) {
+            clientVertx.close().toCompletionStage().toCompletableFuture().get(10, TimeUnit.SECONDS);
+            clientVertx = null;
+            webSocketClient = null;
+        }
+    }
+
+    /**
+     * Waits for the given endpoint to have registered the expected number of connected peers.
+     * <p>
+     * {@link #openWebSocketConnection(String, int, String, Consumer)} returns as soon as the client side of the
+     * handshake completes, which can happen before the server side consumer has registered the peer. Asserting the peer
+     * count immediately after opening the connections is therefore racy.
+     */
+    public Map<String, ServerWebSocket> awaitConnectedPeers(VertxWebsocketEndpoint endpoint, int expectedPeerCount) {
+        await().atMost(10, TimeUnit.SECONDS)
+                .untilAsserted(() -> assertEquals(expectedPeerCount, endpoint.findPeersForHostPort().size()));
+        return endpoint.findPeersForHostPort();
+    }
+
+    public Router createRouter(String path, CountDownLatch latch) {
+        return createRouter(path, null, latch);
+    }
+
+    public Router createRouter(String path, Handler<RoutingContext> handler, CountDownLatch latch) {
+        Router router = Router.router(getClientVertx());
+        Route route = router.route(path);
+
+        if (handler == null) {
+            handler = (RoutingContext ctx) -> ctx.request().toWebSocket()
+                    .onSuccess(webSocket -> webSocket.textMessageHandler(message -> {
+                        webSocket.writeTextMessage("Hello world");
+                        latch.countDown();
+                    }));
+        }
+
+        route.handler(handler);
+        return router;
+    }
+
+    public Vertx createVertxWithThreadBlockedHandler(Handler<BlockedThreadEvent> handler) {
+        VertxOptions vertxOptions = new VertxOptions();
+        vertxOptions.setMaxEventLoopExecuteTime(500);
+        vertxOptions.setMaxEventLoopExecuteTimeUnit(TimeUnit.MILLISECONDS);
+        vertxOptions.setBlockedThreadCheckInterval(10);
+        vertxOptions.setBlockedThreadCheckIntervalUnit(TimeUnit.MILLISECONDS);
+        Vertx vertx = Vertx.vertx(vertxOptions);
+        ((VertxInternal) vertx).blockedThreadChecker().setThreadBlockedHandler(handler);
+        return vertx;
+    }
+
+    static class BlockedThreadReporter implements Handler<BlockedThreadEvent> {
+        private boolean eventLoopBlocked;
+
+        @Override
+        public void handle(BlockedThreadEvent event) {
+            VertxException stackTrace = new VertxException("Thread blocked");
+            stackTrace.setStackTrace(event.thread().getStackTrace());
+            stackTrace.printStackTrace();
+            eventLoopBlocked = true;
+        }
+
+        public boolean isEventLoopBlocked() {
+            return eventLoopBlocked;
+        }
+
+        public void reset() {
+            eventLoopBlocked = false;
+        }
+    }
+}

@@ -1,0 +1,173 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.camel.component.pqc.lifecycle;
+
+import java.security.KeyPair;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
+import java.security.PublicKey;
+import java.time.Duration;
+import java.util.HexFormat;
+import java.util.List;
+
+/**
+ * Interface for managing the lifecycle of PQC keys including generation, rotation, and expiration.
+ */
+public interface KeyLifecycleManager {
+
+    /**
+     * Generate a new key pair for the specified algorithm
+     */
+    KeyPair generateKeyPair(String algorithm, String keyId) throws Exception;
+
+    /**
+     * Generate a key pair with specific parameters
+     */
+    KeyPair generateKeyPair(String algorithm, String keyId, Object parameterSpec) throws Exception;
+
+    /**
+     * Export a key pair to the specified format
+     */
+    byte[] exportKey(KeyPair keyPair, KeyFormat format, boolean includePrivate) throws Exception;
+
+    /**
+     * Export public key only
+     */
+    byte[] exportPublicKey(KeyPair keyPair, KeyFormat format) throws Exception;
+
+    /**
+     * Import a key pair from bytes
+     */
+    KeyPair importKey(byte[] keyData, KeyFormat format, String algorithm) throws Exception;
+
+    /**
+     * Rotate a key - generates new key and deprecates old one
+     */
+    KeyPair rotateKey(String oldKeyId, String newKeyId, String algorithm) throws Exception;
+
+    /**
+     * Store key pair with metadata
+     */
+    void storeKey(String keyId, KeyPair keyPair, KeyMetadata metadata) throws Exception;
+
+    /**
+     * Retrieve key pair by ID
+     */
+    KeyPair getKey(String keyId) throws Exception;
+
+    /**
+     * Get key metadata
+     */
+    KeyMetadata getKeyMetadata(String keyId) throws Exception;
+
+    /**
+     * Update key metadata
+     */
+    void updateKeyMetadata(String keyId, KeyMetadata metadata) throws Exception;
+
+    /**
+     * Delete key
+     */
+    void deleteKey(String keyId) throws Exception;
+
+    /**
+     * List all keys
+     */
+    List<KeyMetadata> listKeys() throws Exception;
+
+    /**
+     * Check if a key needs rotation based on age or usage
+     */
+    boolean needsRotation(String keyId, Duration maxAge, long maxUsage) throws Exception;
+
+    /**
+     * Mark a key as expired
+     */
+    void expireKey(String keyId) throws Exception;
+
+    /**
+     * Mark a key as revoked
+     */
+    void revokeKey(String keyId, String reason) throws Exception;
+
+    /**
+     * Claims a stateful signature key (XMSS, XMSSMT, LMS, HSS) for this process.
+     * <p/>
+     * These are one-time-signature schemes: signing twice from the same index breaks the key. A store that several
+     * processes read from - a shared directory, a vault - hands the same key, at the same index, to each of them, and
+     * each advances its own copy. The claim is what keeps a key to a single owner.
+     * <p/>
+     * The claim is on the key material, identified by its public key (see {@link #fingerprint(PublicKey)}), not on the
+     * name the key is stored under: the same key signed under two names, or under none, is one claim. The name, when
+     * there is one, is what the store knows the key by, for messages and for reading the key back.
+     * <p/>
+     * The claim is held until {@link #releaseStatefulKey(String, PublicKey)}, or until the process ends. Claiming a key
+     * this manager has already claimed succeeds again and adds a holder: the key is given back when the last holder
+     * releases it, so producers that share a manager do not release each other's claim.
+     *
+     * @param  keyId     the name the key is stored under, or {@code null} for a key that has none
+     * @param  publicKey the public key of the key pair, which identifies the claim
+     * @return           {@code true} when this manager guarantees no other process holds the same key, {@code false}
+     *                   when the store cannot offer that guarantee - the default, since most stores cannot
+     * @throws Exception when the key is held by someone else, or the claim cannot be attempted
+     * @since            4.24
+     */
+    default boolean claimStatefulKey(String keyId, PublicKey publicKey) throws Exception {
+        return false;
+    }
+
+    /**
+     * Releases a claim taken by {@link #claimStatefulKey(String, PublicKey)}. The key is given back once every claim on
+     * it is released. Releasing a key that was never claimed does nothing.
+     *
+     * @param  keyId     the name the key is stored under, or {@code null} for a key that has none
+     * @param  publicKey the public key of the key pair, which identifies the claim
+     * @throws Exception when the claim cannot be released
+     * @since            4.24
+     */
+    default void releaseStatefulKey(String keyId, PublicKey publicKey) throws Exception {
+        // nothing is claimed by default
+    }
+
+    /**
+     * The fingerprint of a public key: the SHA-256 digest of its encoding, in lower-case hex. It identifies the key
+     * material independently of the name the key is stored under, which is what a claim on a stateful key has to be
+     * tied to.
+     *
+     * @param  publicKey the public key, may be {@code null}
+     * @return           the fingerprint, or {@code null} when there is no key or the key gives no encoding
+     * @since            4.24
+     */
+    static String fingerprint(PublicKey publicKey) {
+        byte[] encoded = publicKey == null ? null : publicKey.getEncoded();
+        if (encoded == null) {
+            return null;
+        }
+        try {
+            return HexFormat.of().formatHex(MessageDigest.getInstance("SHA-256").digest(encoded));
+        } catch (NoSuchAlgorithmException e) {
+            throw new IllegalStateException("SHA-256 is not available", e);
+        }
+    }
+
+    enum KeyFormat {
+        PEM,
+        DER,
+        PKCS8,
+        X509
+    }
+}

@@ -1,0 +1,310 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.camel.dsl.jbang.core.commands.process;
+
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Comparator;
+import java.util.Iterator;
+import java.util.List;
+import java.util.Map;
+import java.util.stream.Collectors;
+
+import com.github.freva.asciitable.AsciiTable;
+import com.github.freva.asciitable.Column;
+import com.github.freva.asciitable.HorizontalAlign;
+import com.github.freva.asciitable.OverflowBehaviour;
+import org.aesh.command.CommandDefinition;
+import org.aesh.command.option.Argument;
+import org.aesh.command.option.Option;
+import org.apache.camel.dsl.jbang.core.common.CompletionCandidates;
+import org.apache.camel.dsl.jbang.core.common.ListingFormat;
+import org.apache.camel.dsl.jbang.core.common.ProcessHelper;
+import org.apache.camel.dsl.jbang.core.common.RowSort;
+import org.apache.camel.dsl.jbang.run.common.VersionHelper;
+import org.apache.camel.util.TimeUtils;
+import org.apache.camel.util.json.JsonObject;
+import org.apache.camel.util.json.Jsoner;
+
+import static org.apache.camel.dsl.jbang.core.common.CamelCommandHelper.extractState;
+
+@CommandDefinition(name = "context", description = "Top status of Camel integrations", generateHelp = true,
+                   footer = {
+                           "Examples:",
+                           "  camel top context",
+                           "  camel top context --watch" })
+public class CamelContextTop extends ProcessWatchCommand {
+
+    private static final RowSort<Row> ORDER = new RowSort<Row>()
+            .number("pid", r -> r.pid)
+            .text("name", r -> r.name)
+            .by("mem", Comparator.comparingLong((Row r) -> r.heapMemUsed).reversed())
+            .numeric("age", r -> r.uptime);
+
+    public static class PidNameMemAgeCompletionCandidates extends CompletionCandidates {
+
+        public PidNameMemAgeCompletionCandidates() {
+        }
+
+        @Override
+        public Iterator<String> iterator() {
+            return List.of("pid", "name", "mem", "age").iterator();
+        }
+
+    }
+
+    @Argument(description = "Name or pid of running Camel integration")
+    String name = "*";
+
+    @Option(name = "sort", description = "Sort by pid, name, mem, or age", defaultValue = "mem",
+            completer = PidNameMemAgeCompletionCandidates.class)
+    String sort;
+
+    @Override
+    public Integer doProcessWatchCall() throws Exception {
+        List<Row> rows = new ArrayList<>();
+
+        forEachIntegration(name, (ph, root) -> {
+            // there must be a status file for the running Camel integration
+            Row row = new Row();
+            JsonObject context = (JsonObject) root.get("context");
+            if (context == null) {
+                return;
+            }
+            row.name = context.getString("name");
+            if ("CamelJBang".equals(row.name)) {
+                row.name = ProcessHelper.extractName(root, ph);
+            }
+            row.pid = Long.toString(ph.pid());
+            row.uptime = extractSince(ph);
+            row.ago = TimeUtils.printSince(row.uptime);
+            JsonObject runtime = (JsonObject) root.get("runtime");
+            row.platform = extractPlatform(ph, runtime);
+            row.platformVersion = extractPlatformVersion(row.platform,
+                    runtime != null ? runtime.getString("platformVersion") : null);
+            row.javaVersion = runtime != null ? runtime.getString("javaVersion") : null;
+            row.state = context.getInteger("phase");
+            row.camelVersion = context.getString("version");
+            Map<String, ?> stats = context.getMap("statistics");
+            if (stats != null) {
+                Object thp = stats.get("exchangesThroughput");
+                if (thp != null) {
+                    row.throughput = thp.toString();
+                }
+                Object load = stats.get("load01");
+                if (load != null) {
+                    row.load01 = load.toString();
+                }
+                load = stats.get("load05");
+                if (load != null) {
+                    row.load05 = load.toString();
+                }
+                load = stats.get("load15");
+                if (load != null) {
+                    row.load15 = load.toString();
+                }
+            }
+            JsonObject mem = (JsonObject) root.get("memory");
+            if (mem != null) {
+                row.heapMemUsed = mem.getLong("heapMemoryUsed");
+                row.heapMemCommitted = mem.getLong("heapMemoryCommitted");
+                row.heapMemMax = mem.getLong("heapMemoryMax");
+                row.nonHeapMemUsed = mem.getLong("nonHeapMemoryUsed");
+                row.nonHeapMemCommitted = mem.getLong("nonHeapMemoryCommitted");
+            }
+            JsonObject threads = (JsonObject) root.get("threads");
+            if (threads != null) {
+                row.threadCount = threads.getInteger("threadCount");
+                row.peakThreadCount = threads.getInteger("peakThreadCount");
+            }
+            JsonObject cl = (JsonObject) root.get("classLoading");
+            if (cl != null) {
+                row.loadedClassCount = cl.getInteger("loadedClassCount");
+                row.totalLoadedClassCount = cl.getLong("totalLoadedClassCount");
+            }
+            JsonObject gc = (JsonObject) root.get("gc");
+            if (gc != null) {
+                row.gcCount = gc.getLong("collectionCount");
+                row.gcTime = gc.getLong("collectionTime");
+            }
+            rows.add(row);
+        });
+
+        // sort rows
+        rows.sort(ORDER.comparator(sort));
+
+        if (!rows.isEmpty() || jsonOutput) {
+            if (jsonOutput) {
+                printer().println(Jsoner.serialize(rows.stream().map(r -> {
+                    JsonObject jo = new JsonObject();
+                    jo.put("pid", JsonValues.pid(r.pid));
+                    jo.put("name", r.name);
+                    jo.put("javaVersion", getJavaVersion(r));
+                    jo.put("camelVersion", r.camelVersion);
+                    jo.put("platform", getPlatform(r));
+                    jo.put("status", extractState(r.state));
+                    jo.put("age", r.ago);
+                    jo.put("uptime", r.uptime);
+                    // the load averages of the last 1, 5 and 15 minutes
+                    jo.put("load01", JsonValues.decimal(r.load01));
+                    jo.put("load05", JsonValues.decimal(r.load05));
+                    jo.put("load15", JsonValues.decimal(r.load15));
+                    // memory in bytes
+                    jo.put("heapUsed", r.heapMemUsed);
+                    jo.put("heapCommitted", r.heapMemCommitted);
+                    jo.put("heapMax", r.heapMemMax);
+                    jo.put("nonHeapUsed", r.nonHeapMemUsed);
+                    jo.put("nonHeapCommitted", r.nonHeapMemCommitted);
+                    jo.put("gcCount", r.gcCount);
+                    jo.put("gcTime", r.gcTime);
+                    jo.put("threads", r.threadCount);
+                    jo.put("peakThreads", r.peakThreadCount);
+                    return jo;
+                }).collect(Collectors.toList())));
+            } else {
+                printer().println(AsciiTable.getTable(AsciiTable.NO_BORDERS, rows, Arrays.asList(
+                        new Column().header("PID").headerAlign(HorizontalAlign.CENTER).with(r -> r.pid),
+                        new Column().header("NAME").dataAlign(HorizontalAlign.LEFT)
+                                .maxWidth(30, OverflowBehaviour.ELLIPSIS_RIGHT)
+                                .with(r -> r.name),
+                        new Column().header("JAVA").dataAlign(HorizontalAlign.LEFT).with(this::getJavaVersion),
+                        new Column().header("CAMEL").dataAlign(HorizontalAlign.LEFT).with(r -> r.camelVersion),
+                        new Column().header("PLATFORM").dataAlign(HorizontalAlign.LEFT).with(this::getPlatform),
+                        new Column().header("STATUS").headerAlign(HorizontalAlign.CENTER)
+                                .with(r -> extractState(r.state)),
+                        new Column().header("AGE").headerAlign(HorizontalAlign.CENTER).with(r -> r.ago),
+                        new Column().header("LOAD").headerAlign(HorizontalAlign.CENTER).dataAlign(HorizontalAlign.CENTER)
+                                .with(this::getLoad),
+                        new Column().header("HEAP").headerAlign(HorizontalAlign.CENTER).with(this::getHeapMemory),
+                        new Column().header("NON-HEAP").headerAlign(HorizontalAlign.CENTER).with(this::getNonHeapMemory),
+                        new Column().header("GC").headerAlign(HorizontalAlign.CENTER).with(this::getGC),
+                        new Column().header("THREADS").headerAlign(HorizontalAlign.CENTER).with(this::getThreads))));
+            }
+        }
+
+        return 0;
+    }
+
+    private String extractPlatform(ProcessHandle ph, JsonObject runtime) {
+        String answer = runtime != null ? runtime.getString("platform") : null;
+        if ("Camel".equals(answer)) {
+            // generic camel, we need to check if we run in JBang
+            String cl = ProcessHelper.commandLineText(ph);
+            if (cl.contains("main.CamelJBang run")) {
+                answer = "JBang";
+            }
+        }
+        return answer;
+    }
+
+    private String extractPlatformVersion(String platform, String platformVersion) {
+        if (platformVersion == null) {
+            if ("JBang".equals(platform)) {
+                platformVersion = VersionHelper.getJBangVersion();
+            }
+        }
+        return platformVersion;
+    }
+
+    protected String getThroughput(Row r) {
+        String s = r.throughput;
+        if (s == null || s.isEmpty()) {
+            s = "";
+        }
+        return s;
+    }
+
+    private String getPlatform(Row r) {
+        if (r.platformVersion != null) {
+            return r.platform + " v" + r.platformVersion;
+        } else {
+            return r.platform;
+        }
+    }
+
+    private String getHeapMemory(Row r) {
+        return asMegaBytesOneDigit(r.heapMemUsed) + "/" + asMegaBytesOneDigit(r.heapMemCommitted) + "/"
+               + asMegaBytesOneDigit(r.heapMemMax) + " MB";
+    }
+
+    private String getNonHeapMemory(Row r) {
+        return asMegaBytesOneDigit(r.nonHeapMemUsed) + "/" + asMegaBytesOneDigit(r.nonHeapMemCommitted) + " MB";
+    }
+
+    private String getThreads(Row r) {
+        return r.threadCount + "/" + r.peakThreadCount;
+    }
+
+    private String getGC(Row r) {
+        if (r.gcTime <= 0) {
+            return "";
+        } else {
+            return String.format("%s (%d)", TimeUtils.printDuration(r.gcTime, true), r.gcCount);
+        }
+    }
+
+    private String getJavaVersion(Row r) {
+        String v = r.javaVersion;
+        if (v == null) {
+            v = "";
+        }
+        for (int i = 0; i < v.length(); i++) {
+            char ch = v.charAt(i);
+            if (Character.isDigit(ch) || ch == '.') {
+                continue;
+            }
+            return v.substring(0, i);
+        }
+        return v;
+    }
+
+    private String getLoad(Row r) {
+        return ListingFormat.load(r.load01, r.load05, r.load15);
+    }
+
+    private static long asMegaBytesOneDigit(long bytes) {
+        return bytes / 1000 / 1000;
+    }
+
+    private static class Row {
+        String pid;
+        String platform;
+        String platformVersion;
+        String camelVersion;
+        String javaVersion;
+        String name;
+        int state;
+        String ago;
+        long uptime;
+        String throughput;
+        String load01;
+        String load05;
+        String load15;
+        long heapMemUsed;
+        long heapMemCommitted;
+        long heapMemMax;
+        long nonHeapMemUsed;
+        long nonHeapMemCommitted;
+        int threadCount;
+        int peakThreadCount;
+        int loadedClassCount;
+        long totalLoadedClassCount;
+        long gcCount;
+        long gcTime;
+    }
+
+}

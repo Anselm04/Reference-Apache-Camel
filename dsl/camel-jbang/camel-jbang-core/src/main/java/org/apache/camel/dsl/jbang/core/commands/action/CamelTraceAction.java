@@ -1,0 +1,1037 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.camel.dsl.jbang.core.commands.action;
+
+import java.io.IOException;
+import java.io.LineNumberReader;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.text.SimpleDateFormat;
+import java.util.ArrayDeque;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Date;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.Iterator;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Queue;
+import java.util.Set;
+import java.util.concurrent.ArrayBlockingQueue;
+import java.util.regex.Pattern;
+
+import com.github.freva.asciitable.AsciiTable;
+import com.github.freva.asciitable.Column;
+import com.github.freva.asciitable.HorizontalAlign;
+import com.github.freva.asciitable.OverflowBehaviour;
+import org.aesh.command.CommandDefinition;
+import org.aesh.command.option.Argument;
+import org.aesh.command.option.Mixin;
+import org.aesh.command.option.Option;
+import org.aesh.command.option.OptionList;
+import org.apache.camel.dsl.jbang.core.commands.CommandHelper;
+import org.apache.camel.dsl.jbang.core.commands.DurationMixin;
+import org.apache.camel.dsl.jbang.core.commands.process.JsonValues;
+import org.apache.camel.dsl.jbang.core.common.CliException;
+import org.apache.camel.dsl.jbang.core.common.CompletionCandidates;
+import org.apache.camel.dsl.jbang.core.common.JsonOutput;
+import org.apache.camel.dsl.jbang.core.common.PidNameAgeCompletionCandidates;
+import org.apache.camel.dsl.jbang.core.common.ProcessFinder.CamelProcess;
+import org.apache.camel.dsl.jbang.core.common.ProcessHelper;
+import org.apache.camel.dsl.jbang.core.common.RowSort;
+import org.apache.camel.util.IOHelper;
+import org.apache.camel.util.StopWatch;
+import org.apache.camel.util.StringHelper;
+import org.apache.camel.util.TimeUtils;
+import org.apache.camel.util.URISupport;
+import org.apache.camel.util.json.JsonArray;
+import org.apache.camel.util.json.JsonObject;
+import org.apache.camel.util.json.Jsoner;
+import org.jline.jansi.Ansi;
+
+@CommandDefinition(name = "trace", description = "Tail message traces from running Camel integrations", generateHelp = true,
+                   footer = {
+                           "Examples:",
+                           "  camel trace hello",
+                           "  camel trace *" })
+public class CamelTraceAction extends ActionBaseCommand {
+
+    private static final int NAME_MAX_WIDTH = 25;
+    private static final int NAME_MIN_WIDTH = 10;
+    private static final String TIMESTAMP_FORMAT = "yyyy-MM-dd HH:mm:ss.SSS";
+
+    private static final RowSort<StatusRow> ORDER = RowSort.<StatusRow> integration(r -> r.pid, r -> r.name, r -> r.uptime);
+
+    public static class PrefixCompletionCandidates extends CompletionCandidates {
+
+        public PrefixCompletionCandidates() {
+        }
+
+        @Override
+        public Iterator<String> iterator() {
+            return List.of("auto", "true", "false").iterator();
+        }
+    }
+
+    public static class ActionCompletionCandidates extends CompletionCandidates {
+
+        public ActionCompletionCandidates() {
+        }
+
+        @Override
+        public Iterator<String> iterator() {
+            return List.of("dump", "start", "stop", "status", "clear").iterator();
+        }
+    }
+
+    @Argument(description = "Name or pid of running Camel integration. (default selects all)")
+    String name = "*";
+
+    @Option(name = "action", description = "Action to start, stop, clear, list status, or dump traces", defaultValue = "status",
+            completer = ActionCompletionCandidates.class)
+    String action;
+
+    @Option(name = "sort", description = "Sort by pid, name or age for showing status of tracing", defaultValue = "pid",
+            completer = PidNameAgeCompletionCandidates.class)
+    String sort;
+
+    @Option(name = "json", hasValue = false,
+            description = "Output in JSON Format: the status of tracing, and with --action=dump each trace as a JSON object"
+                          + " per line")
+    boolean jsonOutput;
+
+    @Mixin
+    ActionTimeoutMixin timeoutOption;
+
+    @Option(name = "timestamp", hasValue = false, description = "Print timestamp.", defaultValue = "true")
+    boolean timestamp = true;
+
+    @Option(name = "ago", hasValue = false, description = "Use ago instead of yyyy-MM-dd HH:mm:ss in timestamp.")
+    boolean ago;
+
+    @Option(name = "follow", hasValue = false, description = "Keep following and outputting new traces (press enter to exit)."
+                                                             + " Without an interactive terminal the default is false, unless --duration is given.",
+            defaultValue = "true")
+    boolean follow = true;
+
+    @Mixin
+    DurationMixin durationOption = new DurationMixin();
+
+    @Option(name = "prefix",
+            description = "Print prefix with running Camel integration name. auto=only prefix when running multiple integrations. true=always prefix. false=prefix off.",
+            defaultValue = "auto", completer = PrefixCompletionCandidates.class)
+    String prefix = "auto";
+
+    @Option(name = "source", hasValue = false, description = "Prefer to display source filename/code instead of IDs")
+    boolean source;
+
+    @Option(name = "depth",
+            description = "Depth of tracing. 0=Created+Completed. 1=All events on 1st route, 2=All events on 1st+2nd depth, and so on. 9 = all events on every depth.",
+            defaultValue = "9")
+    int depth;
+
+    @Option(name = "tail",
+            description = "The number of traces from the end of the trace to show. Use -1 to read from the beginning. Use 0 to read only new lines. Defaults to showing all traces from beginning.",
+            defaultValue = "-1")
+    int tail = -1;
+
+    @Option(name = "since",
+            description = "Return traces newer than a relative duration like 5s, 2m, or 1h. The value is in seconds if no unit specified.")
+    String since;
+
+    @OptionList(name = "find", valueSeparator = OptionList.NO_SEPARATOR, optionalValue = true,
+                description = "Find and highlight matching text (ignore case).")
+    String[] find;
+
+    @OptionList(name = "grep", valueSeparator = OptionList.NO_SEPARATOR, optionalValue = true,
+                description = "Filter traces to only output trace matching text (ignore case).")
+    String[] grep;
+
+    @Option(name = "show-exchange-properties", hasValue = false, description = "Show exchange properties in traced messages",
+            defaultValue = "false")
+    boolean showExchangeProperties;
+
+    @Option(name = "show-exchange-variables", hasValue = false, description = "Show exchange variables in traced messages",
+            defaultValue = "true")
+    boolean showExchangeVariables = true;
+
+    @Option(name = "show-headers", hasValue = false, description = "Show message headers in traced messages",
+            defaultValue = "true")
+    boolean showHeaders = true;
+
+    @Option(name = "show-body", hasValue = false, description = "Show message body in traced messages", defaultValue = "true")
+    boolean showBody = true;
+
+    @Option(name = "show-exception", hasValue = false, description = "Show exception and stacktrace for failed messages",
+            defaultValue = "true")
+    boolean showException = true;
+
+    @Option(name = "logging-color", hasValue = false, description = "Use colored logging", defaultValue = "true")
+    boolean loggingColor = true;
+
+    @Option(name = "compact", hasValue = false, description = "Compact output (no empty line separating traced messages)",
+            defaultValue = "true")
+    boolean compact = true;
+
+    @Option(name = "latest", hasValue = false,
+            description = "Only output traces from the latest (follow if necessary until complete and exit)")
+    boolean latest;
+
+    @Option(name = "mask", hasValue = false,
+            description = "Whether to mask endpoint URIs to avoid printing sensitive information such as password or access keys")
+    boolean mask;
+
+    @Option(name = "pretty", hasValue = false, description = "Pretty print message body when using JSon or XML format")
+    boolean pretty;
+
+    String findAnsi;
+    Pattern[] grepPatterns;
+    Pattern[] findPatterns;
+
+    private int nameMaxWidth;
+    private boolean prefixShown;
+
+    private MessageTableHelper tableHelper;
+
+    private final Map<String, Ansi.Color> nameColors = new HashMap<>();
+    private final Map<String, Ansi.Color> exchangeIdColors = new HashMap<>();
+    private int exchangeIdColorsIndex = 1;
+    private final SimpleDateFormat sdfTimestamp = new SimpleDateFormat(TIMESTAMP_FORMAT);
+
+    @Override
+    public Integer doCall() throws Exception {
+        // no ANSI codes of colors in a file or a pipe, unless --logging-color is given
+        loggingColor = colorOutput(loggingColor);
+        if ("dump".equals(action)) {
+            return doDumpCall();
+        } else if ("status".equals(action)) {
+            return doStatusCall();
+        } else if ("clear".equals(action)) {
+            for (CamelProcess process : findProcesses(name)) {
+                Path f = getTraceFile(Long.toString(process.pid()));
+                if (Files.exists(f)) {
+                    // empty: the connector appends a line of JSON per batch, which an empty JSON object without
+                    // a new line would join, and that batch would be lost (CAMEL-26911)
+                    Files.writeString(f, "");
+                }
+            }
+            return 0;
+        } else if ("start".equals(action) || "stop".equals(action)) {
+            boolean enabled = "start".equals(action);
+            return sendAction(findProcesses(name), "trace", root -> root.put("enabled", Boolean.toString(enabled)));
+        }
+        throw CliException.usage("Unknown action: " + action + " (use dump, start, stop, status or clear)");
+    }
+
+    protected Integer doStatusCall() {
+        List<StatusRow> rows = new ArrayList<>();
+
+        for (CamelProcess process : findProcesses(name)) {
+            JsonObject root = process.status();
+            StatusRow row = new StatusRow();
+            row.name = process.name();
+            row.pid = Long.toString(process.pid());
+            row.uptime = extractSince(ProcessHandle.of(process.pid()).orElse(null));
+            row.age = TimeUtils.printSince(row.uptime);
+            JsonObject jo = root.getMap("trace");
+            if (jo != null) {
+                row.enabled = jo.getBoolean("enabled");
+                row.standby = jo.getBoolean("standby");
+                row.counter = jo.getLong("counter");
+                row.queueSize = jo.getLong("queueSize");
+                row.filter = jo.getString("traceFilter");
+                row.pattern = jo.getString("tracePattern");
+            }
+            rows.add(row);
+        }
+
+        rows.sort(ORDER.comparator(sort));
+
+        if (jsonOutput) {
+            JsonOutput.printList(printer(), rows.stream().map(r -> {
+                JsonObject jo = new JsonObject();
+                jo.put("pid", JsonValues.pid(r.pid));
+                jo.put("name", r.name);
+                jo.put("age", r.age);
+                jo.put("status", getTraceStatus(r));
+                jo.put("total", r.counter);
+                jo.put("queue", r.queueSize);
+                jo.put("filter", r.filter);
+                jo.put("pattern", r.pattern);
+                return jo;
+            }).toList());
+        } else if (!rows.isEmpty()) {
+            printer().println(AsciiTable.getTable(AsciiTable.NO_BORDERS, rows, Arrays.asList(
+                    new Column().header("PID").headerAlign(HorizontalAlign.CENTER).with(r -> r.pid),
+                    new Column().header("NAME").dataAlign(HorizontalAlign.LEFT).maxWidth(30, OverflowBehaviour.ELLIPSIS_RIGHT)
+                            .with(r -> r.name),
+                    new Column().header("AGE").headerAlign(HorizontalAlign.CENTER).with(r -> r.age),
+                    new Column().header("STATUS").with(this::getTraceStatus),
+                    new Column().header("TOTAL").with(r -> "" + r.counter),
+                    new Column().header("QUEUE").with(r -> "" + r.queueSize),
+                    new Column().header("FILTER").with(r -> r.filter),
+                    new Column().header("PATTERN").with(r -> r.pattern))));
+        }
+
+        return 0;
+    }
+
+    private String getTraceStatus(StatusRow r) {
+        if (r.enabled) {
+            return "Started";
+        } else if (r.standby) {
+            return "Standby";
+        }
+        return "Stopped";
+    }
+
+    protected Integer doDumpCall() throws Exception {
+        follow = isFollowing(follow, durationOption.getDuration());
+        // setup table helper
+        tableHelper = new MessageTableHelper();
+        tableHelper.setPretty(pretty);
+        tableHelper.setLoggingColor(loggingColor);
+        tableHelper.setShowExchangeProperties(showExchangeProperties);
+        tableHelper.setShowExchangeVariables(showExchangeVariables);
+        tableHelper.setExchangeIdColorChooser(value -> {
+            Ansi.Color color = exchangeIdColors.get(value);
+            if (color == null) {
+                // grab a new color
+                exchangeIdColorsIndex++;
+                if (exchangeIdColorsIndex > 6) {
+                    exchangeIdColorsIndex = 2;
+                }
+                color = Ansi.Color.values()[exchangeIdColorsIndex];
+                exchangeIdColors.put(value, color);
+            }
+            return color;
+        });
+
+        Map<Long, Pid> pids = new LinkedHashMap<>();
+
+        if (latest) {
+            // turn of tail/since when in latest mode
+            tail = 0;
+            since = null;
+        }
+
+        // before reading, as an integration that starts later is read with them too
+        if (find != null) {
+            findAnsi = Ansi.ansi().fg(Ansi.Color.BLACK).bg(Ansi.Color.YELLOW).a("$0").reset().toString();
+            findPatterns = quoteAndCompilePatterns(find);
+        }
+        if (grep != null) {
+            findAnsi = Ansi.ansi().fg(Ansi.Color.BLACK).bg(Ansi.Color.YELLOW).a("$0").reset().toString();
+            grepPatterns = quoteAndCompilePatterns(grep);
+        }
+
+        // find new pids
+        updatePids(pids);
+        if (pids.isEmpty() && !follow) {
+            // shown once: a name that matches no running integration is not found
+            findProcesses(name);
+        }
+        if (!pids.isEmpty()) {
+            // read existing trace files (skip by tail/since)
+            Date limit = null;
+            if (since != null) {
+                long millis;
+                if (StringHelper.isDigit(since)) {
+                    // is in seconds by default
+                    millis = TimeUtils.toMilliSeconds(since) * 1000;
+                } else {
+                    millis = TimeUtils.toMilliSeconds(since);
+                }
+                limit = new Date(System.currentTimeMillis() - millis);
+            }
+            // dump existing traces
+            if (tail != 0) {
+                tailTraceFiles(pids, tail);
+                dumpTraceFiles(pids, tail, limit);
+            } else if (latest) {
+                // position until latest start and let follow dump
+                positionTraceLatest(pids);
+            }
+        }
+
+        if (follow) {
+            boolean waitMessage = true;
+            // until Enter is pressed, or the --duration has passed
+            CommandHelper.RunUntil running = CommandHelper.RunUntil.start(durationOption.getDuration());
+            StopWatch watch = new StopWatch();
+            boolean more = true;
+            do {
+                if (pids.isEmpty()) {
+                    if (waitMessage) {
+                        printer().println("Waiting for traces ...");
+                        waitMessage = false;
+                    }
+                    Thread.sleep(500);
+                    updatePids(pids);
+                } else {
+                    waitMessage = true;
+                    if (watch.taken() > 500) {
+                        // check for new traces
+                        updatePids(pids);
+                        watch.restart();
+                    }
+                    int lines = readTraceFiles(pids);
+                    if (lines > 0) {
+                        more = dumpTraceFiles(pids, 0, null);
+                    } else if (lines == 0) {
+                        Thread.sleep(100);
+                    } else {
+                        break;
+                    }
+                }
+            } while (more && running.isRunning());
+        }
+
+        return 0;
+    }
+
+    private void positionTraceLatest(Map<Long, Pid> pids) throws Exception {
+        for (Pid pid : pids.values()) {
+            Path file = getTraceFile(pid.pid);
+            long position = -1;
+            if (Files.exists(file)) {
+                pid.reader = new LineNumberReader(Files.newBufferedReader(file));
+                String line;
+                long counter = 0;
+                do {
+                    line = pid.reader.readLine();
+                    if (line != null) {
+                        counter++;
+                        List<Row> rows = parseTraceLine(pid, line);
+                        for (Row r : rows) {
+                            if (r.first) {
+                                position = counter;
+                                break;
+                            }
+                        }
+                    }
+                } while (line != null);
+            }
+            if (position != -1) {
+                IOHelper.close(pid.reader);
+                // re-create reader and forward to position
+                pid.reader = new LineNumberReader(Files.newBufferedReader(file));
+                while (--position > 0) {
+                    pid.reader.readLine();
+                }
+            }
+        }
+    }
+
+    private void tailTraceFiles(Map<Long, Pid> pids, int tail) throws Exception {
+        for (Pid pid : pids.values()) {
+            Path file = getTraceFile(pid.pid);
+            if (Files.exists(file)) {
+                pid.reader = new LineNumberReader(Files.newBufferedReader(file));
+                String line;
+                if (tail <= 0) {
+                    pid.fifo = new ArrayDeque<>();
+                } else {
+                    pid.fifo = new ArrayBlockingQueue<>(tail);
+                }
+                do {
+                    line = pid.reader.readLine();
+                    if (line != null) {
+                        while (!pid.fifo.offer(line)) {
+                            pid.fifo.poll();
+                        }
+                    }
+                } while (line != null);
+            }
+        }
+    }
+
+    private void updatePids(Map<Long, Pid> rows) {
+        List<Long> pids = findPids(name);
+        ProcessHandle.allProcesses()
+                .filter(ph -> pids.contains(ph.pid()))
+                .forEach(ph -> {
+                    JsonObject root = loadStatus(ph.pid());
+                    if (root != null) {
+                        Pid row = new Pid();
+                        row.pid = Long.toString(ph.pid());
+                        JsonObject context = (JsonObject) root.get("context");
+                        if (context == null) {
+                            return;
+                        }
+                        row.name = context.getString("name");
+                        if ("CamelJBang".equals(row.name)) {
+                            row.name = ProcessHelper.extractName(root, ph);
+                        }
+                        int len = row.name.length();
+                        if (len < NAME_MIN_WIDTH) {
+                            len = NAME_MIN_WIDTH;
+                        }
+                        if (len > NAME_MAX_WIDTH) {
+                            len = NAME_MAX_WIDTH;
+                        }
+                        if (len > nameMaxWidth) {
+                            nameMaxWidth = len;
+                        }
+                        if (!rows.containsKey(ph.pid())) {
+                            rows.put(ph.pid(), row);
+                        }
+                    }
+                });
+
+        // remove pids that are no long active from the rows
+        Set<Long> remove = new HashSet<>();
+        for (long pid : rows.keySet()) {
+            if (!pids.contains(pid)) {
+                remove.add(pid);
+            }
+        }
+        for (long pid : remove) {
+            rows.remove(pid);
+        }
+    }
+
+    private int readTraceFiles(Map<Long, Pid> pids) throws Exception {
+        int lines = 0;
+
+        for (Pid pid : pids.values()) {
+            Path file = getTraceFile(pid.pid);
+            long size = Files.exists(file) ? Files.size(file) : 0;
+            if (pid.reader != null && isNewFile(pid.size, size)) {
+                // the integration started a new trace file, as the old one was full: read the new one from its start
+                IOHelper.close(pid.reader);
+                pid.reader = new LineNumberReader(Files.newBufferedReader(file));
+            }
+            pid.size = size;
+            if (pid.reader == null) {
+                if (Files.exists(file)) {
+                    pid.reader = new LineNumberReader(Files.newBufferedReader(file));
+                    if (tail == 0) {
+                        // only read new lines so forward to end of reader
+                        pid.reader.skip(size);
+                    }
+                }
+            }
+            if (pid.reader != null) {
+                String line;
+                do {
+                    try {
+                        line = pid.reader.readLine();
+                        if (line != null) {
+                            lines++;
+                            // switch fifo to be unlimited as we use it for new traces
+                            if (pid.fifo == null || pid.fifo instanceof ArrayBlockingQueue) {
+                                pid.fifo = new ArrayDeque<>();
+                            }
+                            pid.fifo.offer(line);
+                        }
+                    } catch (IOException e) {
+                        // ignore
+                        line = null;
+                    }
+                } while (line != null);
+            }
+        }
+
+        return lines;
+    }
+
+    /**
+     * Whether a file that a reader follows was started again: it is smaller than when it was last read (CAMEL-26929).
+     */
+    static boolean isNewFile(long lastSize, long size) {
+        return size < lastSize;
+    }
+
+    private List<Row> parseTraceLine(Pid pid, String line) {
+        JsonObject root = null;
+        try {
+            root = (JsonObject) Jsoner.deserialize(line);
+        } catch (Exception e) {
+            // ignore
+        }
+        if (root != null) {
+            List<Row> rows = new ArrayList<>();
+            JsonArray arr = root.getCollection("traces");
+            if (arr != null) {
+                for (Object o : arr) {
+                    Row row = new Row(pid);
+                    row.pid = pid.pid;
+                    row.name = pid.name;
+                    JsonObject jo = (JsonObject) o;
+                    row.uid = jo.getLong("uid");
+                    row.first = jo.getBoolean("first");
+                    row.last = jo.getBoolean("last");
+                    row.location = jo.getString("location");
+                    row.routeId = jo.getString("routeId");
+                    row.nodeId = jo.getString("nodeId");
+                    if ("aggregate".equals(jo.getString("nodeShortName"))) {
+                        row.aggregate = new JsonObject();
+                        row.aggregate.put("nodeLabel", jo.getString("nodeLabel"));
+                    }
+                    String uri = jo.getString("endpointUri");
+                    if (uri != null) {
+                        row.endpoint = new JsonObject();
+                        if (mask) {
+                            uri = URISupport.sanitizeUri(uri);
+                        }
+                        row.endpoint.put("endpoint", uri);
+                        row.endpoint.put("remote", jo.getBooleanOrDefault("remoteEndpoint", true));
+                    }
+                    JsonObject es = jo.getMap("endpointService");
+                    if (es != null) {
+                        row.endpointService = es;
+                    }
+                    Long ts = jo.getLong("timestamp");
+                    if (ts != null) {
+                        row.timestamp = ts;
+                    }
+                    row.elapsed = jo.getLong("elapsed");
+                    row.failed = jo.getBoolean("failed");
+                    row.done = jo.getBoolean("done");
+                    row.threadName = jo.getString("threadName");
+                    row.message = jo.getMap("message");
+                    row.exception = jo.getMap("exception");
+                    row.exchangeId = row.message.getString("exchangeId");
+                    row.exchangePattern = row.message.getString("exchangePattern");
+                    // we should exchangeId/pattern elsewhere
+                    row.message.remove("exchangeId");
+                    row.message.remove("exchangePattern");
+                    if (!showExchangeVariables) {
+                        row.message.remove("exchangeVariables");
+                    }
+                    if (!showExchangeProperties) {
+                        row.message.remove("exchangeProperties");
+                    }
+                    if (!showHeaders) {
+                        row.message.remove("headers");
+                    }
+                    if (!showBody) {
+                        row.message.remove("body");
+                    }
+                    if (!showException) {
+                        row.exception = null;
+                    }
+                    rows.add(row);
+                }
+            }
+            return rows;
+        }
+        return null;
+    }
+
+    private boolean dumpTraceFiles(Map<Long, Pid> pids, int tail, Date limit) {
+        Set<String> names = new HashSet<>();
+        List<Row> rows = new ArrayList<>();
+        for (Pid pid : pids.values()) {
+            Queue<String> queue = pid.fifo;
+            if (queue != null) {
+                for (String l : queue) {
+                    names.add(pid.name);
+                    List<Row> parsed = parseTraceLine(pid, l);
+                    if (parsed != null && !parsed.isEmpty()) {
+                        rows.addAll(parsed);
+                    }
+                }
+                pid.fifo.clear();
+            }
+        }
+
+        // only sort if there are multiple Camels running
+        if (names.size() > 1) {
+            // sort lines
+            final Map<String, Long> lastTimestamp = new HashMap<>();
+            rows.sort((r1, r2) -> {
+                long t1 = r1.timestamp;
+                long t2 = r2.timestamp;
+                if (t1 == 0) {
+                    t1 = lastTimestamp.getOrDefault(r1.name, 0L);
+                }
+                if (t2 == 0) {
+                    t2 = lastTimestamp.getOrDefault(r2.name, 0L);
+                }
+                if (t1 == 0 && t2 == 0) {
+                    return 0;
+                } else if (t1 == 0) {
+                    return -1;
+                } else if (t2 == 0) {
+                    return 1;
+                }
+                lastTimestamp.put(r1.name, t1);
+                lastTimestamp.put(r2.name, t2);
+                return Long.compare(t1, t2);
+            });
+        }
+        if (tail > 0) {
+            // cut according to tail
+            int pos = rows.size() - tail;
+            if (pos > 0) {
+                rows = rows.subList(pos, rows.size());
+            }
+        }
+
+        int doneTraces = 0;
+        for (Row r : rows) {
+            printTrace(r.name, pids.size(), r, limit);
+            if (r.done) {
+                doneTraces++;
+            }
+        }
+
+        if (latest) {
+            // in latest mode we continue until we have first done
+            return doneTraces == 0;
+        } else {
+            return true;
+        }
+    }
+
+    static JsonObject toJson(Row row) {
+        JsonObject jo = new JsonObject();
+        jo.put("pid", JsonValues.pid(row.pid));
+        jo.put("name", row.name);
+        jo.put("uid", row.uid);
+        jo.put("exchangeId", row.exchangeId);
+        jo.put("exchangePattern", row.exchangePattern);
+        jo.put("timestamp", row.timestamp);
+        jo.put("elapsed", row.elapsed);
+        jo.put("threadName", row.threadName);
+        jo.put("location", row.location);
+        jo.put("routeId", row.routeId);
+        jo.put("nodeId", row.nodeId);
+        jo.put("first", row.first);
+        jo.put("last", row.last);
+        jo.put("done", row.done);
+        jo.put("failed", row.failed);
+        putIfNotNull(jo, "endpoint", row.endpoint);
+        putIfNotNull(jo, "endpointService", row.endpointService);
+        putIfNotNull(jo, "aggregate", row.aggregate);
+        putIfNotNull(jo, "message", row.message);
+        putIfNotNull(jo, "exception", row.exception);
+        return jo;
+    }
+
+    private static void putIfNotNull(JsonObject jo, String key, Object value) {
+        if (value != null) {
+            jo.put(key, value);
+        }
+    }
+
+    private boolean isValidGrep(String line) {
+        if (grep == null) {
+            return true;
+        }
+        for (Pattern p : grepPatterns) {
+            if (p.matcher(line).find()) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private boolean isValidSince(Date limit, long timestamp) {
+        if (limit == null || timestamp == 0) {
+            return true;
+        }
+        Date row = new Date(timestamp);
+        return row.compareTo(limit) >= 0;
+    }
+
+    protected void printTrace(String name, int pids, Row row, Date limit) {
+        if (!prefixShown) {
+            // compute whether to show prefix or not
+            if ("false".equals(prefix) || "auto".equals(prefix) && pids <= 1) {
+                name = null;
+            }
+        }
+        prefixShown = name != null;
+
+        if (row.first) {
+            row.parent.depth++;
+        } else if (row.last) {
+            row.parent.depth--;
+        }
+
+        String data = getDataAsTable(row);
+        boolean valid = filterDepth(row) && isValidSince(limit, row.timestamp) && isValidGrep(data);
+        if (!valid) {
+            return;
+        }
+        if (jsonOutput) {
+            // one JSON object per line (JSON Lines), also when following, for a script or an AI agent (CAMEL-26929)
+            printer().println(toJson(row).toJson());
+            return;
+        }
+
+        String nameWithPrefix = null;
+        if (name != null) {
+            if (loggingColor) {
+                Ansi.Color color = nameColors.get(name);
+                if (color == null) {
+                    // grab a new color
+                    int idx = (nameColors.size() % 6) + 1;
+                    color = Ansi.Color.values()[idx];
+                    nameColors.put(name, color);
+                }
+                String n = String.format("%-" + nameMaxWidth + "s", name);
+                nameWithPrefix = Ansi.ansi().fg(color).a(n).a("| ").reset().toString();
+            } else {
+                nameWithPrefix = String.format("%-" + nameMaxWidth + "s", name) + "| ";
+            }
+            printer().print(nameWithPrefix);
+        }
+        if (timestamp) {
+            String ts;
+            if (ago) {
+                ts = String.format("%12s", TimeUtils.printSince(row.timestamp) + " ago");
+            } else {
+                SimpleDateFormat sdf = sdfTimestamp;
+                ts = sdf.format(new Date(row.timestamp));
+            }
+            if (loggingColor) {
+                printColored(Ansi.ansi().fgBrightDefault().a(Ansi.Attribute.INTENSITY_FAINT).a(ts).reset());
+            } else {
+                printer().print(ts);
+            }
+            printer().print("  ");
+        }
+        // pid
+        String p = String.format("%5.5s", row.pid);
+        if (loggingColor) {
+            printColored(Ansi.ansi().fgMagenta().a(p).reset());
+            printColored(Ansi.ansi().fgBrightDefault().a(Ansi.Attribute.INTENSITY_FAINT).a(" --- ").reset());
+        } else {
+            printer().print(p);
+            printer().print(" --- ");
+        }
+        // thread name
+        String tn = row.threadName;
+        if (tn.length() > 25) {
+            tn = tn.substring(tn.length() - 25);
+        }
+        tn = String.format("[%25.25s]", tn);
+        if (loggingColor) {
+            printColored(Ansi.ansi().fgBrightDefault().a(Ansi.Attribute.INTENSITY_FAINT).a(tn).reset());
+        } else {
+            printer().print(tn);
+        }
+        printer().print(" ");
+        // node ids or source location
+        String ids;
+        if (source) {
+            ids = row.location;
+        } else {
+            ids = row.routeId + "/" + getId(row);
+        }
+        if (ids.length() > 40) {
+            ids = ids.substring(ids.length() - 40);
+        }
+        ids = String.format("%40.40s", ids);
+        if (loggingColor) {
+            printColored(Ansi.ansi().fgCyan().a(ids).reset());
+        } else {
+            printer().print(ids);
+        }
+        printer().print(" : ");
+        // uuid
+        String u = String.format("%5.5s", row.uid);
+        if (loggingColor) {
+            printColored(Ansi.ansi().fgMagenta().a(u).reset());
+        } else {
+            printer().print(u);
+        }
+        printer().print(" - ");
+        // status
+        printer().print(getStatus(row));
+        // elapsed
+        String e = getElapsed(row);
+        if (e != null) {
+            if (loggingColor) {
+                printColored(Ansi.ansi().fgBrightDefault().a(" (" + e + ")").reset());
+            } else {
+                printer().print(" (" + e + ")");
+            }
+        }
+        // trace message
+        String[] lines = data.split(System.lineSeparator());
+        if (lines.length > 0) {
+            printer().println();
+            for (String line : lines) {
+                if (findPatterns != null) {
+                    for (Pattern fp : findPatterns) {
+                        line = fp.matcher(line).replaceAll(findAnsi);
+                    }
+                }
+                if (grepPatterns != null) {
+                    for (Pattern gp : grepPatterns) {
+                        line = gp.matcher(line).replaceAll(findAnsi);
+                    }
+                }
+                if (nameWithPrefix != null) {
+                    printer().print(nameWithPrefix);
+                }
+                printer().print(" ");
+                printer().println(line);
+            }
+            if (!compact) {
+                if (nameWithPrefix != null) {
+                    printer().println(nameWithPrefix);
+                } else {
+                    // empty line
+                    printer().println();
+                }
+            }
+        }
+
+        if (row.parent.depth <= 0 && row.last) {
+            exchangeIdColors.remove(row.exchangeId);
+        }
+    }
+
+    private boolean filterDepth(Row row) {
+        if (depth >= 9) {
+            return true;
+        }
+        if (depth == 0) {
+            // special with only created/completed
+            return row.parent.depth == 1 && row.first || row.parent.depth <= 0 && row.last;
+        }
+        return row.parent.depth <= depth;
+    }
+
+    private String getDataAsTable(Row r) {
+        return tableHelper.getDataAsTable(r.exchangeId, r.exchangePattern, r.aggregate, r.endpoint, r.endpointService,
+                r.message,
+                r.exception);
+    }
+
+    private String getElapsed(Row r) {
+        if (!r.first) {
+            return TimeUtils.printDuration(r.elapsed, true);
+        }
+        return null;
+    }
+
+    private String getStatus(Row r) {
+        boolean remote = r.endpoint != null && r.endpoint.getBooleanOrDefault("remote", false);
+
+        if (r.first) {
+            String s = r.parent.depth == 1 ? "Created" : "Routing to " + r.routeId;
+            if (loggingColor) {
+                return Ansi.ansi().fg(Ansi.Color.GREEN).a(s).reset().toString();
+            } else {
+                return s;
+            }
+        } else if (r.last) {
+            String done = r.exception != null ? "Completed (exception)" : "Completed (success)";
+            // below 0 when --tail cut the start of the exchange
+            String s = r.parent.depth <= 0 ? done : "Returning from " + r.routeId;
+            if (loggingColor) {
+                return Ansi.ansi().fg(r.failed ? Ansi.Color.RED : Ansi.Color.GREEN).a(s).reset().toString();
+            } else {
+                return s;
+            }
+        }
+        if (!r.done) {
+            String s = remote ? "Sending" : "Processing";
+            if (loggingColor) {
+                return Ansi.ansi().fg(Ansi.Color.BLUE).a(s).reset().toString();
+            } else {
+                return s;
+            }
+        } else if (r.failed) {
+            String fail = r.exception != null ? "Exception" : "Failed";
+            if (loggingColor) {
+                return Ansi.ansi().fg(Ansi.Color.RED).a(fail).reset().toString();
+            } else {
+                return fail;
+            }
+        } else {
+            String s = remote ? "Sent" : "Processed";
+            if (loggingColor) {
+                return Ansi.ansi().fg(Ansi.Color.GREEN).a(s).reset().toString();
+            } else {
+                return s;
+            }
+        }
+    }
+
+    private String getId(Row r) {
+        if (r.first) {
+            return "*-->";
+        } else if (r.last) {
+            return "*<--";
+        } else {
+            return r.nodeId;
+        }
+    }
+
+    private static class Pid {
+        String pid;
+        String name;
+        Queue<String> fifo;
+        int depth;
+        LineNumberReader reader;
+        // the size of the trace file when it was last read
+        long size;
+    }
+
+    private static class Row {
+        Pid parent;
+        String pid;
+        String name;
+        boolean first;
+        boolean last;
+        long uid;
+        String exchangeId;
+        String exchangePattern;
+        String threadName;
+        String location;
+        String routeId;
+        String nodeId;
+        long timestamp;
+        long elapsed;
+        boolean done;
+        boolean failed;
+        JsonObject aggregate;
+        JsonObject endpoint;
+        JsonObject endpointService;
+        JsonObject message;
+        JsonObject exception;
+
+        Row(Pid parent) {
+            this.parent = parent;
+        }
+
+    }
+
+    private static class StatusRow {
+        String pid;
+        String name;
+        String age;
+        long uptime;
+        boolean enabled;
+        boolean standby;
+        long counter;
+        long queueSize;
+        String filter;
+        String pattern;
+    }
+
+}

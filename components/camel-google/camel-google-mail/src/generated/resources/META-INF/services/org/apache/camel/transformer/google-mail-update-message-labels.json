@@ -1,0 +1,28 @@
+{
+  "transformer": {
+    "kind": "transformer",
+    "name": "google-mail:update-message-labels",
+    "title": "Google Mail (Update Message Labels)",
+    "description": "Updates Gmail message labels by resolving label names from addLabels\/removeLabels exchange variables",
+    "deprecated": false,
+    "javaType": "org.apache.camel.component.google.mail.transform.GoogleMailUpdateMessageLabelsDataTypeTransformer",
+    "groupId": "org.apache.camel",
+    "artifactId": "camel-google-mail",
+    "version": "4.24.0-SNAPSHOT"
+  },
+  "bodyTypes": {
+    "transformerIn": {
+      "carriers": [
+        "any"
+      ],
+      "description": "The body is not read: the labels come from the addLabels and removeLabels variables"
+    },
+    "transformerOut": {
+      "carriers": [
+        "pojo"
+      ],
+      "javaType": "com.google.api.services.gmail.model.ModifyMessageRequest"
+    }
+  }
+}
+

@@ -1,0 +1,270 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.camel.tooling.maven;
+
+import java.util.Collection;
+import java.util.List;
+import java.util.Set;
+import java.util.function.Predicate;
+
+import org.apache.camel.Service;
+
+/**
+ * Pragmatic Maven download/resolution API that should replace usage of Ivy/Grape and Shrinkwrap across Camel.
+ */
+public interface MavenDownloader extends Service {
+
+    /**
+     * A single non-transitive artifact resolution - a shorthand for
+     * {@code resolveArtifacts(List.of(gav), null, false, false)}.
+     *
+     * @param  gav              the Maven artifact to resolve
+     * @throws RuntimeException if there are any resolution problems
+     */
+    default MavenArtifact resolveArtifact(MavenGav gav) {
+        try {
+            List<MavenArtifact> artifacts = resolveArtifacts(List.of(gav.toMavenResolverString()), null, false, false);
+            if (artifacts.size() != 1) {
+                throw new IllegalStateException("Could not resolve " + gav);
+            }
+            return artifacts.get(0);
+        } catch (MavenResolutionException e) {
+            throw new RuntimeException("Could not resolve " + gav, e);
+        }
+    }
+
+    /**
+     * Main resolution method. Using Maven Resolver, a list of maven coordinates (in the form of
+     * {@code groupId:artifactId[:packaging[:classifier]]:version}) is used to download artifacts from configured Maven
+     * repositories.
+     *
+     * @param rootGav            root Maven artifact
+     * @param dependencyGAVs     a list of Maven coordinates
+     * @param extraRepositories  nullable list of additional repositories to use (except the discovered ones)
+     * @param transitively       whether to download/resolve dependencies transitively
+     * @param useApacheSnapshots whether to include Apache Snapshots repository in the list of used repositories
+     */
+    List<MavenArtifact> resolveArtifacts(
+            String rootGav,
+            List<String> dependencyGAVs, Set<String> extraRepositories,
+            boolean transitively, boolean useApacheSnapshots)
+            throws MavenResolutionException;
+
+    /**
+     * Resolves the artifacts as {@link #resolveArtifacts(String, List, Set, boolean, boolean)} does, leaving out the
+     * artifacts that are already available, such as the JARs on the classpath: they are not downloaded, nor are their
+     * dependencies.
+     *
+     * @param available the artifacts that are already available (tested with their base version), or null to resolve
+     *                  them all
+     */
+    default List<MavenArtifact> resolveArtifacts(
+            String rootGav,
+            List<String> dependencyGAVs, Set<String> extraRepositories,
+            boolean transitively, boolean useApacheSnapshots, Predicate<MavenGav> available)
+            throws MavenResolutionException {
+        return resolveArtifacts(rootGav, dependencyGAVs, extraRepositories, transitively, useApacheSnapshots);
+    }
+
+    /**
+     * Resolves the artifacts as {@link #resolveArtifacts(String, List, Set, boolean, boolean, Predicate)} does, with
+     * the versions of the managed artifacts: a transitive dependency on one of them gets its version, as with the
+     * dependencyManagement of a Maven project. For example, camel run passes the libraries it has already loaded, so
+     * that a library is not resolved again in another version.
+     *
+     * @param managed the artifacts whose version is used for the transitive dependencies on them, or null
+     * @since         4.24
+     */
+    default List<MavenArtifact> resolveArtifacts(
+            String rootGav,
+            List<String> dependencyGAVs, Set<String> extraRepositories,
+            boolean transitively, boolean useApacheSnapshots, Predicate<MavenGav> available,
+            Collection<MavenGav> managed)
+            throws MavenResolutionException {
+        return resolveArtifacts(rootGav, dependencyGAVs, extraRepositories, transitively, useApacheSnapshots, available);
+    }
+
+    /**
+     * Overload for {@link MavenDownloader#resolveArtifacts(String, List, Set, boolean, boolean)}
+     */
+    List<MavenArtifact> resolveArtifacts(
+            List<String> dependencyGAVs, Set<String> extraRepositories,
+            boolean transitively, boolean useApacheSnapshots)
+            throws MavenResolutionException;
+
+    /**
+     * Resolves available versions for groupId + artifactId from single remote repository.
+     *
+     * @param groupId    groupId
+     * @param artifactId artifactId
+     * @param repository external repository to use (defaults to Maven Central if {@code null})
+     */
+    List<MavenGav> resolveAvailableVersions(String groupId, String artifactId, String repository)
+            throws MavenResolutionException;
+
+    /**
+     * Resolves the available versions for groupId + artifactId from all the configured remote repositories: Maven
+     * Central (unless disabled), the repositories of the active profiles in the Maven settings, and the configured
+     * repositories (see {@link #setRepos(String)}), with mirrors applied, plus the given extra repositories. The
+     * versions of all repositories are merged, and a repository that cannot be reached is skipped.
+     *
+     * @param  groupId                  groupId
+     * @param  artifactId               artifactId
+     * @param  extraRepositories        nullable set of additional repositories to use
+     * @param  fresh                    whether to check the remote repositories again, instead of using the metadata
+     *                                  downloaded before
+     * @return                          the versions, in no particular order, without duplicates
+     * @throws MavenResolutionException when none of the repositories can be reached
+     */
+    default List<MavenGav> resolveAvailableVersions(
+            String groupId, String artifactId, Set<String> extraRepositories, boolean fresh)
+            throws MavenResolutionException {
+        throw new UnsupportedOperationException("resolveAvailableVersions is not supported by " + getClass().getName());
+    }
+
+    /**
+     * Reads the resolved (effective) POM of a single artifact, without downloading the artifact itself or its
+     * dependencies. Uses the same repositories, mirrors, settings and offline mode as
+     * {@link #resolveArtifacts(List, Set, boolean, boolean)}.
+     *
+     * @param gav               the Maven coordinates ({@code groupId:artifactId:version})
+     * @param extraRepositories nullable set of additional repositories to use (except the discovered ones)
+     */
+    default MavenArtifactDescriptor resolveArtifactDescriptor(String gav, Set<String> extraRepositories)
+            throws MavenResolutionException {
+        throw new UnsupportedOperationException("resolveArtifactDescriptor is not supported by " + getClass().getName());
+    }
+
+    /**
+     * Existing, configured {@link MavenDownloader} can be used as a template to create customized version which shares
+     * most of the configuration except underlying {@code org.eclipse.aether.RepositorySystemSession}, which can't be
+     * shared.
+     */
+    MavenDownloader customize(String localRepository, int connectTimeout, int requestTimeout);
+
+    /**
+     * To use a listener when downloading from remote repositories.
+     */
+    void setRemoteArtifactDownloadListener(RemoteArtifactDownloadListener listener);
+
+    /**
+     * Set a flag determining Maven update behavior. See the description of {@code -U,--update-snapshots} Maven option.
+     * When set to {@code true}, Maven metadata (to determine newest SNAPSHOT or RELEASE or LATEST version) is always
+     * fetched.
+     */
+    void setFresh(boolean fresh);
+
+    /**
+     * Sets maven downloader in offline mode
+     */
+    void setOffline(boolean offline);
+
+    /**
+     * When enabled, the artifacts and metadata already in the local Maven repository are used as is, without checking
+     * the remote repositories for updates (like {@code mvn --no-snapshot-updates}), while missing artifacts are still
+     * downloaded. This is useful for CLI tools where artifacts are typically already cached and remote SNAPSHOT
+     * metadata checks add significant latency.
+     */
+    void setPreferLocal(boolean preferLocal);
+
+    /**
+     * Whether prefer-local resolution mode is enabled.
+     */
+    boolean isPreferLocal();
+
+    /**
+     * Configure comma-separated list of repositories to use (in addition to the ones discovered from Maven settings).
+     */
+    void setRepos(String repos);
+
+    /**
+     * Configures the extra default repositories, which are used in addition to Maven Central, the repositories of the
+     * Maven settings and the configured repositories: a comma-separated list of URLs or {@code id=url} pairs. An empty
+     * value is no extra repositories, and null (the default) takes them from the {@code camel.extra.repos} system
+     * property, else the {@code camel.default.extra.repos.default.value} system property.
+     * <p>
+     * The default implementation throws, rather than ignoring the value: an implementation that does not support it
+     * would otherwise download from repositories the caller asked not to use (for example, none at all).
+     *
+     * @since 4.24
+     */
+    default void setExtraRepos(String extraRepos) {
+        throw new UnsupportedOperationException("setExtraRepos is not supported by " + getClass().getName());
+    }
+
+    /**
+     * The extra default repositories in use (see {@link #setExtraRepos(String)}): the configured ones, else the ones of
+     * the system properties.
+     * <p>
+     * The default implementation returns null (none), which is what an implementation that does not support extra
+     * repositories uses.
+     *
+     * @return the comma-separated repositories, or null or empty when there are none
+     * @since  4.24
+     */
+    default String getExtraRepos() {
+        return null;
+    }
+
+    /**
+     * Configure a location of {@code settings-security.xml} (when not set, defaults to
+     * {@code ~/.m2/settings-security.xml} unless {@link #setMavenSettingsLocation(String)} is set explicitly set to
+     * {@code "false"}.
+     */
+    void setMavenSettingsSecurityLocation(String mavenSettingsSecurity);
+
+    /**
+     * Configure a location of {@code settings.xml} (when not set, defaults to {@code ~/.m2/settings.xml} unless it's
+     * explicitly set to {@code "false"}.
+     */
+    void setMavenSettingsLocation(String mavenSettings);
+
+    /**
+     * Gets the repository resolver.
+     */
+    RepositoryResolver getRepositoryResolver();
+
+    /**
+     * Sets a custom repository resolver.
+     */
+    void setRepositoryResolver(RepositoryResolver repositoryResolver);
+
+    /**
+     * Sets whether maven central repository should be included and as first in the list of repositories. This can be
+     * used to turn of maven central for users that may use their own maven proxy.
+     */
+    void setMavenCentralEnabled(boolean mavenCentralEnabled);
+
+    /**
+     * Sets whether maven central repository should be included and as first in the list of repositories. This can be
+     * used to turn of maven central for users that may use their own maven proxy.
+     */
+    boolean isMavenCentralEnabled();
+
+    /**
+     * Sets whether using SNAPSHOT versions of Apache Camel is enabled. If enabled then SNAPSHOT can be downloaded from
+     * the ASF SNAPSHOT maven repository.
+     */
+    void setMavenApacheSnapshotEnabled(boolean mavenApacheSnapshotEnabled);
+
+    /**
+     * Sets whether using SNAPSHOT versions of Apache Camel is enabled. If enabled then SNAPSHOT can be downloaded from
+     * the ASF SNAPSHOT maven repository.
+     */
+    boolean isMavenApacheSnapshotEnabled();
+
+}

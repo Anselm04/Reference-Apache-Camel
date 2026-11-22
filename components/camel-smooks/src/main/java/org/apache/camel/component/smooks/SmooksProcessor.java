@@ -1,0 +1,401 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.camel.component.smooks;
+
+import java.io.File;
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.InputStreamReader;
+import java.io.Reader;
+import java.net.MalformedURLException;
+import java.net.URI;
+import java.nio.charset.Charset;
+import java.nio.file.Path;
+import java.util.Arrays;
+import java.util.Comparator;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Map.Entry;
+import java.util.Set;
+
+import javax.xml.transform.sax.SAXSource;
+
+import org.w3c.dom.Node;
+
+import org.xml.sax.InputSource;
+import org.xml.sax.SAXException;
+
+import org.apache.camel.CamelContext;
+import org.apache.camel.CamelContextAware;
+import org.apache.camel.Exchange;
+import org.apache.camel.InvalidPayloadException;
+import org.apache.camel.Message;
+import org.apache.camel.Processor;
+import org.apache.camel.RuntimeCamelException;
+import org.apache.camel.WrappedFile;
+import org.apache.camel.support.ExchangeHelper;
+import org.apache.camel.support.ResourceHelper;
+import org.apache.camel.support.builder.OutputStreamBuilder;
+import org.apache.camel.support.service.ServiceSupport;
+import org.apache.camel.util.IOHelper;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.smooks.Smooks;
+import org.smooks.SmooksFactory;
+import org.smooks.api.ExecutionContext;
+import org.smooks.api.NotAppContextScoped;
+import org.smooks.api.SmooksException;
+import org.smooks.api.TypedKey;
+import org.smooks.api.delivery.VisitorAppender;
+import org.smooks.api.io.Sink;
+import org.smooks.api.io.Source;
+import org.smooks.api.resource.visitor.Visitor;
+import org.smooks.engine.lookup.ExportsLookup;
+import org.smooks.engine.report.HtmlReportGenerator;
+import org.smooks.io.payload.Exports;
+import org.smooks.io.sink.StreamSink;
+import org.smooks.io.source.ByteSource;
+import org.smooks.io.source.DOMSource;
+import org.smooks.io.source.ReaderSource;
+import org.smooks.io.source.StreamSource;
+import org.smooks.io.source.URLSource;
+
+/**
+ * Smooks {@link Processor} for Camel.
+ */
+public class SmooksProcessor extends ServiceSupport implements Processor, CamelContextAware {
+
+    private static final TypedKey<Exchange> EXCHANGE_TYPED_KEY = TypedKey.of();
+    private static final Logger LOG = LoggerFactory.getLogger(SmooksProcessor.class);
+
+    private SmooksFactory smooksFactory;
+    private Smooks smooks;
+    private String configUri;
+    private String reportPath;
+    private Boolean allowExecutionContextFromHeader = false;
+    private Boolean lazyStartProducer = false;
+    private boolean allowExternalEntities;
+    private boolean hardenXmlInput;
+
+    private final Set<VisitorAppender> visitorAppender = new HashSet<>();
+    private final Map<String, Visitor> selectorVisitorMap = new HashMap<>();
+    private CamelContext camelContext;
+
+    public SmooksProcessor(final CamelContext camelContext) {
+        this.camelContext = camelContext;
+    }
+
+    public SmooksProcessor(final Smooks smooks, final CamelContext camelContext) {
+        this(camelContext);
+        this.smooks = smooks;
+    }
+
+    public SmooksProcessor(final String configUri, final CamelContext camelContext) throws IOException, SAXException {
+        this(camelContext);
+        this.configUri = configUri;
+    }
+
+    public void setCamelContext(CamelContext camelContext) {
+        this.camelContext = camelContext;
+    }
+
+    public CamelContext getCamelContext() {
+        return camelContext;
+    }
+
+    public Boolean getAllowExecutionContextFromHeader() {
+        return allowExecutionContextFromHeader;
+    }
+
+    public void setAllowExecutionContextFromHeader(Boolean allowExecutionContextFromHeader) {
+        this.allowExecutionContextFromHeader = allowExecutionContextFromHeader;
+    }
+
+    public boolean isAllowExternalEntities() {
+        return allowExternalEntities;
+    }
+
+    public void setAllowExternalEntities(boolean allowExternalEntities) {
+        this.allowExternalEntities = allowExternalEntities;
+    }
+
+    public void process(final Exchange exchange) {
+        ExecutionContext executionContext = null;
+        if (allowExecutionContextFromHeader) {
+            executionContext
+                    = exchange.getMessage().getHeader(SmooksConstants.SMOOKS_EXECUTION_CONTEXT, ExecutionContext.class);
+        }
+        if (executionContext == null) {
+            executionContext = smooks.createExecutionContext();
+            Charset charset = ExchangeHelper.getCharset(exchange, false);
+            if (charset != null) {
+                // if provided use the same character encoding
+                executionContext.setContentEncoding(charset.name());
+            }
+        }
+
+        try {
+            executionContext.put(EXCHANGE_TYPED_KEY, exchange);
+            exchange.getIn().setHeader(SmooksConstants.SMOOKS_EXECUTION_CONTEXT, executionContext);
+            setUpSmooksReporting(executionContext);
+
+            final Exports exports = smooks.getApplicationContext().getRegistry().lookup(new ExportsLookup());
+            if (exports.hasExports()) {
+                final Sink[] sinks = exports.createSinks();
+                // Smooks creates the sinks in no fixed order: sort them by type so that a List body has a stable order
+                Arrays.sort(sinks, Comparator.comparing(sink -> sink.getClass().getName()));
+                smooks.filterSource(executionContext, getSource(exchange, executionContext.getContentEncoding()), sinks);
+                setResultOnBody(exports, sinks, exchange);
+            } else {
+                final OutputStreamBuilder outputStreamBuilder = OutputStreamBuilder.withExchange(exchange);
+                smooks.filterSource(executionContext, getSource(exchange, executionContext.getContentEncoding()),
+                        new StreamSink<>(outputStreamBuilder));
+                exchange.getMessage().setBody(outputStreamBuilder.build());
+            }
+        } catch (IOException | InvalidPayloadException e) {
+            throw new RuntimeCamelException(e);
+        } finally {
+            executionContext.remove(EXCHANGE_TYPED_KEY);
+        }
+    }
+
+    protected void setResultOnBody(final Exports exports, final Sink[] sinks, final Exchange exchange) {
+        final Message message = exchange.getMessage();
+        final List<Object> objects = Exports.extractSinks(sinks, exports);
+        if (objects.size() == 1) {
+            Object value = objects.get(0);
+            message.setBody(value);
+        } else {
+            message.setBody(objects);
+        }
+    }
+
+    private void setUpSmooksReporting(final ExecutionContext executionContext) {
+        if (reportPath != null) {
+            try {
+                executionContext.getContentDeliveryRuntime().addExecutionEventListener(
+                        new HtmlReportGenerator(reportPath, executionContext.getApplicationContext()));
+            } catch (final IOException e) {
+                LOG.warn("Cannot generate Smooks Report. The reportPath specified was [{}]. This exception is ignored.",
+                        reportPath, e);
+            }
+        }
+    }
+
+    private Source getSource(final Exchange exchange, final String contentEncoding) throws InvalidPayloadException {
+        final Object payload = exchange.getIn().getBody();
+
+        if (payload instanceof Source source && !hardenXmlInput) {
+            return source;
+        }
+
+        if (payload instanceof Node node) {
+            return new DOMSource(node);
+        }
+
+        if (payload instanceof SAXSource saxSource) {
+            // The XMLReader of a SAXSource is a parser, not the input: read the input source that it holds
+            final Source source = toSource(saxSource, exchange);
+            if (!hardenXmlInput) {
+                return source;
+            }
+            try {
+                return SmooksSecuritySupport.secureXmlSource(source, contentEncoding);
+            } catch (IOException | SAXException e) {
+                throw new SmooksException(e);
+            }
+        }
+
+        if (hardenXmlInput) {
+            // Untrusted XML: parse with a reader that does not resolve external entities before Smooks sees it
+            try {
+                if (payload instanceof Source source) {
+                    return SmooksSecuritySupport.secureXmlSource(source, contentEncoding);
+                }
+                return SmooksSecuritySupport.secureXmlSource(exchange.getIn().getMandatoryBody(InputStream.class));
+            } catch (IOException | SAXException e) {
+                throw new SmooksException(e);
+            }
+        }
+
+        if (payload instanceof byte[] byteArray) {
+            return new ByteSource(byteArray);
+        }
+
+        if (payload instanceof InputStream inputstream) {
+            return new StreamSource<>(inputstream);
+        }
+
+        if (payload instanceof Reader reader) {
+            return new ReaderSource<>(reader);
+        }
+
+        if (payload instanceof WrappedFile<?> wrappedFile) {
+            if (wrappedFile.getFile() instanceof File file) {
+                return toURLSource(file.toURI().toString());
+            }
+            // A remote file (ftp, sftp, ftps) is not a java.io.File: read its downloaded content
+            return new StreamSource<>(exchange.getIn().getMandatoryBody(InputStream.class));
+        }
+
+        if (payload instanceof File file) {
+            return toURLSource(file.toURI().toString());
+        }
+
+        if (payload instanceof Path path) {
+            return toURLSource(path.toUri().toString());
+        }
+
+        return exchange.getIn().getMandatoryBody(Source.class);
+    }
+
+    private static Source toSource(final SAXSource saxSource, final Exchange exchange) throws InvalidPayloadException {
+        final InputSource inputSource = saxSource.getInputSource();
+        if (inputSource != null) {
+            if (inputSource.getCharacterStream() != null) {
+                return new ReaderSource<>(inputSource.getCharacterStream());
+            }
+            if (inputSource.getByteStream() != null) {
+                if (inputSource.getEncoding() != null) {
+                    return new ReaderSource<>(
+                            new InputStreamReader(inputSource.getByteStream(), Charset.forName(inputSource.getEncoding())));
+                }
+                return new StreamSource<>(inputSource.getByteStream());
+            }
+            if (inputSource.getSystemId() != null) {
+                return toURLSource(inputSource.getSystemId());
+            }
+        }
+        throw new InvalidPayloadException(exchange, Source.class);
+    }
+
+    private static Source toURLSource(final String systemId) {
+        try {
+            return new URLSource(URI.create(systemId).toURL());
+        } catch (MalformedURLException | IllegalArgumentException e) {
+            throw new SmooksException(e);
+        }
+    }
+
+    public String getSmooksConfig() {
+        return configUri;
+    }
+
+    public void setSmooksConfig(final String smooksConfig) {
+        this.configUri = smooksConfig;
+    }
+
+    /**
+     * Add a visitor instance.
+     *
+     * @param  visitor        The visitor implementation.
+     * @param  targetSelector The message fragment target selector.
+     * @return                This instance.
+     */
+    public SmooksProcessor addVisitor(Visitor visitor, String targetSelector) {
+        selectorVisitorMap.put(targetSelector, visitor);
+        return this;
+    }
+
+    /**
+     * Add a visitor instance to <code>this</code> Smooks instance via a {@link VisitorAppender}.
+     *
+     * @param  appender The visitor appender.
+     * @return          This instance.
+     */
+    public SmooksProcessor addVisitor(VisitorAppender appender) {
+        visitorAppender.add(appender);
+        return this;
+    }
+
+    public void setReportPath(String reportPath) {
+        this.reportPath = reportPath;
+    }
+
+    public SmooksFactory getSmooksFactory() {
+        return smooksFactory;
+    }
+
+    public void setSmooksFactory(SmooksFactory smooksFactory) {
+        this.smooksFactory = smooksFactory;
+    }
+
+    private Smooks createSmooks() {
+        return smooksFactory != null ? smooksFactory.createInstance() : new Smooks();
+    }
+
+    private void addAppender(Smooks smooks, Set<VisitorAppender> visitorAppenders) {
+        for (VisitorAppender appender : visitorAppenders)
+            smooks.addVisitors(appender);
+    }
+
+    private void addVisitor(Smooks smooks, Map<String, Visitor> selectorVisitorMap) {
+        for (Entry<String, Visitor> entry : selectorVisitorMap.entrySet())
+            smooks.addVisitor(entry.getValue(), entry.getKey());
+    }
+
+    public Boolean getLazyStartProducer() {
+        return lazyStartProducer;
+    }
+
+    public void setLazyStartProducer(Boolean lazyStartProducer) {
+        this.lazyStartProducer = lazyStartProducer;
+    }
+
+    @Override
+    protected void doStart() {
+        try {
+            if (smooks == null) {
+                smooks = createSmooks();
+                if (configUri != null) {
+                    InputStream is = ResourceHelper.resolveMandatoryResourceAsInputStream(camelContext, configUri);
+                    smooks.addResourceConfigs(is);
+                }
+                smooks.getApplicationContext().getRegistry().registerObject(CamelContext.class,
+                        (NotAppContextScoped.Ref<CamelContext>) () -> camelContext);
+            }
+
+            hardenXmlInput = !allowExternalEntities && SmooksSecuritySupport.usesDefaultXmlReader(smooks);
+
+            addAppender(smooks, visitorAppender);
+            addVisitor(smooks, selectorVisitorMap);
+
+            if (!lazyStartProducer) {
+                smooks.createExecutionContext();
+            }
+
+        } catch (Exception e) {
+            throw new SmooksException(e.getMessage(), e);
+        }
+    }
+
+    @Override
+    protected void doStop() {
+        if (smooks != null) {
+            IOHelper.close(smooks);
+            smooks = null;
+        }
+    }
+
+    @Override
+    public String toString() {
+        return "SmooksProcessor[configUri=" + configUri + "]";
+    }
+
+}

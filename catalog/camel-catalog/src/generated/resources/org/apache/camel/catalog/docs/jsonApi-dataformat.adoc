@@ -1,0 +1,70 @@
+= JSonApi DataFormat
+:doctitle: JSonApi
+:shortname: jsonApi
+:artifactid: camel-jsonapi
+:description: Marshal and unmarshal JSON:API resources using JSONAPI-Converter library
+:since: 3.0
+:supportlevel: Stable
+:tabs-sync-option:
+
+*Since Camel {since}*
+
+// dataformat options: START
+include::partial$dataformat-options.adoc[]
+// dataformat options: END
+
+== Usage
+
+The `dataFormatTypes` are the resource classes, separated by commas.
+They are annotated with `@Type` and `@Id` of the JSONAPI-Converter library.
+On unmarshal, `mainFormatType` is the class of the primary data of the document:
+
+[source,yaml]
+----
+- route:
+    from:
+      uri: direct:marshal
+      steps:
+        - marshal:
+            jsonApi:
+              dataFormatTypes: com.example.Book,com.example.Author
+        - to:
+            uri: mock:marshal
+- route:
+    from:
+      uri: direct:unmarshal
+      steps:
+        - unmarshal:
+            jsonApi:
+              dataFormatTypes: com.example.Book,com.example.Author
+              mainFormatType: com.example.Book
+        - to:
+            uri: mock:unmarshal
+----
+
+=== Collection documents
+
+A JSON:API document whose primary data is an array, such as the answer to `GET /books`, is a collection document.
+
+* On unmarshal, a document whose `data` is an array gives a `java.util.List` of `mainFormatType` objects (an empty
+  list for `"data": []`). A document whose `data` is one resource object gives that object, as before.
+* On marshal, a `java.util.Collection` or an array of resource objects is written as a collection document, whose
+  `data` is an array. Any other body is written as one resource object.
+
+== Dependencies
+
+To use JsonAPI in your Camel routes, you need to add the dependency
+on *camel-jsonapi* which implements this data format.
+
+If you use Maven, you could add the following to your `pom.xml`,
+substituting the version number for the latest & greatest release.
+
+[source,xml]
+----
+<dependency>
+  <groupId>org.apache.camel</groupId>
+  <artifactId>camel-jsonapi</artifactId>
+  <version>x.x.x</version>
+  <!-- use the same version as your Camel core version -->
+</dependency>
+----

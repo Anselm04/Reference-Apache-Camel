@@ -1,0 +1,220 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.camel.dsl.jbang.core.commands.process;
+
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.List;
+import java.util.Map;
+import java.util.stream.Collectors;
+
+import com.github.freva.asciitable.AsciiTable;
+import com.github.freva.asciitable.Column;
+import com.github.freva.asciitable.HorizontalAlign;
+import com.github.freva.asciitable.OverflowBehaviour;
+import org.aesh.command.CommandDefinition;
+import org.aesh.command.option.Option;
+import org.apache.camel.dsl.jbang.core.common.PidNameAgeCompletionCandidates;
+import org.apache.camel.dsl.jbang.core.common.ProcessHelper;
+import org.apache.camel.dsl.jbang.core.common.RowSort;
+import org.apache.camel.dsl.jbang.core.common.TerminalWidthHelper;
+import org.apache.camel.dsl.jbang.core.model.ListProcessDTO;
+import org.apache.camel.util.TimeUtils;
+import org.apache.camel.util.json.JsonObject;
+import org.apache.camel.util.json.Jsoner;
+
+import static org.apache.camel.dsl.jbang.core.common.CamelCommandHelper.extractState;
+
+@CommandDefinition(name = "ps", description = "List running Camel integrations", generateHelp = true,
+                   footer = {
+                           "Examples:",
+                           "  camel ps",
+                           "  camel ps --sort=name",
+                           "  camel ps --watch" })
+public class ListProcess extends ProcessWatchCommand {
+
+    private static final RowSort<Row> ORDER = RowSort.<Row> integration(r -> r.pid, r -> r.name, r -> r.uptime);
+
+    @Option(name = "sort", description = "Sort by pid, name or age", defaultValue = "pid",
+            completer = PidNameAgeCompletionCandidates.class)
+    String sort;
+
+    @Option(name = "remote", hasValue = false, description = "Break down counters into remote/total pairs")
+    boolean remote;
+
+    @Option(name = "pid", hasValue = false, description = "List only pid in the output")
+    boolean pid;
+
+    protected Integer doProcessWatchCall() throws Exception {
+        List<Row> rows = new ArrayList<>();
+
+        forEachIntegration("*", (ph, root) -> {
+            Row row = new Row();
+            row.pid = Long.toString(ph.pid());
+            row.uptime = extractSince(ph);
+            row.ago = TimeUtils.printSince(row.uptime);
+            JsonObject context = (JsonObject) root.get("context");
+            if (context == null) {
+                return;
+            }
+            row.name = context.getString("name");
+            if ("CamelJBang".equals(row.name)) {
+                row.name = ProcessHelper.extractName(root, ph);
+            }
+            row.state = context.getInteger("phase");
+            JsonObject hc = (JsonObject) root.get("healthChecks");
+            boolean rdy = hc != null && hc.getBoolean("ready");
+            if (rdy) {
+                row.ready = "1/1";
+            } else {
+                row.ready = "0/1";
+            }
+            Map<String, ?> stats = context.getMap("statistics");
+            if (stats != null) {
+                row.total = stats.get("exchangesTotal").toString();
+                Object num = stats.get("remoteExchangesTotal");
+                if (num != null) {
+                    row.totalRemote = num.toString();
+                }
+                row.failed = stats.get("exchangesFailed").toString();
+                num = stats.get("remoteExchangesFailed");
+                if (num != null) {
+                    row.failedRemote = num.toString();
+                }
+                row.inflight = stats.get("exchangesInflight").toString();
+                num = stats.get("remoteExchangesInflight");
+                if (num != null) {
+                    row.inflightRemote = num.toString();
+                }
+                stats = (Map<String, ?>) stats.get("reload");
+                if (stats != null) {
+                    stats = (Map<String, ?>) stats.get("lastError");
+                }
+                if (stats != null) {
+                    row.reloadError = (String) stats.get("message");
+                }
+            }
+
+            rows.add(row);
+        });
+
+        // sort rows
+        rows.sort(ORDER.comparator(sort));
+
+        // print rows
+        if (!rows.isEmpty() || jsonOutput) {
+            if (pid) {
+                if (jsonOutput) {
+                    printer().println(
+                            Jsoner.serialize(
+                                    rows.stream().map(row -> JsonValues.pid(row.pid)).collect(Collectors.toList())));
+                } else {
+                    rows.forEach(r -> printer().println(r.pid));
+                }
+            } else {
+                if (jsonOutput) {
+                    printer().println(
+                            Jsoner.serialize(
+                                    rows.stream()
+                                            .map(row -> {
+                                                Map<String, Object> jo = new ListProcessDTO(
+                                                        row.pid, row.name, row.ready, getStatus(row), row.ago, row.total,
+                                                        row.failed, row.inflight).toMap();
+                                                jo.put("uptime", row.uptime);
+                                                return jo;
+                                            })
+                                            .collect(Collectors.toList())));
+                } else {
+                    // Fixed columns: PID(~8) + NAME(up to nameW) + READY(5) + STATUS(8) + AGE(8) + TOTAL(6) + FAIL(5) + INFLIGHT(10)
+                    int tw = terminalWidth();
+                    int nameW = TerminalWidthHelper.flexWidth(tw, 56, TerminalWidthHelper.noBorderOverhead(9), 15, 40);
+                    int errW = TerminalWidthHelper.flexWidth(tw, nameW + 56, TerminalWidthHelper.noBorderOverhead(9), 10, 70);
+                    printer().println(AsciiTable.getTable(AsciiTable.NO_BORDERS, rows, Arrays.asList(
+                            new Column().header("PID").headerAlign(HorizontalAlign.CENTER).with(r -> r.pid),
+                            new Column().header("NAME").dataAlign(HorizontalAlign.LEFT)
+                                    .maxWidth(nameW, OverflowBehaviour.ELLIPSIS_RIGHT)
+                                    .with(r -> r.name),
+                            new Column().header("READY").dataAlign(HorizontalAlign.CENTER).with(r -> r.ready),
+                            new Column().header("STATUS").headerAlign(HorizontalAlign.CENTER)
+                                    .with(this::getStatus),
+                            new Column().header("AGE").headerAlign(HorizontalAlign.CENTER).with(r -> r.ago),
+                            new Column().header("TOTAL").with(this::getTotal),
+                            new Column().header("FAIL").with(this::getFailed),
+                            new Column().header("INFLIGHT").with(this::getInflight),
+                            new Column().header("") // empty header as we only show info when there is an error
+                                    .headerAlign(HorizontalAlign.LEFT).dataAlign(HorizontalAlign.LEFT)
+                                    .maxWidth(errW, OverflowBehaviour.NEWLINE)
+                                    .with(this::getDescription))));
+                }
+            }
+        }
+
+        return 0;
+    }
+
+    private String getStatus(Row r) {
+        if (r.reloadError != null) {
+            return "Error";
+        }
+        return extractState(r.state);
+    }
+
+    private String getDescription(Row r) {
+        if (r.reloadError != null) {
+            return "Reload failed due to: " + r.reloadError;
+        }
+        return null;
+    }
+
+    private String getTotal(Row r) {
+        if (remote && r.totalRemote != null) {
+            return r.totalRemote + "/" + r.total;
+        }
+        return r.total;
+    }
+
+    private String getFailed(Row r) {
+        if (remote && r.failedRemote != null) {
+            return r.failedRemote + "/" + r.failed;
+        }
+        return r.failed;
+    }
+
+    private String getInflight(Row r) {
+        if (remote && r.inflightRemote != null) {
+            return r.inflightRemote + "/" + r.inflight;
+        }
+        return r.inflight;
+    }
+
+    private static class Row {
+        String pid;
+        String name;
+        String ready;
+        int state;
+        String ago;
+        long uptime;
+        String total;
+        String totalRemote;
+        String failed;
+        String failedRemote;
+        String inflight;
+        String inflightRemote;
+        String reloadError;
+    }
+
+}

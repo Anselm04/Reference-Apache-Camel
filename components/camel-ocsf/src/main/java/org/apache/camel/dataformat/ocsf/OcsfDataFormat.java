@@ -1,0 +1,339 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.camel.dataformat.ocsf;
+
+import java.io.File;
+import java.io.InputStream;
+import java.io.OutputStream;
+import java.io.Reader;
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.Set;
+
+import org.apache.camel.CamelContext;
+import org.apache.camel.CamelContextAware;
+import org.apache.camel.Exchange;
+import org.apache.camel.WrappedFile;
+import org.apache.camel.dataformat.ocsf.model.OcsfEvent;
+import org.apache.camel.spi.BodyType;
+import org.apache.camel.spi.BodyType.Carrier;
+import org.apache.camel.spi.BodyTypes;
+import org.apache.camel.spi.DataFormat;
+import org.apache.camel.spi.DataFormatName;
+import org.apache.camel.spi.Metadata;
+import org.apache.camel.spi.annotations.Dataformat;
+import org.apache.camel.support.service.ServiceSupport;
+import org.apache.camel.util.CastUtils;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import tools.jackson.databind.DeserializationFeature;
+import tools.jackson.databind.JsonNode;
+import tools.jackson.databind.ObjectMapper;
+import tools.jackson.databind.ObjectReader;
+import tools.jackson.databind.SerializationFeature;
+import tools.jackson.databind.json.JsonMapper;
+import tools.jackson.databind.type.CollectionType;
+
+/**
+ * OCSF (Open Cybersecurity Schema Framework) DataFormat.
+ * <p>
+ * Marshals POJOs to OCSF-compliant JSON and unmarshals OCSF JSON to POJOs. This data format is designed to work with
+ * security events following the OCSF schema specification.
+ *
+ * @see <a href="https://schema.ocsf.io/">OCSF Schema</a>
+ */
+@Dataformat("ocsf")
+@Metadata(excludeProperties = "library")
+@BodyTypes(marshalIn = @BodyType(value = { Carrier.MAP, Carrier.LIST, Carrier.POJO },
+                                 description = "An OCSF event such as a DetectionFinding, a Map or a List to write as JSON. A"
+                                               + " String is written as one JSON string and bytes as Base64, not as they are"),
+           marshalOut = @BodyType(value = Carrier.STREAM, format = "json",
+                                  description = "The JSON in the stream cache, or a byte array when stream caching is off"),
+           unmarshalIn = @BodyType(value = { Carrier.TEXT, Carrier.BYTES, Carrier.STREAM, Carrier.FILE }, format = "json"),
+           unmarshalOut = @BodyType(value = Carrier.POJO, javaType = "org.apache.camel.dataformat.ocsf.model.OcsfEvent",
+                                    dependsOn = { "collectionType", "useList", "allowUnmarshallType" },
+                                    javaTypeOption = "unmarshalType",
+                                    byOption = @BodyType.When(option = "useList", value = "true", carriers = Carrier.LIST),
+                                    description = "The base OcsfEvent; an object of the class unmarshalType names, such as"
+                                                  + " DetectionFinding"))
+public class OcsfDataFormat extends ServiceSupport implements DataFormat, DataFormatName, CamelContextAware {
+
+    private static final Logger LOG = LoggerFactory.getLogger(OcsfDataFormat.class);
+
+    private CamelContext camelContext;
+    private ObjectMapper objectMapper;
+    private String unmarshalTypeName;
+    private Class<?> unmarshalType;
+    private boolean useDefaultObjectMapper = true;
+    private boolean allowUnmarshallType;
+    private String collectionTypeName;
+    private Class<? extends Collection> collectionType;
+    private boolean useList;
+    private boolean prettyPrint;
+
+    /**
+     * Use the default Jackson {@link ObjectMapper} and {@link OcsfEvent} as unmarshal type.
+     */
+    public OcsfDataFormat() {
+        this.unmarshalType = OcsfEvent.class;
+    }
+
+    /**
+     * Use the default Jackson {@link ObjectMapper} and with a custom unmarshal type.
+     *
+     * @param unmarshalType the custom unmarshal type
+     */
+    public OcsfDataFormat(Class<?> unmarshalType) {
+        this.unmarshalType = unmarshalType;
+    }
+
+    /**
+     * Use a custom Jackson mapper and an unmarshal type.
+     *
+     * @param objectMapper  the custom mapper
+     * @param unmarshalType the custom unmarshal type
+     */
+    public OcsfDataFormat(ObjectMapper objectMapper, Class<?> unmarshalType) {
+        this.objectMapper = objectMapper;
+        this.unmarshalType = unmarshalType;
+    }
+
+    @Override
+    public String getDataFormatName() {
+        return "ocsf";
+    }
+
+    @Override
+    public void marshal(Exchange exchange, Object graph, OutputStream stream) throws Exception {
+        objectMapper.writeValue(stream, graph);
+    }
+
+    @Override
+    public Object unmarshal(Exchange exchange, InputStream stream) throws Exception {
+        return unmarshal(exchange, (Object) stream);
+    }
+
+    @Override
+    public Object unmarshal(Exchange exchange, Object body) throws Exception {
+        Class<?> clazz = unmarshalType;
+        String type = null;
+
+        if (allowUnmarshallType) {
+            type = exchange.getIn().getHeader(OcsfConstants.UNMARSHAL_TYPE, String.class);
+        }
+        if (type != null) {
+            clazz = exchange.getContext().getClassResolver().resolveMandatoryClass(type);
+        }
+
+        ObjectReader reader;
+        if (collectionType != null) {
+            CollectionType collType = objectMapper.getTypeFactory().constructCollectionType(collectionType, clazz);
+            reader = objectMapper.readerFor(collType);
+        } else {
+            reader = objectMapper.readerFor(clazz);
+        }
+
+        // unwrap file (such as from camel-file)
+        if (body instanceof WrappedFile<?>) {
+            body = ((WrappedFile<?>) body).getBody();
+        }
+
+        Object answer;
+        if (body instanceof String b) {
+            answer = reader.readValue(b);
+        } else if (body instanceof byte[] arr) {
+            answer = reader.readValue(arr);
+        } else if (body instanceof Reader r) {
+            answer = reader.readValue(r);
+        } else if (body instanceof File f) {
+            answer = reader.readValue(f);
+        } else if (body instanceof JsonNode n) {
+            answer = reader.readValue(n);
+        } else {
+            // fallback to input stream
+            InputStream is = exchange.getContext().getTypeConverter().mandatoryConvertTo(InputStream.class, exchange, body);
+            answer = reader.readValue(is);
+        }
+
+        return answer;
+    }
+
+    @Override
+    public CamelContext getCamelContext() {
+        return camelContext;
+    }
+
+    @Override
+    public void setCamelContext(CamelContext camelContext) {
+        this.camelContext = camelContext;
+    }
+
+    public ObjectMapper getObjectMapper() {
+        return objectMapper;
+    }
+
+    /**
+     * Sets a custom Jackson {@link ObjectMapper} to use.
+     */
+    public void setObjectMapper(ObjectMapper objectMapper) {
+        this.objectMapper = objectMapper;
+    }
+
+    public String getUnmarshalTypeName() {
+        return unmarshalTypeName;
+    }
+
+    /**
+     * Class name of the OCSF event type to unmarshal to.
+     */
+    public void setUnmarshalTypeName(String unmarshalTypeName) {
+        this.unmarshalTypeName = unmarshalTypeName;
+    }
+
+    public Class<?> getUnmarshalType() {
+        return unmarshalType;
+    }
+
+    /**
+     * Class of the OCSF event type to unmarshal to.
+     */
+    public void setUnmarshalType(Class<?> unmarshalType) {
+        this.unmarshalType = unmarshalType;
+    }
+
+    public boolean isAllowUnmarshallType() {
+        return allowUnmarshallType;
+    }
+
+    /**
+     * If enabled, allows the unmarshal type to be specified via the {@link OcsfConstants#UNMARSHAL_TYPE} header.
+     */
+    public void setAllowUnmarshallType(boolean allowUnmarshallType) {
+        this.allowUnmarshallType = allowUnmarshallType;
+    }
+
+    public String getCollectionTypeName() {
+        return collectionTypeName;
+    }
+
+    /**
+     * Sets the collection type name to use when unmarshalling to a collection.
+     */
+    public void setCollectionTypeName(String collectionTypeName) {
+        this.collectionTypeName = collectionTypeName;
+    }
+
+    public Class<? extends Collection> getCollectionType() {
+        return collectionType;
+    }
+
+    /**
+     * Sets the collection type to use when unmarshalling to a collection.
+     */
+    public void setCollectionType(Class<? extends Collection> collectionType) {
+        this.collectionType = collectionType;
+    }
+
+    public boolean isUseList() {
+        return useList;
+    }
+
+    /**
+     * To unmarshal to a List of OCSF events.
+     */
+    public void setUseList(boolean useList) {
+        this.useList = useList;
+    }
+
+    public boolean isUseDefaultObjectMapper() {
+        return useDefaultObjectMapper;
+    }
+
+    /**
+     * Whether to look up and use a default Jackson ObjectMapper from the registry.
+     */
+    public void setUseDefaultObjectMapper(boolean useDefaultObjectMapper) {
+        this.useDefaultObjectMapper = useDefaultObjectMapper;
+    }
+
+    /**
+     * Uses {@link java.util.ArrayList} when unmarshalling.
+     */
+    public void useList() {
+        setCollectionType(ArrayList.class);
+    }
+
+    public boolean isPrettyPrint() {
+        return prettyPrint;
+    }
+
+    /**
+     * To enable pretty printing output nicely formatted.
+     */
+    public void setPrettyPrint(boolean prettyPrint) {
+        this.prettyPrint = prettyPrint;
+    }
+
+    @Override
+    protected void doInit() throws Exception {
+        super.doInit();
+
+        if (unmarshalTypeName != null && unmarshalType == null) {
+            unmarshalType = camelContext.getClassResolver().resolveClass(unmarshalTypeName);
+        }
+        if (collectionTypeName != null && collectionType == null) {
+            Class<?> clazz = camelContext.getClassResolver().resolveClass(collectionTypeName);
+            collectionType = CastUtils.cast(clazz);
+        }
+
+        if (objectMapper == null) {
+            // lookup if there is a single default mapper we can use
+            if (useDefaultObjectMapper && camelContext != null) {
+                Set<ObjectMapper> set = camelContext.getRegistry().findByType(ObjectMapper.class);
+                if (set.size() == 1) {
+                    objectMapper = set.iterator().next();
+                    LOG.info("Found a single ObjectMapper in the registry, so promoting it as the default ObjectMapper: {}",
+                            objectMapper);
+                } else {
+                    LOG.debug("Found {} ObjectMapper in the registry, so cannot promote any as the default ObjectMapper.",
+                            set.size());
+                }
+            }
+            // use a fallback object mapper in last resort
+            if (objectMapper == null) {
+                objectMapper = JsonMapper.builderWithJackson2Defaults()
+                        // Configure for OCSF compatibility
+                        .disable(DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES)
+                        .build();
+                LOG.debug("Creating new ObjectMapper to use: {}", objectMapper);
+            }
+        }
+
+        if (useList) {
+            setCollectionType(ArrayList.class);
+        }
+
+        if (prettyPrint) {
+            objectMapper = objectMapper.rebuild().enable(SerializationFeature.INDENT_OUTPUT).build();
+        }
+    }
+
+    @Override
+    protected void doStop() throws Exception {
+        // noop
+    }
+}

@@ -1,0 +1,130 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.camel.component.telegram.service;
+
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.InputStreamReader;
+import java.io.Reader;
+import java.io.UnsupportedEncodingException;
+import java.net.URI;
+import java.net.http.HttpResponse;
+import java.nio.charset.StandardCharsets;
+
+import org.apache.camel.Exchange;
+import org.apache.camel.RuntimeCamelException;
+import org.apache.camel.component.telegram.model.MessageResult;
+import org.apache.camel.support.GZIPHelper;
+import org.apache.camel.util.IOHelper;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import tools.jackson.core.JacksonException;
+import tools.jackson.databind.ObjectMapper;
+
+public class TelegramAsyncHandler {
+    private static final Logger LOG = LoggerFactory.getLogger(TelegramAsyncHandler.class);
+
+    // describes the request without its URI, which contains the authorization token
+    private final String request;
+    private final Class<? extends MessageResult> resultClass;
+    private final ObjectMapper mapper;
+    private final Exchange exchange;
+
+    TelegramAsyncHandler(String uri, Class<? extends MessageResult> resultClass, ObjectMapper mapper, Exchange exchange) {
+        this.request = TelegramServiceRestBotAPIAdapter.describe("POST", URI.create(uri));
+        this.resultClass = resultClass;
+        this.mapper = mapper;
+        this.exchange = exchange;
+    }
+
+    public static String extractCharset(String line, String defaultValue) {
+        if (line == null) {
+            return defaultValue;
+        }
+
+        final String[] parts = line.split(" ");
+        String charsetInfo = "";
+
+        for (var part : parts) {
+            if (part.startsWith("charset")) {
+                charsetInfo = part;
+                break;
+            }
+        }
+
+        final String charset = charsetInfo.replace("charset=", "").replace(";", "");
+
+        if (charset.isBlank()) {
+            return defaultValue;
+        }
+
+        return charset;
+
+    }
+
+    /**
+     * Sets the result of a successful response as the message body. Throws for a response with an error status, for an
+     * answer that is not ok and for a body that cannot be read; the caller fails the exchange with that exception and
+     * completes it.
+     */
+    public Object handleCompressedResponse(HttpResponse<InputStream> response) {
+        Object result;
+        final boolean success = response.statusCode() >= 200 && response.statusCode() < 300;
+
+        String charsetInfo = response.headers().firstValue("Content-Type").orElse(null);
+        final String charset = extractCharset(charsetInfo, StandardCharsets.UTF_8.name());
+
+        final String contentEncoding = response.headers().firstValue("Content-Encoding").orElse(null);
+
+        try (InputStream is = GZIPHelper.uncompressGzip(contentEncoding, response.body());
+             Reader r = new InputStreamReader(is, charset)) {
+
+            if (LOG.isDebugEnabled()) {
+                response.headers().map().forEach((key, value) -> LOG.debug("header {}={}", key, value));
+            }
+
+            if (success) {
+                if (LOG.isTraceEnabled()) {
+                    final String body = IOHelper.toString(r);
+                    LOG.trace("Received body for {}: {}", request, body);
+                    result = mapper.readValue(body, resultClass);
+                } else {
+                    result = mapper.readValue(r, resultClass);
+                }
+
+                MessageResult messageResult = (MessageResult) result;
+                if (!messageResult.isOk()) {
+                    throw new RuntimeCamelException(
+                            request + " responded: ok=false, error_code=" + messageResult.getErrorCode() + ", description="
+                                                    + messageResult.getDescription());
+                }
+
+                exchange.getMessage().setBody(result);
+            } else {
+                throw new RuntimeCamelException(
+                        request + " responded: " + response.statusCode() + IOHelper.toString(r));
+            }
+        } catch (UnsupportedEncodingException ex) {
+            throw new RuntimeException(ex);
+        } catch (IOException | JacksonException ex) {
+            throw new RuntimeCamelException("Could not parse the response from " + request, ex);
+        }
+
+        return exchange;
+    }
+}

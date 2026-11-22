@@ -1,0 +1,73 @@
+= Zendesk Component
+:doctitle: Zendesk
+:shortname: zendesk
+:artifactid: camel-zendesk
+:description: Manage Zendesk tickets, users, organizations, etc.
+:since: 2.19
+:supportlevel: Stable
+:tabs-sync-option:
+:component-header: Both producer and consumer are supported
+
+*Since Camel {since}*
+
+*{component-header}*
+
+The Zendesk component provides access to all the zendesk.com APIs accessible
+using https://github.com/cloudbees/zendesk-java-client[zendesk-java-client]. It
+allows producing messages to manage Zendesk ticket, user, organization, etc.
+
+Maven users will need to add the following dependency to their pom.xml
+for this component:
+
+[source,xml]
+----
+<dependency>
+    <groupId>org.apache.camel</groupId>
+    <artifactId>camel-zendesk</artifactId>
+    <version>${camel-version}</version>
+</dependency>
+----
+
+
+// component options: START
+include::partial$component-configure-options.adoc[]
+include::partial$component-endpoint-options.adoc[]
+include::partial$component-endpoint-headers.adoc[]
+// component options: END
+
+[NOTE]
+====
+This is an API-based component, so per-call parameters can be supplied through `Camel`-prefixed
+exchange headers in addition to the endpoint options. If the route consumes messages from untrusted
+producers, strip these internal headers at the trust boundary -- for example with
+`removeHeaders("Camel*")` -- before the message reaches this component, so that a sender cannot
+override the API call. See xref:manual::security-model.adoc[the Camel security model] for details.
+====
+
+== Usage
+
+The server and the credentials are component options, for example in `application.properties`:
+
+[source,properties]
+----
+camel.component.zendesk.server-url = https://yourcompany.zendesk.com
+camel.component.zendesk.username = {{env:ZENDESK_USERNAME}}
+camel.component.zendesk.token = {{env:ZENDESK_TOKEN}}
+----
+
+The endpoint is the method of the Zendesk client, and `inBody` names the method parameter that the message body is.
+The following route gets the ticket whose id is the message body. The body after the call is the `Ticket`:
+
+[source,yaml]
+----
+- route:
+    from:
+      uri: direct:ticket
+      steps:
+        - to:
+            uri: zendesk:getTicket
+            parameters:
+              inBody: id
+        - log:
+            message: "Ticket ${body.id}: ${body.subject}"
+----

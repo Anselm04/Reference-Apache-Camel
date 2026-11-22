@@ -1,0 +1,355 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.camel.dsl.jbang.core.commands.action;
+
+import java.lang.management.ManagementFactory;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.time.LocalDateTime;
+import java.time.format.DateTimeFormatter;
+import java.util.List;
+import java.util.stream.Stream;
+
+import com.sun.management.UnixOperatingSystemMXBean;
+import org.apache.camel.dsl.jbang.core.commands.CamelJBangMain;
+import org.apache.camel.dsl.jbang.core.common.CliException;
+import org.apache.camel.dsl.jbang.core.common.CliExitCode;
+import org.apache.camel.dsl.jbang.core.common.CommandLineHelper;
+import org.apache.camel.dsl.jbang.core.common.CommandLineTestHelper;
+import org.apache.camel.dsl.jbang.run.common.PreviousRun;
+import org.apache.camel.dsl.jbang.run.common.StringPrinter;
+import org.apache.camel.util.json.JsonObject;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.condition.EnabledOnOs;
+import org.junit.jupiter.api.condition.OS;
+import org.junit.jupiter.api.extension.ExtendWith;
+import org.mockito.junit.jupiter.MockitoExtension;
+
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
+
+/**
+ * camel log: the lines of the log of an integration, without following it.
+ */
+@ExtendWith(MockitoExtension.class)
+class CamelLogActionTest extends ActionCommandTestSupport {
+
+    private static final DateTimeFormatter TIMESTAMP = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss.SSS");
+
+    @Test
+    void printsTheLogOfTheIntegration() throws Exception {
+        writeLog(TEST_PID + ".log", line(-300, "Starting"), line(-60, "Slow"), line(-1, "Failed"));
+
+        assertThat(callWithSingleProcess(command())).isZero();
+
+        // one integration: no prefix with its name
+        assertThat(lines()).hasSize(3).allMatch(l -> !l.contains("|"));
+        assertThat(lines().get(2)).endsWith(": Failed");
+    }
+
+    @Test
+    void tailPrintsTheLastLines() throws Exception {
+        writeLog(TEST_PID + ".log", line(-300, "Starting"), line(-60, "Slow"), line(-1, "Failed"));
+
+        assertThat(callWithSingleProcess(command("--tail=2"))).isZero();
+
+        assertThat(lines()).hasSize(2);
+        assertThat(lines().get(0)).endsWith(": Slow");
+    }
+
+    @Test
+    void grepPrintsTheMatchingLines() throws Exception {
+        writeLog(TEST_PID + ".log", line(-300, "Starting"), line(-60, "Slow"), line(-1, "Failed"));
+
+        // ignoring case, and only the message (after ---) matches
+        assertThat(callWithSingleProcess(command("--grep=FAILED"))).isZero();
+
+        assertThat(lines()).hasSize(1);
+        assertThat(lines().get(0)).endsWith(": Failed");
+    }
+
+    @Test
+    void findHighlightsButPrintsAllLines() throws Exception {
+        writeLog(TEST_PID + ".log", line(-300, "Starting"), line(-60, "Slow"), line(-1, "Failed"));
+
+        assertThat(callWithSingleProcess(command("--find=slow"))).isZero();
+
+        assertThat(lines()).hasSize(3);
+        assertThat(printer.getStdout()).contains("\u001B[");
+    }
+
+    @Test
+    void sinceInSecondsOrWithAUnit() throws Exception {
+        writeLog(TEST_PID + ".log", line(-300, "Starting"), line(-60, "Slow"), line(-1, "Failed"));
+
+        assertThat(callWithSingleProcess(command("--since=30"))).isZero();
+        assertThat(lines()).hasSize(1);
+
+        printer = new StringPrinter();
+        assertThat(callWithSingleProcess(command("--since=2m"))).isZero();
+        assertThat(lines()).hasSize(2);
+    }
+
+    @Test
+    void startupPrintsUntilCamelHasStarted() throws Exception {
+        writeLog(TEST_PID + ".log", line(-300, "Starting"),
+                line(-299, "o.a.c.i.e.AbstractCamelContext",
+                        "Apache Camel 4.24.0 (orders) started in 120ms (build:30ms init:10ms start:80ms)"),
+                line(-1, "Failed"));
+
+        assertThat(callWithSingleProcess(command("--startup"))).isZero();
+
+        assertThat(lines()).hasSize(2);
+        assertThat(lines().get(1)).contains("started in 120ms");
+    }
+
+    @Test
+    void withoutTimestamp() throws Exception {
+        String line = line(-1, "Failed");
+        writeLog(TEST_PID + ".log", line);
+
+        assertThat(callWithSingleProcess(command("--timestamp=false"))).isZero();
+
+        assertThat(lines().get(0).trim()).startsWith("INFO").endsWith(": Failed");
+        assertThat(lines().get(0)).doesNotContain(line.substring(0, 23));
+    }
+
+    @Test
+    void prefixWithTheNameOfTheIntegration() throws Exception {
+        writeLog(TEST_PID + ".log", line(-1, "Failed"));
+
+        assertThat(callWithSingleProcess(command("--prefix=true"))).isZero();
+
+        assertThat(lines().get(0)).startsWith("orders    | ");
+    }
+
+    @Test
+    void aStackTraceStaysWithItsRecordInTheLogsOfSeveralIntegrations() throws Exception {
+        long otherPid = TEST_PID + 1;
+        writeStatusFile(TEST_PID, "orders");
+        writeStatusFile(otherPid, "billing");
+        writeLog(TEST_PID + ".log", line(-300, "Starting"), line(-100, "ERROR Failed"),
+                "java.lang.IllegalStateException: boom", "\tat com.acme.Orders.process(Orders.java:42)",
+                line(-1, "Stopping"));
+        writeLog(otherPid + ".log", line(-200, "Billing"), line(-50, "Billed"));
+        CamelLogAction command = new CamelJBangMain().withPrinter(printer).command(new CamelLogAction());
+        CommandLineTestHelper.parse(command, "*", "--follow=false", "--logging-color=false");
+
+        assertThat(callWithResponse(command, new JsonObject(), otherPid)).isZero();
+
+        // by time, and the lines of the stack trace right after the record they belong to
+        List<String> lines = lines();
+        assertThat(lines).hasSize(7);
+        assertThat(lines.get(0)).endsWith(": Starting");
+        assertThat(lines.get(1)).endsWith(": Billing");
+        assertThat(lines.get(2)).endsWith(": ERROR Failed");
+        assertThat(lines.get(3)).endsWith("java.lang.IllegalStateException: boom");
+        assertThat(lines.get(4)).endsWith("at com.acme.Orders.process(Orders.java:42)");
+        assertThat(lines.get(5)).endsWith(": Billed");
+        assertThat(lines.get(6)).endsWith(": Stopping");
+    }
+
+    @Test
+    @EnabledOnOs({ OS.LINUX, OS.MAC })
+    void closesTheLogsItRead() throws Exception {
+        writeLog(TEST_PID + ".log", line(-300, "Starting"), line(-1, "Failed"));
+        UnixOperatingSystemMXBean os = (UnixOperatingSystemMXBean) ManagementFactory.getOperatingSystemMXBean();
+        // warm up: classes and the JARs they are loaded from
+        assertThat(callWithSingleProcess(command())).isZero();
+        long before = os.getOpenFileDescriptorCount();
+
+        // as the shell and the TUI run camel log, in their JVM
+        for (int i = 0; i < 50; i++) {
+            assertThat(callWithSingleProcess(command())).isZero();
+        }
+
+        assertThat(os.getOpenFileDescriptorCount() - before).as("open files").isLessThan(10);
+    }
+
+    @Test
+    void logNamedAfterTheIntegration() throws Exception {
+        // camel run --logging-file-name, or an older version of Camel
+        writeLog("orders.log", line(-1, "Failed"));
+
+        assertThat(callWithSingleProcess(command())).isZero();
+
+        assertThat(lines()).hasSize(1);
+    }
+
+    @Test
+    void nameThatMatchesNoIntegrationIsNotFound() throws Exception {
+        writeStatusFile(TEST_PID, "orders");
+        CamelLogAction command = new CamelJBangMain().withPrinter(printer).command(new CamelLogAction());
+        CommandLineTestHelper.parse(command, "payments", "--follow=false");
+
+        assertThatThrownBy(() -> callWithSingleProcess(command))
+                .isInstanceOfSatisfying(CliException.class,
+                        e -> assertThat(e.getExitCode()).isEqualTo(CliExitCode.NOT_FOUND))
+                .hasMessage("No running Camel integration matches: payments");
+    }
+
+    @Test
+    void coloredLinesAreKeptByThePrinterOfTheCommand() throws Exception {
+        writeStatusFile(TEST_PID, "orders");
+        writeLog(TEST_PID + ".log", line(-300, "Starting"), line(-1, "Failed"));
+        CamelLogAction command = new CamelJBangMain().withPrinter(printer).command(new CamelLogAction());
+        CommandLineTestHelper.parse(command, "orders", "--follow=false", "--prefix=true");
+
+        assertThat(callWithSingleProcess(command)).isZero();
+
+        // a CLI that runs the command in its JVM keeps the colored lines (not printed on the console)
+        assertThat(lines()).hasSize(2);
+        assertThat(lines().get(1)).startsWith("orders").endsWith(": Failed");
+    }
+
+    @Test
+    void coloredLinesArePrintedWithoutColorsWhenTheConsoleStripsThem() throws Exception {
+        writeStatusFile(TEST_PID, "orders");
+        writeLog(TEST_PID + ".log", line(-300, "\u001b[32mStarting\u001b[m"), line(-1, "Failed"));
+        // the output of the console is not a terminal (a file or a pipe), which takes the colors out of each line
+        CamelLogAction command = new CamelLogAction() {
+            @Override
+            protected boolean colorsStripped() {
+                return true;
+            }
+        };
+        command.setCamelMain(new CamelJBangMain().withPrinter(printer));
+        CommandLineTestHelper.parse(command, "orders", "--follow=false", "--prefix=true");
+
+        assertThat(callWithSingleProcess(command)).isZero();
+
+        // printed as without --logging-color: the same text, without the console in between
+        assertThat(lines()).hasSize(2).noneMatch(l -> l.contains("\u001b"));
+        assertThat(lines().get(0)).startsWith("orders").endsWith(": Starting");
+    }
+
+    @Test
+    void previousPrintsTheLogOfTheRunThatEnded() throws Exception {
+        keepPreviousRun("orders", line(-300, "Starting"), line(-1, "Failed to start route route1"));
+
+        assertThat(callWithSingleProcess(command("--previous"))).isZero();
+
+        // which run it was, and how it ended, on stderr; the log on stdout
+        assertThat(printer.getStderr()).startsWith("The previous run of orders (pid 4242) ended at ")
+                .endsWith(" with exit code 70: Failed to start route route1 because: boom");
+        assertThat(stdoutLines()).hasSize(2)
+                .last().asString().endsWith(": Failed to start route route1");
+    }
+
+    @Test
+    void previousTakesTheOptionsOfTheLog() throws Exception {
+        keepPreviousRun("orders", line(-300, "Starting"), line(-60, "Slow"), line(-1, "Failed to start route route1"));
+
+        assertThat(callWithSingleProcess(command("--previous", "--tail=2", "--grep=start"))).isZero();
+
+        assertThat(stdoutLines()).hasSize(2)
+                .first().asString().endsWith(": Starting");
+    }
+
+    @Test
+    void previousPrintsTheLogOfAnIntegrationThatWasKilled() throws Exception {
+        // the process is gone, and left its log and its status file
+        writeLog(TEST_PID + ".log", line(-60, "Started"), line(-1, "Processing"));
+
+        assertThat(callWithSingleProcess(command("--previous"))).isZero();
+
+        assertThat(printer.getStderr()).startsWith("The previous run of orders (pid " + TEST_PID + ") ended at ")
+                .endsWith("ago): " + "the process was gone without stopping Camel (killed, or its JVM crashed)");
+        assertThat(stdoutLines()).hasSize(2);
+    }
+
+    @Test
+    void previousOfANameWithoutPreviousRunIsNotFound() throws Exception {
+        keepPreviousRun("orders", line(-1, "Failed"));
+        CamelLogAction command = new CamelJBangMain().withPrinter(printer).command(new CamelLogAction());
+        CommandLineTestHelper.parse(command, "payments", "--previous");
+
+        assertThatThrownBy(() -> callWithSingleProcess(command))
+                .isInstanceOfSatisfying(CliException.class,
+                        e -> assertThat(e.getExitCode()).isEqualTo(CliExitCode.NOT_FOUND))
+                .hasMessage("No previous run matches: payments");
+    }
+
+    @Test
+    void previousOfANameThatMatchesSeveralRunsAsksForOne() throws Exception {
+        keepPreviousRun("orders", line(-1, "Failed"));
+        keepPreviousRun("orders-eu", line(-1, "Failed"));
+        CamelLogAction command = new CamelJBangMain().withPrinter(printer).command(new CamelLogAction());
+        CommandLineTestHelper.parse(command, "ord", "--previous");
+
+        assertThatThrownBy(() -> callWithSingleProcess(command))
+                .isInstanceOfSatisfying(CliException.class,
+                        e -> assertThat(e.getExitCode()).isEqualTo(CliExitCode.NOT_FOUND))
+                .hasMessageStartingWith("Name ord matches 2 previous runs: ")
+                .hasMessageEndingWith(". Specify the name of one.");
+    }
+
+    @Test
+    void aNameThatIsNotRunningSaysWhereTheLogOfItsPreviousRunIs() throws Exception {
+        writeStatusFile(TEST_PID, "orders");
+        keepPreviousRun("payments", line(-1, "Failed"));
+        CamelLogAction command = new CamelJBangMain().withPrinter(printer).command(new CamelLogAction());
+        CommandLineTestHelper.parse(command, "payments", "--follow=false");
+
+        assertThatThrownBy(() -> callWithSingleProcess(command))
+                .isInstanceOfSatisfying(CliException.class,
+                        e -> assertThat(e.getExitCode()).isEqualTo(CliExitCode.NOT_FOUND))
+                .hasMessageStartingWith("No running Camel integration matches: payments. camel log payments --previous"
+                                        + " prints the log of its previous run, which ended at ")
+                .hasMessageEndingWith(" with exit code 70: Failed to start route route1 because: boom");
+    }
+
+    private CamelLogAction command(String... args) throws Exception {
+        writeStatusFile(TEST_PID, "orders");
+        CamelLogAction command = new CamelJBangMain().withPrinter(printer).command(new CamelLogAction());
+        CommandLineTestHelper.parse(command,
+                Stream.concat(Stream.of("orders", "--follow=false", "--logging-color=false"), Stream.of(args))
+                        .toArray(String[]::new));
+        return command;
+    }
+
+    // the log only (stdout), without the highlighting of --find and --grep
+    private List<String> stdoutLines() {
+        return printer.getStdout().lines().map(l -> l.replaceAll("\u001B\\[[;\\d]*m", "")).toList();
+    }
+
+    // without the highlighting of --find and --grep
+    private List<String> lines() throws Exception {
+        return printer.getLines().stream().map(l -> l.replaceAll("\u001B\\[[;\\d]*m", "")).toList();
+    }
+
+    private static void writeLog(String name, String... lines) throws Exception {
+        Files.write(CommandLineHelper.getCamelDir().resolve(name), List.of(lines));
+    }
+
+    // a run of the name that failed to start
+    private static void keepPreviousRun(String name, String... lines) throws Exception {
+        Path log = CommandLineHelper.getCamelDir().resolve("4242.log");
+        Files.write(log, List.of(lines));
+        PreviousRun.keep(log, name, 4242, 70, "Failed to start route route1 because: boom");
+    }
+
+    private static String line(long seconds, String message) {
+        return line(seconds, "o.a.c.Test", message);
+    }
+
+    // the layout of the log of camel run
+    private static String line(long seconds, String logger, String message) {
+        return LocalDateTime.now().plusSeconds(seconds).format(TIMESTAMP) + "  INFO " + TEST_PID + " --- [main] " + logger
+               + " : " + message;
+    }
+}

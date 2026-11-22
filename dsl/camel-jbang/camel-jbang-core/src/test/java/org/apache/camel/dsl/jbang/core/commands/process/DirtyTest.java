@@ -1,0 +1,215 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.camel.dsl.jbang.core.commands.process;
+
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.Optional;
+
+import org.apache.camel.dsl.jbang.core.commands.CamelJBangMain;
+import org.apache.camel.dsl.jbang.core.common.CommandLineHelper;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.condition.DisabledOnOs;
+import org.junit.jupiter.api.condition.OS;
+import org.junit.jupiter.api.extension.ExtendWith;
+import org.mockito.MockedStatic;
+import org.mockito.junit.jupiter.MockitoExtension;
+
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.mockStatic;
+import static org.mockito.Mockito.when;
+
+@ExtendWith(MockitoExtension.class)
+class DirtyTest extends ProcessCommandTestSupport {
+
+    @Test
+    void testReturnsZeroWhenNoFiles() throws Exception {
+        // camel dir is empty: Dirty returns before touching ProcessHandle
+        Dirty command = new CamelJBangMain().withPrinter(printer).command(new Dirty());
+        int exit = command.doCall();
+        assertEquals(0, exit);
+        assertEquals("", printer.getOutput().trim());
+    }
+
+    @Test
+    void testDetectsOrphanFile() throws Exception {
+        // write a status file for a PID that has no running process
+        Path orphan = CommandLineHelper.getCamelDir().resolve("77777-status.json");
+        Files.writeString(orphan, "{}");
+
+        Dirty command = new CamelJBangMain().withPrinter(printer).command(new Dirty());
+
+        try (MockedStatic<ProcessHandle> mocked = mockStatic(ProcessHandle.class)) {
+            // no process has the pid (ProcessHandle.of answers empty)
+            int exit = command.doCall();
+
+            assertEquals(0, exit);
+            assertTrue(printer.getOutput().contains("orphan"), "Should report orphan file count");
+        }
+    }
+
+    @Test
+    void testRunningProcessFileIsNotDirty() throws Exception {
+        // status file for TEST_PID is owned by a running process -> not dirty
+        writeStatusFile(TEST_PID, buildContextStatus("liveApp", 5));
+
+        Dirty command = new CamelJBangMain().withPrinter(printer).command(new Dirty());
+
+        try (MockedStatic<ProcessHandle> mocked = mockStatic(ProcessHandle.class)) {
+            ProcessHandle ph = mock(ProcessHandle.class);
+            when(ph.isAlive()).thenReturn(true);
+            mocked.when(() -> ProcessHandle.of(TEST_PID)).thenReturn(Optional.of(ph));
+
+            int exit = command.doCall();
+
+            assertEquals(0, exit);
+            assertEquals("", printer.getOutput().trim(), "File belonging to a running PID is not dirty");
+        }
+    }
+
+    @Test
+    void testCleanFlagDeletesOrphanFile() throws Exception {
+        Path orphan = CommandLineHelper.getCamelDir().resolve("88888-status.json");
+        Files.writeString(orphan, "{}");
+        assertTrue(Files.exists(orphan), "Orphan file must exist before cleaning");
+
+        Dirty command = new CamelJBangMain().withPrinter(printer).command(new Dirty());
+        command.clean = true;
+
+        try (MockedStatic<ProcessHandle> mocked = mockStatic(ProcessHandle.class)) {
+            // no process has the pid (ProcessHandle.of answers empty)
+            int exit = command.doCall();
+
+            assertEquals(0, exit);
+            assertFalse(Files.exists(orphan), "Orphan file should be deleted by --clean");
+            assertTrue(printer.getOutput().contains("Cleaned"), "Should print cleaned confirmation");
+        }
+    }
+
+    @Test
+    void testCleanCleansTheLogsOfPreviousRuns() throws Exception {
+        Path dir = CommandLineHelper.getCamelDir();
+        Files.writeString(dir.resolve("orders-previous.log"), "Started");
+        Files.writeString(dir.resolve("orders-previous.json"), "{}");
+        // a name can be a number: a previous run, not the files of pid 123
+        Files.writeString(dir.resolve("123-previous.log"), "Started");
+        Files.writeString(dir.resolve("billing-previous.log"), "Started");
+        Files.writeString(dir.resolve("billing-previous.json"), "{}");
+
+        try (MockedStatic<ProcessHandle> mocked = mockStatic(ProcessHandle.class)) {
+            // without --clean it says how many there are, and how to clean them
+            assertEquals(0, new CamelJBangMain().withPrinter(printer).command(new Dirty()).doCall());
+            assertEquals("There are logs of the previous runs of 3 integrations (camel dirty --clean cleans them)",
+                    printer.getOutput().trim());
+            assertTrue(Files.exists(dir.resolve("orders-previous.log")));
+
+            Dirty command = new CamelJBangMain().withPrinter(printer).command(new Dirty());
+            command.clean = true;
+            assertEquals(0, command.doCall());
+            assertTrue(printer.getOutput().contains("Cleaned 5 files of the previous runs of 3 integrations"),
+                    printer.getOutput());
+            for (String name : new String[] {
+                    "orders-previous.log", "orders-previous.json", "billing-previous.log", "billing-previous.json",
+                    "123-previous.log" }) {
+                assertFalse(Files.exists(dir.resolve(name)), name + " is cleaned");
+            }
+        }
+    }
+
+    @Test
+    void testTheLogOfAnUnsetPidIsAnOrphan() throws Exception {
+        Path stray = CommandLineHelper.getCamelDir().resolve("${sys:pid}.log");
+        Files.writeString(stray, "WARN");
+
+        Dirty command = new CamelJBangMain().withPrinter(printer).command(new Dirty());
+        command.clean = true;
+
+        try (MockedStatic<ProcessHandle> mocked = mockStatic(ProcessHandle.class)) {
+            assertEquals(0, command.doCall());
+            assertEquals("Cleaned 1 orphan files", printer.getOutput().trim());
+            assertFalse(Files.exists(stray));
+        }
+    }
+
+    @Test
+    void testFilesThatBelongToNoProcessAreNotDirty() throws Exception {
+        Path dir = CommandLineHelper.getCamelDir();
+        // the log of a Spring Boot or Quarkus app, which writes it while it runs
+        Files.writeString(dir.resolve("orders.log"), "Started");
+        // the console output the AI tools keep, and other files of the CLI
+        Files.writeString(dir.resolve("camel-launch-123456.log"), "Started");
+        Files.writeString(dir.resolve("ai-prompt.history"), "hello");
+        Files.writeString(dir.resolve("camel-export.log"), "Exported");
+        // directories, such as a cache
+        Files.createDirectories(dir.resolve("quarkus-extension-registries").resolve("cache"));
+        Files.createDirectories(dir.resolve("12345-dir"));
+
+        Dirty command = new CamelJBangMain().withPrinter(printer).command(new Dirty());
+        command.clean = true;
+
+        try (MockedStatic<ProcessHandle> mocked = mockStatic(ProcessHandle.class)) {
+            int exit = command.doCall();
+
+            assertEquals(0, exit);
+            assertEquals("", printer.getOutput().trim());
+            for (String name : new String[] {
+                    "orders.log", "camel-launch-123456.log", "ai-prompt.history", "camel-export.log",
+                    "quarkus-extension-registries", "12345-dir" }) {
+                assertTrue(Files.exists(dir.resolve(name)), name + " is left");
+            }
+        }
+    }
+
+    @Test
+    @DisabledOnOs(OS.WINDOWS)
+    void testOnlyTheFilesThatWereRemovedAreCounted() throws Exception {
+        Path dir = CommandLineHelper.getCamelDir();
+        Path orphan = dir.resolve("77777-status.json");
+        Files.writeString(orphan, "{}");
+        // a file in a directory that cannot be written cannot be deleted
+        assertTrue(dir.toFile().setWritable(false));
+
+        Dirty command = new CamelJBangMain().withPrinter(printer).command(new Dirty());
+        command.clean = true;
+
+        try (MockedStatic<ProcessHandle> mocked = mockStatic(ProcessHandle.class)) {
+            int exit = command.doCall();
+
+            assertEquals(0, exit);
+            assertTrue(printer.getOutput().contains("Cleaned 0 orphan files"), printer.getOutput());
+            assertTrue(printer.getOutput().contains("WARN: Cannot delete: 77777-status.json"), printer.getOutput());
+            assertTrue(Files.exists(orphan));
+        } finally {
+            dir.toFile().setWritable(true);
+        }
+    }
+
+    @Test
+    void testFileBelongsToTheWholePid() {
+        // pid 12 does not own the files of pid 123
+        assertEquals(123L, Dirty.pidOf("123-status.json"));
+        assertEquals(123L, Dirty.pidOf("123"));
+        assertEquals(123L, Dirty.pidOf("123-action-5b1c.json"));
+        assertEquals(4567L, Dirty.pidOf("infra-hive-mq-4567.json"));
+        assertNull(Dirty.pidOf("camel-export.log"));
+        assertNull(Dirty.pidOf("123abc.json"));
+    }
+}

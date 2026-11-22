@@ -1,0 +1,453 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.camel.dsl.jbang.core.commands.ai;
+
+import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.Collection;
+import java.util.List;
+import java.util.Map;
+import java.util.Objects;
+import java.util.function.Consumer;
+import java.util.function.Function;
+import java.util.function.Predicate;
+import java.util.function.Supplier;
+
+import org.apache.camel.catalog.CamelCatalog;
+import org.apache.camel.catalog.DefaultCamelCatalog;
+import org.apache.camel.dsl.jbang.core.common.ActionClient;
+import org.apache.camel.dsl.jbang.core.common.RuntimeHelper;
+import org.apache.camel.dsl.jbang.run.common.CatalogLoader;
+import org.apache.camel.util.json.JsonArray;
+import org.apache.camel.util.json.JsonObject;
+import org.apache.camel.util.json.Jsoner;
+
+/**
+ * Shared execution context for AI tools. Wraps {@link RuntimeHelper} (process IPC) and {@link CamelCatalog} (component
+ * metadata). This class intentionally has no dependency on MCP or Quarkus so it can be used by both the Agent REPL and
+ * the MCP server.
+ */
+public class ToolContext {
+
+    /** How long an action on the integration may take, in millis. */
+    private static final long ACTION_TIMEOUT = 10000;
+
+    private volatile long pid = -1;
+    private volatile CamelCatalog catalog;
+    private volatile String camelVersion;
+    private volatile Path defaultDirectory;
+    // guarded by this: the root is asked for once per context
+    private Supplier<Path> rootDirectory;
+    private Path rootLookedUp;
+    private boolean rootKnown;
+    private volatile Function<String, String> propertyLineValidator;
+    private volatile boolean autoSelectSingleProcess = true;
+    private volatile Predicate<ToolConfirms.Call> confirmer;
+
+    public long pid() {
+        return pid;
+    }
+
+    public void selectProcess(long pid) {
+        this.pid = pid;
+    }
+
+    public boolean hasProcess() {
+        return pid >= 0;
+    }
+
+    /** Forgets the selected process, so tools fall back to what needs no running integration. */
+    public void clearProcess() {
+        this.pid = -1;
+    }
+
+    /**
+     * Whether a runtime tool called without a name may pick the only running Camel process when none is selected: the
+     * default for a server without a selection of its own; the TUI turns it off, since there what the user selected is
+     * the integration.
+     */
+    public boolean isAutoSelectSingleProcess() {
+        return autoSelectSingleProcess;
+    }
+
+    public void setAutoSelectSingleProcess(boolean autoSelectSingleProcess) {
+        this.autoSelectSingleProcess = autoSelectSingleProcess;
+    }
+
+    /**
+     * Selects the only running Camel process when nothing is selected yet and auto-selection is on.
+     *
+     * @return whether a process is selected afterwards
+     */
+    public boolean selectSingleProcessIfNone() {
+        if (hasProcess()) {
+            return true;
+        }
+        if (!autoSelectSingleProcess) {
+            return false;
+        }
+        RuntimeHelper.ProcessInfo only = RuntimeHelper.findProcess(null);
+        if (only == null) {
+            return false;
+        }
+        selectProcess(only.pid());
+        return true;
+    }
+
+    /**
+     * The Camel version the catalog tools answer for: null for the version of the running CLI, otherwise the version of
+     * the integration being worked on (the TUI passes the selected integration's version), downloaded on demand.
+     * <p>
+     * Not synchronized with {@link #catalog()}: a context serves one tool call at a time (the MCP servers and the TUI
+     * build a fresh one per call, {@code camel ask} runs its calls one after the other), and the version is set before
+     * the catalog is first asked for, so a change of version simply drops the cached catalog for the next call.
+     */
+    public String camelVersion() {
+        return camelVersion;
+    }
+
+    public void setCamelVersion(String camelVersion) {
+        if (!Objects.equals(this.camelVersion, camelVersion)) {
+            this.camelVersion = camelVersion;
+            this.catalog = null;
+        }
+    }
+
+    /**
+     * The project directory the file tools use when a call names none: the TUI sets it to the source directory of the
+     * selected integration, {@code camel ask} to the project directory; an MCP server leaves it null.
+     */
+    public Path defaultDirectory() {
+        return defaultDirectory;
+    }
+
+    public void setDefaultDirectory(Path defaultDirectory) {
+        this.defaultDirectory = defaultDirectory;
+    }
+
+    /**
+     * The project directory the client declares, such as the only {@code file:} root of an MCP client: the file tools
+     * read and write there when a call names no directory and there is no default directory, and a write creates a
+     * directory the call names inside it. Asking the client is a round trip, so the root is looked up when a call first
+     * needs it, and once per context; null when there is none.
+     */
+    public synchronized Path rootDirectory() {
+        if (rootDirectory != null && !rootKnown) {
+            rootLookedUp = rootDirectory.get();
+            rootKnown = true;
+        }
+        return rootLookedUp;
+    }
+
+    public synchronized void setRootDirectory(Supplier<Path> rootDirectory) {
+        this.rootDirectory = rootDirectory;
+        this.rootLookedUp = null;
+        this.rootKnown = false;
+    }
+
+    /**
+     * Who the shared tools ask before a call that the user confirms first ({@link ToolConfirms}), such as a file write:
+     * {@code camel ask} asks on the terminal (CAMEL-25676). Null, the default, asks nobody: an MCP server leaves that
+     * to its client, and the TUI confirms in its own tools.
+     */
+    public Predicate<ToolConfirms.Call> confirmer() {
+        return confirmer;
+    }
+
+    public void setConfirmer(Predicate<ToolConfirms.Call> confirmer) {
+        this.confirmer = confirmer;
+    }
+
+    /** Whether a call goes ahead: there is nothing to confirm, nobody to ask, or the user confirmed it. */
+    public boolean confirm(ToolConfirms.Call call) {
+        Predicate<ToolConfirms.Call> c = confirmer;
+        return call == null || c == null || c.test(call);
+    }
+
+    /**
+     * Resolves the directory of a file tool call: the {@code directory} argument, else the default directory, else the
+     * root directory.
+     *
+     * @throws ToolExecutionException when none is given or the directory does not exist
+     */
+    public Path resolveDirectory(String directory) {
+        Path dir = directory != null && !directory.isBlank() ? Path.of(directory) : projectDirectory();
+        if (dir == null) {
+            throw new ToolExecutionException(
+                    "directory is required: pass directory, the absolute project directory with the source files");
+        }
+        dir = dir.toAbsolutePath().normalize();
+        if (!Files.isDirectory(dir)) {
+            throw new ToolExecutionException("No such directory: " + dir);
+        }
+        return dir;
+    }
+
+    /** The directory a call that names none works in: the default directory, else the root directory; may be null. */
+    Path projectDirectory() {
+        Path dir = defaultDirectory;
+        return dir != null ? dir : rootDirectory();
+    }
+
+    /**
+     * An extra check for a line of a .properties file that the catalog does not know (the TUI validates Spring Boot
+     * properties from the project's metadata); returns the message, or null when the line is fine.
+     */
+    public Function<String, String> propertyLineValidator() {
+        return propertyLineValidator;
+    }
+
+    public void setPropertyLineValidator(Function<String, String> propertyLineValidator) {
+        this.propertyLineValidator = propertyLineValidator;
+    }
+
+    /**
+     * Returns the shared {@link CamelCatalog} instance, creating it lazily on first access. Thread-safe: concurrent
+     * callers may race but will all see a fully constructed catalog.
+     */
+    public CamelCatalog catalog() {
+        CamelCatalog result = catalog;
+        if (result == null) {
+            synchronized (this) {
+                result = catalog;
+                if (result == null) {
+                    result = loadCatalog();
+                    catalog = result;
+                }
+            }
+        }
+        return result;
+    }
+
+    /**
+     * Sets the catalog to use for this context, bypassing the lazy-load. Use this to inject a pre-built, shared catalog
+     * instance (e.g. from {@code CatalogService}) so the tool does not create or download one per call.
+     */
+    public synchronized void setCatalog(CamelCatalog catalog) {
+        this.catalog = catalog;
+    }
+
+    private CamelCatalog loadCatalog() {
+        String version = camelVersion;
+        if (version == null || version.isBlank()) {
+            return new DefaultCamelCatalog();
+        }
+        try {
+            return CatalogLoader.loadCatalog(null, version, true);
+        } catch (Exception e) {
+            throw new ToolExecutionException("Cannot load the Camel catalog for version " + version + ": " + e.getMessage());
+        }
+    }
+
+    /**
+     * Selects the process a tool call names ({@code name} is an integration name or pid), or keeps the current
+     * selection when the call names none.
+     *
+     * @throws ToolExecutionException when the name matches no running process, or is the pid of this process
+     */
+    public void selectProcess(String nameOrPid) {
+        if (nameOrPid == null || nameOrPid.isBlank()) {
+            return;
+        }
+        refuseThisProcess(nameOrPid);
+        RuntimeHelper.ProcessInfo p = RuntimeHelper.findProcess(nameOrPid);
+        if (p == null) {
+            throw new ToolExecutionException(
+                    "No running Camel process matches '" + nameOrPid
+                                             + "'; list_processes shows what runs");
+        }
+        selectProcess(p.pid());
+    }
+
+    /**
+     * Refuses the pid of this process, which runs the tools: a status file of its own comes from a CamelContext it ran
+     * for itself, never from an integration, and it would wait for itself to answer an action (CAMEL-26396).
+     *
+     * @throws ToolExecutionException when the name or pid is the pid of this process
+     */
+    static void refuseThisProcess(String nameOrPid) {
+        if (RuntimeHelper.isThisProcess(nameOrPid)) {
+            throw thisProcess(ProcessHandle.current().pid());
+        }
+    }
+
+    /**
+     * The error for a tool call on the pid of this process (see {@link #refuseThisProcess(String)}).
+     */
+    static ToolExecutionException thisProcess(long pid) {
+        return new ToolExecutionException(
+                "pid " + pid + " is the process that runs these tools (the MCP server, camel ask or the TUI), not a"
+                                          + " Camel integration; list_processes shows the integrations");
+    }
+
+    public String readStatus(String section) {
+        requireProcess();
+        return RuntimeHelper.readStatusSection(pid, section);
+    }
+
+    public JsonObject readFullStatus() {
+        requireProcess();
+        return RuntimeHelper.readStatus(pid);
+    }
+
+    /**
+     * Sends an action without a result, such as stopping the routes, to the selected integration, and waits until it
+     * confirms the action (an integration before Camel 4.24 takes the action without confirming it).
+     *
+     * @throws ToolExecutionException when the integration answers that the action failed, or does not take it in time
+     */
+    public void sendAction(String action, Consumer<JsonObject> configure) {
+        requireProcess();
+        JsonObject request = new JsonObject();
+        request.put("action", action);
+        if (configure != null) {
+            configure.accept(request);
+        }
+        ActionClient.ActionResult result;
+        try {
+            result = ActionClient.send(pid, request, ACTION_TIMEOUT);
+        } catch (IOException e) {
+            throw new ToolExecutionException(
+                    "Cannot send the action " + action + " to the integration with pid " + pid + ": " + e.getMessage());
+        }
+        if (!result.isOk()) {
+            throw new ToolExecutionException(result.error());
+        }
+    }
+
+    /**
+     * Runs an action on the selected integration, and returns the answer as the integration wrote it.
+     *
+     * @throws ToolExecutionException when the integration answers that the action failed, or does not answer in time
+     */
+    public String executeAction(String action, Consumer<JsonObject> configure) {
+        requireProcess();
+        JsonObject request = new JsonObject();
+        request.put("action", action);
+        if (configure != null) {
+            configure.accept(request);
+        }
+        String answer;
+        try {
+            answer = ActionClient.executeText(pid, request, ACTION_TIMEOUT);
+        } catch (ActionClient.StoppedException e) {
+            throw new ToolExecutionException(e.getMessage());
+        } catch (IOException e) {
+            throw new ToolExecutionException(
+                    "Cannot send the action " + action + " to the integration with pid " + pid + ": " + e.getMessage());
+        }
+        if (answer == null) {
+            throw new ToolExecutionException(
+                    "No answer from the integration with pid " + pid + " to the action " + action + " within "
+                                             + ACTION_TIMEOUT / 1000 + " seconds");
+        }
+        // an integration of Camel 4.24 or later answers a failed action with the error
+        JsonObject json = Jsoner.deserialize(answer, (JsonObject) null);
+        if (json != null) {
+            ActionClient.ActionResult result = ActionClient.result(json);
+            if (!result.isOk()) {
+                throw new ToolExecutionException(result.error());
+            }
+            if (unescapeCodeLines(json)) {
+                return json.toJson();
+            }
+        }
+        return answer;
+    }
+
+    public JsonObject readErrorFile() {
+        requireProcess();
+        JsonObject errors = RuntimeHelper.readErrorFile(pid);
+        unescapeCodeLines(errors);
+        return errors;
+    }
+
+    public JsonObject readHistoryFile() {
+        requireProcess();
+        JsonObject history = RuntimeHelper.readHistoryFile(pid);
+        unescapeCodeLines(history);
+        return history;
+    }
+
+    /**
+     * Unescapes the lines of source code, so they are as they are in the file. The dev consoles escape each line of a
+     * {@code code} list as JSON text in JSON. The CLI commands undo this when they print the lines, but the AI tools
+     * gave the lines as they came, so the agent saw {@code \"} that is not in the file (CAMEL-26932).
+     *
+     * @return whether a line was changed
+     */
+    static boolean unescapeCodeLines(Object node) {
+        boolean changed = false;
+        if (node instanceof JsonObject jo) {
+            for (Map.Entry<String, Object> e : jo.entrySet()) {
+                if ("code".equals(e.getKey()) && e.getValue() instanceof JsonArray lines) {
+                    for (Object line : lines) {
+                        if (line instanceof JsonObject l && l.get("code") instanceof String code) {
+                            String text = Jsoner.unescape(code);
+                            if (!text.equals(code)) {
+                                l.put("code", text);
+                                changed = true;
+                            }
+                        }
+                    }
+                } else {
+                    changed |= unescapeCodeLines(e.getValue());
+                }
+            }
+        } else if (node instanceof Collection<?> list) {
+            for (Object o : list) {
+                changed |= unescapeCodeLines(o);
+            }
+        }
+        return changed;
+    }
+
+    public String stopApplication() {
+        requireProcess();
+        return RuntimeHelper.stopApplication(pid);
+    }
+
+    public JsonObject sendMessage(String endpoint, String body, String headers) {
+        return sendMessage(endpoint, body, headers, 0, null);
+    }
+
+    public JsonObject sendMessage(String endpoint, String body, String headers, int repeat, String interval) {
+        requireProcess();
+        return RuntimeHelper.sendMessage(pid, endpoint, body, headers, repeat, interval);
+    }
+
+    public List<RuntimeHelper.ProcessInfo> discoverProcesses() {
+        return RuntimeHelper.discoverProcesses();
+    }
+
+    public RuntimeHelper.ProcessInfo findProcess(String name) {
+        return RuntimeHelper.findProcess(name);
+    }
+
+    public JsonObject executeSqlQuery(String sql, String datasource, int maxRows, int queryTimeout) {
+        requireProcess();
+        return RuntimeHelper.executeSqlQuery(pid, sql, datasource, maxRows, queryTimeout);
+    }
+
+    public void requireProcess() {
+        if (pid < 0) {
+            throw new ToolExecutionException(
+                    "No running Camel process connected. Start one with: camel run <file>");
+        }
+    }
+}

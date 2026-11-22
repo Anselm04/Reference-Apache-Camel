@@ -1,0 +1,144 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.camel.dsl.jbang.core.commands.ai;
+
+import org.apache.camel.util.json.JsonObject;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.condition.EnabledIfSystemProperty;
+
+import static org.assertj.core.api.Assertions.assertThat;
+
+/**
+ * CAMEL-24907: a language that is not on this process's classpath is downloaded, so jsonpath, jq and the others can be
+ * evaluated before an integration runs. The download needs a network or a filled local repository, so the test that
+ * downloads runs with -Dcamel.test.download=true.
+ */
+class ExpressionEvaluatorLanguageTest {
+
+    private static final String STOCK = "[{\"sku\":\"CAMEL-MUG\",\"qty\":42},{\"sku\":\"CAMEL-CAP\",\"qty\":0}]";
+
+    /** A jsonpath filter gives a list: the answer says how a route gets the one element (r20 REST runs). */
+    @Test
+    void aJsonPathFilterSaysHowToGetTheOneElement() {
+        assertThat(ExpressionEvaluator.filterNote("jsonpath", "$[?(@.sku == 'CAMEL-MUG')]", "ok"))
+                .contains("resultType: java.util.Map gives the one element it matches (null when none or several do)");
+        // a path that goes on after the filter: a Map would convert 42 to null
+        assertThat(ExpressionEvaluator.filterNote("jsonpath", "$[?(@.sku == 'CAMEL-MUG')].qty", "ok"))
+                .contains("such as java.lang.String or java.lang.Integer, gives the one value").doesNotContain("Map");
+        assertThat(ExpressionEvaluator.filterNote("jsonpath", "$[?(@.sku == 'CAMEL-MUG')][0].qty", "ok"))
+                .startsWith("an index after a filter gives an empty list")
+                .contains("leave the index out, as in $[?(@.sku == 'CAMEL-MUG')].qty");
+        assertThat(ExpressionEvaluator.filterNote("jsonpath", "$.sku", "ok")).isNull();
+        assertThat(ExpressionEvaluator.filterNote("simple", "${body}", "ok")).isNull();
+        // a SpEL filter in Simple, written after the function (r27 rest-code-first step 1, evaluated twice)
+        assertThat(ExpressionEvaluator.filterNote("simple", "${body}?.?[orderId == 'ORD-1001']", "error"))
+                .startsWith("Simple has no filter: .?[...] is SpEL, and after ${body} it is text")
+                .contains("jsonpath:\n        expression: \"$[?(@.orderId == 'ORD-1001')]\"");
+        assertThat(ExpressionEvaluator.filterNote("jsonpath", "$[?(@.sku == 'X')", "error")).isNull();
+    }
+
+    /** The note goes after the one the evaluation has already, as evaluate adds it for any language it runs. */
+    @Test
+    void theFilterNoteIsAddedToTheResult() {
+        JsonObject result = new JsonObject();
+        result.put("status", "ok");
+        result.put("note", "evaluated with an empty body; pass body to evaluate against a value");
+        ExpressionEvaluator.addFilterNote(result, "jsonpath", "$[?(@.sku == 'CAMEL-MUG')]");
+        assertThat(result.getString("note")).startsWith("evaluated with an empty body; pass body to evaluate against a"
+                                                        + " value; a filter gives a list, also for one match");
+
+        JsonObject failed = new JsonObject();
+        failed.put("status", "error");
+        ExpressionEvaluator.addFilterNote(failed, "jsonpath", "$[?(@.sku == 'CAMEL-MUG')]");
+        assertThat(failed.get("note")).isNull();
+    }
+
+    @Test
+    void aLanguageThatCannotBeLoadedSaysWhatToDo() {
+        JsonObject result = ExpressionEvaluator.evaluate(new ToolContext(), "no-such-language", "x", null);
+
+        assertThat(result.getString("status")).isEqualTo("error");
+        assertThat(result.getString("error")).contains("is not on the classpath of this process")
+                .contains("select a running integration that has it");
+    }
+
+    @Test
+    void theLanguagesOfThisProcessAreEvaluatedAsBefore() {
+        JsonObject result = ExpressionEvaluator.evaluate(new ToolContext(), "simple", "${body}", STOCK);
+
+        assertThat(result.getString("status")).isEqualTo("ok");
+        assertThat(result.getString("result")).isEqualTo(STOCK);
+        assertThat(result.get("downloaded")).isNull();
+    }
+
+    @Test
+    void aBrokenSimpleExpressionCarriesTheSyntaxErrorWithItsPosition() {
+        JsonObject result = ExpressionEvaluator.evaluate(new ToolContext(), "simple", "${body", null);
+
+        assertThat(result.getString("status")).isEqualTo("error");
+        assertThat(result.getString("syntaxError")).isNotBlank();
+    }
+
+    /**
+     * r28 connect-stock-api step 2: field reads on a body passed as JSON text failed, with the advice to unmarshal it
+     * first, which the tool cannot do (21 calls, no write). They are read on the data a route has after unmarshal:
+     * json, with a note that says so.
+     */
+    @Test
+    void theFieldsOfAJsonTextBodyAreReadOnTheParsedData() {
+        JsonObject one = ExpressionEvaluator.evaluate(new ToolContext(), "groovy", "body.find { it.sku == 'ABC' }",
+                "[{\"sku\": \"ABC\", \"qty\": 10}, {\"sku\": \"DEF\", \"qty\": 20}]");
+        assertThat(one.getString("status")).isEqualTo("ok");
+        assertThat(one.getString("result")).isEqualTo("{sku=ABC, qty=10}");
+        assertThat(one.getString("evaluatedIn")).isEqualTo("a local scratch context, with the body parsed from its JSON text");
+        assertThat(one.getString("note")).startsWith("the body is JSON text, so this is the result on that text parsed into"
+                                                     + " a List, as a route has the body after unmarshal: json, or in a split"
+                                                     + " over that data; on the text itself it fails: No such property: sku"
+                                                     + " for class: java.lang.String");
+        // r28l-7 connect-http-client step 1: one line of an order, read with simple
+        JsonObject sku = ExpressionEvaluator.evaluate(new ToolContext(), "simple", "${body[sku]}",
+                "{\"sku\": \"CAMEL-MUG\", \"qty\": 1, \"price\": 9.50}");
+        assertThat(sku.getString("status")).isEqualTo("ok");
+        assertThat(sku.getString("result")).isEqualTo("CAMEL-MUG");
+        assertThat(sku.getString("note")).contains("parsed into a Map");
+        // the numbers as unmarshal: json gives them to a route
+        assertThat(ExpressionEvaluator.evaluate(new ToolContext(), "simple", "${body[price]}",
+                "{\"sku\": \"CAMEL-MUG\", \"qty\": 1, \"price\": 9.50}").getString("result")).isEqualTo("9.5");
+        // what works on the text is answered as before, and so is a failure on text that is no JSON
+        JsonObject length = ExpressionEvaluator.evaluate(new ToolContext(), "simple", "${body.length()}",
+                "{\"sku\": \"A\"}");
+        assertThat(length.getString("result")).isEqualTo("12");
+        assertThat(length.get("note")).isNull();
+        assertThat(ExpressionEvaluator.evaluate(new ToolContext(), "simple", "${body[sku]}", "sku=A").getString("status"))
+                .isEqualTo("error");
+        // an error the parsed data does not cure stays the error on the text
+        JsonObject broken = ExpressionEvaluator.evaluate(new ToolContext(), "simple", "${body[sku]", "{\"sku\": \"A\"}");
+        assertThat(broken.getString("status")).isEqualTo("error");
+        assertThat(broken.get("note")).isNull();
+    }
+
+    @Test
+    @EnabledIfSystemProperty(named = "camel.test.download", matches = "true")
+    void jsonpathIsDownloadedAndEvaluated() {
+        JsonObject result = ExpressionEvaluator.evaluate(new ToolContext(), "jsonpath",
+                "$[?(@.sku == 'CAMEL-MUG')]", STOCK);
+
+        assertThat(result.getString("downloaded")).contains("camel-jsonpath");
+        assertThat(result.getString("status")).isEqualTo("ok");
+        assertThat(result.getString("result")).contains("CAMEL-MUG");
+    }
+}

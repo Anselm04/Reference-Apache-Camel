@@ -1,0 +1,332 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.camel.component.cxf.jaxws;
+
+import java.io.IOException;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Map;
+
+import jakarta.xml.ws.Endpoint;
+
+import org.w3c.dom.Document;
+
+import org.apache.camel.CamelContext;
+import org.apache.camel.Exchange;
+import org.apache.camel.Message;
+import org.apache.camel.Processor;
+import org.apache.camel.ProducerTemplate;
+import org.apache.camel.component.cxf.common.message.CxfConstants;
+import org.apache.camel.component.cxf.converter.CxfPayloadConverter;
+import org.apache.camel.converter.jaxp.XmlConverter;
+import org.apache.camel.impl.DefaultCamelContext;
+import org.apache.camel.test.AvailablePortFinder;
+import org.apache.cxf.BusFactory;
+import org.apache.cxf.endpoint.Client;
+import org.apache.cxf.endpoint.Server;
+import org.apache.cxf.frontend.AbstractWSDLBasedEndpointFactory;
+import org.apache.cxf.frontend.ServerFactoryBean;
+import org.apache.cxf.helpers.CastUtils;
+import org.apache.cxf.transport.http.HTTPConduit;
+import org.apache.cxf.transports.http.configuration.HTTPClientPolicy;
+import org.apache.hello_world_soap_http.GreeterImpl;
+import org.junit.jupiter.api.AfterAll;
+import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.BeforeAll;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Disabled;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.Timeout;
+import org.junit.jupiter.api.Timeout.ThreadMode;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertInstanceOf;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertTrue;
+
+// CAMEL-26468: these tests sometimes hang on CI, which used to kill the whole fork (camel.surefire.forkTimeout).
+// The timeout fails only the stuck test, and junit-platform.properties prints a thread dump to show where it hangs.
+@Timeout(value = 30, threadMode = ThreadMode.SEPARATE_THREAD)
+public class CxfProducerTest {
+    private static AvailablePortFinder.Port simplePort;
+    private static AvailablePortFinder.Port jaxWsPort;
+
+    @BeforeAll
+    static void allocatePorts() {
+        simplePort = AvailablePortFinder.find();
+        jaxWsPort = AvailablePortFinder.find();
+    }
+
+    @AfterAll
+    static void releasePorts() {
+        if (simplePort != null) {
+            simplePort.release();
+        }
+        if (jaxWsPort != null) {
+            jaxWsPort.release();
+        }
+    }
+
+    protected static final String ECHO_OPERATION = "echo";
+    protected static final String GREET_ME_OPERATION = "greetMe";
+    protected static final String TEST_MESSAGE = "Hello World!";
+
+    private static final Logger LOG = LoggerFactory.getLogger(CxfProducerTest.class);
+
+    protected CamelContext camelContext;
+    protected ProducerTemplate template;
+    protected Server server;
+    protected Endpoint endpoint;
+
+    protected String getSimpleServerAddress() {
+        return "http://localhost:" + simplePort.getPort() + "/" + getClass().getSimpleName() + "/test";
+    }
+
+    protected String getJaxWsServerAddress() {
+        return "http://localhost:" + jaxWsPort.getPort() + "/" + getClass().getSimpleName() + "/test";
+    }
+
+    // Keep port reference to prevent reuse — this address must have nothing listening on it
+    private AvailablePortFinder.Port wrongPort;
+
+    protected String getWrongServerAddress() {
+        // Avoiding the test error on camel-cxf module
+        wrongPort = AvailablePortFinder.find();
+        return "http://localhost:" + wrongPort.getPort() + "/" + getClass().getSimpleName() + "/test";
+    }
+
+    @BeforeEach
+    @Timeout(value = 30, threadMode = ThreadMode.SEPARATE_THREAD)
+    public void startService() throws Exception {
+        // start a simple front service
+        ServerFactoryBean svrBean = new ServerFactoryBean();
+        svrBean.setAddress(getSimpleServerAddress());
+        svrBean.setServiceClass(HelloService.class);
+        svrBean.setServiceBean(new HelloServiceImpl());
+        svrBean.setBus(BusFactory.getDefaultBus());
+        server = svrBean.create();
+
+        GreeterImpl greeterImpl = new GreeterImpl();
+        endpoint = Endpoint.publish(getJaxWsServerAddress(), greeterImpl);
+    }
+
+    @AfterEach
+    @Timeout(value = 30, threadMode = ThreadMode.SEPARATE_THREAD)
+    public void stopServices() throws Exception {
+        endpoint.stop();
+        server.stop();
+        server.destroy();
+    }
+
+    @BeforeEach
+    @Timeout(value = 30, threadMode = ThreadMode.SEPARATE_THREAD)
+    public void setUp() throws Exception {
+        camelContext = new DefaultCamelContext();
+        camelContext.getRegistry().bind("wrongServerConfigurer", new CxfConfigurer() {
+            @Override
+            public void configure(AbstractWSDLBasedEndpointFactory factoryBean) {
+            }
+
+            @Override
+            public void configureClient(Client client) {
+                HTTPConduit conduit = (HTTPConduit) client.getConduit();
+                HTTPClientPolicy policy = new HTTPClientPolicy();
+                policy.setConnectionTimeout(3000);
+                policy.setReceiveTimeout(3000);
+                conduit.setClient(policy);
+            }
+
+            @Override
+            public void configureServer(Server server) {
+            }
+        });
+        camelContext.start();
+        template = camelContext.createProducerTemplate();
+    }
+
+    @AfterEach
+    @Timeout(value = 30, threadMode = ThreadMode.SEPARATE_THREAD)
+    public void tearDown() throws Exception {
+        template.stop();
+        camelContext.stop();
+        if (wrongPort != null) {
+            wrongPort.release();
+        }
+    }
+
+    @Test
+    public void testInvokingSimpleServerWithParams() throws Exception {
+        Exchange exchange = sendSimpleMessage();
+
+        Message out = exchange.getMessage();
+        String result = out.getBody(String.class);
+        LOG.info("Received output text: {}", result);
+        Map<String, Object> responseContext = CastUtils.cast((Map<?, ?>) out.getHeader(Client.RESPONSE_CONTEXT));
+        assertNotNull(responseContext);
+        assertEquals("UTF-8", responseContext.get(org.apache.cxf.message.Message.ENCODING),
+                "We should get the response context here");
+        assertEquals("echo " + TEST_MESSAGE, result, "reply body on Camel");
+
+        // check the other camel header copying
+        String fileName = out.getHeader(Exchange.FILE_NAME, String.class);
+        assertEquals("testFile", fileName, "Should get the file name from out message header");
+
+        // check if the header object is turned into String
+        Object requestObject = out.getHeader("requestObject");
+        assertTrue(requestObject instanceof DefaultCxfBinding, "We should get the right requestObject.");
+    }
+
+    @Test
+    void testInvokingAWrongServer() throws Exception {
+        Exchange reply = sendSimpleMessage(getWrongEndpointUri());
+        assertNotNull(reply.getException(), "We should get the exception here");
+        assertInstanceOf(IOException.class, reply.getException().getCause());
+
+        //Test the data format PAYLOAD
+        reply = sendSimpleMessageWithPayloadMessage(getWrongEndpointUri() + "&dataFormat=PAYLOAD");
+        assertNotNull(reply.getException(), "We should get the exception here");
+        assertInstanceOf(IOException.class, reply.getException().getCause());
+
+        //Test the data format MESSAGE
+        reply = sendSimpleMessageWithRawMessage(getWrongEndpointUri() + "&dataFormat=RAW");
+        assertNotNull(reply.getException(), "We should get the exception here");
+        assertInstanceOf(IOException.class, reply.getException().getCause());
+    }
+
+    // CAMEL-26696: async producer must always complete the exchange when the connection fails.
+    // The @Timeout(30s) on the class guards against the exchange hanging in
+    // DefaultAsyncProcessorAwaitManager if camelAsyncCallback.done() is never called.
+    // For the callback exception-handling semantics (binding throws, Error thrown, etc.)
+    // see CxfClientCallbackTest which tests CxfClientCallback directly via Mockito.
+    // Disabled: this test passes with or without the fix (CXF goes through handleException, not
+    // through populateExchangeFromCxfResponse, on a connection failure), and CXF-9272 makes it
+    // hang occasionally under load. The CxfClientCallbackTest unit tests cover the invariants.
+    @Disabled("CXF-9272: may hang under load; callback invariants covered by CxfClientCallbackTest")
+    @Test
+    void testInvokingAWrongServerAsync() throws Exception {
+        Exchange reply = sendSimpleMessage(getWrongEndpointUriAsync());
+        assertNotNull(reply.getException(), "Async wrong-server call must complete with an exception");
+        assertInstanceOf(IOException.class, reply.getException().getCause());
+    }
+
+    @Test
+    public void testInvokingJaxWsServerWithParams() throws Exception {
+        Exchange exchange = sendJaxWsMessage();
+
+        Message out = exchange.getMessage();
+        String result = out.getBody(String.class);
+        LOG.info("Received output text: {}", result);
+        Map<String, Object> responseContext = CastUtils.cast((Map<?, ?>) out.getHeader(Client.RESPONSE_CONTEXT));
+        assertNotNull(responseContext);
+        assertEquals("{http://apache.org/hello_world_soap_http}greetMe",
+                responseContext.get("jakarta.xml.ws.wsdl.operation").toString(), "Get the wrong wsdl operation name");
+        assertEquals("Hello " + TEST_MESSAGE, result, "reply body on Camel");
+
+        // check the other camel header copying
+        String fileName = out.getHeader(Exchange.FILE_NAME, String.class);
+        assertEquals("testFile", fileName, "Should get the file name from out message header");
+    }
+
+    protected String getSimpleEndpointUri() {
+        return "cxf://" + getSimpleServerAddress()
+               + "?serviceClass=org.apache.camel.component.cxf.jaxws.HelloService";
+    }
+
+    protected String getJaxwsEndpointUri() {
+        return "cxf://" + getJaxWsServerAddress() + "?serviceClass=org.apache.hello_world_soap_http.Greeter";
+    }
+
+    protected String getWrongEndpointUri() {
+        // CAMEL-26600: synchronous=true, as with the CXF async client the callback sometimes never completes
+        // when the connection fails, leaving the exchange waiting forever.
+        // The async error path is not covered here; see CxfClientCallbackTest and CAMEL-26696.
+        return "cxf://" + getWrongServerAddress()
+               + "?serviceClass=org.apache.camel.component.cxf.jaxws.HelloService"
+               + "&cxfConfigurer=#wrongServerConfigurer"
+               + "&synchronous=true";
+    }
+
+    // CAMEL-26696: async (synchronous=false) wrong-server endpoint — callback must always complete
+    protected String getWrongEndpointUriAsync() {
+        return "cxf://" + getWrongServerAddress()
+               + "?serviceClass=org.apache.camel.component.cxf.jaxws.HelloService"
+               + "&cxfConfigurer=#wrongServerConfigurer";
+    }
+
+    protected Exchange sendSimpleMessage() {
+        return sendSimpleMessage(getSimpleEndpointUri());
+    }
+
+    private Exchange sendSimpleMessage(String endpointUri) {
+        Exchange exchange = template.request(endpointUri, new Processor() {
+            public void process(final Exchange exchange) {
+                final List<String> params = new ArrayList<>();
+                params.add(TEST_MESSAGE);
+                exchange.getIn().setBody(params);
+                exchange.getIn().setHeader(CxfConstants.OPERATION_NAME, ECHO_OPERATION);
+                exchange.getIn().setHeader(Exchange.FILE_NAME, "testFile");
+                exchange.getIn().setHeader("requestObject", new DefaultCxfBinding());
+            }
+        });
+        return exchange;
+
+    }
+
+    private Exchange sendSimpleMessageWithRawMessage(String endpointUri) {
+        Exchange exchange = template.request(endpointUri, new Processor() {
+            public void process(final Exchange exchange) {
+                exchange.getIn().setBody("<soap:Envelope xmlns:soap=\"http://schemas.xmlsoap.org/soap/envelope/\">"
+                                         + "<soap:Body><ns1:echo xmlns:ns1=\"http://jaxws.cxf.component.camel.apache.org/\">"
+                                         + "<arg0 xmlns=\"http://jaxws.cxf.component.camel.apache.org/\">hello world</arg0>"
+                                         + "</ns1:echo></soap:Body></soap:Envelope>");
+            }
+        });
+        return exchange;
+    }
+
+    private Exchange sendSimpleMessageWithPayloadMessage(String endpointUri) {
+        Exchange exchange = template.request(endpointUri, new Processor() {
+            public void process(final Exchange exchange) throws Exception {
+                Document document = new XmlConverter()
+                        .toDOMDocument("<ns1:echo xmlns:ns1=\"http://jaxws.cxf.component.camel.apache.org/\">"
+                                       + "<arg0 xmlns=\"http://jaxws.cxf.component.camel.apache.org/\">hello world</arg0>"
+                                       + "</ns1:echo>",
+                                exchange);
+                exchange.getIn().setBody(CxfPayloadConverter.documentToCxfPayload(document, exchange));
+                exchange.getIn().setHeader(CxfConstants.OPERATION_NAME, ECHO_OPERATION);
+
+            }
+        });
+        return exchange;
+    }
+
+    protected Exchange sendJaxWsMessage() {
+        Exchange exchange = template.request(getJaxwsEndpointUri(), new Processor() {
+            public void process(final Exchange exchange) {
+                final List<String> params = new ArrayList<>();
+                params.add(TEST_MESSAGE);
+                exchange.getIn().setBody(params);
+                exchange.getIn().setHeader(CxfConstants.OPERATION_NAME, GREET_ME_OPERATION);
+                exchange.getIn().setHeader(Exchange.FILE_NAME, "testFile");
+            }
+        });
+        return exchange;
+    }
+
+}

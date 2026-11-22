@@ -1,0 +1,198 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.camel.dsl.jbang.core.commands.process;
+
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Optional;
+import java.util.Set;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
+import java.util.stream.Collectors;
+
+import org.aesh.command.CommandDefinition;
+import org.aesh.command.option.Argument;
+import org.aesh.command.option.Option;
+import org.apache.camel.dsl.jbang.core.common.BackgroundLog;
+import org.apache.camel.dsl.jbang.core.common.CliException;
+import org.apache.camel.dsl.jbang.core.common.CommandLineHelper;
+import org.apache.camel.dsl.jbang.core.common.ProcessFinder;
+import org.apache.camel.dsl.jbang.core.common.TimeoutConverter;
+import org.apache.camel.dsl.jbang.run.common.PathUtils;
+import org.apache.camel.util.TimeUtils;
+
+@CommandDefinition(name = "stop", description = "Shuts down running Camel integrations", generateHelp = true,
+                   footer = {
+                           "Examples:",
+                           "  camel stop hello",
+                           "  camel stop --all",
+                           "  camel stop 12345",
+                           "  camel stop hello --timeout=2m",
+                           "  camel stop hello --kill" })
+public class StopProcess extends ProcessBaseCommand {
+
+    @Argument(description = "Name or pid of running Camel integration(s). Without a name, the one integration that runs"
+                            + " (use --all when several run)")
+    String name;
+
+    @Option(name = "all", hasValue = false, description = "Stop all running Camel integrations")
+    boolean all;
+
+    @Option(name = "kill", hasValue = false, description = "To force killing the process (SIGKILL)")
+    boolean kill;
+
+    @Option(name = "timeout",
+            description = "How long to wait for the integration to stop, in millis or as a duration such as 30s",
+            defaultValue = "60000", converter = TimeoutConverter.class)
+    long timeout = 60000;
+
+    @Option(name = "no-wait", hasValue = false, description = "Do not wait for the integration to stop")
+    boolean noWait;
+
+    @Override
+    public Integer doCall() throws Exception {
+        if (all && name != null && !name.isBlank()) {
+            throw CliException.usage("Give the name or pid of the integration to stop, or --all, not both");
+        }
+        if (!all && (name == null || name.isBlank())) {
+            requireOneRunning();
+        }
+        List<Long> pids = launchedBy(all ? null : name);
+        if (pids.isEmpty()) {
+            pids = findIntegrationPids(all ? "*" : name);
+        }
+
+        for (Long pid : pids) {
+            Path pidFile = CommandLineHelper.getCamelDir().resolve(Long.toString(pid));
+            if (Files.exists(pidFile)) {
+                // the integration stops when its pid file is gone
+                printer().println("Shutting down Camel integration (PID: " + pid + ")");
+                PathUtils.deleteFile(pidFile);
+            } else if (!kill) {
+                printer().println("Shutting down Camel integration (PID: " + pid + ") with SIGTERM");
+                ProcessHandle.of(pid).ifPresent(ProcessHandle::destroy);
+            }
+        }
+        if (kill) {
+            for (Long pid : pids) {
+                ProcessHandle.of(pid).ifPresent(ph -> {
+                    printer().println("Killing Camel integration (PID: " + pid + ")");
+                    ph.destroyForcibly();
+                });
+            }
+        }
+        if (noWait) {
+            return 0;
+        }
+
+        long deadline = System.currentTimeMillis() + timeout;
+        List<Long> running = new ArrayList<>();
+        for (Long pid : pids) {
+            if (awaitExit(pid, deadline)) {
+                // the output of an integration that ran in the background
+                BackgroundLog.remove(pid);
+            } else {
+                running.add(pid);
+            }
+        }
+        if (!running.isEmpty()) {
+            throw CliException.timeout("Camel integration (PID: "
+                                       + running.stream().map(String::valueOf).collect(Collectors.joining(", "))
+                                       + ") did not stop within " + TimeUtils.printDuration(timeout)
+                                       + "; use --kill");
+        }
+        return 0;
+    }
+
+    /**
+     * Without a name and without --all, camel stop stops the one integration that runs. When several run it stops none:
+     * a bare camel stop, such as of an AI agent, stopped the integrations of the user and of other agents too
+     * (CAMEL-26929).
+     *
+     * @throws CliException with exit code 2 when more than one integration runs
+     */
+    private void requireOneRunning() {
+        List<ProcessFinder.CamelProcess> running = ProcessFinder.find("*");
+        if (running.size() > 1) {
+            String names = running.stream().map(p -> p.name() + " (PID: " + p.pid() + ")")
+                    .collect(Collectors.joining(", "));
+            throw CliException.usage(running.size() + " Camel integrations are running: " + names
+                                     + ". Give the name or pid of the one to stop, or --all to stop them all");
+        }
+    }
+
+    /**
+     * The running Camel integrations that the process with this pid launched, when the pid is not a Camel integration
+     * itself: such as the JBang launcher of camel run, whose pid Citrus keeps, while the Camel JVM is its child. Camel
+     * 4.23 signalled a pid as it was given; since CAMEL-26911 only Camel integrations are signalled, so the
+     * integrations below the launcher are stopped instead (CAMEL-27149).
+     *
+     * @param  nameOrPid the argument of camel stop
+     * @return           the pids of the integrations, or an empty list when the argument is not a pid, is a Camel
+     *                   integration, or launched none
+     */
+    private List<Long> launchedBy(String nameOrPid) {
+        if (nameOrPid == null || !nameOrPid.matches("\\d+") || !ProcessFinder.find(nameOrPid).isEmpty()) {
+            return List.of();
+        }
+        long launcher = Long.parseLong(nameOrPid);
+        Set<Long> descendants = ProcessHandle.of(launcher)
+                .map(ph -> ph.descendants().map(ProcessHandle::pid).collect(Collectors.toSet()))
+                .orElse(Set.of());
+        if (descendants.isEmpty()) {
+            return List.of();
+        }
+        List<Long> pids = ProcessFinder.findAll().stream().map(ProcessFinder.CamelProcess::pid)
+                .filter(descendants::contains).collect(Collectors.toCollection(ArrayList::new));
+        if (!pids.isEmpty()) {
+            printer().println("PID " + launcher + " is not a Camel integration: stopping the Camel integration it launched");
+        }
+        return pids;
+    }
+
+    /**
+     * Waits until the process has exited.
+     *
+     * @param  pid      the process
+     * @param  deadline until when to wait, in epoch millis
+     * @return          whether the process is gone
+     */
+    static boolean awaitExit(long pid, long deadline) {
+        Optional<ProcessHandle> ph = ProcessHandle.of(pid);
+        if (ph.isEmpty()) {
+            return true;
+        }
+        long remaining = deadline - System.currentTimeMillis();
+        try {
+            if (remaining > 0) {
+                ph.get().onExit().get(remaining, TimeUnit.MILLISECONDS);
+            }
+            return !ph.get().isAlive();
+        } catch (TimeoutException e) {
+            return false;
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return false;
+        } catch (ExecutionException e) {
+            return !ph.get().isAlive();
+        }
+    }
+
+}

@@ -1,0 +1,106 @@
+= Flowable Component
+:doctitle: Flowable
+:shortname: flowable
+:artifactid: camel-flowable
+:description: Send and receive messages from the Flowable BPMN and CMMN engines.
+:since: 4.9
+:supportlevel: Stable
+:tabs-sync-option:
+:component-header: Both producer and consumer are supported
+
+*Since Camel {since}*
+
+*{component-header}*
+
+Communicate with the Flowable Event Registry for sending and receiving messages from the Flowable BPMN and CMMN engines.
+
+== URI format
+
+------------------------------
+flowable:channelKey[?options]
+------------------------------
+
+Where *channelKey* is the unique key value of the channel model deployed in the Flowable Event Registry.
+
+// component options: START
+include::partial$component-configure-options.adoc[]
+include::partial$component-endpoint-options.adoc[]
+include::partial$component-endpoint-headers.adoc[]
+// component options: END
+
+== Usage
+
+=== Body content
+
+The body content is defined by the event model deployed to the Flowable Event Registry.
+The event message can then be mapped to process or case variables in the process BPMN or case CMMN model.
+
+=== XML events
+
+For an inbound channel of type `camel` with `deserializerType` set to `xml`, the producer parses the event with the XML
+parser settings that Camel uses, which are also the settings of Flowable 8: external DTDs are not loaded, external
+general and parameter entities are not included, entity references are kept as entity reference nodes, and XInclude
+is not processed.
+
+To parse the event in another way, set `deserializerDelegateExpression` in the channel model to your own
+`InboundEventDeserializer`. The producer keeps a custom deserializer as it is.
+
+=== Sending to a channel that is not deployed yet
+
+A route that sends to `flowable:channelKey` can start before the inbound channel model with that key is deployed
+in the Flowable Event Registry. Once the channel is deployed, the producer sends to it.
+Until then, every send fails with a `FlowableException` that names the channel key.
+
+== Examples
+
+The following example sends an event to the Flowable event registry for further processing:
+
+[tabs]
+====
+Java::
++
+[source,java]
+----
+from("direct:start").to("flowable:exampleChannel");
+----
+
+XML::
++
+[source,xml]
+----
+<route>
+  <from uri="direct:start"/>
+  <to uri="flowable:exampleChannel"/>
+</route>
+----
+
+YAML::
++
+[source,yaml]
+----
+- route:
+    from:
+      uri: direct:start
+      steps:
+        - to:
+            uri: flowable:exampleChannel
+----
+====
+
+== Dependencies
+
+To use Flowable in your Camel routes, you need to add a dependency on
+*camel-flowable*, which implements the component.
+
+If you use Maven, you can add the following to your `pom.xml`,
+substituting the version number for the latest and greatest release (see
+the download page for the latest versions).
+
+[source,xml]
+-------------------------------------
+<dependency>
+  <groupId>org.apache.camel</groupId>
+  <artifactId>camel-flowable</artifactId>
+  <version>x.x.x</version>
+</dependency>
+-------------------------------------

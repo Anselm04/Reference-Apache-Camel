@@ -1,0 +1,1537 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.camel.dsl.jbang.core.commands.tui;
+
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Map;
+
+import dev.tamboui.layout.Constraint;
+import dev.tamboui.layout.Layout;
+import dev.tamboui.layout.Rect;
+import dev.tamboui.style.Style;
+import dev.tamboui.terminal.Frame;
+import dev.tamboui.text.CharWidth;
+import dev.tamboui.text.Line;
+import dev.tamboui.text.Span;
+import dev.tamboui.text.Text;
+import dev.tamboui.tui.event.KeyCode;
+import dev.tamboui.tui.event.KeyEvent;
+import dev.tamboui.tui.event.MouseEvent;
+import dev.tamboui.tui.event.MouseEventKind;
+import dev.tamboui.widgets.block.Block;
+import dev.tamboui.widgets.block.BorderType;
+import dev.tamboui.widgets.block.Borders;
+import dev.tamboui.widgets.paragraph.Paragraph;
+import dev.tamboui.widgets.scrollbar.ScrollbarState;
+import dev.tamboui.widgets.table.Cell;
+import dev.tamboui.widgets.table.Row;
+import dev.tamboui.widgets.table.Table;
+import dev.tamboui.widgets.table.TableState;
+import org.apache.camel.util.json.JsonArray;
+import org.apache.camel.util.json.JsonObject;
+
+import static org.apache.camel.dsl.jbang.core.commands.tui.TuiHelper.*;
+
+class RoutesTab extends AbstractDiagramTab {
+
+    /** The widest the body types of a step are in the processors table: the info panel of the diagram has them all. */
+    private static final int MAX_BODY_TYPES_WIDTH = 40;
+    /** The widest the TYPE column of the processors table grows to for the tree of the steps. */
+    private static final int MAX_TYPE_WIDTH = 30;
+    /** The room what a step does has in the processors table before the body types take the rest. */
+    private static final int MIN_PROCESSOR_WIDTH = 30;
+    /** What a step does in the processors table of Top mode, where the bar of the times takes the rest. */
+    private static final int TOP_PROCESSOR_WIDTH = 30;
+
+    private static final String[] ROUTE_SORT_COLUMNS = { "name", "from", "status", "total", "failed" };
+    private static final String[] ROUTE_TOP_SORT_COLUMNS = { "mean", "max", "min", "last", "delta", "p50", "p95", "p99" };
+
+    // Route sort state
+    private String routeSort = "name";
+    private int routeSortIndex;
+    private boolean routeSortReversed;
+    private boolean routeTopMode;
+    private String routeTopSort = "mean";
+    private int routeTopSortIndex;
+    private boolean routeTopSortReversed;
+
+    // Table states
+    private final TableState routeTableState = new TableState();
+    private final ScrollbarState routeTableScrollState = new ScrollbarState();
+    private final TableState processorTableState = new TableState();
+    private final ScrollbarState processorTableScrollState = new ScrollbarState();
+    private Rect lastRouteTableArea;
+    private int topPanelHeight = -1;
+    private final DragSplit vSplit = new DragSplit();
+    private int infoPanelWidth = 30;
+    private final DragSplit hSplit = new DragSplit();
+
+    // the description column of the route table (n)
+    private boolean showDescription;
+
+    RoutesTab(MonitorContext ctx) {
+        super(ctx);
+    }
+
+    @Override
+    public void onTabSelected() {
+        // the tab opens on its table: a diagram shown the last time is closed
+        if (isShowDiagram()) {
+            closeDiagram();
+        }
+    }
+
+    @Override
+    public void refreshWhileVisible() {
+        // what the steps do, for the table of the processors: the route structure the diagrams use, asked of the
+        // integration again only when its routes change
+        String pid = ctx.selectedPid;
+        if (pid != null && !isShowDiagram()) {
+            ctx.diagramTopology.refreshStructure(ctx, pid);
+        }
+    }
+
+    boolean isDiagramMetrics() {
+        return diagramMetrics;
+    }
+
+    boolean isShowSource() {
+        return sourceViewer.isVisible();
+    }
+
+    @Override
+    public boolean handleKeyEvent(KeyEvent ke) {
+        // Go-to node popup (takes priority when active)
+        if (handleGotoNodeKeys(ke)) {
+            return true;
+        }
+
+        // Source view scrolling (takes priority when active)
+        if (sourceViewer.handleKeyEvent(ke)) {
+            return true;
+        }
+
+        // the source of the selected node or route of the diagram
+        if (handleSourceKey(ke)) {
+            return true;
+        }
+        if (handleDiagramKeys(ke)) {
+            return true;
+        }
+
+        // Toggle description (diagram mode)
+        if (diagram.isShowDiagram() && ke.isCharIgnoreCase('n')) {
+            diagram.setShowDescription(!diagram.isShowDescription());
+            diagram.endLoad();
+            reloadDiagram();
+            return true;
+        }
+        return handleTableKeys(ke);
+    }
+
+    /**
+     * Keys in the route table view (sort, top mode, description, open diagram, source, start/stop, suspend/resume).
+     */
+    private boolean handleTableKeys(KeyEvent ke) {
+        if (!diagram.isShowDiagram() && !sourceViewer.isVisible() && ke.isKey(KeyCode.F8) && ke.hasShift()) {
+            askAiAboutSelectedRoute();
+            return true;
+        }
+        // Sort (only when not in diagram)
+        if (!diagram.isShowDiagram() && ke.isChar('s')) {
+            if (routeTopMode) {
+                routeTopSortIndex = (routeTopSortIndex + 1) % ROUTE_TOP_SORT_COLUMNS.length;
+                routeTopSort = ROUTE_TOP_SORT_COLUMNS[routeTopSortIndex];
+                routeTopSortReversed = false;
+            } else {
+                routeSortIndex = (routeSortIndex + 1) % ROUTE_SORT_COLUMNS.length;
+                routeSort = ROUTE_SORT_COLUMNS[routeSortIndex];
+                routeSortReversed = false;
+            }
+            return true;
+        }
+        if (!diagram.isShowDiagram() && ke.isChar('S')) {
+            if (routeTopMode) {
+                routeTopSortReversed = !routeTopSortReversed;
+            } else {
+                routeSortReversed = !routeSortReversed;
+            }
+            return true;
+        }
+
+        // Toggle top mode (only when not in source or diagram view)
+        if (!sourceViewer.isVisible() && !diagram.isShowDiagram() && ke.isCharIgnoreCase('t')) {
+            routeTopMode = !routeTopMode;
+            return true;
+        }
+
+        // Toggle description in route table (only when not in diagram)
+        if (!sourceViewer.isVisible() && !diagram.isShowDiagram() && ke.isCharIgnoreCase('n')) {
+            showDescription = !showDescription;
+            return true;
+        }
+
+        // Enter in table mode opens route diagram
+        if (!diagram.isShowDiagram() && !sourceViewer.isVisible() && ke.isConfirm()) {
+            openRouteDiagram();
+            return true;
+        }
+
+        // Source viewer toggle (table mode — route source)
+        if (!diagram.isShowDiagram() && ke.isChar('c')) {
+            if (sourceViewer.isVisible()) {
+                sourceViewer.hide();
+            } else {
+                loadSourceForSelectedRoute();
+            }
+            return true;
+        }
+
+        // Route start/stop
+        if (!sourceViewer.isVisible() && !diagram.isShowDiagram() && ke.isChar('p')) {
+            toggleRouteStartStop();
+            return true;
+        }
+
+        // Route suspend/resume
+        if (!sourceViewer.isVisible() && !diagram.isShowDiagram() && ke.isChar('P') && selectedRouteSupportsSuspension()) {
+            toggleRouteSuspendResume();
+            return true;
+        }
+        return false;
+    }
+
+    @Override
+    public boolean handleEscape() {
+        // the popup, the source, or back from a route
+        if (handleDiagramEscape()) {
+            return true;
+        }
+        if (diagram.isShowDiagram()) {
+            // Close diagram entirely from topology
+            closeDiagram();
+            return true;
+        }
+        return false;
+    }
+
+    @Override
+    public boolean handleMouseEvent(MouseEvent me, Rect area) {
+        if (gotoNodePopup.isVisible()) {
+            return true;
+        }
+        if (!diagram.isShowDiagram() && vSplit.handleMouse(me, me.y())) {
+            if (vSplit.isDragging() && me.kind() == MouseEventKind.DRAG) {
+                topPanelHeight = Math.max(3, Math.min(me.y() - area.y(), area.height() - 5));
+            }
+            return true;
+        }
+        if (diagram.isShowDiagram() && hSplit.handleMouse(me, me.x())) {
+            if (hSplit.isDragging() && me.kind() == MouseEventKind.DRAG) {
+                infoPanelWidth = Math.max(10, Math.min(me.x() - area.x(), area.width() - 20));
+            }
+            return true;
+        }
+        if (!diagram.isShowDiagram()) {
+            IntegrationInfo info = ctx.findSelectedIntegration();
+            if (info != null) {
+                if (handleTableClick(me, lastRouteTableArea, routeTableState, info.routes.size())) {
+                    return true;
+                }
+            }
+        }
+        if (diagram.isShowDiagram()) {
+            if (diagram.handleMouseScroll(me)) {
+                return true;
+            }
+            if (handleFoldMarkerClick(me)) {
+                return true;
+            }
+            if (me.isClick()) {
+                if (topologyMode) {
+                    int clicked = diagram.handleNodeClick(me);
+                    if (clicked >= 0) {
+                        return true;
+                    }
+                } else {
+                    int clicked = diagram.handleEipNodeClick(me);
+                    if (clicked >= 0) {
+                        return true;
+                    }
+                }
+            }
+        }
+        return false;
+    }
+
+    @Override
+    public void navigateUp() {
+        if (!diagram.isShowDiagram()) {
+            routeTableState.selectPrevious();
+        }
+    }
+
+    @Override
+    public void navigateDown() {
+        if (!diagram.isShowDiagram()) {
+            IntegrationInfo info = ctx.findSelectedIntegration();
+            routeTableState.selectNext(info != null ? info.routes.size() : 0);
+        }
+    }
+
+    @Override
+    public void onIntegrationChanged() {
+        sourceViewer.reset();
+        diagram.reset();
+        topologyMode = true;
+        drillDownRouteId = null;
+        routeNavigationStack.clear();
+        routeTableState.select(0);
+    }
+
+    @Override
+    public void render(Frame frame, Rect area) {
+        IntegrationInfo info = ctx.findSelectedIntegration();
+        if (info == null) {
+            renderNoSelection(frame, area);
+            return;
+        }
+
+        // Fullscreen source view (from table mode)
+        if (sourceViewer.isVisible() && !diagram.isShowDiagram()) {
+            sourceViewer.render(frame, area);
+            return;
+        }
+
+        // Fullscreen source view (from drill-down mode)
+        if (sourceViewer.isVisible() && diagram.isShowDiagram()) {
+            sourceViewer.render(frame, area);
+            return;
+        }
+
+        // Fullscreen diagram mode
+        if (diagram.isShowDiagram() && diagram.hasDiagramData()) {
+            renderDiagramView(frame, area, info);
+            return;
+        }
+
+        // Normal table view
+        List<RouteInfo> sortedRoutes = displayedRoutes(info);
+
+        if (topPanelHeight < 0) {
+            topPanelHeight = area.height() * 45 / 100;
+        }
+        topPanelHeight = Math.max(3, Math.min(topPanelHeight, area.height() - 5));
+        List<Rect> chunks = Layout.vertical()
+                .constraints(Constraint.length(topPanelHeight), Constraint.fill())
+                .split(area);
+
+        // Routes table
+        Table routeTable = routeTopMode ? buildRouteTopTable(sortedRoutes) : buildRouteTable(sortedRoutes, area.width());
+
+        lastRouteTableArea = chunks.get(0);
+        vSplit.setBorderPos(chunks.get(1).y());
+        frame.renderStatefulWidget(routeTable, chunks.get(0), routeTableState);
+        renderTableScrollbar(frame, lastRouteTableArea, routeTable, routeTableState, routeTableScrollState,
+                info.routes.size());
+
+        // Bottom panel: processors
+        Integer selectedRoute = routeTableState.selected();
+        if (selectedRoute != null && selectedRoute >= 0 && selectedRoute < sortedRoutes.size()) {
+            RouteInfo route = sortedRoutes.get(selectedRoute);
+            renderProcessors(frame, chunks.get(1), route);
+        } else if (!sortedRoutes.isEmpty()) {
+            renderProcessors(frame, chunks.get(1), sortedRoutes.get(0));
+        } else {
+            frame.renderWidget(
+                    Paragraph.builder()
+                            .text(Text.from(Line.from(Span.styled("No routes", Style.EMPTY.dim()))))
+                            .block(Block.builder().borderType(BorderType.ROUNDED).borders(Borders.ALL)
+                                    .borderStyle(ctx.paneBorder(false)).title(" Processors ").build())
+                            .build(),
+                    chunks.get(1));
+        }
+    }
+
+    /**
+     * Fullscreen topology or route diagram with its info/detail side panels and breadcrumb title.
+     */
+    private void renderDiagramView(Frame frame, Rect area, IntegrationInfo info) {
+        if (topologyMode && diagram.hasNativeLayout()) {
+            String selectedRouteId = diagram.getSelectedRouteId();
+            Line title;
+            if (info.name != null) {
+                title = Line.from(
+                        Span.raw(" Topology ["),
+                        Span.styled(info.name, Theme.label().bold()),
+                        Span.raw("] "));
+            } else {
+                title = Line.from(Span.raw(" Topology "));
+            }
+            if (selectedRouteId != null && area.width() > 60) {
+                infoPanelWidth = Math.max(10, Math.min(infoPanelWidth, area.width() - 20));
+                List<Rect> hChunks = Layout.horizontal()
+                        .constraints(Constraint.length(infoPanelWidth), Constraint.fill())
+                        .split(area);
+                hSplit.setBorderPos(hChunks.get(1).x());
+                detail.renderRouteInfoPanel(frame, hChunks.get(0), info, selectedRouteId);
+                diagram.setAiSourceDirectory(selectedSourceDirectory());
+                diagram.renderNativeDiagram(frame, hChunks.get(1), title, diagramMetrics);
+            } else {
+                diagram.setAiSourceDirectory(selectedSourceDirectory());
+                diagram.renderNativeDiagram(frame, area, title, diagramMetrics);
+            }
+            return;
+        } else if (!topologyMode && drillDownRouteId != null
+                && diagram.getRouteLayout(drillDownRouteId) != null) {
+            var routeLayout = diagram.getRouteLayout(drillDownRouteId);
+            Line title = diagram.zoom.withStepCount(
+                    DiagramDetailSupport.buildBreadcrumbTitle(routeNavigationStack, drillDownRouteId), drillDownRouteId,
+                    routeLayout);
+
+            // Split for detail panel when active
+            Rect diagramArea = area;
+            if (detailMode) {
+                int detailH = Math.max(5, area.height() * 60 / 100);
+                List<Rect> vChunks = Layout.vertical()
+                        .constraints(Constraint.fill(), Constraint.length(detailH))
+                        .split(area);
+                diagramArea = vChunks.get(0);
+                detail.renderDetail(frame, vChunks.get(1), info, drillDownRouteId);
+            }
+
+            if (diagramArea.width() > 60) {
+                infoPanelWidth = Math.max(10, Math.min(infoPanelWidth, diagramArea.width() - 20));
+                List<Rect> hChunks = Layout.horizontal()
+                        .constraints(Constraint.length(infoPanelWidth), Constraint.fill())
+                        .split(diagramArea);
+                hSplit.setBorderPos(hChunks.get(1).x());
+                detail.renderEipInfoPanel(frame, hChunks.get(0), drillDownRouteId);
+                diagram.renderNativeRouteDiagram(
+                        frame, hChunks.get(1), title, diagramMetrics, drillDownRouteId, routeLayout);
+            } else {
+                diagram.renderNativeRouteDiagram(frame, diagramArea, title, diagramMetrics, drillDownRouteId,
+                        routeLayout);
+            }
+
+            // Render go-to popup overlay
+            if (gotoNodePopup.isVisible()) {
+                gotoNodePopup.render(frame, area);
+            }
+            return;
+        }
+
+        // Fallback: loading or no native layout yet
+        frame.renderWidget(
+                Paragraph.builder()
+                        .text(Text.from(Line.from(Span.styled(
+                                "Loading diagram...",
+                                Style.EMPTY.dim()))))
+                        .block(Block.builder().borderType(BorderType.ROUNDED).borders(Borders.ALL)
+                                .title(" Diagram ").build())
+                        .build(),
+                area);
+    }
+
+    /**
+     * The routes table in top mode (processing time columns).
+     */
+    private Table buildRouteTopTable(List<RouteInfo> sortedRoutes) {
+        List<Row> routeRows = new ArrayList<>();
+        Map<String, String> aiDescriptions = aiDescriptions();
+        for (RouteInfo route : sortedRoutes) {
+            Style failStyle = route.failed > 0
+                    ? Theme.error().bold()
+                    : Style.EMPTY;
+
+            routeRows.add(Row.from(
+                    Cell.from(routeIdLine(route, 24)),
+                    routeFromCell(route, aiDescriptions, Integer.MAX_VALUE),
+                    rightCell(route.total > 0 ? formatDurationMs(route.meanTime) : "", 8,
+                            topTimeStyle(route.meanTime)),
+                    rightCell(route.total > 0 ? formatDurationMs(route.maxTime) : "", 8,
+                            topTimeStyle(route.maxTime)),
+                    rightCell(route.total > 0 ? formatDurationMs(route.minTime) : "", 8),
+                    rightCell(route.total > 0 ? formatDurationMs(route.lastTime) : "", 8),
+                    rightCell(route.deltaTime != 0 ? formatDurationMs(route.deltaTime) : "", 8,
+                            topDeltaStyle(route.deltaTime)),
+                    rightCell(route.p50Time >= 0 ? formatDurationMs(route.p50Time) : "", 8),
+                    rightCell(route.p95Time >= 0 ? formatDurationMs(route.p95Time) : "", 8),
+                    rightCell(route.p99Time >= 0 ? formatDurationMs(route.p99Time) : "", 8),
+                    rightCell(String.valueOf(route.total), 8),
+                    rightCell(String.valueOf(route.failed), 6, failStyle),
+                    rightCell(String.valueOf(route.inflight), 8),
+                    rightCell(formatThroughput(route.throughput), 8),
+                    rightCell(formatLoad(route.load01, route.load05, route.load15), 12)));
+        }
+
+        IntegrationInfo selTop = ctx.findSelectedIntegration();
+        if (selTop != null && selTop.exchangesTotal > 0) {
+            Style ts = Theme.label();
+            routeRows.add(Row.from(
+                    Cell.from(Span.styled("GLOBAL", ts)),
+                    Cell.from(""),
+                    rightCell(formatDurationMs(selTop.meanTime), 8, ts),
+                    rightCell(formatDurationMs(selTop.maxTime), 8, ts),
+                    rightCell(formatDurationMs(selTop.minTime), 8, ts),
+                    rightCell(formatDurationMs(selTop.lastTime), 8, ts),
+                    rightCell(selTop.deltaTime != 0 ? formatDurationMs(selTop.deltaTime) : "", 8, ts),
+                    rightCell(selTop.p50Time >= 0 ? formatDurationMs(selTop.p50Time) : "", 8, ts),
+                    rightCell(selTop.p95Time >= 0 ? formatDurationMs(selTop.p95Time) : "", 8, ts),
+                    rightCell(selTop.p99Time >= 0 ? formatDurationMs(selTop.p99Time) : "", 8, ts),
+                    rightCell(String.valueOf(selTop.exchangesTotal), 8, ts),
+                    rightCell(String.valueOf(selTop.failed), 6,
+                            selTop.failed > 0 ? Theme.error().bold() : ts),
+                    rightCell(String.valueOf(selTop.inflight), 8, ts),
+                    rightCell(formatThroughput(selTop.throughput), 8, ts),
+                    rightCell(TuiHelper.formatLoad(
+                            selTop.inflightLoad01, selTop.inflightLoad05, selTop.inflightLoad15), 12, ts)));
+        }
+
+        return Table.builder()
+                .rows(routeRows)
+                .header(Row.from(
+                        Cell.from(Span.styled("ROUTE", Style.EMPTY.bold())),
+                        Cell.from(Span.styled("FROM", Style.EMPTY.bold())),
+                        rightCell(routeTopSortLabel("MEAN", "mean"), 8, routeTopSortStyle("mean")),
+                        rightCell(routeTopSortLabel("MAX", "max"), 8, routeTopSortStyle("max")),
+                        rightCell(routeTopSortLabel("MIN", "min"), 8, routeTopSortStyle("min")),
+                        rightCell(routeTopSortLabel("LAST", "last"), 8, routeTopSortStyle("last")),
+                        rightCell(routeTopSortLabel("DELTA", "delta"), 8, routeTopSortStyle("delta")),
+                        rightCell(routeTopSortLabel("P50", "p50"), 8, routeTopSortStyle("p50")),
+                        rightCell(routeTopSortLabel("P95", "p95"), 8, routeTopSortStyle("p95")),
+                        rightCell(routeTopSortLabel("P99", "p99"), 8, routeTopSortStyle("p99")),
+                        rightCell("TOTAL", 8, Style.EMPTY.bold()),
+                        rightCell("FAIL", 6, Style.EMPTY.bold()),
+                        rightCell("INFLIGHT", 8, Style.EMPTY.bold()),
+                        rightCell(ctx.ratePerMinute ? "MSG/M" : "MSG/S", 8, Style.EMPTY.bold()),
+                        rightCell("LOAD", 12, Style.EMPTY.bold())))
+                .widths(
+                        Constraint.length(24),
+                        Constraint.fill(),
+                        Constraint.length(8),
+                        Constraint.length(8),
+                        Constraint.length(8),
+                        Constraint.length(8),
+                        Constraint.length(8),
+                        Constraint.length(8),
+                        Constraint.length(8),
+                        Constraint.length(8),
+                        Constraint.length(8),
+                        Constraint.length(6),
+                        Constraint.length(8),
+                        Constraint.length(8),
+                        Constraint.length(13))
+                .highlightStyle(Theme.selectionBg())
+                .highlightSpacing(Table.HighlightSpacing.ALWAYS)
+                .block(Block.builder().borderType(BorderType.ROUNDED).borders(Borders.ALL)
+                        .borderStyle(ctx.paneBorder(true)).title(" Routes ").build())
+                .build();
+    }
+
+    /**
+     * The routes table in the default mode (status, counters, timing).
+     */
+    private Table buildRouteTable(List<RouteInfo> sortedRoutes, int areaWidth) {
+        boolean hasPercentiles = sortedRoutes.stream().anyMatch(r -> r.p50Time >= 0);
+
+        long maxTotal = sortedRoutes.stream().mapToLong(r -> r.total).max().orElse(0);
+        long maxFailed = sortedRoutes.stream().mapToLong(r -> r.failed).max().orElse(0);
+        int tw = Math.max(numWidth(maxTotal), 6);
+        int fw = Math.max(numWidth(maxFailed), 6);
+        // TOTAL and FAIL are as wide as the longest "count (since last)", so the closing parenthesis is not cut
+        int totalColWidth = 14;
+        int failColWidth = 14;
+        for (RouteInfo route : sortedRoutes) {
+            int since = route.sinceLastCompleted != null ? CharWidth.of(route.sinceLastCompleted) + 3 : 0;
+            int failSince = route.sinceLastFailed != null ? CharWidth.of(route.sinceLastFailed) + 3 : 0;
+            totalColWidth = Math.max(totalColWidth, tw + since + 1);
+            failColWidth = Math.max(failColWidth, fw + failSince + 1);
+        }
+        // the steps reached with more than one body type (CAMEL-25750): a column only when a route has some
+        boolean bodyTypes = sortedRoutes.stream().anyMatch(r -> r.variedBodyTypes > 0);
+        int bodyColWidth = 0;
+        if (bodyTypes) {
+            bodyColWidth = CharWidth.of("BODY TYPES");
+            for (RouteInfo route : sortedRoutes) {
+                bodyColWidth = Math.max(bodyColWidth, CharWidth.of(bodyTypesLabel(route)));
+            }
+        }
+        // FROM gets the rest of the width: the borders, ">> ", 7 gaps and the other columns
+        int fromWidth = Math.max(0, areaWidth - 2 - 3 - 7 - (24 + 10 + 10 + totalColWidth + failColWidth + 20 + 12)
+                                    - (bodyTypes ? bodyColWidth + 1 : 0));
+
+        List<Row> routeRows = new ArrayList<>();
+        Map<String, String> aiDescriptions = aiDescriptions();
+        for (RouteInfo route : sortedRoutes) {
+            Style stateStyle = "Started".equals(route.state)
+                    ? Theme.success()
+                    : Theme.error();
+
+            Style failStyle = route.failed > 0
+                    ? Theme.error().bold()
+                    : Style.EMPTY;
+
+            String timingCol;
+            if (hasPercentiles && route.p50Time >= 0) {
+                timingCol = formatDurationMs(route.p50Time) + "/" + formatDurationMs(route.p95Time) + "/"
+                            + formatDurationMs(route.p99Time);
+            } else if (route.total > 0) {
+                timingCol = formatDurationMs(route.minTime) + "/" + formatDurationMs(route.maxTime) + "/"
+                            + formatDurationMs(route.meanTime);
+            } else {
+                timingCol = "";
+            }
+
+            Line totalCell = route.sinceLastCompleted != null
+                    ? Line.from(Span.raw(String.format("%" + tw + "d", route.total)),
+                            Span.styled(" (" + route.sinceLastCompleted + ")", Theme.muted()))
+                    : Line.from(Span.raw(String.format("%" + tw + "d", route.total)));
+            Line failCell = route.sinceLastFailed != null
+                    ? Line.from(Span.styled(String.format("%" + fw + "d", route.failed), failStyle),
+                            Span.styled(" (" + route.sinceLastFailed + ")", Theme.muted()))
+                    : Line.from(Span.styled(String.format("%" + fw + "d", route.failed), failStyle));
+
+            List<Cell> cells = new ArrayList<>(
+                    List.of(
+                            Cell.from(routeIdLine(route, 24)),
+                            routeFromCell(route, aiDescriptions, fromWidth),
+                            Cell.from(Span.styled(route.state != null ? route.state : "", stateStyle)),
+                            rightCell(formatThroughput(route.throughput), 8),
+                            Cell.from(totalCell),
+                            Cell.from(failCell)));
+            if (bodyTypes) {
+                cells.add(Cell.from(Span.styled(bodyTypesLabel(route),
+                        route.mixedBodyKinds > 0 ? Theme.warning() : Theme.muted())));
+            }
+            cells.add(rightCell(timingCol, 20));
+            cells.add(Cell.from(buildPercentileBarLine(route.p50Time, route.p95Time, route.p99Time, 10)));
+            routeRows.add(Row.from(cells));
+        }
+
+        IntegrationInfo selDef = ctx.findSelectedIntegration();
+        if (selDef != null && selDef.exchangesTotal > 0) {
+            Style ts = Theme.label();
+            String totalTimingCol;
+            if (hasPercentiles && selDef.p50Time >= 0) {
+                totalTimingCol = formatDurationMs(selDef.p50Time) + "/" + formatDurationMs(selDef.p95Time) + "/"
+                                 + formatDurationMs(selDef.p99Time);
+            } else {
+                totalTimingCol = formatDurationMs(selDef.minTime) + "/" + formatDurationMs(selDef.maxTime) + "/"
+                                 + formatDurationMs(selDef.meanTime);
+            }
+            List<Cell> cells = new ArrayList<>(
+                    List.of(
+                            Cell.from(Span.styled("GLOBAL", ts)),
+                            Cell.from(""),
+                            Cell.from(""),
+                            rightCell(formatThroughput(selDef.throughput), 8, ts),
+                            Cell.from(Span.styled(String.format("%" + tw + "d", selDef.exchangesTotal), ts)),
+                            Cell.from(Span.styled(String.format("%" + fw + "d", selDef.failed),
+                                    selDef.failed > 0 ? Theme.error().bold() : ts))));
+            if (bodyTypes) {
+                cells.add(Cell.from(""));
+            }
+            cells.add(rightCell(totalTimingCol, 20, ts));
+            cells.add(Cell.from(buildPercentileBarLine(selDef.p50Time, selDef.p95Time, selDef.p99Time, 10)));
+            routeRows.add(Row.from(cells));
+        }
+
+        String timingHeader = hasPercentiles ? "P50/P95/P99" : "MIN/MAX/MEAN";
+
+        List<Cell> header = new ArrayList<>(
+                List.of(
+                        Cell.from(Span.styled(routeSortLabel("ROUTE", "name"), routeSortStyle("name"))),
+                        Cell.from(Span.styled(routeSortLabel("FROM", "from"), routeSortStyle("from"))),
+                        Cell.from(Span.styled(routeSortLabel("STATUS", "status"), routeSortStyle("status"))),
+                        rightCell(ctx.ratePerMinute ? "MSG/M" : "MSG/S", 8, Style.EMPTY.bold()),
+                        // the time in brackets is since the last one
+                        centerCell(routeSortLabel("TOTAL (AGO)", "total"), 14, routeSortStyle("total")),
+                        centerCell(routeSortLabel("FAIL (AGO)", "failed"), 14, routeSortStyle("failed"))));
+        List<Constraint> widths = new ArrayList<>(
+                List.of(
+                        Constraint.length(24),
+                        Constraint.fill(),
+                        Constraint.length(10),
+                        Constraint.length(10),
+                        Constraint.length(totalColWidth),
+                        Constraint.length(failColWidth)));
+        if (bodyTypes) {
+            header.add(Cell.from(Span.styled("BODY TYPES", Style.EMPTY.bold())));
+            widths.add(Constraint.length(bodyColWidth));
+        }
+        header.add(rightCell(timingHeader, 20, Style.EMPTY.bold()));
+        header.add(Cell.from(""));
+        widths.add(Constraint.length(20));
+        widths.add(Constraint.length(12));
+
+        return Table.builder()
+                .rows(routeRows)
+                .header(Row.from(header))
+                .widths(widths.toArray(Constraint[]::new))
+                .highlightStyle(Theme.selectionBg())
+                .highlightSpacing(Table.HighlightSpacing.ALWAYS)
+                .block(Block.builder().borderType(BorderType.ROUNDED).borders(Borders.ALL)
+                        .borderStyle(ctx.paneBorder(true)).title(" Routes ").build())
+                .build();
+    }
+
+    /**
+     * The route id, and the revision dimmed after it when the route was added again changed in this run, such as by a
+     * reload (CAMEL-25771): "orders (rev 3)" runs the third version of its route since the start. The id is cut to
+     * leave room for the revision.
+     */
+    static Line routeIdLine(RouteInfo route, int width) {
+        String id = route.routeId != null ? route.routeId : "";
+        Style idStyle = Style.EMPTY.fg(Theme.accent());
+        if (route.revision <= 1) {
+            return Line.from(Span.styled(TuiHelper.truncate(id, width), idStyle));
+        }
+        String rev = " (rev " + route.revision + ")";
+        return Line.from(
+                Span.styled(TuiHelper.truncate(id, Math.max(4, width - CharWidth.of(rev))), idStyle),
+                Span.styled(rev, Style.EMPTY.dim()));
+    }
+
+    /**
+     * The steps of a route reached with more than one body type, across the messages (CAMEL-25750): "⚠ 1 mixed · 2
+     * varied" when some are reached with bodies of more than one kind, which need attention; empty when none varied.
+     */
+    static String bodyTypesLabel(RouteInfo route) {
+        if (route.variedBodyTypes <= 0) {
+            return "";
+        }
+        if (route.mixedBodyKinds <= 0) {
+            return route.variedBodyTypes + " varied";
+        }
+        return TuiIcons.WARN + " " + route.mixedBodyKinds + " mixed"
+               + (route.variedBodyTypes > route.mixedBodyKinds ? " · " + route.variedBodyTypes + " varied" : "");
+    }
+
+    @Override
+    public SubViewBar.Spec subViewBar() {
+        if (ctx.findSelectedIntegration() == null || sourceViewer.isVisible()) {
+            return null;
+        }
+        boolean diagramShown = diagram.isShowDiagram();
+        List<SubViewBar.View> views = List.of(
+                new SubViewBar.View("Routes", !diagramShown, true, () -> {
+                    // Esc goes back a level at a time: from a route's diagram to the topology, then to the table
+                    for (int i = 0; i < 3 && diagram.isShowDiagram(); i++) {
+                        handleEscape();
+                    }
+                }),
+                new SubViewBar.View("Diagram", diagramShown, true, () -> handleKeyEvent(KeyEvent.ofKey(KeyCode.ENTER))));
+        List<SubViewBar.Toggle> toggles = new ArrayList<>();
+        if (diagramShown) {
+            toggles.add(new SubViewBar.Toggle("m", "metrics", diagramMetrics ? "on" : "off"));
+            toggles.add(new SubViewBar.Toggle("w", "flow", diagram.zoom.flow().isEnabled() ? "on" : "off"));
+            if (topologyMode) {
+                toggles.add(new SubViewBar.Toggle("+/-", "", diagram.zoom.label(diagram.getTopologyDensity())));
+                toggles.add(new SubViewBar.Toggle(
+                        "e", "external",
+                        EXTERNAL_LABELS[externalMode].trim().replace("[", "").replace("]", "")));
+            } else if (!diagram.getEipNodeBoxes().isEmpty()) {
+                toggles.add(new SubViewBar.Toggle(
+                        "+/-", "", diagram.zoom.label(diagram.getRouteLayout(drillDownRouteId))));
+                toggles.add(new SubViewBar.Toggle("y", "types", diagram.isShowBodyTypes() ? "on" : "off"));
+                toggles.add(new SubViewBar.Toggle("d", "detail", detailMode ? "on" : "off"));
+            }
+            toggles.add(new SubViewBar.Toggle("n", "description", diagram.isShowDescription() ? "on" : "off"));
+            toggles.add(new SubViewBar.Toggle("p", "panels", diagram.zoom.isPanels() ? "on" : "off"));
+        } else {
+            toggles.add(new SubViewBar.Toggle("n", "description", showDescription ? "on" : "off"));
+            toggles.add(new SubViewBar.Toggle("t", "top", routeTopMode ? "on" : "off"));
+        }
+        return new SubViewBar.Spec(null, views, toggles, false);
+    }
+
+    @Override
+    public void renderFooter(List<Span> spans) {
+        if (renderGotoNodeFooter(spans)) {
+            return;
+        }
+        if (sourceViewer.isVisible()) {
+            sourceViewer.renderFooter(spans);
+        } else if (diagram.isShowDiagram()) {
+            if (!topologyMode && !diagram.getEipNodeBoxes().isEmpty()) {
+                hint(spans, "Esc", "back");
+                hint(spans, "t", "topology");
+                hint(spans, TuiIcons.HINT_NAV, "navigate");
+                hint(spans, "g", "go to");
+                hint(spans, "+/-", "zoom");
+                hint(spans, "Space", "fold");
+                hint(spans, "f/F", "fold/expand all");
+                hint(spans, "PgUp/PgDn", detailMode ? "detail" : "page");
+                hint(spans, "c", "source");
+            } else if (!topologyMode) {
+                hint(spans, "Esc", "back");
+                hint(spans, "t", "topology");
+                hint(spans, TuiIcons.HINT_NAV, "scroll");
+                hint(spans, "PgUp/PgDn", "page");
+            } else if (!diagram.getNodeBoxes().isEmpty()) {
+                hint(spans, "Esc", "close");
+                hint(spans, TuiIcons.HINT_NAV, "navigate");
+                hint(spans, "Enter", "drill-down");
+                hint(spans, "+/-", "zoom");
+                hint(spans, "PgUp/PgDn", "page");
+                hint(spans, "c", "source");
+            } else {
+                diagram.renderFooterHints(spans);
+            }
+        } else {
+            hint(spans, "Esc", "back");
+            hint(spans, "Enter", "diagram");
+            hint(spans, "s", "sort");
+            if (!routeTopMode) {
+                hint(spans, "c", "source");
+                String routeState = selectedRouteState();
+                boolean supSus = selectedRouteSupportsSuspension();
+                if ("Started".equals(routeState)) {
+                    hint(spans, "p", "stop");
+                    if (supSus) {
+                        hint(spans, "P", "suspend");
+                    }
+                } else if ("Suspended".equals(routeState)) {
+                    hint(spans, "p", "start");
+                    if (supSus) {
+                        hint(spans, "P", "resume");
+                    }
+                } else if (routeState != null) {
+                    hint(spans, "p", "start");
+                }
+            }
+        }
+    }
+
+    @Override
+    public void renderFKeyHints(List<Span> spans) {
+        // with the global F-keys, as the AI key of a screen is an F-key of every screen that has one
+        String label = aiHintLabel();
+        if (label != null) {
+            hint(spans, "Shift+F8", label);
+        }
+    }
+
+    /** The label of Shift+F8 for the selected route: fix its failures, else explain its time; null when not offered. */
+    String aiHintLabel() {
+        if (ctx.askAiCallback == null || diagram.isShowDiagram() || sourceViewer.isVisible()
+                || gotoNodePopup.isVisible()) {
+            return null;
+        }
+        RouteInfo route = selectedRoute();
+        if (route == null) {
+            return null;
+        }
+        if (RouteAiPrompt.hasFailures(route)) {
+            return "fix with AI";
+        }
+        return route.total > 0 ? "explain with AI" : null;
+    }
+
+    /**
+     * Shift+F8 on a route (CAMEL-25362): fix with AI when its exchanges fail, else explain with AI where its time goes.
+     */
+    private void askAiAboutSelectedRoute() {
+        IntegrationInfo info = ctx.findSelectedIntegration();
+        RouteInfo route = selectedRoute();
+        if (info == null || route == null || ctx.askAiCallback == null) {
+            return;
+        }
+        if (RouteAiPrompt.hasFailures(route)) {
+            ctx.askAiCallback.ask(RouteAiPrompt.ofFailures(info, route));
+        } else if (route.total > 0) {
+            ctx.askAiCallback.ask(RouteAiPrompt.ofPerformance(info, route));
+        } else if (ctx.notificationCallback != null) {
+            ctx.notificationCallback.accept("No exchanges in this route yet: ask the AI with F8", false);
+        }
+    }
+
+    private String routeFromLabel(RouteInfo route) {
+        if (showDescription && route.description != null && !route.description.isBlank()) {
+            return route.description;
+        }
+        return route.from != null ? TuiHelper.displayUri(route.from) : "";
+    }
+
+    /**
+     * The from or description cell. A route without a description of its own shows the one the AI project overview
+     * suggested, marked and styled as AI-assisted so it is not taken for what the route says (CAMEL-25143).
+     */
+    private Cell routeFromCell(RouteInfo route, Map<String, String> aiDescriptions, int width) {
+        if (showDescription && (route.description == null || route.description.isBlank())) {
+            String ai = route.routeId != null ? aiDescriptions.get(route.routeId) : null;
+            if (ai != null) {
+                return Cell.from(Span.styled(TuiHelper.truncate(IntegrationSummaryHints.MARK + ai, width),
+                        Theme.aiAssisted()));
+            }
+        }
+        // a long URI ends with an ellipsis where it is cut, so it does not read as the whole URI
+        return Cell.from(TuiHelper.truncate(routeFromLabel(route), width));
+    }
+
+    /** The AI-assisted descriptions of the selected integration's project, read once per table. */
+    private Map<String, String> aiDescriptions() {
+        return showDescription ? IntegrationSummaryHints.descriptionsIfEnabled(selectedSourceDirectory()) : Map.of();
+    }
+
+    // ---- Diagram open/close ----
+
+    private void openTopology() {
+        topologyMode = true;
+        drillDownRouteId = null;
+        routeNavigationStack.clear();
+        diagram.setTopologyMode(true);
+
+        // Pre-select the currently highlighted route from the table
+        String selectedId = selectedRouteId();
+        if (selectedId != null) {
+            diagram.setPendingSelectionRouteId(selectedId);
+        }
+
+        if (diagram.hasCachedData(ctx.selectedPid)) {
+            diagram.showCached();
+            diagram.applyPendingSelection();
+        } else {
+            loadDiagram(true);
+        }
+    }
+
+    private void openRouteDiagram() {
+        String selectedId = selectedRouteId();
+        if (selectedId == null) {
+            return;
+        }
+        topologyMode = false;
+        drillDownRouteId = selectedId;
+        routeNavigationStack.clear();
+        diagram.setTopologyMode(false);
+        diagram.selectFromNode(selectedId);
+
+        if (diagram.hasCachedData(ctx.selectedPid)) {
+            diagram.showCached();
+        } else {
+            loadDiagram(true);
+        }
+    }
+
+    void closeDiagram() {
+        topologyMode = true;
+        drillDownRouteId = null;
+        routeNavigationStack.clear();
+        diagram.close();
+    }
+
+    // ---- Info panels (mirrored from DiagramTab) ----
+
+    // ---- Rendering helpers ----
+
+    private void renderProcessors(Frame frame, Rect area, RouteInfo route) {
+        Table table;
+
+        if (routeTopMode) {
+            List<Row> rows = new ArrayList<>();
+
+            List<ProcessorInfo> sorted = new ArrayList<>(route.processors);
+            sorted.sort(this::sortProcessorTop);
+
+            long maxValue = sorted.stream().mapToLong(this::procChartValue).max().orElse(1);
+            if (maxValue <= 0) {
+                maxValue = 1;
+            }
+            // sorted by time, not a tree: the steps are known by their line and what they do
+            int lineWidth = lineWidth(route);
+
+            for (ProcessorInfo proc : sorted) {
+                Style nameStyle = proc.failed > 0 ? Theme.error() : Style.EMPTY;
+                long chartVal = procChartValue(proc);
+                String bar;
+                if (chartVal > 0) {
+                    bar = buildBar(chartVal, maxValue, 20);
+                } else if (proc.total > 0) {
+                    bar = "█";
+                } else {
+                    bar = "";
+                }
+                Style barStyle = topTimeStyle(chartVal);
+                if (barStyle == Style.EMPTY) {
+                    barStyle = Style.EMPTY.fg(Theme.accent());
+                }
+
+                List<Cell> cells = new ArrayList<>();
+                cells.add(Cell.from("   " + (proc.processor != null ? proc.processor : "")));
+                if (lineWidth > 0) {
+                    cells.add(lineCell(ProcessorLabels.line(proc.source), lineWidth));
+                }
+                cells.addAll(List.of(
+                        Cell.from(ProcessorLabels.label(proc, step(route, proc), TOP_PROCESSOR_WIDTH, nameStyle)),
+                        Cell.from(Span.styled(bar, barStyle)),
+                        rightCell(proc.total > 0 ? String.valueOf(proc.meanTime) : "", 6, topTimeStyle(proc.meanTime)),
+                        rightCell(proc.total > 0 ? String.valueOf(proc.maxTime) : "", 6, topTimeStyle(proc.maxTime)),
+                        rightCell(proc.total > 0 ? String.valueOf(proc.minTime) : "", 6),
+                        rightCell(proc.total > 0 ? String.valueOf(proc.lastTime) : "", 6),
+                        rightCell(proc.deltaTime != 0 ? String.valueOf(proc.deltaTime) : "", 6,
+                                topDeltaStyle(proc.deltaTime)),
+                        rightCell(proc.p50Time >= 0 ? String.valueOf(proc.p50Time) : "", 6),
+                        rightCell(proc.p95Time >= 0 ? String.valueOf(proc.p95Time) : "", 6),
+                        rightCell(proc.p99Time >= 0 ? String.valueOf(proc.p99Time) : "", 6),
+                        rightCell(String.valueOf(proc.total), 8),
+                        rightCell(String.valueOf(proc.failed), 6,
+                                proc.failed > 0 ? Theme.error() : Style.EMPTY),
+                        rightCell(String.valueOf(proc.inflight), 8)));
+                rows.add(Row.from(cells));
+            }
+
+            List<Cell> header = new ArrayList<>();
+            List<Constraint> widths = new ArrayList<>();
+            header.add(Cell.from(Span.styled("   TYPE", Style.EMPTY.bold())));
+            widths.add(Constraint.length(20));
+            if (lineWidth > 0) {
+                header.add(rightCell("LINE", lineWidth, Style.EMPTY.bold()));
+                widths.add(Constraint.length(lineWidth));
+            }
+            header.addAll(List.of(
+                    Cell.from(Span.styled("PROCESSOR", Style.EMPTY.bold())),
+                    Cell.from(""),
+                    rightCell(routeTopSortLabel("MEAN", "mean"), 6, routeTopSortStyle("mean")),
+                    rightCell(routeTopSortLabel("MAX", "max"), 6, routeTopSortStyle("max")),
+                    rightCell(routeTopSortLabel("MIN", "min"), 6, routeTopSortStyle("min")),
+                    rightCell(routeTopSortLabel("LAST", "last"), 6, routeTopSortStyle("last")),
+                    rightCell(routeTopSortLabel("DELTA", "delta"), 6, routeTopSortStyle("delta")),
+                    rightCell(routeTopSortLabel("P50", "p50"), 6, routeTopSortStyle("p50")),
+                    rightCell(routeTopSortLabel("P95", "p95"), 6, routeTopSortStyle("p95")),
+                    rightCell(routeTopSortLabel("P99", "p99"), 6, routeTopSortStyle("p99")),
+                    rightCell("TOTAL", 8, Style.EMPTY.bold()),
+                    rightCell("FAIL", 6, Style.EMPTY.bold()),
+                    rightCell("INFLIGHT", 8, Style.EMPTY.bold())));
+            widths.addAll(List.of(
+                    Constraint.length(TOP_PROCESSOR_WIDTH),
+                    Constraint.fill(),
+                    Constraint.length(6),
+                    Constraint.length(6),
+                    Constraint.length(6),
+                    Constraint.length(6),
+                    Constraint.length(6),
+                    Constraint.length(6),
+                    Constraint.length(6),
+                    Constraint.length(6),
+                    Constraint.length(8),
+                    Constraint.length(6),
+                    Constraint.length(9)));
+
+            table = Table.builder()
+                    .rows(rows)
+                    .header(Row.from(header))
+                    .widths(widths.toArray(Constraint[]::new))
+                    .block(Block.builder().borderType(BorderType.ROUNDED).borders(Borders.ALL)
+                            .borderStyle(ctx.paneBorder(false)).title(" Processors [" + route.routeId + "] ")
+                            .build())
+                    .build();
+        } else {
+            table = buildProcessorTable(area, route);
+        }
+
+        frame.renderStatefulWidget(table, area, processorTableState);
+        int processorRowCount = routeTopMode ? route.processors.size() : route.processors.size() + 1;
+        renderTableScrollbar(frame, area, table, processorTableState, processorTableScrollState,
+                processorRowCount);
+    }
+
+    /**
+     * The processors of a route in the default mode (counters, timing), with the body types each step has been reached
+     * with, when the message history recorded them (CAMEL-25750).
+     */
+    private Table buildProcessorTable(Rect area, RouteInfo route) {
+        boolean hasProcPercentiles = route.p50Time >= 0
+                || route.processors.stream().anyMatch(p -> p.p50Time >= 0);
+        // a column only when a step has body types, as wide as the longest up to a limit: the info panel of the
+        // diagram has them all; a space before them sets them apart from the inflight count
+        boolean bodyTypes = route.processors.stream().anyMatch(p -> !p.bodyTypes.isEmpty());
+        int bodyColWidth = 0;
+        if (bodyTypes) {
+            bodyColWidth = CharWidth.of("BODY TYPES");
+            for (ProcessorInfo proc : route.processors) {
+                bodyColWidth = Math.max(bodyColWidth, CharWidth.of(BodyTypes.shortLabel(proc.bodyTypes, proc.bodyKinds)));
+            }
+            bodyColWidth = Math.min(bodyColWidth, MAX_BODY_TYPES_WIDTH) + 1;
+        }
+
+        // the tree of the steps is in TYPE, and LINE says where a step is in the source (when the runtime records it)
+        int typeWidth = typeWidth(route);
+        int lineWidth = lineWidth(route);
+        // PROCESSOR and BODY TYPES share what the borders, the gaps and the other columns leave: what a step does comes
+        // first, the body types get the rest up to their width (the info panel of the diagram has them all)
+        // REDEL and HAND only once the error handler redelivered or handled an exchange of the route
+        boolean errorHandler = route.redeliveries > 0 || route.failuresHandled > 0
+                || route.processors.stream().anyMatch(p -> p.redeliveries > 0 || p.failuresHandled > 0);
+        int columns = 8 + (lineWidth > 0 ? 1 : 0) + (bodyTypes ? 1 : 0) + (errorHandler ? 2 : 0);
+        int rest = Math.max(0,
+                area.width() - 2 - (columns - 1)
+                               - (typeWidth + lineWidth + 10 + 8 + 6 + 8 + 20 + 12 + (errorHandler ? 12 : 0)));
+        if (bodyTypes) {
+            bodyColWidth = Math.max(CharWidth.of(" BODY TYPES"), Math.min(bodyColWidth, rest - MIN_PROCESSOR_WIDTH));
+        }
+        int procWidth = Math.max(0, rest - bodyColWidth);
+
+        List<Row> rows = new ArrayList<>();
+
+        // Synthetic top row representing the route itself
+        Style routeStyle = route.failed > 0 ? Theme.error() : Style.EMPTY.fg(Theme.accent());
+        String routeTimingCol;
+        if (hasProcPercentiles && route.p50Time >= 0) {
+            routeTimingCol = formatDurationMs(route.p50Time) + "/" + formatDurationMs(route.p95Time) + "/"
+                             + formatDurationMs(route.p99Time);
+        } else if (route.total > 0) {
+            routeTimingCol = formatDurationMs(route.minTime) + "/" + formatDurationMs(route.maxTime) + "/"
+                             + formatDurationMs(route.meanTime);
+        } else {
+            routeTimingCol = "";
+        }
+        List<Cell> routeCells = new ArrayList<>();
+        routeCells.add(Cell.from("   route"));
+        if (lineWidth > 0) {
+            routeCells.add(lineCell(ProcessorLabels.line(route.source), lineWidth));
+        }
+        routeCells.addAll(List.of(
+                Cell.from(Span.styled(TuiHelper.truncate(
+                        route.from != null ? TuiHelper.displayUri(route.from) : route.routeId, procWidth),
+                        routeStyle)),
+                rightCell(formatThroughput(route.throughput), 8),
+                rightCell(String.valueOf(route.total), 8),
+                rightCell(String.valueOf(route.failed), 6,
+                        route.failed > 0 ? Theme.error() : Style.EMPTY)));
+        if (errorHandler) {
+            routeCells.addAll(errorHandlerCells(route.redeliveries, route.failuresHandled));
+        }
+        routeCells.add(rightCell(String.valueOf(route.inflight), 8));
+        if (bodyTypes) {
+            routeCells.add(Cell.from(""));
+        }
+        routeCells.add(rightCell(routeTimingCol, 20));
+        routeCells.add(Cell.from(buildPercentileBarLine(route.p50Time, route.p95Time, route.p99Time, 10)));
+        rows.add(Row.from(routeCells));
+
+        for (ProcessorInfo proc : route.processors) {
+            Style nameStyle = proc.failed > 0 ? Theme.error() : Style.EMPTY;
+
+            String procTimingCol;
+            if (hasProcPercentiles && proc.p50Time >= 0) {
+                procTimingCol = formatDurationMs(proc.p50Time) + "/" + formatDurationMs(proc.p95Time) + "/"
+                                + formatDurationMs(proc.p99Time);
+            } else if (proc.total > 0) {
+                procTimingCol = formatDurationMs(proc.minTime) + "/" + formatDurationMs(proc.maxTime) + "/"
+                                + formatDurationMs(proc.meanTime);
+            } else {
+                procTimingCol = "";
+            }
+
+            List<Cell> cells = new ArrayList<>();
+            cells.add(Cell.from(TuiHelper.truncate(typeCell(proc), typeWidth)));
+            if (lineWidth > 0) {
+                cells.add(lineCell(ProcessorLabels.line(proc.source), lineWidth));
+            }
+            cells.addAll(List.of(
+                    Cell.from(ProcessorLabels.label(proc, step(route, proc), procWidth, nameStyle)),
+                    rightCell(formatThroughput(proc.throughput), 8),
+                    rightCell(String.valueOf(proc.total), 8),
+                    rightCell(String.valueOf(proc.failed), 6,
+                            proc.failed > 0 ? Theme.error() : Style.EMPTY)));
+            if (errorHandler) {
+                cells.addAll(errorHandlerCells(proc.redeliveries, proc.failuresHandled));
+            }
+            cells.add(rightCell(String.valueOf(proc.inflight), 8));
+            if (bodyTypes) {
+                cells.add(Cell.from(Span.styled(
+                        " " + TuiHelper.truncate(BodyTypes.shortLabel(proc.bodyTypes, proc.bodyKinds), bodyColWidth - 1),
+                        BodyTypes.style(proc.bodyKinds))));
+            }
+            cells.add(rightCell(procTimingCol, 20));
+            cells.add(Cell.from(buildPercentileBarLine(proc.p50Time, proc.p95Time, proc.p99Time, 10)));
+            rows.add(Row.from(cells));
+        }
+        List<Cell> header = new ArrayList<>();
+        List<Constraint> widths = new ArrayList<>();
+        processorHeader(header, widths, typeWidth, lineWidth, errorHandler, bodyTypes ? bodyColWidth : 0,
+                hasProcPercentiles);
+
+        return Table.builder()
+                .rows(rows)
+                .header(Row.from(header))
+                .widths(widths.toArray(Constraint[]::new))
+                .block(Block.builder().borderType(BorderType.ROUNDED).borders(Borders.ALL)
+                        .borderStyle(ctx.paneBorder(false)).title(" Processors [" + route.routeId + "] ")
+                        .build())
+                .build();
+    }
+
+    /** The header of the processor table and the widths of its columns. */
+    private void processorHeader(
+            List<Cell> header, List<Constraint> widths, int typeWidth, int lineWidth, boolean errorHandler,
+            int bodyColWidth, boolean hasProcPercentiles) {
+        String procTimingHeader = hasProcPercentiles ? "P50/P95/P99" : "MIN/MAX/MEAN";
+
+        header.add(Cell.from(Span.styled("   TYPE", Style.EMPTY.bold())));
+        widths.add(Constraint.length(typeWidth));
+        if (lineWidth > 0) {
+            header.add(rightCell("LINE", lineWidth, Style.EMPTY.bold()));
+            widths.add(Constraint.length(lineWidth));
+        }
+        header.addAll(List.of(
+                Cell.from(Span.styled("PROCESSOR", Style.EMPTY.bold())),
+                rightCell(ctx.ratePerMinute ? "MSG/M" : "MSG/S", 8, Style.EMPTY.bold()),
+                rightCell("TOTAL", 8, Style.EMPTY.bold()),
+                rightCell("FAIL", 6, Style.EMPTY.bold())));
+        widths.addAll(List.of(
+                Constraint.fill(),
+                Constraint.length(10),
+                Constraint.length(8),
+                Constraint.length(6)));
+        if (errorHandler) {
+            header.add(rightCell("REDEL", 6, Style.EMPTY.bold()));
+            header.add(rightCell("HAND", 6, Style.EMPTY.bold()));
+            widths.add(Constraint.length(6));
+            widths.add(Constraint.length(6));
+        }
+        header.add(rightCell("INFLIGHT", 8, Style.EMPTY.bold()));
+        widths.add(Constraint.length(8));
+        if (bodyColWidth > 0) {
+            header.add(Cell.from(Span.styled(" BODY TYPES", Style.EMPTY.bold())));
+            widths.add(Constraint.length(bodyColWidth));
+        }
+        header.add(rightCell(procTimingHeader, 20, Style.EMPTY.bold()));
+        header.add(Cell.from(""));
+        widths.add(Constraint.length(20));
+        widths.add(Constraint.length(12));
+    }
+
+    /** The redeliveries and the failures handled by the error handler: a step that failed and was retried. */
+    private static List<Cell> errorHandlerCells(long redeliveries, long failuresHandled) {
+        return List.of(
+                rightCell(redeliveries > 0 ? String.valueOf(redeliveries) : "", 6,
+                        redeliveries > 0 ? Theme.warning() : Style.EMPTY),
+                rightCell(failuresHandled > 0 ? String.valueOf(failuresHandled) : "", 6,
+                        failuresHandled > 0 ? Theme.warning() : Style.EMPTY));
+    }
+
+    /** The type of a step, indented by its level: the tree of the steps of the route. */
+    private static String typeCell(ProcessorInfo proc) {
+        return "   " + "  ".repeat(Math.max(0, proc.level - 1)) + (proc.processor != null ? proc.processor : "");
+    }
+
+    /** As wide as the deepest step needs, up to a limit. */
+    private static int typeWidth(RouteInfo route) {
+        int width = CharWidth.of("   route");
+        for (ProcessorInfo proc : route.processors) {
+            width = Math.max(width, CharWidth.of(typeCell(proc)));
+        }
+        return Math.min(width, MAX_TYPE_WIDTH);
+    }
+
+    /** As wide as the highest line needs, or 0 when the runtime records no source locations (no LINE column). */
+    private static int lineWidth(RouteInfo route) {
+        int max = 0;
+        for (ProcessorInfo proc : route.processors) {
+            Integer line = ProcessorLabels.line(proc.source);
+            max = line != null ? Math.max(max, line) : max;
+        }
+        return max > 0 ? Math.max(CharWidth.of("LINE"), String.valueOf(max).length()) : 0;
+    }
+
+    private static Cell lineCell(Integer line, int width) {
+        return rightCell(line != null ? String.valueOf(line) : "", width, Theme.muted());
+    }
+
+    /** The step as the route structure has it, from what the diagrams asked of the integration. */
+    private DiagramTopology.Step step(RouteInfo route, ProcessorInfo proc) {
+        return ctx.diagramTopology.step(ctx.selectedPid, route.routeId, proc.id);
+    }
+
+    private String formatThroughput(String throughput) {
+        if (throughput == null || throughput.isEmpty()) {
+            return "";
+        }
+        if (ctx.ratePerMinute) {
+            return TuiHelper.throughputPerMinute(throughput);
+        }
+        return throughput;
+    }
+
+    // ---- Sorting ----
+
+    private int sortRoute(RouteInfo a, RouteInfo b) {
+        int result = switch (routeSort) {
+            case "total" -> Long.compare(b.total, a.total);
+            case "failed" -> Long.compare(b.failed, a.failed);
+            case "name" -> {
+                String ra = a.routeId != null ? a.routeId : "";
+                String rb = b.routeId != null ? b.routeId : "";
+                yield ra.compareToIgnoreCase(rb);
+            }
+            case "status" -> {
+                String sa = a.state != null ? a.state : "";
+                String sb2 = b.state != null ? b.state : "";
+                yield sa.compareToIgnoreCase(sb2);
+            }
+            case "from" -> {
+                String fa = a.from != null ? a.from : "";
+                String fb = b.from != null ? b.from : "";
+                yield fa.compareToIgnoreCase(fb);
+            }
+            default -> 0;
+        };
+        return routeSortReversed ? -result : result;
+    }
+
+    private int sortRouteTop(RouteInfo a, RouteInfo b) {
+        int result = switch (routeTopSort) {
+            case "mean" -> Long.compare(b.meanTime, a.meanTime);
+            case "max" -> Long.compare(b.maxTime, a.maxTime);
+            case "min" -> Long.compare(b.minTime, a.minTime);
+            case "last" -> Long.compare(b.lastTime, a.lastTime);
+            case "delta" -> Long.compare(b.deltaTime, a.deltaTime);
+            case "p50" -> Long.compare(b.p50Time, a.p50Time);
+            case "p95" -> Long.compare(b.p95Time, a.p95Time);
+            case "p99" -> Long.compare(b.p99Time, a.p99Time);
+            default -> 0;
+        };
+        return routeTopSortReversed ? -result : result;
+    }
+
+    private int sortProcessorTop(ProcessorInfo a, ProcessorInfo b) {
+        int result = switch (routeTopSort) {
+            case "mean" -> Long.compare(b.meanTime, a.meanTime);
+            case "max" -> Long.compare(b.maxTime, a.maxTime);
+            case "min" -> Long.compare(b.minTime, a.minTime);
+            case "last" -> Long.compare(b.lastTime, a.lastTime);
+            case "delta" -> Long.compare(b.deltaTime, a.deltaTime);
+            case "p50" -> Long.compare(b.p50Time, a.p50Time);
+            case "p95" -> Long.compare(b.p95Time, a.p95Time);
+            case "p99" -> Long.compare(b.p99Time, a.p99Time);
+            default -> 0;
+        };
+        return routeTopSortReversed ? -result : result;
+    }
+
+    private long procChartValue(ProcessorInfo proc) {
+        return switch (routeTopSort) {
+            case "mean" -> proc.meanTime;
+            case "max" -> proc.maxTime;
+            case "min" -> proc.minTime;
+            case "last" -> proc.lastTime;
+            case "delta" -> Math.abs(proc.deltaTime);
+            case "p50" -> proc.p50Time;
+            case "p95" -> proc.p95Time;
+            case "p99" -> proc.p99Time;
+            default -> proc.meanTime;
+        };
+    }
+
+    private String routeSortLabel(String label, String column) {
+        return sortLabel(label, column, routeSort, routeSortReversed);
+    }
+
+    private Style routeSortStyle(String column) {
+        return sortStyle(column, routeSort);
+    }
+
+    private String routeTopSortLabel(String label, String column) {
+        return sortLabel(label, column, routeTopSort, routeTopSortReversed);
+    }
+
+    private Style routeTopSortStyle(String column) {
+        return sortStyle(column, routeTopSort);
+    }
+
+    // ---- Route actions ----
+
+    private List<RouteInfo> displayedRoutes(IntegrationInfo info) {
+        List<RouteInfo> sorted = new ArrayList<>(info.routes);
+        sorted.sort(this::sortRoute);
+        if (routeTopMode) {
+            sorted.sort(this::sortRouteTop);
+        }
+        return sorted;
+    }
+
+    private RouteInfo selectedRoute() {
+        IntegrationInfo info = ctx.findSelectedIntegration();
+        if (info == null || info.routes.isEmpty()) {
+            return null;
+        }
+        List<RouteInfo> sortedRoutes = displayedRoutes(info);
+        Integer sel = routeTableState.selected();
+        return (sel != null && sel >= 0 && sel < sortedRoutes.size())
+                ? sortedRoutes.get(sel) : sortedRoutes.get(0);
+    }
+
+    String selectedRouteId() {
+        RouteInfo route = selectedRoute();
+        return route != null ? route.routeId : null;
+    }
+
+    private String selectedRouteState() {
+        RouteInfo route = selectedRoute();
+        return route != null ? route.state : null;
+    }
+
+    private boolean selectedRouteSupportsSuspension() {
+        RouteInfo route = selectedRoute();
+        return route != null && route.supportsSuspension;
+    }
+
+    private void toggleRouteStartStop() {
+        if (ctx.selectedPid == null) {
+            return;
+        }
+        RouteInfo route = selectedRoute();
+        if (route == null) {
+            return;
+        }
+        String command = "Started".equals(route.state) ? "stop" : "start";
+        sendRouteCommand(ctx.selectedPid, route.routeId, command);
+    }
+
+    private void toggleRouteSuspendResume() {
+        if (ctx.selectedPid == null) {
+            return;
+        }
+        RouteInfo route = selectedRoute();
+        if (route == null) {
+            return;
+        }
+        String command = switch (route.state != null ? route.state : "") {
+            case "Started" -> "suspend";
+            case "Suspended" -> "resume";
+            default -> "start";
+        };
+        sendRouteCommand(ctx.selectedPid, route.routeId, command);
+    }
+
+    void sendRouteCommand(String pid, String routeId, String command) {
+        JsonObject root = new JsonObject();
+        root.put("action", "route");
+        root.put("id", routeId);
+        root.put("command", command);
+        ctx.fireAction(pid, root);
+    }
+
+    private void loadSourceForSelectedRoute() {
+        RouteInfo selected = selectedRoute();
+        if (selected == null) {
+            return;
+        }
+        String routeId = selected.routeId;
+        sourceViewer.setOnLineSelected(sourceLine -> {
+            sourceViewer.hide();
+            // Open drill-down diagram for this route
+            topologyMode = false;
+            drillDownRouteId = routeId;
+            routeNavigationStack.clear();
+            diagram.setTopologyMode(false);
+            diagram.selectFromNode(routeId);
+            if (diagram.hasCachedData(ctx.selectedPid)) {
+                diagram.showCached();
+            } else {
+                loadDiagram(true);
+            }
+            // Select the closest EIP node after diagram is available
+            int bestIdx = diagram.findClosestEipNode(sourceLine);
+            if (bestIdx >= 0) {
+                diagram.setSelectedEipNodeIndex(bestIdx);
+                diagram.scrollToSelectedEipNode();
+            }
+        });
+        detail.ensureProcessorDetailLoaded(routeId);
+        var rl = diagram.getRouteLayout(routeId);
+        sourceViewer.loadSource(ctx, routeId, 0, rl != null ? rl.source : null);
+    }
+
+    @Override
+    public SelectionContext getSelectionContext() {
+        IntegrationInfo info = ctx.findSelectedIntegration();
+        if (info == null || info.routes.isEmpty()) {
+            return null;
+        }
+        List<RouteInfo> sorted = displayedRoutes(info);
+        List<String> items = sorted.stream().map(r -> r.routeId != null ? r.routeId : "").toList();
+        Integer sel = routeTableState.selected();
+        return new SelectionContext("table", items, sel != null ? sel : -1, items.size(), "Routes");
+    }
+
+    // ---- Detail panel ----
+
+    // ---- Quick doc (q toggle in source viewer) ----
+
+    @Override
+    public String description() {
+        return "Route list with state, message counts, throughput, and failure statistics";
+    }
+
+    @Override
+    public String getHelpText() {
+        return DocHelper.loadHelpText("routes");
+    }
+
+    @Override
+    public JsonObject getTableDataAsJson() {
+        IntegrationInfo info = ctx.findSelectedIntegration();
+        if (info == null) {
+            return null;
+        }
+        JsonObject result = new JsonObject();
+        result.put("tab", "Routes");
+        JsonArray rows = new JsonArray();
+        for (RouteInfo ri : info.routes) {
+            JsonObject row = new JsonObject();
+            row.put("routeId", ri.routeId);
+            row.put("from", ri.from);
+            row.put("state", ri.state);
+            row.put("uptime", ri.uptime);
+            row.put("total", ri.total);
+            row.put("failed", ri.failed);
+            row.put("failuresHandled", ri.failuresHandled);
+            row.put("redeliveries", ri.redeliveries);
+            row.put("inflight", ri.inflight);
+            row.put("mean", ri.meanTime);
+            row.put("max", ri.maxTime);
+            row.put("min", ri.minTime);
+            row.put("last", ri.lastTime);
+            row.put("throughput", ri.throughput);
+            if (ri.p50Time >= 0) {
+                row.put("p50", ri.p50Time);
+                row.put("p95", ri.p95Time);
+                row.put("p99", ri.p99Time);
+            }
+            if (ri.group != null) {
+                row.put("group", ri.group);
+            }
+            // the route as written, to compare with its source or an earlier run, and its changes in this run
+            if (ri.checksum != null) {
+                row.put("checksum", ri.checksum);
+                row.put("revision", ri.revision);
+            }
+            rows.add(row);
+        }
+        result.put("rows", rows);
+        result.put("totalRows", info.routes.size());
+        Integer sel = routeTableState.selected();
+        result.put("selectedIndex", sel != null ? sel : -1);
+        return result;
+    }
+
+}

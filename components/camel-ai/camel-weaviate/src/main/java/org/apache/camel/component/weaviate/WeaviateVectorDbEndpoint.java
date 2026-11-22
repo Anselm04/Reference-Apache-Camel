@@ -1,0 +1,212 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.camel.component.weaviate;
+
+import io.weaviate.client6.v1.api.Authentication;
+import io.weaviate.client6.v1.api.WeaviateClient;
+import io.weaviate.client6.v1.api.WeaviateException;
+import org.apache.camel.Category;
+import org.apache.camel.Component;
+import org.apache.camel.Consumer;
+import org.apache.camel.Processor;
+import org.apache.camel.Producer;
+import org.apache.camel.spi.BodyType;
+import org.apache.camel.spi.BodyType.Carrier;
+import org.apache.camel.spi.BodyTypes;
+import org.apache.camel.spi.Metadata;
+import org.apache.camel.spi.UriEndpoint;
+import org.apache.camel.spi.UriParam;
+import org.apache.camel.spi.UriPath;
+import org.apache.camel.support.DefaultEndpoint;
+
+/**
+ * Perform operations on the Weaviate Vector Database.
+ */
+@UriEndpoint(
+             firstVersion = "4.12.0",
+             scheme = WeaviateVectorDb.SCHEME,
+             title = "weaviate",
+             syntax = "weaviate:collection",
+             producerOnly = true,
+             category = {
+                     Category.DATABASE,
+                     Category.AI
+             },
+             headersClass = WeaviateVectorDbHeaders.class)
+@BodyTypes(producerIn = @BodyType(value = { Carrier.LIST, Carrier.TEXT, Carrier.NULL },
+                                  byOption = {
+                                          @BodyType.When(option = "action", value = "CREATE", carriers = Carrier.LIST),
+                                          @BodyType.When(option = "action", value = "BATCH_CREATE", carriers = Carrier.LIST,
+                                                         javaType = "java.util.List<io.weaviate.client6.v1.api.collections.WeaviateObject<java.util.Map<java.lang.String, java.lang.Object>>>"),
+                                          @BodyType.When(option = "action", value = "UPDATE_BY_ID", carriers = Carrier.LIST),
+                                          @BodyType.When(option = "action", value = "QUERY", carriers = Carrier.LIST),
+                                          @BodyType.When(option = "action", value = "HYBRID_QUERY", carriers = Carrier.TEXT,
+                                                         javaType = "java.lang.String"),
+                                          @BodyType.When(option = "action", value = "BM25_QUERY", carriers = Carrier.TEXT,
+                                                         javaType = "java.lang.String"),
+                                          @BodyType.When(option = "action", value = "CREATE_COLLECTION",
+                                                         carriers = Carrier.ANY),
+                                          @BodyType.When(option = "action", value = "DELETE_COLLECTION",
+                                                         carriers = Carrier.ANY),
+                                          @BodyType.When(option = "action", value = "QUERY_BY_ID", carriers = Carrier.ANY),
+                                          @BodyType.When(option = "action", value = "DELETE_BY_ID", carriers = Carrier.ANY),
+                                          @BodyType.When(option = "action", value = "AGGREGATE", carriers = Carrier.ANY) },
+                                  description = "By the action in the action option or the CamelWeaviateAction header: the vector as a"
+                                                + " List of numbers, such as the List of Double a JSON array unmarshals to, or a float or"
+                                                + " double array for CREATE, UPDATE_BY_ID and QUERY, with the properties in the"
+                                                + " CamelWeaviateProperties header, a List of WeaviateObject for BATCH_CREATE, and the query"
+                                                + " text for HYBRID_QUERY and BM25_QUERY. CREATE_COLLECTION, DELETE_COLLECTION, QUERY_BY_ID,"
+                                                + " DELETE_BY_ID and AGGREGATE do not read the body, the id is in the CamelWeaviateIndexId"
+                                                + " header. Another body fails: the weaviate:embeddings data type transformer builds the"
+                                                + " vector from the output of langchain4j-embeddings"),
+           producerOut = @BodyType(value = { Carrier.POJO, Carrier.VALUE },
+                                   byOption = {
+                                           @BodyType.When(option = "action", value = "CREATE", carriers = Carrier.POJO,
+                                                          javaType = "io.weaviate.client6.v1.api.collections.WeaviateObject<java.util.Map<java.lang.String, java.lang.Object>>"),
+                                           @BodyType.When(option = "action", value = "BATCH_CREATE", carriers = Carrier.POJO,
+                                                          javaType = "io.weaviate.client6.v1.api.collections.data.InsertManyResponse"),
+                                           @BodyType.When(option = "action", value = "QUERY", carriers = Carrier.POJO,
+                                                          javaType = "io.weaviate.client6.v1.api.collections.query.QueryResponse<java.util.Map<java.lang.String, java.lang.Object>>"),
+                                           @BodyType.When(option = "action", value = "HYBRID_QUERY", carriers = Carrier.POJO,
+                                                          javaType = "io.weaviate.client6.v1.api.collections.query.QueryResponse<java.util.Map<java.lang.String, java.lang.Object>>"),
+                                           @BodyType.When(option = "action", value = "BM25_QUERY", carriers = Carrier.POJO,
+                                                          javaType = "io.weaviate.client6.v1.api.collections.query.QueryResponse<java.util.Map<java.lang.String, java.lang.Object>>"),
+                                           @BodyType.When(option = "action", value = "QUERY_BY_ID", carriers = Carrier.POJO,
+                                                          javaType = "java.util.Optional<io.weaviate.client6.v1.api.collections.WeaviateObject<java.util.Map<java.lang.String, java.lang.Object>>>"),
+                                           @BodyType.When(option = "action", value = "AGGREGATE", carriers = Carrier.POJO,
+                                                          javaType = "io.weaviate.client6.v1.api.collections.aggregate.AggregateResponse"),
+                                           @BodyType.When(option = "action", value = "CREATE_COLLECTION",
+                                                          carriers = Carrier.VALUE,
+                                                          javaType = "java.lang.Boolean"),
+                                           @BodyType.When(option = "action", value = "UPDATE_BY_ID", carriers = Carrier.VALUE,
+                                                          javaType = "java.lang.Boolean"),
+                                           @BodyType.When(option = "action", value = "DELETE_BY_ID", carriers = Carrier.VALUE,
+                                                          javaType = "java.lang.Boolean"),
+                                           @BodyType.When(option = "action", value = "DELETE_COLLECTION",
+                                                          carriers = Carrier.VALUE,
+                                                          javaType = "java.lang.Boolean") },
+                                   description = "By the action: a WeaviateObject for CREATE, an InsertManyResponse for BATCH_CREATE, a"
+                                                 + " QueryResponse for QUERY, HYBRID_QUERY and BM25_QUERY, an Optional of WeaviateObject for"
+                                                 + " QUERY_BY_ID, an AggregateResponse for AGGREGATE, and a Boolean for CREATE_COLLECTION,"
+                                                 + " UPDATE_BY_ID, DELETE_BY_ID and DELETE_COLLECTION"))
+public class WeaviateVectorDbEndpoint extends DefaultEndpoint {
+
+    @Metadata(required = true)
+    @UriPath(description = "The collection Name")
+    private final String collection;
+
+    @UriParam
+    private WeaviateVectorDbConfiguration configuration;
+
+    private volatile boolean closeClient;
+    private volatile WeaviateClient client;
+
+    public WeaviateVectorDbEndpoint(
+                                    String endpointUri,
+                                    Component component,
+                                    String collection,
+                                    WeaviateVectorDbConfiguration configuration) {
+
+        super(endpointUri, component);
+
+        this.collection = collection;
+        this.configuration = configuration;
+    }
+
+    public WeaviateVectorDbConfiguration getConfiguration() {
+        return configuration;
+    }
+
+    public String getCollection() {
+        return collection;
+    }
+
+    public WeaviateClient getClient() throws WeaviateException {
+        if (this.client == null) {
+            lock.lock();
+            try {
+                if (this.client == null) {
+                    this.client = this.configuration.getClient();
+                    this.closeClient = false;
+
+                    if (this.client == null) {
+                        this.client = createClient();
+                        this.closeClient = true;
+                    }
+                }
+            } finally {
+                lock.unlock();
+            }
+        }
+        return this.client;
+    }
+
+    @Override
+    public Producer createProducer() throws Exception {
+        return new WeaviateVectorDbProducer(this);
+    }
+
+    @Override
+    public Consumer createConsumer(Processor processor) throws Exception {
+        throw new UnsupportedOperationException("Consumer is not implemented for this component");
+    }
+
+    @Override
+    public void doStop() throws Exception {
+        super.doStop();
+        if (this.client != null && this.closeClient) {
+            this.client.close();
+            this.client = null;
+            this.closeClient = false;
+        }
+    }
+
+    private WeaviateClient createClient() throws WeaviateException {
+        String scheme = configuration.getScheme();
+        String host = configuration.getHost();
+        if (host == null) {
+            throw new IllegalArgumentException("Weaviate host must be configured");
+        }
+
+        // Parse host:port if port is embedded in the host string
+        String httpHost = host;
+        // Weaviate's default HTTP port; overridden below if host contains ":port"
+        int httpPort = 8080;
+        if (host.contains(":")) {
+            String[] parts = host.split(":");
+            httpHost = parts[0];
+            httpPort = Integer.parseInt(parts[1]);
+        }
+
+        final String resolvedHttpHost = httpHost;
+        final int resolvedHttpPort = httpPort;
+        final String grpcHost = configuration.getGrpcHost() != null ? configuration.getGrpcHost() : httpHost;
+        final int grpcPort = configuration.getGrpcPort();
+
+        return WeaviateClient.connectToCustom(conn -> {
+            conn.scheme(scheme)
+                    .httpHost(resolvedHttpHost)
+                    .httpPort(resolvedHttpPort)
+                    .grpcHost(grpcHost)
+                    .grpcPort(grpcPort);
+            if (configuration.getApiKey() != null) {
+                conn.authentication(Authentication.apiKey(configuration.getApiKey()));
+            }
+            return conn;
+        });
+    }
+}

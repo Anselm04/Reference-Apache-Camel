@@ -1,0 +1,303 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.camel.component.duckdb;
+
+import java.io.File;
+import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.sql.Connection;
+import java.sql.ResultSet;
+import java.sql.Statement;
+import java.util.List;
+import java.util.Locale;
+import java.util.Map;
+import java.util.regex.Pattern;
+
+import org.apache.camel.Exchange;
+import org.apache.camel.Message;
+import org.apache.camel.WrappedFile;
+import org.apache.camel.support.DefaultProducer;
+import org.apache.camel.util.ObjectHelper;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+public class DuckDbProducer extends DefaultProducer {
+
+    private static final Logger LOG = LoggerFactory.getLogger(DuckDbProducer.class);
+    private static final Pattern URL_SCHEME = Pattern.compile("^[A-Za-z][A-Za-z0-9+.-]*://");
+    private static final String GLOB_CHARS = "*?[{";
+
+    private final DuckDbEndpoint endpoint;
+
+    public DuckDbProducer(DuckDbEndpoint endpoint) {
+        super(endpoint);
+        this.endpoint = endpoint;
+    }
+
+    @Override
+    public void process(Exchange exchange) throws Exception {
+        DuckDbOperation operation = resolveOperation(exchange);
+        // the header may only move the endpoint to another database file when the endpoint opts in
+        String databasePathOverride = endpoint.isAllowDatabasePathFromHeader()
+                ? exchange.getIn().getHeader(DuckDbConstants.DATABASE_PATH, String.class) : null;
+        try (DuckDbConnectionScope scope = endpoint.openConnectionScope(databasePathOverride)) {
+            Connection connection = scope.connection();
+            switch (operation) {
+                case EXECUTE -> doExecute(exchange, connection);
+                case QUERY -> doQuery(exchange, connection);
+                case INSERT -> doInsert(exchange, connection);
+                case COPY -> doCopy(exchange, connection);
+                case PING -> doPing(exchange, connection);
+                default -> throw new DuckDbException("Unsupported operation: " + operation);
+            }
+        }
+    }
+
+    private void doExecute(Exchange exchange, Connection connection) throws Exception {
+        String sql = resolveSql(exchange);
+        if (ObjectHelper.isEmpty(sql)) {
+            throw new DuckDbException("SQL is required for execute (message body or query option)");
+        }
+        long updated;
+        try (Statement statement = connection.createStatement()) {
+            if (statement.execute(sql)) {
+                throw new DuckDbException(
+                        "The statement returns rows, which the execute operation does not read (DuckDB has run it)."
+                                          + " Use operation=query for a statement that returns rows.");
+            }
+            updated = statement.getUpdateCount();
+        }
+        setRowsWritten(exchange, updated);
+        exchange.getMessage().setBody(updated);
+    }
+
+    private void doQuery(Exchange exchange, Connection connection) throws Exception {
+        String sql = resolveSql(exchange);
+        if (ObjectHelper.isEmpty(sql)) {
+            throw new DuckDbException("SQL is required for query (message body, query option or CamelDuckDbQuery header)");
+        }
+        try (Statement statement = connection.createStatement()) {
+            if (!statement.execute(sql)) {
+                throw new DuckDbException(
+                        "The query operation expects a statement that returns rows, but this one returns none"
+                                          + " (DuckDB has run it). Use operation=execute for DDL or DML that returns no rows.");
+            }
+            List<Map<String, Object>> rows;
+            try (ResultSet resultSet = statement.getResultSet()) {
+                rows = DuckDbResultSetMapper.toListMap(resultSet);
+            }
+            Message message = exchange.getMessage();
+            message.setHeader(DuckDbConstants.ROWS_READ, (long) rows.size());
+            if (endpoint.getResultFormat() == DuckDbResultFormat.JSON) {
+                message.setBody(DuckDbResultSetMapper.toJson(rows));
+            } else {
+                message.setBody(rows);
+            }
+        }
+    }
+
+    private void doInsert(Exchange exchange, Connection connection) throws Exception {
+        String table = resolveTable(exchange);
+        if (ObjectHelper.isEmpty(table)) {
+            throw new DuckDbException(
+                    "A table is required for insert. Provide the table option or the "
+                                      + DuckDbConstants.TABLE + " header.");
+        }
+        List<?> body = exchange.getIn().getBody(List.class);
+        if (body == null) {
+            throw new DuckDbException("Insert operation expects the message body to be a List of rows");
+        }
+        long written = DuckDbInsertSupport.insertMaps(connection, table, body, endpoint.getBatchSize());
+        LOG.debug("Inserted {} rows into {}", written, table);
+        setRowsWritten(exchange, written);
+    }
+
+    private void doCopy(Exchange exchange, Connection connection) throws Exception {
+        String table = resolveTable(exchange);
+        if (ObjectHelper.isEmpty(table)) {
+            throw new DuckDbException("A table is required for copy operations");
+        }
+        String path = resolveCopySource(resolveFilePath(exchange));
+        String format = resolveFormat(path);
+        String sql = buildCopySql(table, path, format);
+        long updated;
+        try (Statement statement = connection.createStatement()) {
+            updated = statement.executeUpdate(sql);
+        }
+        setRowsWritten(exchange, updated);
+    }
+
+    private void doPing(Exchange exchange, Connection connection) throws Exception {
+        boolean ok;
+        try (Statement statement = connection.createStatement();
+             ResultSet rs = statement.executeQuery("SELECT 1")) {
+            ok = rs.next() && rs.getInt(1) == 1;
+        }
+        Message message = exchange.getMessage();
+        message.setHeader(DuckDbConstants.PING_OK, ok);
+        message.setBody(ok);
+    }
+
+    private String buildCopySql(String table, String path, String format) {
+        String escapedPath = DuckDbJdbcSupport.escapeSqlLiteral(path);
+        String quotedTable = DuckDbJdbcSupport.quoteQualifiedIdentifier(table);
+        return switch (format.toLowerCase(Locale.ROOT)) {
+            case "csv" -> "INSERT INTO " + quotedTable + " SELECT * FROM read_csv('" + escapedPath + "')";
+            case "parquet" -> "INSERT INTO " + quotedTable + " SELECT * FROM read_parquet('" + escapedPath + "')";
+            case "json" -> "INSERT INTO " + quotedTable + " SELECT * FROM read_json('" + escapedPath + "')";
+            default -> throw new DuckDbException("Unsupported copy format: " + format);
+        };
+    }
+
+    private String resolveFormat(String path) {
+        String configured = endpoint.getFormat();
+        if (ObjectHelper.isNotEmpty(configured) && !"auto".equalsIgnoreCase(configured)) {
+            return configured;
+        }
+        String lower = path.toLowerCase(Locale.ROOT);
+        if (lower.endsWith(".csv")) {
+            return "csv";
+        }
+        if (lower.endsWith(".parquet")) {
+            return "parquet";
+        }
+        if (lower.endsWith(".json")) {
+            return "json";
+        }
+        throw new DuckDbException("Could not infer copy format from file name: " + path);
+    }
+
+    private static String resolveFilePath(Exchange exchange) {
+        Object body = exchange.getIn().getBody();
+        if (body instanceof WrappedFile<?> wrappedFile) {
+            body = wrappedFile.getBody();
+        }
+        if (body instanceof File file) {
+            return file.getAbsolutePath();
+        }
+        if (body instanceof Path path) {
+            return path.toAbsolutePath().toString();
+        }
+        String str = body != null
+                ? exchange.getContext().getTypeConverter().tryConvertTo(String.class, exchange, body)
+                : null;
+        if (ObjectHelper.isNotEmpty(str)) {
+            return str.trim();
+        }
+        throw new DuckDbException("Copy operation expects a file path in the message body (File, Path, String or bytes)");
+    }
+
+    /**
+     * DuckDB reads the source of a copy as a remote file when it starts with a URL scheme, and expands it to many files
+     * when it holds glob characters. Both need an option, and copyBaseDirectory keeps a local source inside a
+     * directory.
+     *
+     * @return the source to give to DuckDB
+     */
+    private String resolveCopySource(String source) throws IOException {
+        if (URL_SCHEME.matcher(source).find()) {
+            if (!endpoint.isAllowUrlCopySource()) {
+                throw new IllegalArgumentException(
+                        "The copy source is a URL, which is loaded only when allowUrlCopySource=true: " + source);
+            }
+            return source;
+        }
+        int glob = indexOfGlob(source);
+        if (glob >= 0 && !endpoint.isAllowGlobCopySource()) {
+            throw new IllegalArgumentException(
+                    "The copy source contains a glob pattern character (*, ?, [ or {), which is expanded only when"
+                                               + " allowGlobCopySource=true: " + source);
+        }
+        String base = endpoint.getCopyBaseDirectory();
+        if (ObjectHelper.isEmpty(base)) {
+            return source;
+        }
+        Path baseDir = Path.of(base).toRealPath();
+        if (glob < 0) {
+            return resolveWithinBaseDirectory(baseDir, source, source).toString();
+        }
+        // a pattern: check the directory before the first glob character, and keep the pattern itself as is
+        for (String segment : source.split("[/\\\\]")) {
+            if ("..".equals(segment)) {
+                throw new IllegalArgumentException(
+                        "The copy source must not contain .. when copyBaseDirectory is set: " + source);
+            }
+        }
+        int sep = source.lastIndexOf('/', glob);
+        if (File.separatorChar != '/') {
+            sep = Math.max(sep, source.lastIndexOf(File.separatorChar, glob));
+        }
+        String dir = resolveWithinBaseDirectory(baseDir, source.substring(0, sep + 1), source).toString();
+        String pattern = source.substring(sep + 1);
+        return dir.endsWith(File.separator) ? dir + pattern : dir + File.separator + pattern;
+    }
+
+    private static Path resolveWithinBaseDirectory(Path baseDir, String path, String source) throws IOException {
+        Path resolved = baseDir.resolve(path).normalize();
+        if (Files.exists(resolved)) {
+            // follow symbolic links, so a link inside the directory to a file outside it is not loaded
+            resolved = resolved.toRealPath();
+        }
+        if (!resolved.startsWith(baseDir)) {
+            throw new IllegalArgumentException(
+                    "The copy source is outside the directory of the copyBaseDirectory option: " + source);
+        }
+        return resolved;
+    }
+
+    private static int indexOfGlob(String source) {
+        for (int i = 0; i < source.length(); i++) {
+            if (GLOB_CHARS.indexOf(source.charAt(i)) >= 0) {
+                return i;
+            }
+        }
+        return -1;
+    }
+
+    private void setRowsWritten(Exchange exchange, long rows) {
+        exchange.getMessage().setHeader(DuckDbConstants.ROWS_WRITTEN, rows);
+        exchange.getMessage().setBody(rows);
+    }
+
+    private DuckDbOperation resolveOperation(Exchange exchange) {
+        String header = exchange.getIn().getHeader(DuckDbConstants.OPERATION, String.class);
+        if (ObjectHelper.isNotEmpty(header)) {
+            return DuckDbOperation.valueOf(header.trim().toUpperCase(Locale.ROOT));
+        }
+        return endpoint.getOperation();
+    }
+
+    private String resolveSql(Exchange exchange) {
+        String header = exchange.getIn().getHeader(DuckDbConstants.QUERY, String.class);
+        if (ObjectHelper.isNotEmpty(header)) {
+            return header;
+        }
+        if (ObjectHelper.isNotEmpty(endpoint.getQuery())) {
+            return endpoint.getQuery();
+        }
+        return exchange.getIn().getBody(String.class);
+    }
+
+    private String resolveTable(Exchange exchange) {
+        String header = exchange.getIn().getHeader(DuckDbConstants.TABLE, String.class);
+        if (ObjectHelper.isNotEmpty(header)) {
+            return header;
+        }
+        return endpoint.getTable();
+    }
+}

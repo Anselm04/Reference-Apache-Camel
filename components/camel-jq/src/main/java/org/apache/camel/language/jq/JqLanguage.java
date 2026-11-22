@@ -1,0 +1,98 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.camel.language.jq;
+
+import net.thisptr.jackson.jq.v2.core.Environment;
+import net.thisptr.jackson.jq.v2.core.EnvironmentBuilder;
+import org.apache.camel.Expression;
+import org.apache.camel.StaticService;
+import org.apache.camel.spi.BodyType;
+import org.apache.camel.spi.BodyType.Carrier;
+import org.apache.camel.spi.BodyTypes;
+import org.apache.camel.spi.annotations.Language;
+import org.apache.camel.support.CamelContextHelper;
+import org.apache.camel.support.SingleInputTypedLanguageSupport;
+import tools.jackson.databind.JsonNode;
+
+@Language("jq")
+@BodyTypes(expressionIn = @BodyType(value = { Carrier.TEXT, Carrier.BYTES, Carrier.STREAM, Carrier.FILE, Carrier.MAP },
+                                    format = "json", dependsOn = "source",
+                                    description = "JSON as text, bytes, a stream or a file, or a Map"),
+           expressionOut = @BodyType(value = { Carrier.POJO, Carrier.LIST, Carrier.NULL },
+                                     javaTypeOption = "resultType",
+                                     description = "A JsonNode; a List of JsonNode when the filter gives several, null when it"
+                                                   + " gives none"))
+public class JqLanguage extends SingleInputTypedLanguageSupport implements StaticService {
+
+    private Environment<JsonNode> environment;
+
+    @Override
+    @SuppressWarnings("unchecked")
+    public void init() {
+        if (getCamelContext() != null) {
+            this.environment = CamelContextHelper.findSingleByType(getCamelContext(), Environment.class);
+        }
+        if (this.environment == null) {
+            // a custom environment is used as-is, as an environment cannot be changed once built
+            EnvironmentBuilder<JsonNode> builder = JqFunctions.newEnvironmentBuilder(getCamelContext());
+            if (getCamelContext() != null) {
+                JqFunctions.loadFromRegistry(getCamelContext(), builder);
+            }
+            this.environment = builder.build();
+        }
+    }
+
+    public Environment<JsonNode> getEnvironment() {
+        return environment;
+    }
+
+    @Override
+    public void start() {
+        // noop
+    }
+
+    @Override
+    public void stop() {
+        // noop
+    }
+
+    @Override
+    public Expression createExpression(Expression source, String expression, Object[] properties) {
+        JqExpression answer = new JqExpression(environment, expression);
+        answer.setResultType(property(Class.class, properties, 0, null));
+        answer.setSource(source);
+        if (getCamelContext() != null) {
+            answer.init(getCamelContext());
+        }
+        return answer;
+    }
+
+    // use by tooling
+    public boolean validateExpression(String expression) throws Exception {
+        init();
+        environment.compile(expression);
+        return true;
+    }
+
+    // use by tooling
+    public boolean validatePredicate(String expression) throws Exception {
+        init();
+        environment.compile(expression);
+        return true;
+    }
+
+}

@@ -1,0 +1,153 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.camel.component.sql;
+
+import java.io.Closeable;
+import java.sql.Connection;
+import java.sql.ResultSet;
+import java.sql.SQLException;
+import java.sql.Statement;
+import java.util.Iterator;
+import java.util.NoSuchElementException;
+import java.util.concurrent.atomic.AtomicBoolean;
+
+import javax.sql.DataSource;
+
+import org.apache.camel.RuntimeCamelException;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.jdbc.core.RowMapper;
+import org.springframework.jdbc.datasource.DataSourceUtils;
+
+public class ResultSetIterator implements Iterator<Object>, Closeable {
+
+    private static final Logger LOG = LoggerFactory.getLogger(ResultSetIterator.class);
+
+    private final Connection connection;
+    private final DataSource dataSource;
+    private final Statement statement;
+    private final ResultSet resultSet;
+    private final RowMapper<?> rowMapper;
+    private final AtomicBoolean closed = new AtomicBoolean();
+    private int rowNum;
+    // set when reading or mapping a row has failed: the rest of the result cannot be read, so the iterator must not
+    // look finished (an SQLException, or the RuntimeException of the row mapper)
+    private volatile Exception failure;
+
+    public ResultSetIterator(Connection connection, Statement statement, ResultSet resultSet,
+                             RowMapper<?> rowMapper) throws SQLException {
+        this(connection, null, statement, resultSet, rowMapper);
+    }
+
+    /**
+     * @param dataSource the data source the connection was obtained from with {@link DataSourceUtils}, so the
+     *                   connection is released with {@link DataSourceUtils#releaseConnection}, which does not close the
+     *                   connection of a transaction
+     */
+    public ResultSetIterator(Connection connection, DataSource dataSource, Statement statement, ResultSet resultSet,
+                             RowMapper<?> rowMapper) throws SQLException {
+        this.connection = connection;
+        this.dataSource = dataSource;
+        this.statement = statement;
+        this.resultSet = resultSet;
+        this.rowMapper = rowMapper;
+
+        loadNext();
+    }
+
+    /**
+     * Whether there are more rows.
+     *
+     * @throws RuntimeCamelException when reading or mapping a row has failed before, as whether there are more rows is
+     *                               then unknown (whoever reads the iterator again, such as a redelivered split, gets
+     *                               an error and not the end of the rows)
+     */
+    @Override
+    public boolean hasNext() {
+        Exception cause = failure;
+        if (cause != null) {
+            String step = cause instanceof SQLException ? "reading" : "mapping";
+            throw new RuntimeCamelException("Cannot process result: " + step + " a row failed before", cause);
+        }
+        return !closed.get();
+    }
+
+    @Override
+    public Object next() {
+        if (!hasNext()) {
+            throw new NoSuchElementException();
+        }
+
+        try {
+            Object next = rowMapper.mapRow(resultSet, rowNum++);
+            loadNext();
+            return next;
+        } catch (SQLException e) {
+            failure = e;
+            close();
+            throw new RuntimeCamelException("Cannot process result", e);
+        } catch (RuntimeException e) {
+            // the row mapper failed (such as a value that does not convert to a property of the outputClass): keep
+            // failing, as a closed iterator looks finished (the splitter closes it when the split fails), and whoever
+            // reads it again, such as a redelivered split, must not skip the rest of the rows
+            failure = e;
+            close();
+            throw e;
+        }
+    }
+
+    private void loadNext() throws SQLException {
+        boolean hasNext = resultSet.next();
+        if (!hasNext) {
+            close();
+        }
+    }
+
+    @Override
+    public void close() {
+        if (closed.compareAndSet(false, true)) {
+            safeCloseResultSet();
+            safeCloseStatement();
+            safeCloseConnection();
+        }
+    }
+
+    private void safeCloseResultSet() {
+        try {
+            resultSet.close();
+        } catch (SQLException e) {
+            LOG.warn("Error by closing result set: {}", e, e);
+        }
+    }
+
+    private void safeCloseStatement() {
+        try {
+            statement.close();
+        } catch (SQLException e) {
+            LOG.warn("Error by closing statement: {}", e, e);
+        }
+    }
+
+    private void safeCloseConnection() {
+        try {
+            DataSourceUtils.doReleaseConnection(connection, dataSource);
+        } catch (SQLException e) {
+            LOG.warn("Error by closing connection: {}", e, e);
+        }
+    }
+
+}

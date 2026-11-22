@@ -1,0 +1,242 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.camel.dsl.jbang.core.commands.mcp;
+
+import java.lang.management.ManagementFactory;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
+import java.util.stream.Stream;
+
+import javax.management.MBeanServer;
+import javax.management.MBeanServerDelegate;
+import javax.management.MBeanServerNotification;
+import javax.management.NotificationListener;
+import javax.management.ObjectName;
+
+import io.quarkiverse.mcp.server.ToolCallException;
+import org.apache.camel.dsl.jbang.core.common.CommandLineHelper;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
+
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
+
+class RouteDiagramToolsTest {
+
+    @Test
+    void missingSourceFileThrows() {
+        RouteDiagramTools tools = new RouteDiagramTools();
+
+        assertThatThrownBy(() -> tools.camel_render_route_diagram(null, null, null, null, null, null, null, null, null))
+                .isInstanceOf(ToolCallException.class)
+                .hasMessageContaining("sourceFile");
+    }
+
+    @Test
+    void blankSourceFileThrows() {
+        RouteDiagramTools tools = new RouteDiagramTools();
+
+        assertThatThrownBy(() -> tools.camel_render_route_diagram("   ", null, null, null, null, null, null, null, null))
+                .isInstanceOf(ToolCallException.class)
+                .hasMessageContaining("sourceFile");
+    }
+
+    @Test
+    void nonExistingSourceFileThrows() {
+        RouteDiagramTools tools = new RouteDiagramTools();
+
+        assertThatThrownBy(() -> tools.camel_render_route_diagram(
+                "/no/such/file.yaml", null, null, null, null, null, null, null, null))
+                .isInstanceOf(ToolCallException.class)
+                .hasMessageContaining("does not exist");
+    }
+
+    @Test
+    void nonExistingSourceFileWithAsciiThemeThrows() {
+        RouteDiagramTools tools = new RouteDiagramTools();
+
+        assertThatThrownBy(() -> tools.camel_render_route_diagram(
+                "/no/such/file.yaml", null, "ascii", null, null, null, null, null, null))
+                .isInstanceOf(ToolCallException.class)
+                .hasMessageContaining("does not exist");
+    }
+
+    @Test
+    void nonExistingSourceFileWithUnicodeThemeThrows() {
+        RouteDiagramTools tools = new RouteDiagramTools();
+
+        assertThatThrownBy(() -> tools.camel_render_route_diagram(
+                "/no/such/file.yaml", null, "unicode", null, null, null, null, null, null))
+                .isInstanceOf(ToolCallException.class)
+                .hasMessageContaining("does not exist");
+    }
+
+    @Test
+    void imageWithoutATheme(@TempDir Path dir) throws Exception {
+        Path source = dir.resolve("orders.camel.yaml");
+        Files.writeString(source, """
+                - route:
+                    id: orders
+                    from:
+                      uri: timer:orders
+                      steps:
+                        - setBody:
+                            constant: hello
+                        - to:
+                            uri: log:orders
+                """);
+        Path png = dir.resolve("orders.png");
+        RouteDiagramTools tools = new RouteDiagramTools();
+
+        RouteDiagramTools.RouteDiagramResult result = tools.camel_render_route_diagram(
+                source.toString(), png.toString(), null, null, null, null, null, null, null);
+
+        assertThat(result.success()).isTrue();
+        assertThat(result.outputFile()).isEqualTo(png.toAbsolutePath().toString());
+        // a PNG image, not the text diagram
+        assertThat(Files.readAllBytes(png)).startsWith(0x89, 'P', 'N', 'G');
+        assertThat(result.asciiDiagram()).isNull();
+    }
+
+    @Test
+    void theMessageSaysOnceWhereTheImageIs(@TempDir Path dir) throws Exception {
+        Path png = dir.resolve("orders.png");
+
+        RouteDiagramTools.RouteDiagramResult result = new RouteDiagramTools().camel_render_route_diagram(
+                route(dir, "orders").toString(), png.toString(), null, null, null, null, null, null, null);
+
+        assertThat(result.success()).isTrue();
+        assertThat(result.message()).isEqualTo("Diagram saved to: " + png.toAbsolutePath());
+    }
+
+    @Test
+    void aTextDiagramLeavesNoFileBehind(@TempDir Path dir) throws Exception {
+        Path source = route(dir, "orders");
+        List<Path> before = tempDiagrams();
+
+        RouteDiagramTools.RouteDiagramResult result = new RouteDiagramTools().camel_render_route_diagram(
+                source.toString(), null, "ascii", null, null, null, null, null, null);
+
+        assertThat(result.success()).isTrue();
+        assertThat(result.asciiDiagram()).contains("orders");
+        assertThat(result.outputFile()).isNull();
+        assertThat(result.message()).doesNotContain("saved to");
+        // CAMEL-26932: a temporary file was left for each call
+        assertThat(tempDiagrams()).isEqualTo(before);
+    }
+
+    @Test
+    void renderRouteDoesNotWipeSharedWorkDir(@TempDir Path dir) throws Exception {
+        // CAMEL-27156: transient run should not wipe the shared .camel-jbang directory
+        Path workDir = CommandLineHelper.getWorkDir();
+        Files.createDirectories(workDir);
+        Path marker = workDir.resolve("marker-" + ProcessHandle.current().pid() + ".tmp");
+        Files.writeString(marker, "marker");
+        try {
+            Path source = route(dir, "marker-route");
+            RouteDiagramTools tools = new RouteDiagramTools();
+            RouteDiagramTools.RouteDiagramResult result = tools.camel_render_route_diagram(
+                    source.toString(), null, "ascii", null, null, null, null, null, null);
+
+            assertThat(result.success()).as(result.message()).isTrue();
+            assertThat(result.asciiDiagram()).contains("marker-route");
+            assertThat(Files.exists(marker)).as("Shared work directory marker must not be wiped by transient run").isTrue();
+        } finally {
+            Files.deleteIfExists(marker);
+        }
+    }
+
+    @Test
+    void callsAtTheSameTime(@TempDir Path dir) throws Exception {
+        // CAMEL-26932: the calls shared one work directory, which each deleted at its start, so of three calls at
+        // once one failed with NoSuchFileException and one timed out
+        List<String> routes = List.of("first", "second", "third");
+        RouteDiagramTools tools = new RouteDiagramTools();
+        ExecutorService executor = Executors.newFixedThreadPool(routes.size());
+        try {
+            List<Future<RouteDiagramTools.RouteDiagramResult>> calls = new ArrayList<>();
+            for (String id : routes) {
+                Path source = route(dir, id);
+                calls.add(executor.submit(() -> tools.camel_render_route_diagram(
+                        source.toString(), null, "ascii", null, null, null, null, null, null)));
+            }
+            for (int i = 0; i < routes.size(); i++) {
+                RouteDiagramTools.RouteDiagramResult result = calls.get(i).get(60, TimeUnit.SECONDS);
+                assertThat(result.success()).as(result.message()).isTrue();
+                assertThat(result.asciiDiagram()).contains(routes.get(i));
+            }
+        } finally {
+            executor.shutdownNow();
+        }
+    }
+
+    @Test
+    void aTransformRunRegistersNoMBeans(@TempDir Path dir) throws Exception {
+        // CAMEL-27326: every transform run names its context transform; with JMX on, two runs at the same time in one
+        // JVM (the MCP server) could both take that name, and the second failed with InstanceAlreadyExistsException,
+        // which made callsAtTheSameTime flaky. A transform run only dumps the routes to files, so it has no JMX.
+        MBeanServer server = ManagementFactory.getPlatformMBeanServer();
+        List<ObjectName> registered = new CopyOnWriteArrayList<>();
+        NotificationListener listener = (notification, handback) -> {
+            if (notification instanceof MBeanServerNotification n
+                    && MBeanServerNotification.REGISTRATION_NOTIFICATION.equals(n.getType())
+                    && "org.apache.camel".equals(n.getMBeanName().getDomain())
+            // the MBeans of the transform run; other tests may start contexts of their own meanwhile
+                    && String.valueOf(n.getMBeanName().getKeyProperty("context")).startsWith("transform")) {
+                registered.add(n.getMBeanName());
+            }
+        };
+        server.addNotificationListener(MBeanServerDelegate.DELEGATE_NAME, listener, null, null);
+        try {
+            RouteDiagramTools.RouteDiagramResult result = new RouteDiagramTools().camel_render_route_diagram(
+                    route(dir, "lonely").toString(), null, "ascii", null, null, null, null, null, null);
+
+            assertThat(result.success()).as(result.message()).isTrue();
+            assertThat(result.asciiDiagram()).contains("lonely");
+        } finally {
+            server.removeNotificationListener(MBeanServerDelegate.DELEGATE_NAME, listener);
+        }
+        assertThat(registered).isEmpty();
+    }
+
+    private static Path route(Path dir, String id) throws Exception {
+        Path source = dir.resolve(id + ".camel.yaml");
+        Files.writeString(source, """
+                - route:
+                    id: %s
+                    from:
+                      uri: timer:%s
+                      steps:
+                        - to:
+                            uri: log:%s
+                """.formatted(id, id, id));
+        return source;
+    }
+
+    private static List<Path> tempDiagrams() throws Exception {
+        try (Stream<Path> files = Files.list(Path.of(System.getProperty("java.io.tmpdir")))) {
+            return files.filter(f -> f.getFileName().toString().startsWith("camel-route-diagram-")).sorted().toList();
+        }
+    }
+}

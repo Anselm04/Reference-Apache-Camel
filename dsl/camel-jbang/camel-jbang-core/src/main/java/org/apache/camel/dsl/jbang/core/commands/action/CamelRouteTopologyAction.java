@@ -1,0 +1,348 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.camel.dsl.jbang.core.commands.action;
+
+import java.awt.image.BufferedImage;
+import java.io.File;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.ArrayList;
+import java.util.List;
+
+import javax.imageio.ImageIO;
+
+import org.aesh.command.CommandDefinition;
+import org.aesh.command.option.Arguments;
+import org.aesh.command.option.Mixin;
+import org.aesh.command.option.Option;
+import org.apache.camel.diagram.RouteDiagramRenderer.DiagramColors;
+import org.apache.camel.diagram.TopologyAsciiRenderer;
+import org.apache.camel.diagram.TopologyErrorFrame;
+import org.apache.camel.diagram.TopologyHelper;
+import org.apache.camel.diagram.TopologyImageRenderer;
+import org.apache.camel.diagram.TopologyLayoutEngine;
+import org.apache.camel.diagram.TopologyLayoutEngine.TopologyEdgeInfo;
+import org.apache.camel.diagram.TopologyLayoutEngine.TopologyLayoutResult;
+import org.apache.camel.diagram.TopologyLayoutEngine.TopologyNodeInfo;
+import org.apache.camel.dsl.jbang.core.common.CliException;
+import org.apache.camel.dsl.jbang.core.common.ProcessFinder;
+import org.apache.camel.dsl.jbang.core.common.ProcessFinder.CamelProcess;
+import org.apache.camel.dsl.jbang.run.common.PathUtils;
+import org.apache.camel.util.json.JsonArray;
+import org.apache.camel.util.json.JsonObject;
+import org.apache.camel.util.json.Jsoner;
+import org.jline.terminal.Terminal;
+import org.jline.terminal.TerminalBuilder;
+import org.jline.terminal.impl.TerminalGraphics;
+import org.jline.terminal.impl.TerminalGraphicsManager;
+
+@CommandDefinition(name = "route-topology", description = "Display inter-route topology connections", generateHelp = true,
+                   footer = {
+                           "Examples:",
+                           "  camel cmd route-topology",
+                           "  camel cmd route-topology --json",
+                           "  camel cmd route-topology --theme=unicode",
+                           "  camel cmd route-topology --theme=dark",
+                           "  camel cmd route-topology --theme=dark --output=topology.png",
+                           "  camel cmd route-topology hello.yaml bye.yaml" })
+public class CamelRouteTopologyAction extends ActionBaseCommand {
+
+    @Arguments(description = "Source file name(s) (shell-expanded wildcards), or name/pid of a running "
+                             + "Camel integration",
+               paramLabel = "files")
+    List<String> files = new ArrayList<>();
+
+    @Option(name = "json", hasValue = false, description = "Output in JSON Format")
+    boolean jsonOutput;
+
+    @Option(name = "theme", description = "Color theme preset (dark, light, transparent, ascii, unicode) or custom colors "
+                                          + "(e.g. bg=#1e1e1e:from=#2e7d32:to=#1565c0). "
+                                          + "Use ascii/unicode for plain text output.")
+    String theme;
+
+    @Option(name = "output", description = "Save diagram to a file (PNG for image themes, text for ascii theme)")
+    String output;
+
+    @Option(name = "box-width", description = "Width of diagram node boxes", defaultValue = "180")
+    int boxWidth = 180;
+
+    @Option(name = "font-size", description = "Font size in logical pixels for node text", defaultValue = "12")
+    int fontSize;
+
+    @Option(name = "description", hasValue = false, description = "Prefer route description over route id in node labels")
+    boolean description;
+
+    @Option(name = "metric", hasValue = false,
+            description = "Whether to include live metrics (only possible for a running Camel application)",
+            defaultValue = "true")
+    boolean metric;
+
+    @Option(name = "external", hasValue = false,
+            description = "Include external systems (consumers at top, producers at bottom)")
+    boolean external;
+
+    @Option(name = "errors", hasValue = false,
+            description = "Draw the error handling: the routes reached only on error in a frame of their own below the"
+                          + " routes, with where their failures come from (with --theme)")
+    boolean errors;
+
+    @Option(name = "kamelets", hasValue = false,
+            description = "Include routes created by Kamelets (hidden by default, only for a running Camel application)")
+    boolean kamelets;
+
+    @Option(name = "ignore-loading-error", hasValue = false,
+            description = "Whether to ignore route loading and compilation errors (use this with care!)",
+            defaultValue = "false")
+    boolean ignoreLoadingError;
+
+    @Option(name = "compile", hasValue = false,
+            description = "Whether to compile Java source files and load their routes. By default Java "
+                          + "routes are read by the Java DSL parser, without compiling them",
+            defaultValue = "false")
+    boolean compile;
+
+    @Mixin
+    ActionTimeoutMixin timeoutOption;
+
+    private long pid;
+
+    @Override
+    public Integer doCall() throws Exception {
+        // only attempt to resolve a running integration when a single token is given (or none, defaulting to "*"):
+        // multiple tokens can only be a set of source files
+        String nameOrPid = files.isEmpty() ? "*" : files.get(0);
+        List<CamelProcess> processes = files.size() <= 1 ? ProcessFinder.find(nameOrPid) : List.of();
+
+        if (processes.isEmpty()) {
+            if (files.isEmpty()) {
+                throw CliException.notFound("No running Camel integration found");
+            }
+            return doCallSource(files);
+        }
+        // more than one match is an error that says which integrations match
+        CamelProcess process = processes.size() > 1 ? ProcessFinder.requireOne(nameOrPid) : processes.get(0);
+        this.pid = process.pid();
+        JsonObject jo = executeAction(process, "route-topology", root -> {
+            root.put("metric", String.valueOf(metric));
+            root.put("external", String.valueOf(external));
+            root.put("kamelets", String.valueOf(kamelets));
+        });
+        return renderTopology(jo);
+    }
+
+    private int doCallSource(List<String> sourceFiles) throws Exception {
+        SourceDump dump = dumpRoutesFromSource(sourceFiles, "route-topology-source-", ignoreLoadingError, compile);
+        if (dump == null) {
+            return 1;
+        }
+
+        try {
+            Path topologyFile = dump.workDir().resolve("route-topology.json");
+            JsonObject jo = getJsonObject(topologyFile, 10000);
+            if (jo == null) {
+                // DefaultDumpRoutesStrategy always writes route-topology.json once the source is loaded, even when
+                // there are no routes, so reaching this means the dump never completed within the timeout: either
+                // the source failed to load, or it took longer than the timeout allows.
+                throw CliException.failure("No routes found in: " + sourceFiles
+                                           + " (if this is unexpected, the source may have failed to fully load within"
+                                           + " the timeout; try --ignore-loading-error or check the logs)");
+            }
+
+            return renderTopology(jo);
+        } finally {
+            PathUtils.deleteDirectory(dump.workDir());
+        }
+    }
+
+    /**
+     * Renders the topology described by the given JSON, which may come either from a running Camel integration (via the
+     * {@code route-topology} developer console) or from a source-file dump (via {@code camel.main.dumpRoutes=json}).
+     * Both share the same {@code nodes}/{@code edges}/{@code externalEndpoints} schema (see
+     * {@code RouteTopologyDevConsole}); the console additionally includes live exchange-count metrics when
+     * {@code --metric} is requested, which the source-file dump never provides. Package visible for testing.
+     */
+    int renderTopology(JsonObject jo) throws Exception {
+        if (jsonOutput) {
+            addUnreadSourceParts(jo);
+            String dump = Jsoner.prettyPrint(jo.toJson(), 2);
+            printer().println(dump);
+        } else if (theme != null) {
+            if (isTextTheme()) {
+                printTextDiagram(jo);
+            } else {
+                printImageDiagram(jo);
+            }
+        } else {
+            printTopology(jo);
+        }
+        return 0;
+    }
+
+    /** The error paths of the topology: sent to only when a route handles a failure (Camel 4.23 or newer). */
+    private static List<TopologyEdgeInfo> errorPaths(JsonObject jo) {
+        return TopologyHelper.parseEdges(jo, true).stream().filter(TopologyEdgeInfo::isErrorPath).toList();
+    }
+
+    private static boolean isErrorPath(JsonObject edge) {
+        return "error".equals(edge.getString("kind"));
+    }
+
+    private void printTopology(JsonObject jo) {
+        JsonArray nodes = (JsonArray) jo.get("nodes");
+        JsonArray edges = (JsonArray) jo.get("edges");
+
+        int nodeCount = nodes != null ? nodes.size() : 0;
+        int edgeCount = edges != null ? edges.size() : 0;
+        int errorPaths = 0;
+        for (int i = 0; i < edgeCount; i++) {
+            if (isErrorPath((JsonObject) edges.get(i))) {
+                errorPaths++;
+            }
+        }
+        // the error paths are counted only when there are any, so the line stays as it was without them
+        printer().printf("Route Topology (%d routes, %d connections%s)%n%n", nodeCount, edgeCount - errorPaths,
+                errorPaths > 0 ? ", " + errorPaths + " error paths" : "");
+
+        if (nodes != null) {
+            for (Object n : nodes) {
+                JsonObject node = (JsonObject) n;
+                printer().printf("  %s (%s) type=%s%n",
+                        node.getString("routeId"),
+                        node.getString("from"),
+                        node.getString("nodeType"));
+
+                if (edges != null) {
+                    for (Object e : edges) {
+                        JsonObject edge = (JsonObject) e;
+                        if (node.getString("routeId").equals(edge.getString("fromRouteId"))) {
+                            if (isErrorPath(edge)) {
+                                // sent to only when the route handles a failure
+                                String handling = edge.getString("handling");
+                                printer().printf("    ..> %s via %s [%s, on failure: %s%s]%n",
+                                        edge.getString("toRouteId"),
+                                        edge.getString("endpoint"),
+                                        edge.getString("connectionType"),
+                                        edge.getString("via"),
+                                        handling != null ? ", " + handling : "");
+                            } else {
+                                printer().printf("    --> %s via %s [%s]%n",
+                                        edge.getString("toRouteId"),
+                                        edge.getString("endpoint"),
+                                        edge.getString("connectionType"));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    private void printTextDiagram(JsonObject jo) throws Exception {
+        List<TopologyNodeInfo> nodes = TopologyHelper.parseNodes(jo);
+        List<TopologyEdgeInfo> edges = TopologyHelper.parseEdges(jo);
+        TopologyHelper.addExternalEndpoints(nodes, edges, jo);
+
+        TopologyLayoutEngine engine = new TopologyLayoutEngine(boxWidth);
+        TopologyAsciiRenderer renderer = new TopologyAsciiRenderer(
+                engine.getNodeWidth(), isUnicodeTheme(), pid > 0 && metric, description);
+        String text;
+        if (errors) {
+            TopologyErrorFrame.Placed placed = TopologyErrorFrame.layout(
+                    engine, nodes, edges, errorPaths(jo), TopologyAsciiRenderer.ROW_HEIGHT);
+            text = renderer.renderDiagram(placed.layout(), placed.frame());
+        } else {
+            text = renderer.renderDiagram(engine.layout(nodes, edges));
+        }
+
+        if (output != null) {
+            String fileName = output.endsWith(".png")
+                    ? output.substring(0, output.length() - 4) + ".txt" : output;
+            File file = new File(fileName);
+            File parentDir = file.getParentFile();
+            if (parentDir != null) {
+                parentDir.mkdirs();
+            }
+            Files.writeString(file.toPath(), text);
+            printer().println("Diagram saved to: " + file.getAbsolutePath());
+        } else {
+            printer().print(text);
+        }
+    }
+
+    private void printImageDiagram(JsonObject jo) throws Exception {
+        System.setProperty("java.awt.headless", "true");
+
+        List<TopologyNodeInfo> nodes = TopologyHelper.parseNodes(jo);
+        List<TopologyEdgeInfo> edges = TopologyHelper.parseEdges(jo);
+        TopologyHelper.addExternalEndpoints(nodes, edges, jo);
+
+        TopologyLayoutEngine engine = new TopologyLayoutEngine(boxWidth);
+        TopologyLayoutResult result;
+        TopologyErrorFrame frame = null;
+        if (errors) {
+            TopologyErrorFrame.Placed placed = TopologyErrorFrame.layout(
+                    engine, nodes, edges, errorPaths(jo), TopologyImageRenderer.rowHeight(fontSize));
+            result = placed.layout();
+            frame = placed.frame();
+        } else {
+            result = engine.layout(nodes, edges);
+        }
+
+        String colorSpec = System.getenv("DIAGRAM_COLORS");
+        DiagramColors colors = DiagramColors.parse(colorSpec != null ? colorSpec : theme);
+
+        BufferedImage image = TopologyImageRenderer.renderImage(
+                result, colors, fontSize, boxWidth, pid > 0 && metric, description, frame);
+
+        if (output != null) {
+            File file = new File(output);
+            File parentDir = file.getParentFile();
+            if (parentDir != null) {
+                parentDir.mkdirs();
+            }
+            ImageIO.write(image, "PNG", file);
+            printer().println("Diagram saved to: " + file.getAbsolutePath());
+        } else {
+            Terminal terminal = TerminalBuilder.builder().system(true).build();
+            try {
+                TerminalGraphics terminalGraphics = TerminalGraphicsManager.getBestProtocol(terminal).orElse(null);
+                if (terminalGraphics == null) {
+                    printer().println("Terminal does not support graphics protocols (Kitty, iTerm2, or Sixel).");
+                    printer().println(
+                            "Try running in a supported terminal: Kitty, iTerm2, WezTerm, Ghostty, or VS Code.");
+                    printer().println("Or use --theme=ascii or --theme=unicode for plain text output.");
+                    return;
+                }
+                TerminalGraphics.ImageOptions opts = new TerminalGraphics.ImageOptions()
+                        .preserveAspectRatio(true);
+                terminalGraphics.displayImage(terminal, image, opts);
+                terminal.writer().println();
+                terminal.flush();
+            } finally {
+                terminal.close();
+            }
+        }
+    }
+
+    private boolean isTextTheme() {
+        return "ascii".equalsIgnoreCase(theme) || "unicode".equalsIgnoreCase(theme);
+    }
+
+    private boolean isUnicodeTheme() {
+        return "unicode".equalsIgnoreCase(theme);
+    }
+}

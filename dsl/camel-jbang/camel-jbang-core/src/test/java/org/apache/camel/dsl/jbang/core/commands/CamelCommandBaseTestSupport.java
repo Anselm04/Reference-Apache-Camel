@@ -1,0 +1,115 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.camel.dsl.jbang.core.commands;
+
+import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
+
+import org.apache.camel.dsl.jbang.core.common.CommandLineHelper;
+import org.apache.camel.dsl.jbang.run.common.CamelHome;
+import org.apache.camel.dsl.jbang.run.common.StringPrinter;
+import org.apache.camel.util.FileUtil;
+import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.BeforeEach;
+
+public class CamelCommandBaseTestSupport {
+
+    protected StringPrinter printer;
+
+    private Path previousHome;
+    private Path testHome;
+    private Path testWorkDir;
+
+    @BeforeEach
+    public void setup() throws Exception {
+        printer = new StringPrinter();
+    }
+
+    /**
+     * Gives the test a home directory of its own: an empty directory for the {@code .camel} directory, the user
+     * configuration and the plugins of the CLI. The tests run in parallel forks, so a fixed directory would be shared
+     * with the tests of the other forks. The previous home is used again after the test.
+     *
+     * @return the home directory
+     */
+    protected Path useTestHomeDir() throws IOException {
+        if (testHome != null) {
+            // called again: the home of the earlier call is not used anymore
+            FileUtil.removeDir(testHome.toFile());
+        }
+        testHome = Files.createTempDirectory("camel-cli-test-home");
+        useHomeDir(testHome);
+        return testHome;
+    }
+
+    /**
+     * Uses the given directory as the home of the CLI in the test, and the previous home again after the test. A test
+     * that talks to a Camel which runs outside this JVM uses the home of that Camel; any other test uses
+     * {@link #useTestHomeDir()}.
+     *
+     * @param home the home directory
+     */
+    protected void useHomeDir(Path home) {
+        if (previousHome == null) {
+            previousHome = CommandLineHelper.getHomeDir();
+        }
+        CommandLineHelper.useHomeDir(home.toString());
+    }
+
+    /**
+     * Gives the test a working directory of its own: a temporary directory that replaces the shared
+     * {@code .camel-jbang} directory that {@code camel run}, {@code camel export}, and others create. With an isolated
+     * directory per test instance, tests annotated with {@link UsesWorkingDirectory} can run in parallel forks instead
+     * of one at a time in the serial-test execution.
+     *
+     * @return             the working directory
+     * @throws IOException if the temp directory cannot be created
+     */
+    protected Path useTestWorkDir() throws IOException {
+        if (testWorkDir != null) {
+            FileUtil.removeDir(testWorkDir.toFile());
+        }
+        testWorkDir = Files.createTempDirectory("camel-jbang-work");
+        CamelHome.useWorkDir(testWorkDir);
+        return testWorkDir;
+    }
+
+    @AfterEach
+    public void restoreHomeDir() {
+        if (previousHome != null) {
+            CommandLineHelper.useHomeDir(previousHome.toString());
+            previousHome = null;
+        }
+        if (testHome != null) {
+            FileUtil.removeDir(testHome.toFile());
+            testHome = null;
+        }
+        if (testWorkDir != null) {
+            FileUtil.removeDir(testWorkDir.toFile());
+            testWorkDir = null;
+            CamelHome.resetWorkDir();
+        }
+    }
+
+    public static String quarkusExtRegistry() {
+        return "--quarkus-ext-registry="
+               + Path.of("target/test-classes/registry.quarkus.io").toAbsolutePath().normalize().toUri().toString();
+    }
+
+}

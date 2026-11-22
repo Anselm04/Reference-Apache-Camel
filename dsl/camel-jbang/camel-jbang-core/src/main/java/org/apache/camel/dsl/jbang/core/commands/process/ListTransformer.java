@@ -1,0 +1,131 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.camel.dsl.jbang.core.commands.process;
+
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.List;
+import java.util.stream.Collectors;
+
+import com.github.freva.asciitable.AsciiTable;
+import com.github.freva.asciitable.Column;
+import com.github.freva.asciitable.HorizontalAlign;
+import com.github.freva.asciitable.OverflowBehaviour;
+import org.aesh.command.CommandDefinition;
+import org.aesh.command.option.Argument;
+import org.aesh.command.option.Option;
+import org.apache.camel.dsl.jbang.core.common.PidNameAgeCompletionCandidates;
+import org.apache.camel.dsl.jbang.core.common.ProcessHelper;
+import org.apache.camel.dsl.jbang.core.common.RowSort;
+import org.apache.camel.util.TimeUtils;
+import org.apache.camel.util.json.JsonArray;
+import org.apache.camel.util.json.JsonObject;
+import org.apache.camel.util.json.Jsoner;
+
+@CommandDefinition(name = "transformer", description = "Get list of data type transformers", generateHelp = true,
+                   footer = {
+                           "Examples:",
+                           "  camel get transformer",
+                           "  camel get transformer --watch" })
+public class ListTransformer extends ProcessBaseCommand {
+
+    private static final RowSort<Row> ORDER = RowSort.<Row> integration(r -> r.pid, r -> r.name, r -> r.uptime);
+
+    @Argument(description = "Name or pid of running Camel integration")
+    String name = "*";
+
+    @Option(name = "sort", description = "Sort by pid, name or age", defaultValue = "pid",
+            completer = PidNameAgeCompletionCandidates.class)
+    String sort;
+
+    @Option(name = "json", hasValue = false, description = "Output in JSON Format")
+    boolean jsonOutput;
+
+    @Override
+    public Integer doCall() throws Exception {
+        List<Row> rows = new ArrayList<>();
+
+        forEachIntegration(name, (ph, root) -> {
+            JsonObject context = (JsonObject) root.get("context");
+            JsonObject jo = (JsonObject) root.get("transformers");
+            // the console leaves the list out when there are no transformers (CAMEL-26929)
+            JsonArray array = jo != null ? (JsonArray) jo.get("transformers") : null;
+            if (context != null && array != null) {
+                for (int i = 0; i < array.size(); i++) {
+                    JsonObject o = (JsonObject) array.get(i);
+                    Row row = new Row();
+                    row.name = context.getString("name");
+                    if ("CamelJBang".equals(row.name)) {
+                        row.name = ProcessHelper.extractName(root, ph);
+                    }
+                    row.pid = Long.toString(ph.pid());
+                    row.dataTypeName = o.getString("name");
+                    row.dataTypeFrom = o.getString("from");
+                    row.dataTypeTo = o.getString("to");
+                    row.uptime = extractSince(ph);
+                    row.age = TimeUtils.printSince(row.uptime);
+                    rows.add(row);
+                }
+            }
+        });
+
+        // sort rows
+        rows.sort(ORDER.comparator(sort));
+
+        if (!rows.isEmpty() || jsonOutput) {
+            printTable(rows);
+        }
+
+        return 0;
+    }
+
+    protected void printTable(List<Row> rows) {
+        if (jsonOutput) {
+            printer().println(Jsoner.serialize(rows.stream().map(r -> {
+                JsonObject jo = new JsonObject();
+                jo.put("pid", JsonValues.pid(r.pid));
+                jo.put("name", r.name);
+                jo.put("age", r.age);
+                jo.put("uptime", r.uptime);
+                jo.put("dataType", r.dataTypeName);
+                jo.put("from", r.dataTypeFrom);
+                jo.put("to", r.dataTypeTo);
+                return jo;
+            }).collect(Collectors.toList())));
+            return;
+        }
+        printer().println(AsciiTable.getTable(AsciiTable.NO_BORDERS, rows, Arrays.asList(
+                new Column().header("PID").headerAlign(HorizontalAlign.CENTER).with(r -> r.pid),
+                new Column().header("NAME").dataAlign(HorizontalAlign.LEFT).maxWidth(30, OverflowBehaviour.ELLIPSIS_RIGHT)
+                        .with(r -> r.name),
+                new Column().header("AGE").headerAlign(HorizontalAlign.CENTER).with(r -> r.age),
+                new Column().header("DATA-TYPE").dataAlign(HorizontalAlign.LEFT).with(r -> r.dataTypeName),
+                new Column().header("FROM").dataAlign(HorizontalAlign.LEFT).with(r -> r.dataTypeFrom),
+                new Column().header("TO").dataAlign(HorizontalAlign.LEFT).with(r -> r.dataTypeTo))));
+    }
+
+    static class Row {
+        String pid;
+        String name;
+        long uptime;
+        String age;
+        String dataTypeName;
+        String dataTypeFrom;
+        String dataTypeTo;
+    }
+
+}

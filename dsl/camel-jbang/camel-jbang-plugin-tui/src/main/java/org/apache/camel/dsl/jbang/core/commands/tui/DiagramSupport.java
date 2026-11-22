@@ -1,0 +1,2360 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.camel.dsl.jbang.core.commands.tui;
+
+import java.nio.file.Path;
+import java.util.ArrayDeque;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.Deque;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.function.Function;
+import java.util.function.Supplier;
+
+import dev.tamboui.layout.Constraint;
+import dev.tamboui.layout.Layout;
+import dev.tamboui.layout.Rect;
+import dev.tamboui.style.Color;
+import dev.tamboui.style.Style;
+import dev.tamboui.terminal.Frame;
+import dev.tamboui.text.Line;
+import dev.tamboui.text.Span;
+import dev.tamboui.text.Text;
+import dev.tamboui.tui.event.KeyEvent;
+import dev.tamboui.tui.event.MouseEvent;
+import dev.tamboui.tui.event.MouseEventKind;
+import dev.tamboui.widgets.Clear;
+import dev.tamboui.widgets.block.Block;
+import dev.tamboui.widgets.block.BorderType;
+import dev.tamboui.widgets.block.Borders;
+import dev.tamboui.widgets.block.Title;
+import dev.tamboui.widgets.paragraph.Paragraph;
+import dev.tamboui.widgets.scrollbar.Scrollbar;
+import dev.tamboui.widgets.scrollbar.ScrollbarState;
+import org.apache.camel.diagram.RouteDiagramHelper;
+import org.apache.camel.diagram.RouteDiagramLayoutEngine;
+import org.apache.camel.diagram.RouteErrorFrame;
+import org.apache.camel.diagram.TopologyAsciiRenderer;
+import org.apache.camel.diagram.TopologyErrorFrame;
+import org.apache.camel.diagram.TopologyHelper;
+import org.apache.camel.diagram.TopologyLayoutEngine;
+import org.apache.camel.diagram.TopologyLayoutEngine.TopologyEdgeInfo;
+import org.apache.camel.diagram.TopologyLayoutEngine.TopologyLayoutEdge;
+import org.apache.camel.diagram.TopologyLayoutEngine.TopologyLayoutNode;
+import org.apache.camel.diagram.TopologyLayoutEngine.TopologyLayoutResult;
+import org.apache.camel.diagram.TopologyLayoutEngine.TopologyNodeInfo;
+import org.apache.camel.dsl.jbang.core.commands.ai.IntegrationSummary;
+import org.apache.camel.dsl.jbang.core.commands.tui.diagram.RouteDensity;
+import org.apache.camel.dsl.jbang.core.commands.tui.diagram.RouteDiagramWidget;
+import org.apache.camel.dsl.jbang.core.commands.tui.diagram.TopologyDiagramWidget;
+import org.apache.camel.dsl.jbang.core.commands.tui.diagram.TopologyZoom;
+import org.apache.camel.util.json.JsonArray;
+import org.apache.camel.util.json.JsonObject;
+
+import static org.apache.camel.dsl.jbang.core.commands.tui.DiagramLayouts.addParentNodes;
+import static org.apache.camel.dsl.jbang.core.commands.tui.DiagramLayouts.normalizeTopologyLayoutY;
+import static org.apache.camel.dsl.jbang.core.commands.tui.TuiHelper.*;
+import static org.apache.camel.dsl.jbang.core.commands.tui.TuiHelper.hint;
+
+class DiagramSupport {
+
+    // the border of the diagram panel: a screen where the keys move in the diagram gives it the focus border
+    Function<Boolean, Style> paneBorder = focused -> Style.EMPTY;
+
+    /** The width of a topology box in columns, as the layout engine draws it by default. */
+    static final int DEFAULT_BOX_COLUMNS = new TopologyLayoutEngine().getNodeWidth() / 15;
+    /** How wide a topology box may grow so its label and group tag fit on a line. */
+    static final int MAX_BOX_COLUMNS = 34;
+
+    private boolean showDiagram;
+    private boolean topologyMode;
+    private boolean showDescription;
+    /** The body types each step has been reached with, beside the arrows of the route diagram (CAMEL-25750). */
+    private boolean showBodyTypes;
+    private Path aiSourceDirectory;
+    /** The AI labels of the decision points of the routes shown, by their node (CAMEL-25161). */
+    private volatile Map<String, IntegrationSummary.StepLabel> stepLabels = Map.of();
+    private Map<String, List<TopologyDiagramWidget.NodeLine>> nodeLines = Map.of();
+    /** Routes highlighted in the topology: the routes of the capability the user came down from, and its name. */
+    private Set<String> focusRouteIds = Set.of();
+    private String focusName;
+    /** The group of each route in the topology, when groups are shown: tag lines and border colours. */
+    private Map<String, TopologyDiagramWidget.NodeLine> groupTags = Map.of();
+    private Map<String, Color> groupColors = Map.of();
+    private Line groupLegend;
+    /** Routes left out of the topology (the utility routes when hidden), and what the current layout was made for. */
+    private volatile Set<String> hiddenRouteIds = Set.of();
+    private Set<String> layoutHidden = Set.of();
+    // the error handling drawn in a frame of its own below the routes (x); off shows the happy path only
+    private volatile boolean showErrorPaths;
+    private boolean layoutShowErrorPaths;
+    private TopologyErrorFrame errorLayer;
+    // the error handling of each route, in a frame below its happy path, when shown (x)
+    private Map<String, RouteErrorFrame> routeErrorFrames = Map.of();
+    // the error paths of the topology, shown or not (an agent sees them in tui_get_topology)
+    private List<TopologyErrorFrame.ErrorPath> errorPaths = List.of();
+    // whether the integration reports error paths: its Camel is 4.23 or newer (older ones report calls only)
+    private boolean errorPathsKnown = true;
+    private int layoutBoxColumns = DEFAULT_BOX_COLUMNS;
+    private int scrollY;
+    private int scrollX;
+    private final ScrollbarState vScrollState = new ScrollbarState();
+    private final ScrollbarState hScrollState = new ScrollbarState();
+    private final AtomicBoolean loading = new AtomicBoolean(false);
+    private List<TopologyAsciiRenderer.NodeBox> nodeBoxes = Collections.emptyList();
+    private List<TopologyLayoutNode> topologyNodes = Collections.emptyList();
+    private List<TopologyLayoutEdge> topologyEdges = Collections.emptyList();
+    private int selectedNodeIndex = -1;
+    private String pendingSelectionRouteId;
+    private int lastVisibleHeight;
+    private int lastVisibleWidth;
+    private int lastAreaX;
+    private int lastAreaY;
+
+    // Native widget rendering data
+    private TopologyLayoutResult topologyLayout;
+    private int topologyNodeWidth;
+    private java.util.Map<String, RouteDiagramLayoutEngine.LayoutRoute> routeLayouts = Collections.emptyMap();
+    /** The group of each route, for folding a group into a box; the Diagram tab sets them as it draws. */
+    private volatile Map<String, RouteGroups.Tag> routeGroups = Map.of();
+
+    void setRouteGroups(Map<String, RouteGroups.Tag> groups) {
+        this.routeGroups = groups;
+    }
+
+    /** The density the topology was laid out with: the zoom's, or with fit the one chosen for the screen. */
+    private RouteDensity topologyDensity = RouteDensity.DETAILED;
+
+    RouteDensity getTopologyDensity() {
+        return topologyDensity;
+    }
+
+    /** The zoom of the route diagram, and its folded blocks; the tabs of the route diagram share theirs. */
+    RouteDiagramZoom zoom = new RouteDiagramZoom();
+    private String cachedPid;
+    private volatile boolean preloading;
+
+    // History diagram state
+    private boolean historyMode;
+    private List<String> historyNodeOrder = Collections.emptyList();
+    private int historyStepIndex;
+    private boolean historyFailed;
+
+    // History drill-down state (topology → route navigation)
+    private boolean historyTopologyMode;
+    private String historyDrillDownRouteId;
+    private final Deque<String> historyNavigationStack = new ArrayDeque<>();
+    private Map<String, String> historyNodeRouteMap = Collections.emptyMap();
+    private Set<String> historyRouteIds = Collections.emptySet();
+
+    boolean isShowDiagram() {
+        return showDiagram;
+    }
+
+    void setShowDiagram(boolean show) {
+        this.showDiagram = show;
+    }
+
+    boolean isLoading() {
+        return loading.get();
+    }
+
+    boolean isTopologyMode() {
+        return topologyMode;
+    }
+
+    void setTopologyMode(boolean topologyMode) {
+        this.topologyMode = topologyMode;
+    }
+
+    boolean isShowDescription() {
+        return showDescription;
+    }
+
+    void setShowDescription(boolean showDescription) {
+        this.showDescription = showDescription;
+    }
+
+    boolean isShowBodyTypes() {
+        return showBodyTypes;
+    }
+
+    void setShowBodyTypes(boolean showBodyTypes) {
+        this.showBodyTypes = showBodyTypes;
+    }
+
+    List<TopologyAsciiRenderer.NodeBox> getNodeBoxes() {
+        return nodeBoxes;
+    }
+
+    int getSelectedNodeIndex() {
+        return selectedNodeIndex;
+    }
+
+    void setSelectedNodeIndex(int idx) {
+        this.selectedNodeIndex = idx;
+    }
+
+    void setPendingSelectionRouteId(String routeId) {
+        this.pendingSelectionRouteId = routeId;
+    }
+
+    String getSelectedRouteId() {
+        if (selectedNodeIndex >= 0 && selectedNodeIndex < nodeBoxes.size()) {
+            return nodeBoxes.get(selectedNodeIndex).routeId();
+        }
+        return null;
+    }
+
+    int findNodeIndexByRouteId(String routeId) {
+        for (int i = 0; i < nodeBoxes.size(); i++) {
+            if (routeId.equals(nodeBoxes.get(i).routeId())) {
+                return i;
+            }
+        }
+        return -1;
+    }
+
+    TopologyLayoutNode getSelectedTopologyNode() {
+        String routeId = getSelectedRouteId();
+        if (routeId == null) {
+            return null;
+        }
+        for (TopologyLayoutNode node : topologyNodes) {
+            if (routeId.equals(node.routeId)) {
+                return node;
+            }
+        }
+        return null;
+    }
+
+    String getConnectedRouteId(String externalNodeId) {
+        for (TopologyLayoutEdge edge : topologyEdges) {
+            if (externalNodeId.equals(edge.from.routeId)) {
+                return edge.to.routeId;
+            }
+            if (externalNodeId.equals(edge.to.routeId)) {
+                return edge.from.routeId;
+            }
+        }
+        return null;
+    }
+
+    boolean hasDiagramData() {
+        return topologyLayout != null || !routeLayouts.isEmpty();
+    }
+
+    boolean hasNativeLayout() {
+        return topologyLayout != null;
+    }
+
+    TopologyLayoutResult getTopologyLayout() {
+        return topologyLayout;
+    }
+
+    int getTopologyNodeWidth() {
+        return topologyNodeWidth;
+    }
+
+    JsonObject getTopologyDataAsJson() {
+        TopologyLayoutResult layout = topologyLayout;
+        if (layout == null || layout.nodes.isEmpty()) {
+            return null;
+        }
+        JsonObject result = new JsonObject();
+
+        JsonArray nodesArr = new JsonArray();
+        for (TopologyLayoutNode node : layout.nodes) {
+            JsonObject n = new JsonObject();
+            n.put("routeId", node.routeId);
+            if (node.nodeType != null) {
+                n.put("nodeType", node.nodeType);
+            }
+            n.put("layer", node.layer);
+            if (node.description != null) {
+                n.put("description", node.description);
+            }
+            if (node.from != null) {
+                n.put("from", node.from);
+            }
+            if (node.connectionType != null) {
+                n.put("connectionType", node.connectionType);
+            }
+            n.put("exchangesTotal", node.exchangesTotal);
+            n.put("exchangesFailed", node.exchangesFailed);
+            nodesArr.add(n);
+        }
+        result.put("nodes", nodesArr);
+
+        JsonArray edgesArr = new JsonArray();
+        for (TopologyLayoutEdge edge : layout.edges) {
+            JsonObject e = new JsonObject();
+            e.put("from", edge.from.routeId);
+            e.put("to", edge.to.routeId);
+            if (edge.endpoint != null) {
+                e.put("endpoint", edge.endpoint);
+            }
+            if (edge.connectionType != null) {
+                e.put("connectionType", edge.connectionType);
+            }
+            e.put("selfLoop", edge.selfLoop);
+            e.put("backEdge", edge.backEdge);
+            edgesArr.add(e);
+        }
+        result.put("edges", edgesArr);
+
+        // the error paths, shown in the diagram or not (x): sent to only when a route handles a failure
+        JsonArray errorArr = new JsonArray();
+        for (TopologyErrorFrame.ErrorPath p : errorPaths) {
+            JsonObject e = new JsonObject();
+            e.put("from", p.fromRouteId());
+            e.put("to", p.toRouteId());
+            e.put("via", p.via());
+            if (p.handling() != null) {
+                e.put("handling", p.handling());
+            }
+            errorArr.add(e);
+        }
+        result.put("errorPaths", errorArr);
+        result.put("errorsShown", layoutShowErrorPaths && errorLayer != null);
+        if (!errorPathsKnown) {
+            result.put("errorPathsNote", "the integration runs a Camel before 4.23, which does not report error paths");
+        }
+
+        result.put("totalNodes", layout.nodes.size());
+        result.put("totalEdges", layout.edges.size());
+        return result;
+    }
+
+    JsonObject locateNodes(List<String> ids) {
+        if (ids == null || ids.isEmpty()) {
+            return null;
+        }
+        JsonArray matches = new JsonArray();
+        int minX = Integer.MAX_VALUE, minY = Integer.MAX_VALUE;
+        int maxX = Integer.MIN_VALUE, maxY = Integer.MIN_VALUE;
+
+        for (String id : ids) {
+            // search topology nodeBoxes by routeId
+            for (var nb : nodeBoxes) {
+                if (id.equals(nb.routeId())) {
+                    JsonObject m = nodeBoxToScreen(nb.startRow(), nb.endRow(), nb.startCol(), nb.endCol());
+                    m.put("node", id);
+                    matches.add(m);
+                    minX = Math.min(minX, m.getInteger("x"));
+                    minY = Math.min(minY, m.getInteger("y"));
+                    maxX = Math.max(maxX, m.getInteger("x") + m.getInteger("width"));
+                    maxY = Math.max(maxY, m.getInteger("y") + m.getInteger("height"));
+                    break;
+                }
+            }
+            // search eip nodeBoxes by nodeId
+            for (var nb : eipNodeBoxes) {
+                if (id.equals(nb.nodeId())) {
+                    JsonObject m = nodeBoxToScreen(nb.startRow(), nb.endRow(), nb.startCol(), nb.endCol());
+                    m.put("node", id);
+                    matches.add(m);
+                    minX = Math.min(minX, m.getInteger("x"));
+                    minY = Math.min(minY, m.getInteger("y"));
+                    maxX = Math.max(maxX, m.getInteger("x") + m.getInteger("width"));
+                    maxY = Math.max(maxY, m.getInteger("y") + m.getInteger("height"));
+                    break;
+                }
+            }
+        }
+        if (matches.isEmpty()) {
+            return null;
+        }
+        JsonObject result = new JsonObject();
+        result.put("matches", matches);
+        if (matches.size() > 1) {
+            JsonObject bounds = new JsonObject();
+            bounds.put("x", minX);
+            bounds.put("y", minY);
+            bounds.put("width", maxX - minX);
+            bounds.put("height", maxY - minY);
+            result.put("bounds", bounds);
+        }
+        return result;
+    }
+
+    private JsonObject nodeBoxToScreen(int startRow, int endRow, int startCol, int endCol) {
+        JsonObject m = new JsonObject();
+        m.put("x", lastAreaX + startCol - scrollX);
+        m.put("y", lastAreaY + startRow - scrollY);
+        m.put("width", endCol - startCol + 1);
+        m.put("height", endRow - startRow + 1);
+        return m;
+    }
+
+    /** The routes of the message history at the zoom as it is now (+, -, z), without loading them again. */
+    void zoomHistoryRoutes() {
+        routeLayouts = zoom.layoutWholeAgain(lastVisibleHeight, routeLayouts);
+    }
+
+    RouteDiagramLayoutEngine.LayoutRoute getRouteLayout(String routeId) {
+        return routeLayouts.get(routeId);
+    }
+
+    int getScrollX() {
+        return scrollX;
+    }
+
+    int getScrollY() {
+        return scrollY;
+    }
+
+    ScrollbarState getVScrollState() {
+        return vScrollState;
+    }
+
+    ScrollbarState getHScrollState() {
+        return hScrollState;
+    }
+
+    boolean handleScrollKeys(KeyEvent ke) {
+        if (!showDiagram) {
+            return false;
+        }
+        if (ke.isUp()) {
+            scrollY = Math.max(0, scrollY - 1);
+            return true;
+        }
+        if (ke.isDown()) {
+            scrollY++;
+            return true;
+        }
+        if (ke.isPageUp()) {
+            scrollY = Math.max(0, scrollY - 20);
+            return true;
+        }
+        if (ke.isPageDown()) {
+            scrollY += 20;
+            return true;
+        }
+        if (ke.isLeft()) {
+            scrollX = Math.max(0, scrollX - 1);
+            return true;
+        }
+        if (ke.isRight()) {
+            scrollX++;
+            return true;
+        }
+        if (ke.isHome()) {
+            scrollY = 0;
+            scrollX = 0;
+            return true;
+        }
+        if (ke.isEnd()) {
+            scrollY = Integer.MAX_VALUE;
+            return true;
+        }
+        return false;
+    }
+
+    private static final int MOUSE_SCROLL_LINES = 3;
+
+    /**
+     * Handle mouse scroll events for the diagram. Returns true if consumed.
+     */
+    boolean handleMouseScroll(MouseEvent me) {
+        if (!showDiagram) {
+            return false;
+        }
+        if (me.kind() == MouseEventKind.SCROLL_UP) {
+            scrollY = Math.max(0, scrollY - MOUSE_SCROLL_LINES);
+            return true;
+        }
+        if (me.kind() == MouseEventKind.SCROLL_DOWN) {
+            scrollY += MOUSE_SCROLL_LINES;
+            return true;
+        }
+        return false;
+    }
+
+    /**
+     * Handle a mouse click in the diagram area. Checks if the click falls on a topology node box and selects it.
+     * Returns the index of the clicked node, or -1 if no node was hit.
+     */
+    int handleNodeClick(MouseEvent me) {
+        if (!showDiagram || !me.isClick() || nodeBoxes.isEmpty()) {
+            return -1;
+        }
+        // Convert screen coordinates to diagram coordinates
+        int diagramCol = me.x() - lastAreaX + scrollX;
+        int diagramRow = me.y() - lastAreaY + scrollY;
+
+        for (int i = 0; i < nodeBoxes.size(); i++) {
+            TopologyAsciiRenderer.NodeBox nb = nodeBoxes.get(i);
+            if (diagramRow >= nb.startRow() && diagramRow <= nb.endRow()
+                    && diagramCol >= nb.startCol() && diagramCol <= nb.endCol()) {
+                selectedNodeIndex = i;
+                return i;
+            }
+        }
+        return -1;
+    }
+
+    /**
+     * Handle a mouse click in the route diagram area. Checks if the click falls on an EIP node box and selects it.
+     * Returns the index of the clicked EIP node, or -1 if no node was hit.
+     */
+    int handleEipNodeClick(MouseEvent me) {
+        if (!showDiagram || !me.isClick() || eipNodeBoxes.isEmpty()) {
+            return -1;
+        }
+        int diagramCol = me.x() - lastAreaX + scrollX;
+        int diagramRow = me.y() - lastAreaY + scrollY;
+
+        for (int i = 0; i < eipNodeBoxes.size(); i++) {
+            var nb = eipNodeBoxes.get(i);
+            if (diagramRow >= nb.startRow() && diagramRow <= nb.endRow()
+                    && diagramCol >= nb.startCol() && diagramCol <= nb.endCol()) {
+                selectedEipNodeIndex = i;
+                return i;
+            }
+        }
+        return -1;
+    }
+
+    void resetScroll() {
+        scrollY = 0;
+        scrollX = 0;
+    }
+
+    void scrollLeft() {
+        scrollX = Math.max(0, scrollX - 1);
+    }
+
+    void scrollRight() {
+        scrollX++;
+    }
+
+    void scrollHome() {
+        scrollY = 0;
+        scrollX = 0;
+    }
+
+    void toggleDiagram(Runnable loadTrigger) {
+        if (showDiagram) {
+            close();
+        } else {
+            loadTrigger.run();
+        }
+    }
+
+    boolean handleEscape() {
+        if (showDiagram) {
+            close();
+            return true;
+        }
+        return false;
+    }
+
+    void close() {
+        showDiagram = false;
+    }
+
+    void reset() {
+        close();
+        invalidateCache();
+    }
+
+    void invalidateCache() {
+        cachedPid = null;
+        nodeBoxes = Collections.emptyList();
+        topologyNodes = Collections.emptyList();
+        topologyEdges = Collections.emptyList();
+        topologyLayout = null;
+        topologyNodeWidth = 0;
+        routeLayouts = Collections.emptyMap();
+        selectedNodeIndex = -1;
+        eipNodeBoxes = Collections.emptyList();
+        selectedEipNodeIndex = -1;
+        scrollY = 0;
+        scrollX = 0;
+        historyMode = false;
+        historyNodeOrder = Collections.emptyList();
+        historyStepIndex = 0;
+        historyFailed = false;
+        historyTopologyMode = false;
+        historyDrillDownRouteId = null;
+        historyNavigationStack.clear();
+        historyNodeRouteMap = Collections.emptyMap();
+        historyRouteIds = Collections.emptySet();
+    }
+
+    boolean hasCachedData(String pid) {
+        return pid != null && pid.equals(cachedPid) && hasDiagramData();
+    }
+
+    void showCached() {
+        showDiagram = true;
+        scrollY = 0;
+        scrollX = 0;
+    }
+
+    void applyPendingSelection() {
+        if (pendingSelectionRouteId != null && !nodeBoxes.isEmpty()) {
+            int newIdx = -1;
+            for (int i = 0; i < nodeBoxes.size(); i++) {
+                if (pendingSelectionRouteId.equals(nodeBoxes.get(i).routeId())) {
+                    newIdx = i;
+                    break;
+                }
+            }
+            if (newIdx >= 0) {
+                selectedNodeIndex = newIdx;
+            }
+        }
+        pendingSelectionRouteId = null;
+    }
+
+    void preload(MonitorContext ctx, String pid) {
+        if (hasCachedData(pid)) {
+            return;
+        }
+        if (!beginLoad()) {
+            return;
+        }
+        preloading = true;
+        if (ctx.runner != null) {
+            ctx.backgroundExecutor.execute(() -> {
+                try {
+                    setTopologyMode(true);
+                    loadAllDiagramsInBackground(ctx, pid, false, 0);
+                } finally {
+                    endLoad();
+                }
+            });
+        } else {
+            endLoad();
+        }
+    }
+
+    void renderFooterHints(List<Span> spans) {
+        hint(spans, "d/Esc", "close");
+        hint(spans, TuiIcons.HINT_NAV, "scroll");
+        hint(spans, "PgUp/PgDn", "page");
+        hint(spans, "Home/End", "top/end");
+    }
+
+    // ---- Node selection ----
+
+    private static int findTopLeftNode(List<TopologyAsciiRenderer.NodeBox> boxes) {
+        int bestIdx = 0;
+        for (int i = 1; i < boxes.size(); i++) {
+            TopologyAsciiRenderer.NodeBox nb = boxes.get(i);
+            TopologyAsciiRenderer.NodeBox best = boxes.get(bestIdx);
+            if (nb.startRow() < best.startRow()
+                    || (nb.startRow() == best.startRow() && nb.startCol() < best.startCol())) {
+                bestIdx = i;
+            }
+        }
+        return bestIdx;
+    }
+
+    // ---- Node selection navigation ----
+
+    void selectNodeUp() {
+        if (nodeBoxes.isEmpty()) {
+            return;
+        }
+        if (selectedNodeIndex < 0) {
+            selectedNodeIndex = 0;
+            return;
+        }
+        TopologyAsciiRenderer.NodeBox current = nodeBoxes.get(selectedNodeIndex);
+        int currentMidCol = (current.startCol() + current.endCol()) / 2;
+        int bestIdx = -1;
+        int bestDist = Integer.MAX_VALUE;
+        for (int i = 0; i < nodeBoxes.size(); i++) {
+            TopologyAsciiRenderer.NodeBox nb = nodeBoxes.get(i);
+            if (nb.layer() < current.layer()) {
+                int midCol = (nb.startCol() + nb.endCol()) / 2;
+                int dist = Math.abs(midCol - currentMidCol);
+                if (nb.layer() > (bestIdx >= 0 ? nodeBoxes.get(bestIdx).layer() : -1) || dist < bestDist) {
+                    bestIdx = i;
+                    bestDist = dist;
+                }
+            }
+        }
+        if (bestIdx >= 0) {
+            // find the closest layer above, then pick closest column within that layer
+            int targetLayer = nodeBoxes.get(bestIdx).layer();
+            bestIdx = -1;
+            bestDist = Integer.MAX_VALUE;
+            for (int i = 0; i < nodeBoxes.size(); i++) {
+                TopologyAsciiRenderer.NodeBox nb = nodeBoxes.get(i);
+                if (nb.layer() == targetLayer) {
+                    int midCol = (nb.startCol() + nb.endCol()) / 2;
+                    int dist = Math.abs(midCol - currentMidCol);
+                    if (dist < bestDist) {
+                        bestIdx = i;
+                        bestDist = dist;
+                    }
+                }
+            }
+            if (bestIdx >= 0) {
+                selectedNodeIndex = bestIdx;
+            }
+        }
+    }
+
+    void selectNodeDown() {
+        if (nodeBoxes.isEmpty()) {
+            return;
+        }
+        if (selectedNodeIndex < 0) {
+            selectedNodeIndex = 0;
+            return;
+        }
+        TopologyAsciiRenderer.NodeBox current = nodeBoxes.get(selectedNodeIndex);
+        int currentMidCol = (current.startCol() + current.endCol()) / 2;
+        int bestIdx = -1;
+        for (int i = 0; i < nodeBoxes.size(); i++) {
+            TopologyAsciiRenderer.NodeBox nb = nodeBoxes.get(i);
+            if (nb.layer() > current.layer()) {
+                if (bestIdx < 0 || nb.layer() < nodeBoxes.get(bestIdx).layer()) {
+                    bestIdx = i;
+                }
+            }
+        }
+        if (bestIdx >= 0) {
+            int targetLayer = nodeBoxes.get(bestIdx).layer();
+            bestIdx = -1;
+            int bestDist = Integer.MAX_VALUE;
+            for (int i = 0; i < nodeBoxes.size(); i++) {
+                TopologyAsciiRenderer.NodeBox nb = nodeBoxes.get(i);
+                if (nb.layer() == targetLayer) {
+                    int midCol = (nb.startCol() + nb.endCol()) / 2;
+                    int dist = Math.abs(midCol - currentMidCol);
+                    if (dist < bestDist) {
+                        bestIdx = i;
+                        bestDist = dist;
+                    }
+                }
+            }
+            if (bestIdx >= 0) {
+                selectedNodeIndex = bestIdx;
+            }
+        }
+    }
+
+    void selectNodeLeft() {
+        if (nodeBoxes.isEmpty()) {
+            return;
+        }
+        if (selectedNodeIndex < 0) {
+            selectedNodeIndex = 0;
+            return;
+        }
+        TopologyAsciiRenderer.NodeBox current = nodeBoxes.get(selectedNodeIndex);
+        int bestIdx = -1;
+        int bestCol = -1;
+        for (int i = 0; i < nodeBoxes.size(); i++) {
+            TopologyAsciiRenderer.NodeBox nb = nodeBoxes.get(i);
+            if (nb.layer() == current.layer() && nb.startCol() < current.startCol()) {
+                if (nb.startCol() > bestCol) {
+                    bestIdx = i;
+                    bestCol = nb.startCol();
+                }
+            }
+        }
+        if (bestIdx >= 0) {
+            selectedNodeIndex = bestIdx;
+        }
+    }
+
+    void selectNodeRight() {
+        if (nodeBoxes.isEmpty()) {
+            return;
+        }
+        if (selectedNodeIndex < 0) {
+            selectedNodeIndex = 0;
+            return;
+        }
+        TopologyAsciiRenderer.NodeBox current = nodeBoxes.get(selectedNodeIndex);
+        int bestIdx = -1;
+        int bestCol = Integer.MAX_VALUE;
+        for (int i = 0; i < nodeBoxes.size(); i++) {
+            TopologyAsciiRenderer.NodeBox nb = nodeBoxes.get(i);
+            if (nb.layer() == current.layer() && nb.startCol() > current.startCol()) {
+                if (nb.startCol() < bestCol) {
+                    bestIdx = i;
+                    bestCol = nb.startCol();
+                }
+            }
+        }
+        if (bestIdx >= 0) {
+            selectedNodeIndex = bestIdx;
+        }
+    }
+
+    void selectFirstNode() {
+        if (nodeBoxes.isEmpty()) {
+            return;
+        }
+        int bestIdx = 0;
+        for (int i = 1; i < nodeBoxes.size(); i++) {
+            var best = nodeBoxes.get(bestIdx);
+            var nb = nodeBoxes.get(i);
+            if (nb.startRow() < best.startRow()
+                    || (nb.startRow() == best.startRow() && nb.startCol() < best.startCol())) {
+                bestIdx = i;
+            }
+        }
+        selectedNodeIndex = bestIdx;
+    }
+
+    void selectLastNode() {
+        if (nodeBoxes.isEmpty()) {
+            return;
+        }
+        int bestIdx = 0;
+        for (int i = 1; i < nodeBoxes.size(); i++) {
+            var best = nodeBoxes.get(bestIdx);
+            var nb = nodeBoxes.get(i);
+            if (nb.startRow() > best.startRow()
+                    || (nb.startRow() == best.startRow() && nb.startCol() > best.startCol())) {
+                bestIdx = i;
+            }
+        }
+        selectedNodeIndex = bestIdx;
+    }
+
+    void scrollToSelectedNode() {
+        if (selectedNodeIndex < 0 || selectedNodeIndex >= nodeBoxes.size()) {
+            return;
+        }
+        TopologyAsciiRenderer.NodeBox box = nodeBoxes.get(selectedNodeIndex);
+        if (lastVisibleHeight > 0) {
+            if (box.startRow() < scrollY + 1) {
+                scrollY = Math.max(0, box.startRow() - 1);
+            }
+            if (box.endRow() >= scrollY + lastVisibleHeight - 1) {
+                scrollY = box.endRow() - lastVisibleHeight + 2;
+            }
+        }
+        if (lastVisibleWidth > 0) {
+            if (box.startCol() < scrollX + 1) {
+                scrollX = Math.max(0, box.startCol() - 1);
+            }
+            if (box.endCol() >= scrollX + lastVisibleWidth - 1) {
+                scrollX = box.endCol() - lastVisibleWidth + 2;
+            }
+        }
+    }
+
+    private List<TopologyAsciiRenderer.NodeBox> computeNodeBoxes(
+            TopologyLayoutResult result, int nodeW, boolean metrics) {
+        int bw = Math.max(16, nodeW / 15);
+        List<TopologyAsciiRenderer.NodeBox> boxes = new ArrayList<>();
+        for (TopologyLayoutNode node : result.nodes) {
+            int col = nodeW == 0 ? 0 : node.x * bw / nodeW;
+            int row = node.y / 20;
+            boolean ext = "external-in".equals(node.nodeType) || "external-out".equals(node.nodeType)
+                    || "external".equals(node.nodeType);
+            int contentLines;
+            if (ext) {
+                contentLines = 1;
+                if (metrics && node.exchangesTotal > 0) {
+                    contentLines++;
+                }
+            } else {
+                contentLines = 3; // routeId + from (2 lines reserved)
+                if (metrics) {
+                    contentLines++;
+                }
+                contentLines = Math.min(contentLines, 4);
+            }
+            int height = 2 + contentLines;
+            boxes.add(new TopologyAsciiRenderer.NodeBox(
+                    node.routeId, row, row + height - 1, col, col + bw - 1, node.layer));
+        }
+        return boxes;
+    }
+
+    /**
+     * Shows a topology whose nodes are not the running routes, such as the architecture view (CAMEL-25147): the nodes
+     * and edges are laid out as the route topology is, and each box shows the given lines. Selection and scrolling work
+     * as in the route topology; the node ids are what {@link #getSelectedRouteId()} returns.
+     *
+     * @param select the node to select, or null for the first
+     */
+    void showCustomTopology(
+            List<TopologyNodeInfo> nodes, List<TopologyEdgeInfo> edges,
+            Map<String, List<TopologyDiagramWidget.NodeLine>> lines, String select) {
+        DiagramLayouts.Custom custom
+                = DiagramLayouts.layoutCustom(nodes, edges, lines, zoom, lastVisibleHeight, lastVisibleWidth);
+        TopologyLayoutResult result = custom.layout();
+        topologyDensity = custom.density();
+        topologyLayout = result;
+        topologyNodeWidth = custom.nodeWidth();
+        topologyNodes = result.nodes;
+        topologyEdges = result.edges;
+        nodeLines = lines;
+        nodeBoxes = computeNodeBoxes(result, topologyNodeWidth, false);
+        int idx = select != null ? findNodeIndexByRouteId(select) : -1;
+        selectedNodeIndex = idx >= 0 ? idx : nodeBoxes.isEmpty() ? -1 : 0;
+        scrollX = 0;
+        scrollY = 0;
+        topologyMode = true;
+        showDiagram = true;
+    }
+
+    /** The topology as it is laid out and scrolled now. */
+    private TopologyDiagramWidget topologyWidget(boolean metrics) {
+        return new TopologyDiagramWidget(
+                topologyLayout, topologyNodeWidth, selectedNodeIndex, scrollX, scrollY, metrics, showDescription,
+                highlightRouteIds(), false)
+                .withAiDescriptions(aiDescriptions(), Theme.aiAssisted()).withNodeLines(nodeLines)
+                .withGroups(groupTags, groupColors).withErrorLayer(layoutShowErrorPaths ? errorLayer : null)
+                .withErrorMarks(errorMarkRouteIds()).withDensity(topologyDensity)
+                .withFlow(zoom.flow(), zoom.flowFeed());
+    }
+
+    /** A layout engine whose boxes the widget draws the given number of columns wide. */
+    static TopologyLayoutEngine engineFor(int columns) {
+        // the engine scales the width it is given; the widget draws its node width / 15 columns
+        int scale = Math.max(1, new TopologyLayoutEngine().getNodeWidth() / TopologyLayoutEngine.DEFAULT_NODE_WIDTH);
+        return new TopologyLayoutEngine((columns * 15 + scale - 1) / scale);
+    }
+
+    /** The groups of the topology with their colours, shown at the bottom of its frame; null for none. */
+    void setGroupLegend(Line legend) {
+        this.groupLegend = legend;
+    }
+
+    /** Leaves routes out of the topology from its next load; empty shows all. */
+    void setHiddenRoutes(Set<String> routeIds) {
+        this.hiddenRouteIds = routeIds != null ? Set.copyOf(routeIds) : Set.of();
+    }
+
+    /**
+     * How wide the topology boxes should be: as wide as the longest label or group tag a box shows on one line, from
+     * the default up to {@link #MAX_BOX_COLUMNS}. A longer label wraps as before.
+     */
+    int wantedBoxColumns() {
+        int longest = 0;
+        if (showDescription) {
+            for (Map.Entry<String, String> e : aiDescriptions().entrySet()) {
+                if (!hiddenRouteIds.contains(e.getKey())) {
+                    longest = Math.max(longest, IntegrationSummary.AI_MARK.length() + 1 + e.getValue().length());
+                }
+            }
+            for (TopologyLayoutNode n : topologyNodes) {
+                if (n.description != null && n.routeId != null && !hiddenRouteIds.contains(n.routeId)) {
+                    longest = Math.max(longest, n.description.length());
+                }
+            }
+        }
+        for (Map.Entry<String, TopologyDiagramWidget.NodeLine> e : groupTags.entrySet()) {
+            if (!hiddenRouteIds.contains(e.getKey())) {
+                longest = Math.max(longest, e.getValue().text().length());
+            }
+        }
+        // two border columns and a space of padding each side
+        return Math.max(DEFAULT_BOX_COLUMNS, Math.min(MAX_BOX_COLUMNS, longest + 4));
+    }
+
+    /** Whether the topology was laid out for other hidden routes or another box width, and needs a new load. */
+    boolean isTopologyStale() {
+        return !hiddenRouteIds.equals(layoutHidden) || wantedBoxColumns() != layoutBoxColumns
+                || showErrorPaths != layoutShowErrorPaths;
+    }
+
+    boolean isShowErrorPaths() {
+        return showErrorPaths;
+    }
+
+    void setShowErrorPaths(boolean show) {
+        this.showErrorPaths = show;
+    }
+
+    /** The routes with error handling (that send somewhere when they handle a failure), for the mark on their box. */
+    Set<String> errorMarkRouteIds() {
+        Set<String> answer = new HashSet<>();
+        for (TopologyErrorFrame.ErrorPath p : errorPaths) {
+            answer.add(p.fromRouteId());
+        }
+        return answer;
+    }
+
+    /** The error paths of the topology last loaded, whether shown or not. */
+    List<TopologyErrorFrame.ErrorPath> getErrorPaths() {
+        return errorPaths;
+    }
+
+    /** Whether the integration reports error paths: Camel 4.23 or newer. */
+    boolean isErrorPathsKnown() {
+        return errorPathsKnown;
+    }
+
+    /** The error frame of a route in the route view: its onException blocks, where its failures go and come from. */
+    /** Leaves out the hidden routes, the links to and from them, and external systems only they used. */
+    static void removeRoutes(List<TopologyNodeInfo> nodes, List<TopologyEdgeInfo> edges, Set<String> hidden) {
+        if (hidden.isEmpty()) {
+            return;
+        }
+        nodes.removeIf(n -> n.routeId != null && hidden.contains(n.routeId));
+        edges.removeIf(e -> hidden.contains(e.fromRouteId) || hidden.contains(e.toRouteId));
+        Set<String> linked = new HashSet<>();
+        for (TopologyEdgeInfo e : edges) {
+            linked.add(e.fromRouteId);
+            linked.add(e.toRouteId);
+        }
+        nodes.removeIf(n -> n.nodeType != null && n.nodeType.startsWith("external") && !linked.contains(n.routeId));
+    }
+
+    /**
+     * The routes to highlight: those of a capability in focus, or, when a route of the error frame is selected, the
+     * routes whose error handling sends to it.
+     */
+    private Set<String> highlightRouteIds() {
+        if (!focusRouteIds.isEmpty() || !layoutShowErrorPaths || errorLayer == null) {
+            return focusRouteIds;
+        }
+        String selected = getSelectedRouteId();
+        if (selected == null || !errorLayer.routeIds().contains(selected)) {
+            return focusRouteIds;
+        }
+        Set<String> answer = new HashSet<>();
+        answer.add(selected);
+        for (TopologyErrorFrame.ErrorPath p : errorLayer.paths()) {
+            if (selected.equals(p.toRouteId())) {
+                answer.add(p.fromRouteId());
+            }
+        }
+        return answer;
+    }
+
+    /** Highlights routes in the topology (the routes of a capability); null clears it. */
+    void setFocus(Set<String> routeIds, String name) {
+        this.focusRouteIds = routeIds != null ? routeIds : Set.of();
+        this.focusName = routeIds != null ? name : null;
+    }
+
+    /** Shows each route's group in the topology; empty maps hide them. */
+    void setGroups(Map<String, TopologyDiagramWidget.NodeLine> tags, Map<String, Color> colors) {
+        this.groupTags = tags;
+        this.groupColors = colors;
+    }
+
+    String getFocusName() {
+        return focusName;
+    }
+
+    /** Where the AI-assisted route descriptions of the project come from (CAMEL-25143). */
+    void setAiSourceDirectory(Path dir) {
+        this.aiSourceDirectory = dir;
+    }
+
+    private Map<String, String> aiDescriptions() {
+        return showDescription ? IntegrationSummaryHints.descriptionsIfEnabled(aiSourceDirectory) : Map.of();
+    }
+
+    /** A route in words in the business view: its description, else its AI label (marked); null otherwise. */
+    String routeLabel(String routeId) {
+        if (!showDescription || routeId == null) {
+            return null;
+        }
+        String label = computeRouteDescriptions().get(routeId);
+        return label != null && !label.isBlank() ? label : null;
+    }
+
+    /** What the AI wrote about a decision point of a route shown, or null. */
+    IntegrationSummary.StepLabel stepLabel(String routeId, String nodeId) {
+        return routeId != null && nodeId != null ? stepLabels.get(RouteStepHints.key(routeId, nodeId)) : null;
+    }
+
+    /**
+     * The title with the AI-assisted mark when a box of the topology shows an AI description: a route without a
+     * description of its own that the AI project overview described.
+     */
+    private Line withAiMark(Line title) {
+        Map<String, String> ai = aiDescriptions();
+        if (ai.isEmpty() || topologyLayout == null) {
+            return title;
+        }
+        boolean shown = topologyLayout.nodes.stream().anyMatch(n -> n.routeId != null && ai.containsKey(n.routeId)
+                && (n.description == null || n.description.isBlank()));
+        if (!shown) {
+            return title;
+        }
+        List<Span> spans = new ArrayList<>(title.spans());
+        spans.add(Span.styled(" " + IntegrationSummary.AI_MARK + " ", Theme.aiAssisted()));
+        return Line.from(spans);
+    }
+
+    void renderNativeDiagram(Frame frame, Rect area, Line title, boolean metrics) {
+        Block.Builder builder = Block.builder()
+                .borderType(BorderType.ROUNDED).borders(Borders.ALL).borderStyle(paneBorder.apply(true))
+                .title(Title.from(withAiMark(title)));
+        if (groupLegend != null) {
+            builder.titleBottom(Title.from(groupLegend));
+        }
+        Block block = builder.build();
+        frame.renderWidget(block, area);
+
+        Rect inner = block.inner(area);
+
+        var widget = topologyWidget(metrics);
+
+        int totalRows = widget.getTotalRows();
+        int totalCols = widget.getTotalCols();
+        int visibleLines = Math.max(1, inner.height() - 1);
+        int visibleCols = Math.max(1, inner.width() - 1);
+        lastVisibleHeight = visibleLines;
+        lastVisibleWidth = visibleCols;
+
+        int maxVScroll = Math.max(0, totalRows - visibleLines);
+        int maxHScroll = Math.max(0, totalCols - visibleCols);
+        scrollY = Math.min(scrollY, maxVScroll);
+        scrollX = Math.min(scrollX, maxHScroll);
+
+        // Re-create widget with clamped scroll
+        var finalWidget = topologyWidget(metrics);
+
+        List<Rect> vChunks = Layout.vertical()
+                .constraints(Constraint.fill(), Constraint.length(1))
+                .split(inner);
+
+        List<Rect> hChunks = Layout.horizontal()
+                .constraints(Constraint.fill(), Constraint.length(1))
+                .split(vChunks.get(0));
+
+        Rect widgetArea = hChunks.get(0);
+        frame.renderWidget(finalWidget, widgetArea);
+        lastAreaX = widgetArea.x();
+        lastAreaY = widgetArea.y();
+
+        // Update nodeBoxes from widget
+        List<TopologyAsciiRenderer.NodeBox> widgetBoxes = new ArrayList<>();
+        for (var nb : finalWidget.getNodeBoxes()) {
+            widgetBoxes.add(new TopologyAsciiRenderer.NodeBox(
+                    nb.routeId(), nb.startRow(), nb.endRow(), nb.startCol(), nb.endCol(), nb.layer()));
+        }
+        if (!widgetBoxes.isEmpty()) {
+            nodeBoxes = widgetBoxes;
+        }
+
+        vScrollState.contentLength(totalRows);
+        vScrollState.viewportContentLength(visibleLines);
+        vScrollState.position(scrollY);
+        frame.renderStatefulWidget(
+                Scrollbar.builder().build(),
+                hChunks.get(1), vScrollState);
+
+        if (totalCols > visibleCols) {
+            hScrollState.contentLength(totalCols);
+            hScrollState.viewportContentLength(visibleCols);
+            hScrollState.position(scrollX);
+            frame.renderStatefulWidget(
+                    Scrollbar.horizontal(),
+                    vChunks.get(1), hScrollState);
+        }
+
+        if (zoom.isPanels()) {
+            renderTreePreview(frame, hChunks.get(0), getSelectedRouteId());
+        }
+    }
+
+    private void renderTreePreview(Frame frame, Rect area, String routeId) {
+        if (routeId == null) {
+            return;
+        }
+        RouteDiagramLayoutEngine.LayoutRoute routeLayout = routeLayouts.get(routeId);
+        if (routeLayout == null || routeLayout.nodes.isEmpty()) {
+            return;
+        }
+
+        int previewW = Math.min(38, area.width() / 3);
+        int previewH = Math.min(10, area.height() / 2);
+        if (previewW < 10 || previewH < 4 || area.width() < 40 || area.height() < 12) {
+            return;
+        }
+
+        int previewX = area.x() + area.width() - previewW - 1;
+        int previewY = area.y() + area.height() - previewH - 1;
+        Rect previewRect = new Rect(previewX, previewY, previewW, previewH);
+
+        frame.renderWidget(Clear.INSTANCE, previewRect);
+
+        Block previewBlock = Block.builder()
+                .borderType(BorderType.ROUNDED).borders(Borders.ALL)
+                .title(DiagramPanels.title("Route"))
+                .build();
+        frame.renderWidget(previewBlock, previewRect);
+
+        Rect innerRect = previewBlock.inner(previewRect);
+        RouteDiagramLayoutEngine.TreeNode selectedTreeNode = null;
+        var selectedBox = getSelectedEipNodeBox();
+        if (selectedBox != null && selectedBox.layoutNode() != null) {
+            selectedTreeNode = selectedBox.layoutNode().treeNode;
+        }
+        List<Line> treeLines = RouteTreePreview.buildTree(
+                routeLayout, innerRect.height(), innerRect.width(), selectedTreeNode);
+        frame.renderWidget(Paragraph.builder().text(Text.from(treeLines)).build(), innerRect);
+    }
+
+    // ---- Route EIP node selection ----
+
+    private List<RouteDiagramWidget.EipNodeBox> eipNodeBoxes
+            = Collections.emptyList();
+    private int selectedEipNodeIndex = -1;
+
+    List<RouteDiagramWidget.EipNodeBox> getEipNodeBoxes() {
+        return eipNodeBoxes;
+    }
+
+    int getSelectedEipNodeIndex() {
+        return selectedEipNodeIndex;
+    }
+
+    void setSelectedEipNodeIndex(int idx) {
+        this.selectedEipNodeIndex = idx;
+    }
+
+    void selectFromNode(String routeId) {
+        selectedEipNodeIndex = 0;
+    }
+
+    RouteDiagramWidget.EipNodeBox getSelectedEipNodeBox() {
+        if (selectedEipNodeIndex >= 0 && selectedEipNodeIndex < eipNodeBoxes.size()) {
+            return eipNodeBoxes.get(selectedEipNodeIndex);
+        }
+        return null;
+    }
+
+    int findEipNodeIndexByNodeId(String nodeId) {
+        for (int i = 0; i < eipNodeBoxes.size(); i++) {
+            if (nodeId.equals(eipNodeBoxes.get(i).nodeId())) {
+                return i;
+            }
+        }
+        return -1;
+    }
+
+    /**
+     * Finds the route ID that the selected EIP node links to, by matching the node's endpoint URI against topology
+     * edges and route "from" endpoints.
+     */
+    String findLinkedRouteId(String currentRouteId) {
+        var box = getSelectedEipNodeBox();
+        if (box == null || box.layoutNode() == null || box.layoutNode().treeNode == null) {
+            return null;
+        }
+        String type = box.type();
+        if (type == null) {
+            return null;
+        }
+        // Only "to"-style nodes can link to other routes
+        if (!"to".equals(type) && !"toD".equals(type) && !"case".equals(type) && !"wireTap".equals(type)
+                && !"enrich".equals(type) && !"pollEnrich".equals(type)
+                && !"from".equals(type)) {
+            return null;
+        }
+        String baseUri = getBaseUri(box.layoutNode().treeNode.info);
+        if (baseUri == null || baseUri.isBlank()) {
+            return null;
+        }
+
+        // First try topology edges for direct matching
+        for (TopologyLayoutEdge edge : topologyEdges) {
+            if ("from".equals(type)) {
+                // "from" node: find route that sends TO this endpoint
+                if (currentRouteId.equals(edge.to.routeId) && !currentRouteId.equals(edge.from.routeId)) {
+                    String resolved = resolveThrough(edge.from.routeId, currentRouteId);
+                    if (resolved != null) {
+                        return resolved;
+                    }
+                    return edge.from.routeId;
+                }
+            } else {
+                // "to" node: find route that consumes FROM this endpoint
+                if (currentRouteId.equals(edge.from.routeId) && !currentRouteId.equals(edge.to.routeId)) {
+                    String targetFrom = stripQueryParams(edge.to.from);
+                    if (baseUri.equals(targetFrom)) {
+                        String resolved = resolveThrough(edge.to.routeId, currentRouteId);
+                        if (resolved != null) {
+                            return resolved;
+                        }
+                        return edge.to.routeId;
+                    }
+                }
+            }
+        }
+
+        // Fallback: match uri against the routes in routeLayouts, which has the routes hidden in the topology too
+        // (utility routes turned off), whose edges are left out
+        for (var entry : routeLayouts.entrySet()) {
+            if (currentRouteId.equals(entry.getKey())) {
+                continue;
+            }
+            RouteErrorFrame frame = layoutShowErrorPaths ? routeErrorFrames.get(entry.getKey()) : null;
+            if ("from".equals(type)
+                    ? RouteLinks.sendsTo(entry.getValue(), baseUri, frame)
+                    : baseUri.equals(RouteLinks.fromUri(entry.getValue()))) {
+                return entry.getKey();
+            }
+        }
+        return null;
+    }
+
+    private String resolveThrough(String nodeId, String excludeRouteId) {
+        if (!"external".equals(findNodeType(nodeId))) {
+            return null;
+        }
+        for (TopologyLayoutEdge e : topologyEdges) {
+            if (nodeId.equals(e.from.routeId) && !excludeRouteId.equals(e.to.routeId)) {
+                return e.to.routeId;
+            }
+            if (nodeId.equals(e.to.routeId) && !excludeRouteId.equals(e.from.routeId)) {
+                return e.from.routeId;
+            }
+        }
+        return null;
+    }
+
+    private String findNodeType(String nodeId) {
+        for (TopologyLayoutNode n : topologyNodes) {
+            if (nodeId.equals(n.routeId)) {
+                return n.nodeType;
+            }
+        }
+        return null;
+    }
+
+    static String getBaseUri(RouteDiagramLayoutEngine.NodeInfo info) {
+        String uri = info.uri;
+        if (uri == null) {
+            uri = extractUriFromCode(info.code);
+        }
+        return stripQueryParams(uri);
+    }
+
+    private static String extractUriFromCode(String code) {
+        if (code == null) {
+            return null;
+        }
+        int open = code.indexOf('[');
+        int close = code.lastIndexOf(']');
+        return (open >= 0 && close > open) ? code.substring(open + 1, close) : code;
+    }
+
+    static String stripQueryParams(String uri) {
+        if (uri == null) {
+            return null;
+        }
+        int q = uri.indexOf('?');
+        return q >= 0 ? uri.substring(0, q) : uri;
+    }
+
+    void selectEipNodeUp() {
+        if (eipNodeBoxes.isEmpty()) {
+            return;
+        }
+        if (selectedEipNodeIndex < 0) {
+            selectedEipNodeIndex = 0;
+            return;
+        }
+        // Move to previous node in list (follow flow upward)
+        if (selectedEipNodeIndex > 0) {
+            selectedEipNodeIndex--;
+        }
+    }
+
+    void selectEipNodeDown() {
+        if (eipNodeBoxes.isEmpty()) {
+            return;
+        }
+        if (selectedEipNodeIndex < 0) {
+            selectedEipNodeIndex = 0;
+            return;
+        }
+        if (selectedEipNodeIndex < eipNodeBoxes.size() - 1) {
+            selectedEipNodeIndex++;
+        }
+    }
+
+    void selectEipNodeLeft() {
+        if (eipNodeBoxes.isEmpty() || selectedEipNodeIndex < 0) {
+            return;
+        }
+        var current = eipNodeBoxes.get(selectedEipNodeIndex);
+        int bestIdx = -1;
+        int bestCol = -1;
+        for (int i = 0; i < eipNodeBoxes.size(); i++) {
+            var nb = eipNodeBoxes.get(i);
+            if (nb.startCol() < current.startCol()
+                    && Math.abs(nb.startRow() - current.startRow()) <= 2) {
+                if (nb.startCol() > bestCol) {
+                    bestIdx = i;
+                    bestCol = nb.startCol();
+                }
+            }
+        }
+        if (bestIdx >= 0) {
+            selectedEipNodeIndex = bestIdx;
+        }
+    }
+
+    void selectEipNodeRight() {
+        if (eipNodeBoxes.isEmpty() || selectedEipNodeIndex < 0) {
+            return;
+        }
+        var current = eipNodeBoxes.get(selectedEipNodeIndex);
+        int bestIdx = -1;
+        int bestCol = Integer.MAX_VALUE;
+        for (int i = 0; i < eipNodeBoxes.size(); i++) {
+            var nb = eipNodeBoxes.get(i);
+            if (nb.startCol() > current.startCol()
+                    && Math.abs(nb.startRow() - current.startRow()) <= 2) {
+                if (nb.startCol() < bestCol) {
+                    bestIdx = i;
+                    bestCol = nb.startCol();
+                }
+            }
+        }
+        if (bestIdx >= 0) {
+            selectedEipNodeIndex = bestIdx;
+        }
+    }
+
+    void selectFirstEipNode() {
+        if (eipNodeBoxes.isEmpty()) {
+            return;
+        }
+        int bestIdx = 0;
+        for (int i = 1; i < eipNodeBoxes.size(); i++) {
+            var best = eipNodeBoxes.get(bestIdx);
+            var nb = eipNodeBoxes.get(i);
+            if (nb.startRow() < best.startRow()
+                    || (nb.startRow() == best.startRow() && nb.startCol() < best.startCol())) {
+                bestIdx = i;
+            }
+        }
+        selectedEipNodeIndex = bestIdx;
+    }
+
+    void selectLastEipNode() {
+        if (eipNodeBoxes.isEmpty()) {
+            return;
+        }
+        int bestIdx = 0;
+        for (int i = 1; i < eipNodeBoxes.size(); i++) {
+            var best = eipNodeBoxes.get(bestIdx);
+            var nb = eipNodeBoxes.get(i);
+            if (nb.startRow() > best.startRow()
+                    || (nb.startRow() == best.startRow() && nb.startCol() > best.startCol())) {
+                bestIdx = i;
+            }
+        }
+        selectedEipNodeIndex = bestIdx;
+    }
+
+    void scrollToSelectedEipNode() {
+        if (selectedEipNodeIndex < 0 || selectedEipNodeIndex >= eipNodeBoxes.size()) {
+            return;
+        }
+        var box = eipNodeBoxes.get(selectedEipNodeIndex);
+        if (lastVisibleHeight > 0) {
+            if (box.startRow() < scrollY + 1) {
+                scrollY = Math.max(0, box.startRow() - 1);
+            }
+            if (box.endRow() >= scrollY + lastVisibleHeight - 1) {
+                scrollY = box.endRow() - lastVisibleHeight + 2;
+            }
+        }
+        if (lastVisibleWidth > 0) {
+            if (box.startCol() < scrollX + 1) {
+                scrollX = Math.max(0, box.startCol() - 1);
+            }
+            if (box.endCol() >= scrollX + lastVisibleWidth - 1) {
+                scrollX = box.endCol() - lastVisibleWidth + 2;
+            }
+        }
+    }
+
+    /**
+     * Computes a mapping from base endpoint URI to target route ID for navigable links from the current route.
+     */
+    private Map<String, String> computeLinkableEndpoints(String currentRouteId) {
+        return RouteLinks.linkable(currentRouteId, routeLayouts, layoutShowErrorPaths ? routeErrorFrames : Map.of());
+    }
+
+    private Map<String, String> computeRouteDescriptions() {
+        Map<String, String> descriptions = new HashMap<>();
+        for (var entry : routeLayouts.entrySet()) {
+            var lr = entry.getValue();
+            for (var node : lr.nodes) {
+                if ("route".equals(node.type) && node.treeNode != null) {
+                    String desc = node.treeNode.info.description;
+                    if (desc != null && !desc.isBlank()) {
+                        descriptions.put(entry.getKey(), desc);
+                    }
+                    break;
+                }
+            }
+        }
+        // a route without a description of its own shows the AI's label, marked
+        IntegrationSummaryHints.descriptionsIfEnabled(aiSourceDirectory)
+                .forEach((id, d) -> descriptions.putIfAbsent(id, IntegrationSummaryHints.MARK + d));
+        return descriptions;
+    }
+
+    private static Set<String> parseExternalUris(JsonObject topoJson) {
+        Set<String> uris = new HashSet<>();
+        JsonArray arr = topoJson.getJsonArray("externalEndpoints");
+        if (arr == null) {
+            return uris;
+        }
+        for (int i = 0; i < arr.size(); i++) {
+            JsonObject eo = arr.getJsonObject(i);
+            String uri = eo.getString("uri");
+            if (uri != null) {
+                String base = stripQueryParams(uri);
+                if (base != null) {
+                    uris.add(base);
+                }
+            }
+        }
+        return uris;
+    }
+
+    void renderNativeRouteDiagram(
+            Frame frame, Rect area, Line title, boolean metrics,
+            String currentRouteId, RouteDiagramLayoutEngine.LayoutRoute routeLayout) {
+        Block block = Block.builder().borderType(BorderType.ROUNDED).borders(Borders.ALL)
+                .borderStyle(paneBorder.apply(true)).title(Title.from(title)).build();
+        frame.renderWidget(block, area);
+
+        Rect inner = block.inner(area);
+        int nw = zoom.nodeWidthOf(routeLayout);
+        Map<String, String> linkable = computeLinkableEndpoints(currentRouteId);
+        Map<String, String> routeDescs = showDescription ? computeRouteDescriptions() : Collections.emptyMap();
+
+        RouteDiagramZoom.Restore restore = zoom.restore(routeLayout);
+        if (restore != null) {
+            // zoomed or folded: the selected step stays on its row of the screen, unless the whole route fits on it
+            selectedEipNodeIndex = restore.index();
+            boolean fits = RouteDensity.rows(routeLayout) <= lastVisibleHeight;
+            scrollY = fits ? 0 : Math.max(0, restore.row() - restore.screenRow());
+        }
+        // built again once the scroll is clamped to its size
+        Supplier<RouteDiagramWidget> widgets = () -> new RouteDiagramWidget(
+                routeLayout, nw, selectedEipNodeIndex, scrollX, scrollY, metrics, linkable,
+                showDescription, routeDescs)
+                .withDensity(zoom.densityOf(routeLayout)).withFoldedSteps(zoom.foldedStepsOf(routeLayout))
+                .withErrorFrame(layoutShowErrorPaths ? routeErrorFrames.get(currentRouteId) : null)
+                .withErrorMark(errorMarkRouteIds().contains(currentRouteId))
+                .withBodyTypes(showBodyTypes).withBodyKindMarks(true).withFlow(zoom.flow());
+        var widget = widgets.get();
+
+        int totalRows = widget.getTotalRows();
+        int totalCols = widget.getTotalCols();
+        int visibleLines = Math.max(1, inner.height() - 1);
+        int visibleCols = Math.max(1, inner.width() - 1);
+        lastVisibleHeight = visibleLines;
+        lastVisibleWidth = visibleCols;
+
+        int maxVScroll = Math.max(0, totalRows - visibleLines);
+        int maxHScroll = Math.max(0, totalCols - visibleCols);
+        scrollY = Math.min(scrollY, maxVScroll);
+        scrollX = Math.min(scrollX, maxHScroll);
+
+        var finalWidget = widgets.get();
+
+        List<Rect> vChunks = Layout.vertical()
+                .constraints(Constraint.fill(), Constraint.length(1))
+                .split(inner);
+
+        List<Rect> hChunks = Layout.horizontal()
+                .constraints(Constraint.fill(), Constraint.length(1))
+                .split(vChunks.get(0));
+
+        Rect widgetArea = hChunks.get(0);
+        frame.renderWidget(finalWidget, widgetArea);
+        lastAreaX = widgetArea.x();
+        lastAreaY = widgetArea.y();
+
+        eipNodeBoxes = new ArrayList<>(finalWidget.getNodeBoxes());
+        zoom.foldHits(finalWidget.getFoldHits(), lastAreaX - scrollX, lastAreaY - scrollY);
+        if (selectedEipNodeIndex < 0 && !eipNodeBoxes.isEmpty()) {
+            selectedEipNodeIndex = 0;
+        } else if (restore != null) {
+            // a step on a branch to the right is scrolled to as well
+            scrollToSelectedEipNode();
+        }
+
+        vScrollState.contentLength(totalRows);
+        vScrollState.viewportContentLength(visibleLines);
+        vScrollState.position(scrollY);
+        frame.renderStatefulWidget(
+                Scrollbar.builder().build(),
+                hChunks.get(1), vScrollState);
+
+        if (totalCols > visibleCols) {
+            hScrollState.contentLength(totalCols);
+            hScrollState.viewportContentLength(visibleCols);
+            hScrollState.position(scrollX);
+            frame.renderStatefulWidget(
+                    Scrollbar.horizontal(),
+                    vChunks.get(1), hScrollState);
+        }
+
+        if (zoom.isPanels()) {
+            DiagramPanels.renderMinimap(frame, hChunks.get(0), topologyLayout, currentRouteId);
+            renderTreePreview(frame, hChunks.get(0), currentRouteId);
+        }
+    }
+
+    // ---- Async loading ----
+
+    boolean beginLoad() {
+        return loading.compareAndSet(false, true);
+    }
+
+    void endLoad() {
+        loading.set(false);
+    }
+
+    void setLoadingPlaceholder() {
+        showDiagram = true;
+        scrollY = 0;
+        scrollX = 0;
+    }
+
+    void loadHighlightedNativeDiagramInBackground(
+            MonitorContext ctx, String pid,
+            String[] messageHistory, boolean failed, int initialStepIndex) {
+        // the topology and the structure of the routes, with the numbers of the status file
+        JsonObject jo = ctx.diagramTopology.load(ctx, pid);
+        if (jo == null) {
+            close();
+            return;
+        }
+
+        // Parse topology layout
+        TopologyLayoutResult topoResult = null;
+        int nodeW = 0;
+        List<TopologyLayoutNode> topoNodes = Collections.emptyList();
+        List<TopologyLayoutEdge> topoEdges = Collections.emptyList();
+        List<TopologyNodeInfo> tNodes = TopologyHelper.parseNodes(jo);
+        List<TopologyEdgeInfo> tEdges = TopologyHelper.parseEdges(jo);
+        if (!tNodes.isEmpty()) {
+            TopologyLayoutEngine topoEngine = new TopologyLayoutEngine();
+            topoResult = topoEngine.layout(tNodes, tEdges);
+            normalizeTopologyLayoutY(topoResult);
+            nodeW = topoEngine.getNodeWidth();
+            topoNodes = topoResult.nodes;
+            topoEdges = topoResult.edges;
+        }
+
+        // Parse and layout all routes
+        List<RouteDiagramLayoutEngine.RouteInfo> routes = RouteDiagramHelper.parseRoutes(jo);
+        if (routes.isEmpty()) {
+            close();
+            return;
+        }
+
+        DiagramLayouts.markRemote(routes, parseExternalUris(jo));
+
+        stepLabels = RouteStepHints.apply(routes, aiSourceDirectory, showDescription);
+        if (showDescription) {
+            BusinessEndpointLabels.apply(routes);
+        }
+        RouteDiagramLayoutEngine.NodeLabelMode labelMode = showDescription
+                ? RouteDiagramLayoutEngine.NodeLabelMode.DESCRIPTION
+                : RouteDiagramLayoutEngine.NodeLabelMode.CODE;
+        // whole and not folded, at the zoom of the route diagram: the history highlights the steps a message took
+        Map<String, RouteDiagramLayoutEngine.LayoutRoute> routeMap
+                = zoom.layoutWhole(routes, labelMode, lastVisibleHeight);
+
+        // Parse message history: build nodeId visit order and nodeId→routeId mapping
+        RouteDiagramHelper.HighlightStyle hlStyle = failed
+                ? RouteDiagramHelper.HighlightStyle.FAIL
+                : RouteDiagramHelper.HighlightStyle.SUCCESS;
+        RouteDiagramHelper.HighlightInfo highlightInfo
+                = RouteDiagramHelper.parseMessageHistory(messageHistory, hlStyle);
+
+        List<String> nodeOrder = new ArrayList<>();
+        Map<String, String> nodeRouteMap = new LinkedHashMap<>();
+        Set<String> visitedRouteIds = new LinkedHashSet<>();
+        Set<String> seenNodes = new LinkedHashSet<>();
+        for (String h : messageHistory) {
+            int bracket = h.indexOf('[');
+            int end = h.indexOf(']');
+            if (bracket >= 0 && end > bracket) {
+                String routeId = h.substring(0, bracket);
+                String nodeId = h.substring(bracket + 1, end);
+                if (!nodeId.isEmpty() && seenNodes.add(nodeId)) {
+                    nodeOrder.add(nodeId);
+                    nodeRouteMap.put(nodeId, routeId);
+                }
+                if (!routeId.isEmpty()) {
+                    visitedRouteIds.add(routeId);
+                }
+            }
+        }
+
+        // Expand visited routes by following topology edges where the trace contains
+        // a to-node matching the edge's endpoint (e.g. to6 sends to kafka:notifications
+        // → follow edge to notification route)
+        Set<String> tracedNodeIds = new HashSet<>(nodeOrder);
+        Map<String, List<RouteDiagramLayoutEngine.NodeInfo>> routeNodeMap = new HashMap<>();
+        for (RouteDiagramLayoutEngine.RouteInfo ri : routes) {
+            routeNodeMap.put(ri.routeId, ri.nodes);
+        }
+        boolean expanded = true;
+        while (expanded) {
+            expanded = false;
+            for (TopologyEdgeInfo te : tEdges) {
+                if (te.fromRouteId != null && te.toRouteId != null && te.endpoint != null
+                        && visitedRouteIds.contains(te.fromRouteId)
+                        && !visitedRouteIds.contains(te.toRouteId)) {
+                    List<RouteDiagramLayoutEngine.NodeInfo> fromNodes = routeNodeMap.get(te.fromRouteId);
+                    if (fromNodes != null) {
+                        for (RouteDiagramLayoutEngine.NodeInfo ni : fromNodes) {
+                            if (ni.id != null && tracedNodeIds.contains(ni.id)
+                                    && ni.uri != null && ni.uri.contains(te.endpoint)) {
+                                visitedRouteIds.add(te.toRouteId);
+                                expanded = true;
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Add parent scope nodes to highlight info for routes with highlighted children
+        Set<String> allNodeIds = new LinkedHashSet<>(highlightInfo.getNodeIds());
+        for (RouteDiagramLayoutEngine.RouteInfo ri : routes) {
+            boolean routeHasHighlight = ri.nodes.stream().anyMatch(n -> n.id != null && allNodeIds.contains(n.id));
+            if (routeHasHighlight) {
+                addParentNodes(ri.nodes, allNodeIds);
+            }
+        }
+
+        // Map initialStepIndex (index into messageHistory) to nodeOrder index
+        int resolvedStep = nodeOrder.size() - 1;
+        if (initialStepIndex >= 0 && initialStepIndex < messageHistory.length) {
+            String h = messageHistory[initialStepIndex];
+            int br = h.indexOf('[');
+            int en = h.indexOf(']');
+            if (br >= 0 && en > br) {
+                String nid = h.substring(br + 1, en);
+                int idx = nodeOrder.indexOf(nid);
+                if (idx >= 0) {
+                    resolvedStep = idx;
+                }
+            }
+        }
+        final int clampedStep = resolvedStep;
+
+        // Compute topology nodeBoxes for selection
+        boolean isFailed = failed;
+        TopologyLayoutResult finalTopoResult = topoResult;
+        int finalNodeW = nodeW;
+        List<TopologyLayoutNode> finalTopoNodes = topoNodes;
+        List<TopologyLayoutEdge> finalTopoEdges = topoEdges;
+
+        if (ctx.runner == null) {
+            return;
+        }
+        ctx.runner.runOnRenderThread(() -> {
+            historyMode = true;
+            historyNodeOrder = nodeOrder;
+            historyStepIndex = clampedStep;
+            historyFailed = isFailed;
+            historyNodeRouteMap = nodeRouteMap;
+            historyRouteIds = visitedRouteIds;
+            historyTopologyMode = true;
+            historyDrillDownRouteId = null;
+            historyNavigationStack.clear();
+
+            // Store topology data
+            topologyLayout = finalTopoResult;
+            topologyNodeWidth = finalNodeW;
+            topologyNodes = finalTopoNodes;
+            topologyEdges = finalTopoEdges;
+            routeLayouts = routeMap;
+
+            // Initialize topology node selection
+            if (finalTopoResult != null) {
+                List<TopologyAsciiRenderer.NodeBox> boxes
+                        = computeNodeBoxes(finalTopoResult, finalNodeW, false);
+                nodeBoxes = boxes;
+                // Select the route box matching the current step
+                String stepRouteId = null;
+                if (clampedStep >= 0 && clampedStep < nodeOrder.size()) {
+                    stepRouteId = nodeRouteMap.get(nodeOrder.get(clampedStep));
+                }
+                int selIdx = -1;
+                if (stepRouteId != null) {
+                    for (int i = 0; i < boxes.size(); i++) {
+                        if (stepRouteId.equals(boxes.get(i).routeId())) {
+                            selIdx = i;
+                            break;
+                        }
+                    }
+                }
+                if (selIdx < 0) {
+                    for (int i = 0; i < boxes.size(); i++) {
+                        if (visitedRouteIds.contains(boxes.get(i).routeId())) {
+                            selIdx = i;
+                            break;
+                        }
+                    }
+                }
+                selectedNodeIndex = selIdx >= 0 ? selIdx : (boxes.isEmpty() ? -1 : 0);
+            }
+
+            scrollY = 0;
+            scrollX = 0;
+            showDiagram = true;
+        });
+    }
+
+    boolean isHistoryMode() {
+        return historyMode;
+    }
+
+    boolean hasHistoryData() {
+        return !historyNodeOrder.isEmpty();
+    }
+
+    int getHistoryStepIndex() {
+        return historyStepIndex;
+    }
+
+    int getHistoryStepCount() {
+        return historyNodeOrder.size();
+    }
+
+    void historyNavigateDown() {
+        if (historyStepIndex < historyNodeOrder.size() - 1) {
+            historyStepIndex++;
+            handleHistoryRouteTransition();
+        }
+    }
+
+    void historyNavigateUp() {
+        if (historyStepIndex > 0) {
+            historyStepIndex--;
+            handleHistoryRouteTransition();
+        }
+    }
+
+    private void handleHistoryRouteTransition() {
+        if (historyTopologyMode || historyDrillDownRouteId == null) {
+            return;
+        }
+        String nodeId = historyNodeOrder.get(historyStepIndex);
+        String nodeRoute = historyNodeRouteMap.get(nodeId);
+        if (nodeRoute != null && !nodeRoute.equals(historyDrillDownRouteId)) {
+            if (historyNavigationStack.contains(nodeRoute)) {
+                while (!historyNavigationStack.isEmpty() && !nodeRoute.equals(historyNavigationStack.peek())) {
+                    historyNavigationStack.pop();
+                }
+                historyNavigationStack.pop();
+            } else {
+                historyNavigationStack.push(historyDrillDownRouteId);
+            }
+            historyDrillDownRouteId = nodeRoute;
+            scrollY = 0;
+            scrollX = 0;
+        }
+    }
+
+    boolean isHistoryTopologyMode() {
+        return historyTopologyMode;
+    }
+
+    String getHistoryDrillDownRouteId() {
+        return historyDrillDownRouteId;
+    }
+
+    Deque<String> getHistoryNavigationStack() {
+        return historyNavigationStack;
+    }
+
+    void historyEnterDrillDown() {
+        String selectedRoute = getSelectedRouteId();
+        if (selectedRoute == null && !historyRouteIds.isEmpty()) {
+            selectedRoute = historyRouteIds.iterator().next();
+        }
+        if (selectedRoute == null) {
+            return;
+        }
+        historyTopologyMode = false;
+        historyDrillDownRouteId = selectedRoute;
+        historyNavigationStack.clear();
+
+        // Set step index to the first node in this route
+        for (int i = 0; i < historyNodeOrder.size(); i++) {
+            String nRoute = historyNodeRouteMap.get(historyNodeOrder.get(i));
+            if (selectedRoute.equals(nRoute)) {
+                historyStepIndex = i;
+                break;
+            }
+        }
+        scrollY = 0;
+        scrollX = 0;
+    }
+
+    void historyReturnToTopology() {
+        historyTopologyMode = true;
+        historyDrillDownRouteId = null;
+        historyNavigationStack.clear();
+        scrollY = 0;
+        scrollX = 0;
+        // Restore topology selection to highlight the current route
+        if (historyStepIndex >= 0 && historyStepIndex < historyNodeOrder.size()) {
+            String nodeId = historyNodeOrder.get(historyStepIndex);
+            String nodeRoute = historyNodeRouteMap.get(nodeId);
+            if (nodeRoute != null) {
+                for (int i = 0; i < nodeBoxes.size(); i++) {
+                    if (nodeRoute.equals(nodeBoxes.get(i).routeId())) {
+                        selectedNodeIndex = i;
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    void historyGoBack() {
+        if (!historyNavigationStack.isEmpty()) {
+            historyDrillDownRouteId = historyNavigationStack.pop();
+            scrollY = 0;
+            scrollX = 0;
+        } else {
+            historyReturnToTopology();
+        }
+    }
+
+    void renderHistoryTopologyDiagram(Frame frame, Rect area, Line title) {
+        if (topologyLayout == null) {
+            return;
+        }
+
+        Block block = Block.builder().borderType(BorderType.ROUNDED).borders(Borders.ALL)
+                .title(Title.from(withAiMark(title))).build();
+        frame.renderWidget(block, area);
+
+        Rect inner = block.inner(area);
+
+        var widget = new org.apache.camel.dsl.jbang.core.commands.tui.diagram.TopologyDiagramWidget(
+                topologyLayout, topologyNodeWidth, selectedNodeIndex, scrollX, scrollY,
+                false, showDescription, historyRouteIds, historyFailed)
+                .withAiDescriptions(aiDescriptions(), Theme.aiAssisted())
+                .withNodeLines(nodeLines)
+                .withGroups(groupTags, groupColors)
+                .withErrorLayer(layoutShowErrorPaths ? errorLayer : null)
+                .withErrorMarks(errorMarkRouteIds());
+
+        int totalRows = widget.getTotalRows();
+        int totalCols = widget.getTotalCols();
+        int visibleLines = Math.max(1, inner.height() - 1);
+        int visibleCols = Math.max(1, inner.width() - 1);
+        lastVisibleHeight = visibleLines;
+        lastVisibleWidth = visibleCols;
+
+        int maxVScroll = Math.max(0, totalRows - visibleLines);
+        int maxHScroll = Math.max(0, totalCols - visibleCols);
+        scrollY = Math.min(scrollY, maxVScroll);
+        scrollX = Math.min(scrollX, maxHScroll);
+
+        var finalWidget = new org.apache.camel.dsl.jbang.core.commands.tui.diagram.TopologyDiagramWidget(
+                topologyLayout, topologyNodeWidth, selectedNodeIndex, scrollX, scrollY,
+                false, showDescription, historyRouteIds, historyFailed)
+                .withAiDescriptions(aiDescriptions(), Theme.aiAssisted())
+                .withNodeLines(nodeLines)
+                .withGroups(groupTags, groupColors)
+                .withErrorLayer(layoutShowErrorPaths ? errorLayer : null)
+                .withErrorMarks(errorMarkRouteIds());
+
+        List<Rect> vChunks = Layout.vertical()
+                .constraints(Constraint.fill(), Constraint.length(1))
+                .split(inner);
+
+        List<Rect> hChunks = Layout.horizontal()
+                .constraints(Constraint.fill(), Constraint.length(1))
+                .split(vChunks.get(0));
+
+        Rect widgetArea = hChunks.get(0);
+        frame.renderWidget(finalWidget, widgetArea);
+        lastAreaX = widgetArea.x();
+        lastAreaY = widgetArea.y();
+
+        List<TopologyAsciiRenderer.NodeBox> widgetBoxes = new ArrayList<>();
+        for (var nb : finalWidget.getNodeBoxes()) {
+            widgetBoxes.add(new TopologyAsciiRenderer.NodeBox(
+                    nb.routeId(), nb.startRow(), nb.endRow(), nb.startCol(), nb.endCol(), nb.layer()));
+        }
+        if (!widgetBoxes.isEmpty()) {
+            nodeBoxes = widgetBoxes;
+        }
+
+        vScrollState.contentLength(totalRows);
+        vScrollState.viewportContentLength(visibleLines);
+        vScrollState.position(scrollY);
+        frame.renderStatefulWidget(
+                Scrollbar.builder().build(),
+                hChunks.get(1), vScrollState);
+
+        if (totalCols > visibleCols) {
+            hScrollState.contentLength(totalCols);
+            hScrollState.viewportContentLength(visibleCols);
+            hScrollState.position(scrollX);
+            frame.renderStatefulWidget(
+                    Scrollbar.horizontal(),
+                    vChunks.get(1), hScrollState);
+        }
+    }
+
+    void renderHistoryRouteDiagram(Frame frame, Rect area, Line title, String routeId, boolean hideOverlays) {
+        RouteDiagramLayoutEngine.LayoutRoute routeLayout = routeLayouts.get(routeId);
+        if (routeLayout == null) {
+            return;
+        }
+
+        Block block = Block.builder().borderType(BorderType.ROUNDED).borders(Borders.ALL)
+                .title(Title.from(title)).build();
+        frame.renderWidget(block, area);
+
+        Rect inner = block.inner(area);
+        int nw = zoom.nodeWidthOf(routeLayout);
+
+        // Build progressive highlight set filtered to this route
+        Set<String> activeHighlight = new LinkedHashSet<>();
+        String currentNodeId = historyStepIndex >= 0 && historyStepIndex < historyNodeOrder.size()
+                ? historyNodeOrder.get(historyStepIndex) : null;
+        for (int i = 0; i <= historyStepIndex && i < historyNodeOrder.size(); i++) {
+            String nid = historyNodeOrder.get(i);
+            String nRoute = historyNodeRouteMap.get(nid);
+            if (routeId.equals(nRoute)) {
+                activeHighlight.add(nid);
+            }
+        }
+        // Add parent/scope nodes
+        Set<String> parentIds = new LinkedHashSet<>();
+        for (RouteDiagramLayoutEngine.LayoutNode ln : routeLayout.nodes) {
+            if (ln.id != null && activeHighlight.contains(ln.id) && ln.parentNode != null
+                    && ln.parentNode.id != null && !"route".equals(ln.parentNode.type)) {
+                parentIds.add(ln.parentNode.id);
+            }
+        }
+        activeHighlight.addAll(parentIds);
+
+        // Find selected EIP node index within this route
+        int selIdx = -1;
+        if (currentNodeId != null && routeId.equals(historyNodeRouteMap.get(currentNodeId))) {
+            int idx = 0;
+            for (RouteDiagramLayoutEngine.LayoutNode ln : routeLayout.nodes) {
+                if (!"route".equals(ln.type)) {
+                    if (ln.id != null && ln.id.equals(currentNodeId)) {
+                        selIdx = idx;
+                        break;
+                    }
+                    idx++;
+                }
+            }
+        }
+
+        Map<String, String> linkable = computeLinkableEndpoints(routeId);
+        Map<String, String> routeDescs = showDescription ? computeRouteDescriptions() : Collections.emptyMap();
+
+        int sel = selIdx;
+        // built again once the scroll is clamped to its size, and follows the step
+        Supplier<RouteDiagramWidget> widgets = () -> new RouteDiagramWidget(
+                routeLayout, nw, sel, scrollX, scrollY, false,
+                linkable, showDescription, routeDescs, activeHighlight, historyFailed).withDensity(zoom.densityOf(routeLayout));
+        var widget = widgets.get();
+
+        int totalRows = widget.getTotalRows();
+        int totalCols = widget.getTotalCols();
+        int visibleLines = Math.max(1, inner.height() - 1);
+        int visibleCols = Math.max(1, inner.width() - 1);
+        lastVisibleHeight = visibleLines;
+        lastVisibleWidth = visibleCols;
+
+        int maxVScroll = Math.max(0, totalRows - visibleLines);
+        int maxHScroll = Math.max(0, totalCols - visibleCols);
+        scrollY = Math.min(scrollY, maxVScroll);
+        scrollX = Math.min(scrollX, maxHScroll);
+
+        // Auto-scroll to keep selected node visible
+        if (selIdx >= 0 && currentNodeId != null) {
+            for (RouteDiagramLayoutEngine.LayoutNode ln : routeLayout.nodes) {
+                if (ln.id != null && ln.id.equals(currentNodeId)) {
+                    int nodeRow = ln.y / 20;
+                    if (nodeRow < scrollY) {
+                        scrollY = Math.max(0, nodeRow - 2);
+                    } else if (nodeRow >= scrollY + visibleLines) {
+                        scrollY = Math.min(maxVScroll, nodeRow - visibleLines + 4);
+                    }
+                    break;
+                }
+            }
+        }
+
+        var finalWidget = widgets.get();
+
+        List<Rect> vChunks = Layout.vertical()
+                .constraints(Constraint.fill(), Constraint.length(1))
+                .split(inner);
+
+        List<Rect> hChunks = Layout.horizontal()
+                .constraints(Constraint.fill(), Constraint.length(1))
+                .split(vChunks.get(0));
+
+        Rect widgetArea = hChunks.get(0);
+        frame.renderWidget(finalWidget, widgetArea);
+        lastAreaX = widgetArea.x();
+        lastAreaY = widgetArea.y();
+
+        eipNodeBoxes = new ArrayList<>(finalWidget.getNodeBoxes());
+        selectedEipNodeIndex = selIdx;
+
+        vScrollState.contentLength(totalRows);
+        vScrollState.viewportContentLength(visibleLines);
+        vScrollState.position(scrollY);
+        frame.renderStatefulWidget(
+                Scrollbar.builder().build(),
+                hChunks.get(1), vScrollState);
+
+        if (totalCols > visibleCols) {
+            hScrollState.contentLength(totalCols);
+            hScrollState.viewportContentLength(visibleCols);
+            hScrollState.position(scrollX);
+            frame.renderStatefulWidget(
+                    Scrollbar.horizontal(),
+                    vChunks.get(1), hScrollState);
+        }
+
+        if (!hideOverlays) {
+            DiagramPanels.renderMinimap(frame, hChunks.get(0), topologyLayout, routeId);
+            renderTreePreview(frame, hChunks.get(0), routeId);
+        }
+    }
+
+    void loadAllDiagramsInBackground(
+            MonitorContext ctx, String pid, boolean metrics, int externalMode) {
+        boolean external = externalMode > 0;
+        Set<String> hidden = hiddenRouteIds;
+        int boxColumns = wantedBoxColumns();
+        // the topology and the structure of the routes, with the numbers of the status file
+        JsonObject topoJson = ctx.diagramTopology.load(ctx, pid);
+
+        TopologyLayoutResult topoResult = null;
+        int nodeW = 0;
+        List<TopologyLayoutNode> topoNodes = Collections.emptyList();
+        List<TopologyLayoutEdge> topoEdges = Collections.emptyList();
+
+        boolean showErrors = showErrorPaths;
+        List<TopologyErrorFrame.ErrorPath> loadedErrorPaths = List.of();
+        TopologyErrorFrame loadedErrorLayer = null;
+        Map<String, List<TopologyDiagramWidget.NodeLine>> foldedLines = Map.of();
+        RouteDensity topoDensity = RouteDensity.DETAILED;
+        boolean loadedErrorPathsKnown = true;
+        if (topoJson != null) {
+            List<TopologyNodeInfo> nodes = TopologyHelper.parseNodes(topoJson);
+            List<TopologyEdgeInfo> all = TopologyHelper.parseEdges(topoJson, true);
+            List<TopologyEdgeInfo> edges = new ArrayList<>(all.stream().filter(e -> !e.isErrorPath()).toList());
+            List<TopologyEdgeInfo> errors = all.stream().filter(TopologyEdgeInfo::isErrorPath).toList();
+            // a Camel before 4.23 says no kind of edge: it reports calls only
+            JsonArray rawEdges = topoJson.getCollection("edges");
+            loadedErrorPathsKnown = rawEdges == null || rawEdges.isEmpty()
+                    || rawEdges.stream().anyMatch(o -> o instanceof JsonObject jo && jo.containsKey("kind"));
+            Set<String> errorOnly = TopologyErrorFrame.errorOnlyRoutes(edges, errors);
+            loadedErrorPaths = errors.stream()
+                    .filter(e -> !hidden.contains(e.fromRouteId) || errorOnly.contains(e.fromRouteId))
+                    .map(e -> new TopologyErrorFrame.ErrorPath(e.fromRouteId, e.toRouteId, e.via, e.handling))
+                    .distinct().toList();
+            if (external) {
+                TopologyHelper.addExternalEndpoints(nodes, edges, topoJson);
+            }
+            if (externalMode == 2) {
+                TopologyHelper.expandExternalEdges(nodes, edges);
+            }
+            // shown, the routes reached only on error are in the frame (whether utility routes are shown or not)
+            TopologyErrorFrame.Taken frameRoutes = showErrors
+                    ? TopologyErrorFrame.take(nodes, edges, errorOnly)
+                    : new TopologyErrorFrame.Taken(List.of(), TopologyErrorFrame.Externals.NONE);
+            List<TopologyNodeInfo> errorNodes = frameRoutes.routes();
+            removeRoutes(nodes, edges, hidden);
+            // the folded groups of routes: a box each (Space)
+            foldedLines = TopologyGroupFolds.fold(nodes, edges, routeGroups, zoom.foldedGroups());
+            // the zoom: a density, or with fit the most detail in which the topology fits the screen
+            topoDensity = zoom.isFit() ? RouteDensity.DETAILED : zoom.density().forTopology();
+            while (true) {
+                int columns = TopologyZoom.columns(topoDensity, boxColumns);
+                nodeW = engineFor(columns).getNodeWidth();
+                TopologyErrorFrame.Placed placed = DiagramLayouts.layoutTopology(
+                        nodes, edges, showErrors ? errorNodes : List.of(), frameRoutes.externals(), loadedErrorPaths,
+                        columns);
+                TopologyZoom.Zoomed zoomed = TopologyZoom.apply(topoDensity, placed.layout(), placed.frame());
+                topoResult = zoomed.layout();
+                loadedErrorLayer = zoomed.frame();
+                if (!zoom.isFit() || topoDensity == RouteDensity.BARE
+                        || TopologyZoom.fits(topoResult, nodeW, lastVisibleHeight, lastVisibleWidth)) {
+                    break;
+                }
+                topoDensity = topoDensity.zoomOut();
+            }
+            if (topoResult != null) {
+                topoNodes = topoResult.nodes;
+                topoEdges = topoResult.edges;
+            }
+        }
+
+        Map<String, RouteErrorFrame> loadedRouteFrames = new java.util.HashMap<>();
+        // Route structure is included in the topology response (routes=true)
+        java.util.Map<String, RouteDiagramLayoutEngine.LayoutRoute> routeMap = new java.util.LinkedHashMap<>();
+        if (topoJson != null) {
+            List<RouteDiagramLayoutEngine.RouteInfo> routes = RouteDiagramHelper.parseRoutes(topoJson);
+            if (!routes.isEmpty()) {
+                DiagramLayouts.markRemote(routes, parseExternalUris(topoJson));
+                stepLabels = RouteStepHints.apply(routes, aiSourceDirectory, showDescription);
+                if (showDescription) {
+                    BusinessEndpointLabels.apply(routes);
+                }
+                RouteDiagramLayoutEngine.NodeLabelMode labelMode = showDescription
+                        ? RouteDiagramLayoutEngine.NodeLabelMode.DESCRIPTION
+                        : RouteDiagramLayoutEngine.NodeLabelMode.CODE;
+                // folded and zoomed (+ - z space), with the error handling in its frame below
+                routeMap.putAll(zoom.layoutRoutes(
+                        routes, labelMode, showErrors, loadedErrorPaths, loadedRouteFrames, lastVisibleHeight));
+            }
+        }
+
+        TopologyLayoutResult finalTopoResult = topoResult;
+        int finalNodeW = nodeW;
+        List<TopologyLayoutNode> finalTopoNodes = topoNodes;
+        List<TopologyLayoutEdge> finalTopoEdges = topoEdges;
+
+        if (ctx.runner == null) {
+            return;
+        }
+        List<TopologyErrorFrame.ErrorPath> finalErrorPaths = loadedErrorPaths;
+        TopologyErrorFrame finalErrorLayer = loadedErrorLayer;
+        boolean finalErrorPathsKnown = loadedErrorPathsKnown;
+        Map<String, List<TopologyDiagramWidget.NodeLine>> finalFoldedLines = foldedLines;
+        RouteDensity finalTopoDensity = topoDensity;
+        ctx.runner.runOnRenderThread(() -> {
+            layoutHidden = hidden;
+            layoutBoxColumns = boxColumns;
+            layoutShowErrorPaths = showErrors;
+            errorPaths = finalErrorPaths;
+            errorLayer = finalErrorLayer;
+            routeErrorFrames = loadedRouteFrames;
+            errorPathsKnown = finalErrorPathsKnown;
+            if (!showDiagram && !preloading) {
+                return;
+            }
+            preloading = false;
+            cachedPid = pid;
+            topologyLayout = finalTopoResult;
+            topologyDensity = finalTopoDensity;
+            nodeLines = finalFoldedLines;
+            topologyNodeWidth = finalNodeW;
+            topologyNodes = finalTopoNodes;
+            topologyEdges = finalTopoEdges;
+            routeLayouts = routeMap;
+
+            // Preserve selection, or select the route asked for (the route left, the box of a folded group)
+            String prevRouteId = pendingSelectionRouteId != null ? pendingSelectionRouteId : getSelectedRouteId();
+            pendingSelectionRouteId = null;
+
+            if (finalTopoResult != null) {
+                List<TopologyAsciiRenderer.NodeBox> boxes
+                        = computeNodeBoxes(finalTopoResult, finalNodeW, metrics);
+                nodeBoxes = boxes;
+
+                if (prevRouteId != null && !boxes.isEmpty()) {
+                    int newIdx = -1;
+                    for (int i = 0; i < boxes.size(); i++) {
+                        if (prevRouteId.equals(boxes.get(i).routeId())) {
+                            newIdx = i;
+                            break;
+                        }
+                    }
+                    selectedNodeIndex = newIdx >= 0 ? newIdx : 0;
+                } else if (!boxes.isEmpty() && selectedNodeIndex < 0) {
+                    selectedNodeIndex = findTopLeftNode(boxes);
+                } else if (boxes.isEmpty()) {
+                    selectedNodeIndex = -1;
+                }
+            }
+        });
+    }
+
+    /**
+     * Finds the index of the EIP node box whose source line is closest to the given line, preferring the closest node
+     * at or before the line. Returns -1 when there are no boxes with line information.
+     */
+    int findClosestEipNode(int sourceLine) {
+        var boxes = getEipNodeBoxes();
+        if (boxes.isEmpty()) {
+            return -1;
+        }
+        // Prefer the closest node at or before the cursor line
+        int bestBeforeIdx = -1;
+        int bestBeforeDist = Integer.MAX_VALUE;
+        int bestAfterIdx = -1;
+        int bestAfterDist = Integer.MAX_VALUE;
+        for (int i = 0; i < boxes.size(); i++) {
+            var box = boxes.get(i);
+            if (box.layoutNode() == null || box.layoutNode().treeNode == null) {
+                continue;
+            }
+            int nodeLine = box.layoutNode().treeNode.info.line;
+            if (nodeLine <= 0) {
+                continue;
+            }
+            if (nodeLine == sourceLine) {
+                return i;
+            }
+            if (nodeLine < sourceLine) {
+                int dist = sourceLine - nodeLine;
+                if (dist < bestBeforeDist) {
+                    bestBeforeDist = dist;
+                    bestBeforeIdx = i;
+                }
+            } else {
+                int dist = nodeLine - sourceLine;
+                if (dist < bestAfterDist) {
+                    bestAfterDist = dist;
+                    bestAfterIdx = i;
+                }
+            }
+        }
+        return bestBeforeIdx >= 0 ? bestBeforeIdx : bestAfterIdx;
+    }
+
+}

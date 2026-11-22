@@ -1,0 +1,1211 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.camel.component.file;
+
+import java.util.ArrayDeque;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.Deque;
+import java.util.HashSet;
+import java.util.LinkedList;
+import java.util.List;
+import java.util.Map;
+import java.util.Queue;
+import java.util.Set;
+import java.util.function.Supplier;
+import java.util.regex.Pattern;
+
+import org.apache.camel.CamelContextAware;
+import org.apache.camel.Exchange;
+import org.apache.camel.ExchangePropertyKey;
+import org.apache.camel.Message;
+import org.apache.camel.Processor;
+import org.apache.camel.RuntimeCamelException;
+import org.apache.camel.ShutdownRunningTask;
+import org.apache.camel.support.EmptyAsyncCallback;
+import org.apache.camel.support.LRUCacheFactory;
+import org.apache.camel.support.ScheduledBatchPollingConsumer;
+import org.apache.camel.support.service.ServiceHelper;
+import org.apache.camel.util.CastUtils;
+import org.apache.camel.util.StopWatch;
+import org.apache.camel.util.StringHelper;
+import org.apache.camel.util.TimeUtils;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+/**
+ * Base class for file consumers.
+ */
+public abstract class GenericFileConsumer<T> extends ScheduledBatchPollingConsumer {
+
+    private static final Logger LOG = LoggerFactory.getLogger(GenericFileConsumer.class);
+
+    protected GenericFileEndpoint<T> endpoint;
+    protected GenericFileOperations<T> operations;
+    protected GenericFileProcessStrategy<T> processStrategy;
+    protected volatile ShutdownRunningTask shutdownRunningTask;
+    // the fileName of the message that poll or pollEnrich polls for, during that poll (CAMEL-25792). Parallel pollEnrich
+    // calls can share this consumer, so the value may belong to another exchange: isMatched() then evaluates the
+    // fileName itself, and the cache only saves work
+    private volatile DynamicFileName dynamicFileName;
+    protected volatile int pendingExchanges;
+    protected Processor customProcessor;
+    protected boolean eagerLimitMaxMessagesPerPoll = true;
+    protected volatile boolean prepareOnStartup;
+    private final Pattern includePattern;
+    private final Pattern excludePattern;
+    private final String[] includeExt;
+    private final String[] excludeExt;
+    private boolean retrieveFile = true;
+    // files already reported as resolving outside the starting directory (bounded)
+    private final Map<String, Boolean> skippedOutsideStartingDirectory = LRUCacheFactory.newLRUCache(1000);
+    // the done files with a fixed name kept for the files a poll left (null if the endpoint has no such done file)
+    private final GenericFileKeptDoneFiles keptDoneFiles;
+
+    protected GenericFileConsumer(GenericFileEndpoint<T> endpoint, Processor processor, GenericFileOperations<T> operations,
+                                  GenericFileProcessStrategy<T> processStrategy) {
+        super(endpoint, processor);
+        this.endpoint = endpoint;
+        this.operations = operations;
+        this.processStrategy = processStrategy;
+
+        this.includePattern = endpoint.getIncludePattern();
+        this.excludePattern = endpoint.getExcludePattern();
+        this.includeExt = endpoint.getIncludeExt() != null ? endpoint.getIncludeExt().toLowerCase().split(",") : null;
+        this.excludeExt = endpoint.getExcludeExt() != null ? endpoint.getExcludeExt().toLowerCase().split(",") : null;
+        // a done file with a fixed name stands for all the files of its directory, and is deleted (unless noop) after
+        // the last file of a poll, so it must be kept when the poll left some of them for the next poll
+        this.keptDoneFiles = endpoint.getDoneFileName() != null && !endpoint.isNoop()
+                && !endpoint.getDoneFileName().contains("{file:name") ? new GenericFileKeptDoneFiles() : null;
+    }
+
+    public Processor getCustomProcessor() {
+        return customProcessor;
+    }
+
+    /**
+     * Use a custom processor to process the exchange.
+     * <p/>
+     * Only set this if you need to do custom processing, instead of the regular processing.
+     * <p/>
+     * This is for example used to browse file endpoints by leveraging the file consumer to poll the directory to gather
+     * the list of exchanges. But to avoid processing the files regularly we can use a custom processor.
+     *
+     * @param processor a custom processor
+     */
+    public void setCustomProcessor(Processor processor) {
+        this.customProcessor = processor;
+    }
+
+    public boolean isEagerLimitMaxMessagesPerPoll() {
+        return eagerLimitMaxMessagesPerPoll;
+    }
+
+    public void setEagerLimitMaxMessagesPerPoll(boolean eagerLimitMaxMessagesPerPoll) {
+        this.eagerLimitMaxMessagesPerPoll = eagerLimitMaxMessagesPerPoll;
+    }
+
+    /**
+     * Creates the exchange from the polled file
+     */
+    protected abstract Exchange createExchange(GenericFile<T> file);
+
+    @Override
+    protected int poll() throws Exception {
+        return poll(null);
+    }
+
+    /**
+     * Poll for files
+     */
+    @Override
+    protected int poll(Exchange dynamic) throws Exception {
+        if (dynamic == null || endpoint.getFileName() == null || endpoint.isFileNameUsingFileFunctions()) {
+            return doPoll(dynamic);
+        }
+        // poll and pollEnrich: a fileName without the file functions is about the message being enriched, not the
+        // file found, so it is evaluated once for this poll on a copy of that message (CAMEL-25792)
+        DynamicFileName current = new DynamicFileName(dynamic, evaluateDynamicFileName(dynamic));
+        dynamicFileName = current;
+        try {
+            return doPoll(dynamic);
+        } finally {
+            if (dynamicFileName == current) {
+                dynamicFileName = null;
+            }
+        }
+    }
+
+    private int doPoll(Exchange dynamic) throws Exception {
+        // must prepare on startup the very first time
+        if (!prepareOnStartup) {
+            // prepare on startup
+            processStrategy.prepareOnStartup(operations, endpoint);
+            prepareOnStartup = true;
+        }
+
+        // must reset for each poll
+        shutdownRunningTask = null;
+        pendingExchanges = 0;
+
+        // before we poll is there anything we need to check?
+        // such as are we connected to the FTP Server still?
+        if (!prePollCheck()) {
+            LOG.debug("Skipping poll as pre poll check returned false");
+            return 0;
+        }
+
+        // gather list of files to process
+        List<GenericFile<T>> files = new ArrayList<>();
+        String name = endpoint.getConfiguration().getDirectory();
+
+        // time how long it takes to poll
+        StopWatch stop = new StopWatch();
+        boolean limitHit;
+        try {
+            limitHit = !pollDirectory(dynamic, name, files, 0);
+        } catch (Exception e) {
+            // during poll directory we add files to the in progress repository,
+            // in case of any exception thrown after this work
+            // we must then drain the in progress files before rethrowing the
+            // exception
+            LOG.debug("Error occurred during poll directory: {} due {}. Removing {} files marked as in-progress.", name,
+                    e.getMessage(), files.size());
+            removeExcessiveInProgressFiles(files);
+            throw e;
+        }
+
+        long delta = stop.taken();
+        if (LOG.isDebugEnabled()) {
+            LOG.debug("Took {} to poll: {}", TimeUtils.printDuration(delta, true), name);
+        }
+
+        GenericFileKeptDoneFiles kept = getKeptDoneFiles();
+        if (kept != null) {
+            // one file more than the limit is listed when a done file with a fixed name is used (see
+            // canPollMoreFiles): then the poll leaves files for the next one, so cut the list to the files the eager
+            // limit takes and keep the done files of the files listed
+            boolean listingCut = eagerLimitMaxMessagesPerPoll && maxMessagesPerPoll > 0 && files.size() > maxMessagesPerPoll;
+            Set<String> listedDoneFiles = startDoneFileBatch(kept, files, !listingCut);
+            if (listingCut) {
+                List<GenericFile<T>> excessive = files.subList(maxMessagesPerPoll, files.size());
+                removeExcessiveInProgressFiles(excessive);
+                excessive.clear();
+                limitHit = true;
+                listedDoneFiles.forEach(kept::keep);
+            }
+        }
+
+        // log if we hit the limit
+        if (limitHit) {
+            LOG.debug("Limiting maximum messages to poll at {} files as there were more messages in this poll.",
+                    maxMessagesPerPoll);
+        }
+
+        // sort files using file comparator if provided
+        if (endpoint.getSorter() != null) {
+            files.sort(endpoint.getSorter());
+        }
+
+        // sort using build in sorters so we can use expressions
+        // use a linked list so we can dequeue the exchanges
+        LinkedList<Exchange> exchanges = new LinkedList<>();
+        for (GenericFile<T> file : files) {
+            Exchange exchange = createExchange(file);
+            endpoint.configureExchange(exchange);
+            endpoint.configureMessage(file, exchange.getIn());
+            exchanges.add(exchange);
+        }
+        // sort files using exchange comparator if provided
+        if (endpoint.getSortBy() != null) {
+            exchanges.sort(endpoint.getSortBy());
+        }
+        if (endpoint.isShuffle()) {
+            Collections.shuffle(exchanges);
+        }
+
+        // use a queue for the exchanges
+
+        // we are not eager limiting, but we have configured a limit, so cut the
+        // list of files
+        if (!eagerLimitMaxMessagesPerPoll && maxMessagesPerPoll > 0) {
+            if (files.size() > maxMessagesPerPoll) {
+                LOG.debug("Limiting maximum messages to poll at {} files as there were more messages in this poll.",
+                        maxMessagesPerPoll);
+                // the done files of the files cut are kept for the next poll
+                for (Exchange exchange : exchanges.subList(maxMessagesPerPoll, exchanges.size())) {
+                    keepDoneFile(getExchangeFileProperty(exchange));
+                }
+                // must first remove excessive files from the in progress
+                // repository
+                removeExcessiveInProgressFiles(exchanges, maxMessagesPerPoll);
+            }
+        }
+
+        // consume files one by one
+        int total = exchanges.size();
+        if (total > 0) {
+            LOG.debug("Total {} files to consume", total);
+        }
+
+        int polledMessages = processBatch(CastUtils.cast((Deque<Exchange>) exchanges));
+
+        postPollCheck(polledMessages);
+
+        return polledMessages;
+    }
+
+    @Override
+    public int processBatch(Queue<Object> exchanges) {
+        int total = exchanges.size();
+        int answer = total;
+
+        // limit if needed
+        if (maxMessagesPerPoll > 0 && total > maxMessagesPerPoll) {
+            LOG.debug("Limiting to maximum messages to poll {} as there were {} messages in this poll.", maxMessagesPerPoll,
+                    total);
+            total = maxMessagesPerPoll;
+        }
+
+        Queue<Object> notStarted = new ArrayDeque<>();
+
+        for (int index = 0; index < total && isBatchAllowed(); index++) {
+            // only loop if we are started (allowed to run)
+            // use poll to remove the head so it does not consume memory even
+            // after we have processed it
+            Exchange exchange = (Exchange) exchanges.poll();
+            // add current index and total as properties
+            exchange.setProperty(ExchangePropertyKey.BATCH_INDEX, index);
+            exchange.setProperty(ExchangePropertyKey.BATCH_SIZE, total);
+            exchange.setProperty(ExchangePropertyKey.BATCH_COMPLETE, index == total - 1);
+
+            // update pending number of exchanges
+            pendingExchanges = total - index - 1;
+
+            // the file as polled: the begin strategy may pre move it, and then binds the pre moved file to the exchange
+            GenericFile<?> polledFile = getExchangeFileProperty(exchange);
+
+            // process the current exchange
+            boolean started;
+            if (customProcessor != null) {
+                // use a custom processor
+                started = customProcessExchange(exchange, customProcessor);
+            } else {
+                // process the exchange regular
+                started = processExchange(exchange);
+            }
+
+            // if we did not start process the file then decrement the counter
+            if (!started) {
+                // the done file must stay for this file, also if it is not started as the last file of the batch
+                keepDoneFile(polledFile);
+                answer--;
+                // this exchange was not started processing so remember to release it afterward
+                notStarted.add(exchange);
+            }
+        }
+
+        // the files not processed (the batch was stopped) are left for the next poll too
+        for (Object exchange : exchanges) {
+            keepDoneFile(getExchangeFileProperty((Exchange) exchange));
+        }
+
+        // drain any in progress files as we are done with this batch
+        removeExcessiveInProgressFiles(CastUtils.cast((Deque<?>) notStarted, Exchange.class), 0);
+        removeExcessiveInProgressFiles(CastUtils.cast((Deque<?>) exchanges, Exchange.class), 0);
+
+        return answer;
+    }
+
+    /**
+     * Drain any in progress files as we are done with this batch
+     *
+     * @param exchanges the exchanges
+     * @param limit     the limit
+     */
+    protected void removeExcessiveInProgressFiles(Deque<Exchange> exchanges, int limit) {
+        // remove the file from the in progress list in case the batch was
+        // limited by max messages per poll
+        while (exchanges.size() > limit) {
+            // must remove last
+            Exchange exchange = exchanges.removeLast();
+            GenericFile file = exchange.getProperty(ExchangePropertyKey.FILE_EXCHANGE_FILE, GenericFile.class);
+            String key = file.getAbsoluteFilePath();
+            endpoint.getInProgressRepository().remove(key);
+            // if we added eager to idempotent then we need to remove this
+            if (Boolean.TRUE.equals(endpoint.isIdempotent()) && endpoint.isIdempotentEager()
+                    && endpoint.getIdempotentRepository() != null) {
+                removeExcessiveIdempotentFile(file, null);
+            }
+            releaseExchange(exchange, true);
+        }
+    }
+
+    void removeExcessiveIdempotentFile(GenericFile file, Exchange dynamic) {
+        String key = file.getAbsoluteFilePath();
+        if (endpoint.getIdempotentKey() != null) {
+            Exchange dummy = GenericFileHelper.createDummy(endpoint, dynamic, () -> file);
+            key = endpoint.getIdempotentKey().evaluate(dummy, String.class);
+        }
+        if (key != null) {
+            endpoint.getIdempotentRepository().remove(key);
+        }
+    }
+
+    /**
+     * Drain any in progress files as we are done with the files
+     *
+     * @param files the files
+     */
+    protected void removeExcessiveInProgressFiles(List<GenericFile<T>> files) {
+        for (GenericFile file : files) {
+            String key = file.getAbsoluteFilePath();
+            endpoint.getInProgressRepository().remove(key);
+            if (Boolean.TRUE.equals(endpoint.isIdempotent()) && endpoint.isIdempotentEager()
+                    && endpoint.getIdempotentRepository() != null) {
+                removeExcessiveIdempotentFile(file, null);
+            }
+        }
+    }
+
+    /**
+     * The done files with a fixed name kept for the files left by the last poll, or <tt>null</tt> if not used (no such
+     * done file, or a custom processor that does not complete the files).
+     */
+    GenericFileKeptDoneFiles getKeptDoneFiles() {
+        return customProcessor == null ? keptDoneFiles : null;
+    }
+
+    /**
+     * Starts the batch of the kept done files with the files listed, and deletes the done files kept for files that are
+     * gone.
+     *
+     * @return the done files of the files listed
+     */
+    private Set<String> startDoneFileBatch(GenericFileKeptDoneFiles kept, List<GenericFile<T>> files, boolean complete) {
+        Set<String> doneFiles = new HashSet<>();
+        for (GenericFile<T> file : files) {
+            doneFiles.add(endpoint.createDoneFileName(file.getAbsoluteFilePath()));
+        }
+        List<String> gone = kept.startBatch(doneFiles, complete);
+        if (gone != null) {
+            // the done file was kept for files that are no longer there, so it is no longer needed
+            for (String doneFileName : gone) {
+                try {
+                    boolean deleted = operations.deleteFile(doneFileName);
+                    LOG.trace("Done file: {} kept for files that are gone was deleted: {}", doneFileName, deleted);
+                } catch (Exception e) {
+                    LOG.debug("Cannot delete done file: {} due to: {}", doneFileName, e.getMessage(), e);
+                }
+            }
+        }
+        return doneFiles;
+    }
+
+    private void keepDoneFile(GenericFile<?> file) {
+        GenericFileKeptDoneFiles kept = getKeptDoneFiles();
+        if (kept != null) {
+            kept.keep(endpoint.createDoneFileName(file.getAbsoluteFilePath()));
+        }
+    }
+
+    /**
+     * Whether or not we can continue polling for more files
+     *
+     * @param  fileList the current list of gathered files
+     * @return          <tt>true</tt> to continue, <tt>false</tt> to stop due hitting maxMessagesPerPoll limit
+     */
+    public boolean canPollMoreFiles(List<?> fileList) {
+        // at this point we should not limit if we are not eager
+        if (!eagerLimitMaxMessagesPerPoll) {
+            return true;
+        }
+
+        if (maxMessagesPerPoll <= 0) {
+            // no limitation
+            return true;
+        }
+
+        if (getKeptDoneFiles() != null) {
+            // with a done file with a fixed name, one more file is listed to know whether the poll leaves files for the
+            // next one, and then the done file is kept (the list is cut to the limit after polling)
+            return fileList.size() <= maxMessagesPerPoll;
+        }
+
+        // then only poll if we haven't reached the max limit
+        return fileList.size() < maxMessagesPerPoll;
+    }
+
+    /**
+     * Whether a directory can be listed one entry at a time, and the listing stopped once {@link #canPollMoreFiles}
+     * returns {@code false}, rather than listed whole before its files are picked. This is the case when the eager
+     * {@code maxMessagesPerPoll} limit is in use, and nothing needs the whole directory: {@code preSort} sorts all its
+     * files, and a done file is looked up among them.
+     *
+     * @return <tt>true</tt> if the listing can stop at the limit
+     */
+    protected boolean canStopListingAtLimit() {
+        return eagerLimitMaxMessagesPerPoll && maxMessagesPerPoll > 0
+                && !endpoint.isPreSort() && endpoint.getDoneFileName() == null;
+    }
+
+    /**
+     * Override if required. Perform some checks (and perhaps actions) before we poll.
+     *
+     * @return <tt>true</tt> to poll, <tt>false</tt> to skip this poll.
+     */
+    protected boolean prePollCheck() throws Exception {
+        return true;
+    }
+
+    /**
+     * Override if required. Perform some checks (and perhaps actions) after we have polled.
+     *
+     * @param polledMessages number of polled messages
+     */
+    protected void postPollCheck(int polledMessages) {
+        // noop
+    }
+
+    /**
+     * Polls the given directory for files to process
+     *
+     * @param  fileName current directory or file
+     * @param  fileList current list of files gathered
+     * @param  depth    the current depth of the directory (will start from 0)
+     * @return          whether or not to continue polling, <tt>false</tt> means the maxMessagesPerPoll limit has been
+     *                  hit
+     */
+    protected abstract boolean pollDirectory(Exchange dynamic, String fileName, List<GenericFile<T>> fileList, int depth);
+
+    /**
+     * Sets the operations to be used.
+     * <p/>
+     * Can be used to set a fresh operations in case of recovery attempts
+     *
+     * @param operations the operations
+     */
+    public void setOperations(GenericFileOperations<T> operations) {
+        this.operations = operations;
+    }
+
+    /**
+     * Whether to ignore if the file cannot be retrieved.
+     * <p/>
+     * By default an {@link GenericFileOperationFailedException} is thrown if the file cannot be retrieved.
+     * <p/>
+     * This method allows to suppress this and just ignore that.
+     *
+     * @param  name     the file name
+     * @param  exchange the exchange
+     * @param  cause    optional exception occurred during retrieving file
+     * @return          <tt>true</tt> to ignore, <tt>false</tt> is the default.
+     */
+    protected boolean ignoreCannotRetrieveFile(String name, Exchange exchange, Exception cause) {
+        return false;
+    }
+
+    /**
+     * Processes the exchange
+     *
+     * @param  exchange the exchange
+     * @return          <tt>true</tt> if the file was started to be processed, <tt>false</tt> if the file was not
+     *                  started to be processed, for some reason (not found, or aborted etc)
+     */
+    protected boolean processExchange(final Exchange exchange) {
+        GenericFile<T> file = getExchangeFileProperty(exchange);
+        LOG.trace("Processing file: {}", file);
+
+        // must extract the absolute name before the begin strategy as the file
+        // could potentially be pre moved
+        // and then the file name would be changed
+        String absoluteFileName = file.getAbsoluteFilePath();
+
+        // snapshot the idempotent key now while the exchange still has pristine file headers;
+        // after routing, headers like CamelFileName may be mutated, causing key mismatch at completion time
+        if (Boolean.TRUE.equals(endpoint.isIdempotent()) && endpoint.getIdempotentKey() != null) {
+            String key = endpoint.getIdempotentKey().evaluate(exchange, String.class);
+            exchange.setProperty(Exchange.FILE_IDEMPOTENT_KEY, key);
+        }
+
+        // check if we can begin processing the file
+        Exception beginCause = null;
+        boolean begin = false;
+        try {
+            begin = processStrategy.begin(operations, endpoint, exchange, file);
+        } catch (Exception e) {
+            beginCause = e;
+        }
+
+        if (!begin) {
+            // no something was wrong, so we need to abort and remove the file
+            // from the in progress list
+            Exception abortCause = null;
+            LOG.debug("{} cannot begin processing file: {}", endpoint, file);
+            try {
+                // abort
+                processStrategy.abort(operations, endpoint, exchange, file);
+            } catch (Exception e) {
+                abortCause = e;
+            } finally {
+                // begin returned false, so remove file from the in progress
+                // list as its no longer in progress
+                endpoint.getInProgressRepository().remove(absoluteFileName);
+            }
+            if (beginCause != null) {
+                String msg = endpoint + " cannot begin processing file: " + file + " due to: " + beginCause.getMessage();
+                handleException(msg, exchange, beginCause);
+            }
+            if (abortCause != null) {
+                String msg2 = endpoint + " cannot abort processing file: " + file + " due to: " + abortCause.getMessage();
+                handleException(msg2, exchange, abortCause);
+            }
+            return false;
+        }
+
+        // must use file from exchange as it can be updated due the
+        // preMoveNamePrefix/preMoveNamePostfix options
+        final GenericFile<T> target = getExchangeFileProperty(exchange);
+
+        // we can begin processing the file so update file headers on the Camel
+        // message
+        // in case it took some time to acquire read lock, and file
+        // size/timestamp has been updated since etc
+        updateFileHeaders(target, exchange.getIn());
+
+        // must use full name when downloading so we have the correct path
+        final String name = target.getAbsoluteFilePath();
+        try {
+            if (isRetrieveFile()) {
+                if (!retrieveFileOrAbort(exchange, name, target, absoluteFileName, file)) {
+                    return false;
+                }
+            } else {
+                LOG.trace("Skipped retrieval of file: {} from: {}", name, endpoint);
+                exchange.getIn().setBody(null);
+            }
+
+            // register on completion callback that does the completion
+            // strategies
+            // (for instance to move the file after we have processed it)
+            GenericFileOnCompletion<T> onCompletion
+                    = new GenericFileOnCompletion<>(endpoint, operations, processStrategy, target, absoluteFileName);
+            GenericFileKeptDoneFiles kept = getKeptDoneFiles();
+            if (kept != null) {
+                onCompletion.setKeptDoneFiles(kept.batch());
+            }
+            exchange.getExchangeExtension().addOnCompletion(onCompletion);
+
+            LOG.debug("About to process file: {} using exchange: {}", target, exchange);
+
+            if (endpoint.isSynchronous()) {
+                // process synchronously
+                getProcessor().process(exchange);
+            } else {
+                // process the exchange using the async consumer to support
+                // async routing engine
+                // which can be supported by this file consumer as all the done
+                // work is
+                // provided in the GenericFileOnCompletion
+                getAsyncProcessor().process(exchange, EmptyAsyncCallback.get());
+            }
+
+        } catch (Exception e) {
+            // remove file from the in progress list due to failure
+            // (cannot be in finally block due to GenericFileOnCompletion will
+            // remove it
+            // from in progress when it takes over and processes the file, which
+            // may happen
+            // by another thread at a later time. So its only safe to remove it
+            // if there was an exception)
+            endpoint.getInProgressRepository().remove(absoluteFileName);
+
+            String msg = "Error processing file " + file + " due to " + e.getMessage();
+            handleException(msg, exchange, e);
+        }
+
+        return true;
+    }
+
+    /**
+     * Retrieves the file, and aborts if the file could not be retrieved (or cannot be retrieved and is ignored).
+     * <p/>
+     * The read lock has already been acquired by the begin strategy, and no {@link GenericFileOnCompletion} is
+     * registered yet, so the abort must release the read lock here. The idempotent key, when it was added eagerly, is
+     * removed here as well, for the original file: the begin strategy may have pre moved the file and bound the pre
+     * moved file to the exchange (preMove), so the key cannot be derived from the exchange file later. Returning
+     * <tt>false</tt> marks the file as not started, so the file can be retried on a later poll (the same as when the
+     * read lock could not be acquired).
+     *
+     * @return <tt>true</tt> if the file was retrieved, <tt>false</tt> if the file was not retrieved and processing was
+     *         aborted
+     */
+    private boolean retrieveFileOrAbort(
+            Exchange exchange, String name, GenericFile<T> target, String absoluteFileName, GenericFile<T> file) {
+        Exception retrieveCause = null;
+        boolean retrieved = false;
+        try {
+            retrieved = tryRetrievingFile(exchange, name, target, absoluteFileName, file);
+        } catch (Exception e) {
+            retrieveCause = e;
+        }
+        if (retrieved) {
+            return true;
+        }
+
+        LOG.debug("{} cannot retrieve file: {}", endpoint, target);
+        Exception abortCause = null;
+        try {
+            processStrategy.abort(operations, endpoint, exchange, target);
+        } catch (Exception e) {
+            abortCause = e;
+        } finally {
+            // the file is no longer in progress
+            endpoint.getInProgressRepository().remove(absoluteFileName);
+            removeEagerIdempotentKey(exchange, absoluteFileName);
+        }
+        if (retrieveCause != null) {
+            String msg = "Error processing file " + file + " due to " + retrieveCause.getMessage();
+            handleException(msg, exchange, retrieveCause);
+        }
+        if (abortCause != null) {
+            String msg2 = endpoint + " cannot abort processing file: " + target + " due to: " + abortCause.getMessage();
+            handleException(msg2, exchange, abortCause);
+        }
+        return false;
+    }
+
+    /**
+     * Removes the idempotent key that was added eagerly while polling the file, so the file can be consumed again.
+     * <p/>
+     * Uses the key of the original file (as {@link GenericFileOnCompletion} does on rollback), and not the file bound
+     * to the exchange, which is the pre moved file when using preMove.
+     */
+    private void removeEagerIdempotentKey(Exchange exchange, String absoluteFileName) {
+        if (Boolean.TRUE.equals(endpoint.isIdempotent()) && endpoint.isIdempotentEager()
+                && endpoint.getIdempotentRepository() != null) {
+            String key = absoluteFileName;
+            if (endpoint.getIdempotentKey() != null) {
+                key = exchange.getProperty(Exchange.FILE_IDEMPOTENT_KEY, absoluteFileName, String.class);
+            }
+            if (key != null) {
+                endpoint.getIdempotentRepository().remove(key);
+            }
+        }
+    }
+
+    boolean tryRetrievingFile(
+            Exchange exchange, String name, GenericFile<T> target, String absoluteFileName, GenericFile<T> file)
+            throws Exception {
+        // retrieve the file using the stream
+        LOG.trace("Retrieving file: {} from: {}", name, endpoint);
+
+        // retrieve the file and check it was a success
+        boolean retrieved;
+        Exception cause = null;
+        try {
+            retrieved = operations.retrieveFile(name, exchange, target.getFileLength());
+        } catch (Exception e) {
+            retrieved = false;
+            cause = e;
+        }
+
+        if (!retrieved) {
+            if (ignoreCannotRetrieveFile(name, exchange, cause)) {
+                LOG.trace("Cannot retrieve file {} maybe it does not exist. Ignoring.", name);
+                // remove file from the in progress list as we could not
+                // retrieve it, but should ignore
+                endpoint.getInProgressRepository().remove(absoluteFileName);
+                return false;
+            } else {
+                // throw exception to handle the problem with retrieving
+                // the file
+                // then if the method return false or throws an
+                // exception is handled the same in here
+                // as in both cases an exception is being thrown
+                if (cause instanceof GenericFileOperationFailedException) {
+                    throw cause;
+                } else {
+                    throw new GenericFileOperationFailedException(
+                            "Cannot retrieve file: " + file + " from: " + endpoint, cause);
+                }
+            }
+        }
+
+        LOG.trace("Retrieved file: {} from: {}", name, endpoint);
+        return true;
+    }
+
+    /**
+     * Updates the information on {@link Message} after we have acquired read-lock and can begin process the file.
+     *
+     * @param file    the file
+     * @param message the Camel message to update its headers
+     */
+    protected abstract void updateFileHeaders(GenericFile<T> file, Message message);
+
+    /**
+     * Whether the consumer should retrieve/download files. If false then the message body is null as no file is
+     * retrieved.
+     */
+    public boolean isRetrieveFile() {
+        return retrieveFile;
+    }
+
+    /**
+     * Whether the consumer should retrieve/download files. If false then the message body is null as no file is
+     * retrieved.
+     */
+    public void setRetrieveFile(boolean retrieveFile) {
+        this.retrieveFile = retrieveFile;
+    }
+
+    /**
+     * Processes the exchange using a custom processor.
+     *
+     * @param exchange  the exchange
+     * @param processor the custom processor
+     */
+    protected boolean customProcessExchange(final Exchange exchange, final Processor processor) {
+        GenericFile<T> file = getExchangeFileProperty(exchange);
+        LOG.trace("Custom processing file: {}", file);
+
+        // must extract the absolute name before the begin strategy as the file
+        // could potentially be pre moved
+        // and then the file name would be changed
+        String absoluteFileName = file.getAbsoluteFilePath();
+
+        try {
+            // process using the custom processor
+            processor.process(exchange);
+        } catch (Exception e) {
+            LOG.debug("{} error custom processing: {} due to: {}. This exception will be ignored.",
+                    endpoint, file, e.getMessage(), e);
+
+            handleException("Error during custom processing", exchange, e);
+        } finally {
+            // always remove file from the in progress list as its no longer in
+            // progress
+            // use the original file name that was used to add it to the
+            // repository
+            // as the name can be different when using preMove option
+            endpoint.getInProgressRepository().remove(absoluteFileName);
+        }
+
+        return true;
+    }
+
+    /**
+     * Strategy for validating if the given remote file should be included or not
+     *
+     * @param  file        the file
+     * @param  name        the file name
+     * @param  isDirectory whether the file is a directory or a file
+     * @param  files       files in the directory
+     * @return             <tt>true</tt> to include the file, <tt>false</tt> to skip it
+     */
+    protected boolean isValidFile(
+            Exchange dynamic,
+            Supplier<GenericFile<T>> file, String name, String absoluteFilePath,
+            Supplier<String> relativeFilePath, boolean isDirectory, T[] files) {
+        if (!isMatched(dynamic, file, name, absoluteFilePath, relativeFilePath, isDirectory, files)) {
+            LOG.trace("File did not match. Will skip this file: {}", name);
+            return false;
+        }
+
+        // the resolved path must stay within the starting directory, as the name it was built from is
+        // reported by the remote server and is not necessarily a single path segment, and a local file
+        // can be a symbolic link
+        if (endpoint.isJailStartingDirectory() && !isWithinStartingDirectory(file, absoluteFilePath)) {
+            String message = isUnresolvableLink(absoluteFilePath)
+                    ? "Skipping file as symbolic link cannot be resolved: {}"
+                    : "Skipping file as it resolves outside the starting directory: {}";
+            // such a file usually stays where it is and is listed again on every poll, so only warn the first time
+            if (skippedOutsideStartingDirectory.put(absoluteFilePath, Boolean.TRUE) == null) {
+                LOG.warn(message, absoluteFilePath);
+            } else {
+                LOG.debug(message, absoluteFilePath);
+            }
+            return false;
+        }
+
+        // directory is always valid
+        if (isDirectory) {
+            return true;
+        }
+
+        // check if file is already in progress
+        if (endpoint.getInProgressRepository().contains(absoluteFilePath)) {
+            if (LOG.isTraceEnabled()) {
+                LOG.trace("Skipping as file is already in progress: {}", name);
+            }
+            return false;
+        }
+
+        // if it is a file then check we have the file in the idempotent registry
+        // already
+        if (Boolean.TRUE.equals(endpoint.isIdempotent())) {
+            if (notUnique(dynamic, file, absoluteFilePath)) {
+                return false;
+            }
+        }
+
+        // okay so final step is to be able to add atomic as in-progress, so we
+        // are the
+        // only thread processing this file
+        return endpoint.getInProgressRepository().add(absoluteFilePath);
+    }
+
+    private boolean notUnique(Exchange dynamic, Supplier<GenericFile<T>> file, String absoluteFilePath) {
+        boolean answer = false;
+        // use absolute file path as default key, but evaluate if an
+        // expression key was configured
+        String key = absoluteFilePath;
+        if (endpoint.getIdempotentKey() != null) {
+            Exchange dummy = GenericFileHelper.createDummy(endpoint, dynamic, file);
+            key = endpoint.getIdempotentKey().evaluate(dummy, String.class);
+            LOG.trace("Evaluated idempotentKey: {} for file: {}", key, file);
+        }
+        if (key != null) {
+            answer = endpoint.isIdempotentEager()
+                    ? !endpoint.getIdempotentRepository().add(key) : endpoint.getIdempotentRepository().contains(key);
+            if (answer) {
+                LOG.trace(
+                        "This consumer is idempotent and the file has been consumed before matching idempotentKey: {}. Will skip this file: {}",
+                        key, file);
+            }
+        }
+        return answer;
+    }
+
+    /**
+     * Strategy to determine whether the resolved path of a listed file stays within the configured starting directory.
+     * <p/>
+     * Consumers that build the path from a name supplied by a remote server must override this, as such a name is not
+     * guaranteed to be a single path segment and can otherwise navigate outside the directory being polled. The local
+     * file consumer overrides this to resolve symbolic links. The check is only consulted when
+     * {@link GenericFileEndpoint#isJailStartingDirectory()} is enabled.
+     *
+     * @param  absoluteFilePath the resolved absolute path of the listed file
+     * @return                  {@code true} if the path stays within the starting directory
+     */
+    protected boolean isWithinStartingDirectory(String absoluteFilePath) {
+        // no boundary to enforce by default
+        return true;
+    }
+
+    /**
+     * Strategy to determine whether a listed file stays within the configured starting directory.
+     * <p/>
+     * Checks the resolved path with {@link #isWithinStartingDirectory(String)} by default. Consumers whose listing
+     * tells more about a file than its path, such as whether it is a symbolic link, override this. The check is only
+     * consulted when {@link GenericFileEndpoint#isJailStartingDirectory()} is enabled.
+     *
+     * @param  file             the listed file
+     * @param  absoluteFilePath the resolved absolute path of the listed file
+     * @return                  {@code true} if the file stays within the starting directory
+     */
+    protected boolean isWithinStartingDirectory(Supplier<GenericFile<T>> file, String absoluteFilePath) {
+        return isWithinStartingDirectory(absoluteFilePath);
+    }
+
+    /**
+     * Strategy to determine whether a skipped file could not be resolved (such as a dangling symbolic link).
+     *
+     * @param  absoluteFilePath the resolved absolute path of the listed file
+     * @return                  {@code true} if the file could not be resolved rather than resolving outside
+     */
+    protected boolean isUnresolvableLink(String absoluteFilePath) {
+        return false;
+    }
+
+    /**
+     * Strategy to perform hidden file matching based on endpoint configuration.
+     * <p/>
+     * Will always return <tt>false</tt> for certain files/folders:
+     * <ul>
+     * <li>Starting with a dot (hidden)</li>
+     * </ul>
+     */
+    protected boolean isMatchedHiddenFile(Supplier<GenericFile<T>> file, String name, boolean isDirectory) {
+        // folders/names starting with dot is always skipped (eg. ".", ".camel",
+        // ".camelLock")
+        if (name.startsWith(".")) {
+            return false;
+        }
+
+        return true;
+    }
+
+    /**
+     * Geta the relative path from the given file, calculated from the starting path, current path, and current absolute
+     * path
+     */
+    protected abstract Supplier<String> getRelativeFilePath(String endpointPath, String path, String absolutePath, T file);
+
+    /**
+     * Strategy to perform file matching based on endpoint configuration.
+     * <p/>
+     * Will always return <tt>false</tt> for certain files/folders:
+     * <ul>
+     * <li>Starting with a dot</li>
+     * <li>lock files</li>
+     * </ul>
+     * And then <tt>true</tt> for directories.
+     *
+     * @param  file             the file
+     * @param  name             the file name
+     * @param  absoluteFilePath the absolute file name
+     * @param  relativeFilePath the relative file name
+     * @param  isDirectory      whether the file is a directory or a file
+     * @param  files            files in the directory
+     * @return                  <tt>true</tt> if the file is matched, <tt>false</tt> if not
+     */
+    protected boolean isMatched(
+            Exchange dynamic,
+            Supplier<GenericFile<T>> file, String name, String absoluteFilePath,
+            Supplier<String> relativeFilePath, boolean isDirectory, T[] files) {
+
+        if (!isMatchedHiddenFile(file, name, isDirectory)) {
+            // folders/names starting with dot is always skipped (eg. ".", ".camel",
+            // ".camelLock")
+            return false;
+        }
+
+        // lock files should be skipped
+        if (name.endsWith(FileComponent.DEFAULT_LOCK_FILE_POSTFIX)) {
+            return false;
+        }
+
+        if (endpoint.getFilter() != null) {
+            Boolean accepted = null;
+            if (endpoint.getFilter() instanceof OptimizedFileFilter off) {
+                // use optimized test using file name only
+                accepted = off.accept(name);
+            }
+            if (accepted == null) {
+                // use default test using generic file
+                accepted = endpoint.getFilter().accept(file.get());
+            }
+            if (!accepted) {
+                return false;
+            }
+        }
+
+        if (endpoint.getAntFilter() != null) {
+            if (!endpoint.getAntFilter().accept(isDirectory, relativeFilePath.get())) {
+                return false;
+            }
+        }
+
+        if (isDirectory && endpoint.getFilterDirectory() != null) {
+            // create a dummy exchange as Exchange is needed for expression evaluation
+            Exchange dummy = GenericFileHelper.createDummy(endpoint, dynamic, file);
+            boolean matches = endpoint.getFilterDirectory().matches(dummy);
+            if (!matches) {
+                return false;
+            }
+        }
+
+        // directories are regarded as matched if filter accepted them
+        if (isDirectory) {
+            return true;
+        }
+
+        if (hasInclusionsOrExclusions(name)) {
+            return false;
+        }
+
+        if (endpoint.getFileName() != null) {
+            String result;
+            if (dynamic != null && !endpoint.isFileNameUsingFileFunctions()) {
+                // poll and pollEnrich: the fileName of the message being enriched (CAMEL-25792)
+                DynamicFileName current = dynamicFileName;
+                result = current != null && current.exchange() == dynamic
+                        ? current.name() : evaluateDynamicFileName(dynamic);
+            } else {
+                // create a dummy exchange as Exchange is needed for expression evaluation
+                Exchange dummy = GenericFileHelper.createDummy(endpoint, dynamic, file);
+                result = evaluateFileExpression(dummy);
+            }
+            if (result != null) {
+                if (!name.equals(result)) {
+                    return false;
+                }
+            }
+        }
+
+        if (endpoint.getFilterFile() != null) {
+            // create a dummy exchange as Exchange is needed for expression evaluation
+            Exchange dummy = GenericFileHelper.createDummy(endpoint, dynamic, file);
+            boolean matches = endpoint.getFilterFile().matches(dummy);
+            if (!matches) {
+                return false;
+            }
+        }
+
+        // if done file name is enabled, then the file is only valid if a done
+        // file exists
+        if (endpoint.getDoneFileName() != null) {
+            // done file must be in same path as the file
+            String doneFileName = endpoint.createDoneFileName(absoluteFilePath);
+            StringHelper.notEmpty(doneFileName, "doneFileName", endpoint);
+
+            // is it a done file name?
+            if (endpoint.isDoneFile(name)) {
+                LOG.trace("Skipping done file: {}", file);
+                return false;
+            }
+
+            if (!isMatched(file, doneFileName, files)) {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    private boolean hasInclusionsOrExclusions(String name) {
+        // exclude take precedence over include
+        if (excludePattern != null) {
+            if (excludePattern.matcher(name).matches()) {
+                return true;
+            }
+        }
+        String fname = null;
+        if (excludeExt != null) {
+            fname = name.toLowerCase();
+            if (hasExtExlusions(fname)) {
+                return true;
+            }
+        }
+        if (includePattern != null) {
+            if (!includePattern.matcher(name).matches()) {
+                return true;
+            }
+        }
+        if (includeExt != null) {
+            if (fname == null) {
+                fname = name.toLowerCase();
+            }
+            if (hasExtInclusions(fname)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    protected boolean hasExtInclusions(String fname) {
+        boolean any = false;
+        for (String include : includeExt) {
+            any |= fname.endsWith("." + include);
+        }
+        if (!any) {
+            return true;
+        }
+        return false;
+    }
+
+    protected boolean hasExtExlusions(String fname) {
+        for (String exclude : excludeExt) {
+            if (fname.endsWith("." + exclude)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * Strategy to perform file matching based on endpoint configuration in terms of done file name.
+     *
+     * @param  file         the file
+     * @param  doneFileName the done file name (without any paths)
+     * @param  files        files in the directory
+     * @return              <tt>true</tt> if the file is matched, <tt>false</tt> if not
+     */
+    protected abstract boolean isMatched(Supplier<GenericFile<T>> file, String doneFileName, T[] files);
+
+    /**
+     * The fileName evaluated on a copy of the message being enriched by poll or pollEnrich: its body, headers,
+     * variables and exchange properties, without the file found (CAMEL-25792).
+     */
+    private String evaluateDynamicFileName(Exchange dynamic) {
+        Exchange copy = GenericFileHelper.createDummy(endpoint, dynamic);
+        copy.getMessage().setBody(dynamic.getMessage().getBody());
+        return evaluateFileExpression(copy);
+    }
+
+    /** The fileName of the message being enriched, for the poll of that message. */
+    private record DynamicFileName(Exchange exchange, String name) {
+    }
+
+    protected String evaluateFileExpression(Exchange exchange) {
+        String result = endpoint.getFileName().evaluate(exchange, String.class);
+        if (exchange.getException() != null) {
+            throw RuntimeCamelException.wrapRuntimeCamelException(exchange.getException());
+        }
+        return result;
+    }
+
+    @SuppressWarnings("unchecked")
+    private GenericFile<T> getExchangeFileProperty(Exchange exchange) {
+        return (GenericFile<T>) exchange.getProperty(ExchangePropertyKey.FILE_EXCHANGE_FILE);
+    }
+
+    @Override
+    protected void doInit() throws Exception {
+        super.doInit();
+        // inject CamelContext before starting as it may be needed
+        if (processStrategy instanceof CamelContextAware camelContextAware) {
+            camelContextAware.setCamelContext(getEndpoint().getCamelContext());
+        }
+    }
+
+    @Override
+    protected void doStart() throws Exception {
+        ServiceHelper.startService(processStrategy);
+        super.doStart();
+    }
+
+    @Override
+    protected void doStop() throws Exception {
+        prepareOnStartup = false;
+        skippedOutsideStartingDirectory.clear();
+        if (keptDoneFiles != null) {
+            keptDoneFiles.clear();
+        }
+        super.doStop();
+        ServiceHelper.stopService(processStrategy);
+    }
+
+    @Override
+    public void onInit() throws Exception {
+        // noop as we do a manual on-demand poll with GenericFilePollingConsumer
+    }
+
+    @Override
+    public long beforePoll(long timeout) throws Exception {
+        // noop as we do a manual on-demand poll with GenericFilePollingConsumer
+        return timeout;
+    }
+
+    @Override
+    public void afterPoll() throws Exception {
+        // noop as we do a manual on-demand poll with GenericFilePollingConsumer
+    }
+
+}

@@ -1,0 +1,189 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.camel.component.statestore;
+
+import java.util.Map;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicBoolean;
+
+import org.apache.camel.Endpoint;
+import org.apache.camel.spi.KeyValueRepository;
+import org.apache.camel.spi.Metadata;
+import org.apache.camel.spi.annotations.Component;
+import org.apache.camel.support.DefaultComponent;
+import org.apache.camel.support.MemoryKeyValueRepository;
+import org.apache.camel.support.NamespacedKeyValueRepository;
+import org.apache.camel.support.service.ServiceHelper;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+/**
+ * The State Store component provides a simple, unified key-value store API backed by a {@link KeyValueRepository}.
+ *
+ * @since 4.23
+ */
+@Component("state-store")
+public class StateStoreComponent extends DefaultComponent {
+
+    private static final Logger LOG = LoggerFactory.getLogger(StateStoreComponent.class);
+
+    private final ConcurrentHashMap<String, KeyValueRepository> backends = new ConcurrentHashMap<>();
+    private final AtomicBoolean backendFactoryChecked = new AtomicBoolean();
+
+    @Metadata(label = "advanced", autowired = true,
+              description = "Factory that creates a dedicated backend for each store name. When set, it takes precedence over"
+                            + " registry auto-discovery for endpoints without an explicit backend.")
+    private StateStoreBackendFactory backendFactory;
+
+    @Metadata(description = "Whether to use a store-specific namespace prefix to isolate keys on a shared backend repository.",
+              defaultValue = "true")
+    private boolean namespaced = true;
+
+    @Override
+    protected Endpoint createEndpoint(String uri, String remaining, Map<String, Object> parameters) throws Exception {
+        StateStoreEndpoint endpoint = new StateStoreEndpoint(uri, this);
+        endpoint.setStoreName(remaining);
+        endpoint.setNamespaced(isNamespaced());
+        setProperties(endpoint, parameters);
+        return endpoint;
+    }
+
+    private static String toNamespace(String storeName) {
+        return "statestore:" + storeName.replace("%", "%25").replace(":", "%3A");
+    }
+
+    /**
+     * Returns the backend for the given store name, creating one if needed. Uses first-one-wins semantics: if a backend
+     * already exists for this store name, subsequent calls return the existing one regardless of the explicit backend
+     * passed.
+     */
+    KeyValueRepository getOrCreateBackend(String storeName, KeyValueRepository explicitBackend) {
+        return getOrCreateBackend(storeName, explicitBackend, isNamespaced());
+    }
+
+    KeyValueRepository getOrCreateBackend(String storeName, KeyValueRepository explicitBackend, boolean namespaced) {
+        if (explicitBackend != null) {
+            KeyValueRepository target = namespaced
+                    ? NamespacedKeyValueRepository.namespaced(explicitBackend, toNamespace(storeName))
+                    : explicitBackend;
+            KeyValueRepository existing = backends.putIfAbsent(storeName, target);
+            if (existing != null) {
+                KeyValueRepository existingDelegate
+                        = existing instanceof NamespacedKeyValueRepository n ? n.getDelegate() : existing;
+                if (existingDelegate != explicitBackend) {
+                    LOG.warn("Store '{}' already has a backend ({}). Ignoring explicit backend=# reference ({}).",
+                            storeName, existingDelegate.getClass().getSimpleName(), explicitBackend.getClass().getSimpleName());
+                }
+                boolean existingNamespaced = existing instanceof NamespacedKeyValueRepository;
+                if (existingNamespaced != namespaced) {
+                    LOG.warn("Store '{}' was already initialized with namespaced={}. Ignoring namespaced={} for this endpoint.",
+                            storeName, existingNamespaced, namespaced);
+                }
+                return existing;
+            }
+            ServiceHelper.startService(target);
+            return target;
+        }
+        KeyValueRepository result = backends.computeIfAbsent(storeName, k -> {
+            if (backendFactory == null && backendFactoryChecked.compareAndSet(false, true)) {
+                // checked lazily as autowiring happens after the component is initialized
+                int count = getCamelContext().getRegistry().findByType(StateStoreBackendFactory.class).size();
+                if (count > 1) {
+                    LOG.warn("Found {} StateStoreBackendFactory instances in the registry. None is autowired;"
+                             + " set the backendFactory option to choose one.",
+                            count);
+                }
+            }
+            KeyValueRepository backend = backendFactory != null ? backendFactory.createBackend(storeName) : null;
+            if (backend != null) {
+                LOG.debug("Created KeyValueRepository '{}' for store '{}' using backend factory",
+                        backend.getClass().getSimpleName(), storeName);
+                ServiceHelper.startService(backend);
+                return backend;
+            }
+            // Auto-discover a KeyValueRepository from the registry
+            Set<KeyValueRepository> found = getCamelContext().getRegistry().findByType(KeyValueRepository.class);
+            if (found.size() == 1) {
+                backend = found.iterator().next();
+                LOG.debug("Auto-discovered KeyValueRepository '{}' for store '{}'",
+                        backend.getClass().getSimpleName(), storeName);
+                KeyValueRepository target = namespaced
+                        ? NamespacedKeyValueRepository.namespaced(backend, toNamespace(storeName))
+                        : backend;
+                ServiceHelper.startService(target);
+                return target;
+            } else {
+                if (found.size() > 1) {
+                    LOG.warn(
+                            "Found {} KeyValueRepository instances in the registry for store '{}'. "
+                             + "Cannot auto-select — falling back to MemoryKeyValueRepository. "
+                             + "Use an explicit backend=# reference to choose one.",
+                            found.size(), storeName);
+                } else {
+                    LOG.info("No KeyValueRepository found in the registry for store '{}'. Using MemoryKeyValueRepository.",
+                            storeName);
+                }
+                backend = new MemoryKeyValueRepository();
+                ServiceHelper.startService(backend);
+                return backend;
+            }
+        });
+        boolean existingNamespaced = result instanceof NamespacedKeyValueRepository;
+        if (existingNamespaced != namespaced && backendFactory == null && !(result instanceof MemoryKeyValueRepository)) {
+            LOG.warn("Store '{}' was already initialized with namespaced={}. Ignoring namespaced={} for this endpoint.",
+                    storeName, existingNamespaced, namespaced);
+        }
+        return result;
+    }
+
+    public boolean isNamespaced() {
+        return namespaced;
+    }
+
+    public void setNamespaced(boolean namespaced) {
+        this.namespaced = namespaced;
+    }
+
+    public StateStoreBackendFactory getBackendFactory() {
+        return backendFactory;
+    }
+
+    public void setBackendFactory(StateStoreBackendFactory backendFactory) {
+        this.backendFactory = backendFactory;
+    }
+
+    @Override
+    protected void doStop() throws Exception {
+        Exception firstException = null;
+        for (KeyValueRepository backend : backends.values()) {
+            try {
+                ServiceHelper.stopService(backend);
+            } catch (Exception e) {
+                LOG.warn("Error stopping backend: {}", e.getMessage(), e);
+                if (firstException == null) {
+                    firstException = e;
+                }
+            }
+        }
+        backends.clear();
+        super.doStop();
+        if (firstException != null) {
+            throw firstException;
+        }
+    }
+}

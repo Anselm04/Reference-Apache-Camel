@@ -1,0 +1,316 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.camel.component.mcp.server;
+
+import java.util.List;
+
+/**
+ * Configuration for the {@link McpServerBridge}.
+ * <p>
+ * Bridge-owned options ({@code tags}, {@code toolTimeout}) are honored on every runtime. Engine-owned options
+ * ({@code path}, {@code serverName}, {@code serverTitle}, {@code serverDescription}, {@code serverWebsiteUrl},
+ * {@code instructions}, {@code serverIcons}) are consumed only by engines that serve through Camel — native engines
+ * (Quarkus, Spring Boot) use their own runtime configuration instead. OAuth options are accepted only by engines that
+ * explicitly support OAuth; configuring them for an unsupported engine fails during bridge initialization.
+ *
+ * @since 4.22
+ */
+public class McpServerConfiguration {
+
+    private String tags;
+    private long toolTimeout = McpServerConstants.DEFAULT_TOOL_TIMEOUT;
+    private long resourceTimeout = McpServerConstants.DEFAULT_RESOURCE_TIMEOUT;
+    private long promptTimeout = McpServerConstants.DEFAULT_PROMPT_TIMEOUT;
+    private String path = McpServerConstants.DEFAULT_PATH;
+    private String serverName;
+    private String serverTitle;
+    private String serverDescription;
+    private String serverWebsiteUrl;
+    private String instructions;
+    private List<McpServerIcon> serverIcons;
+    private long sessionKeepAliveInterval = McpServerConstants.DEFAULT_SESSION_KEEP_ALIVE_INTERVAL;
+    private long sessionIdleTtl = McpServerConstants.DEFAULT_SESSION_IDLE_TTL;
+    private String allowedOrigins;
+    private String allowedHosts;
+    private String protocolEra = McpProtocolEra.DUAL.value();
+    private boolean stateless;
+    private String oauthProfile;
+    private String requiredScopes;
+    private String resourceUri;
+
+    /**
+     * Comma-separated list of ai-tool tag patterns to expose as MCP tools. Matching is case-insensitive and supports
+     * exact match, wildcard prefix ({@code foo*}), and {@code *} to match all tags. Only tools registered under a
+     * matching tag are published; the untagged default pool is never exposed. When not set, no tools are published.
+     */
+    public String getTags() {
+        return tags;
+    }
+
+    public void setTags(String tags) {
+        this.tags = tags;
+    }
+
+    /**
+     * Per-call tool execution timeout in milliseconds. A call exceeding the timeout returns an error result to the MCP
+     * client; the underlying route keeps running until it completes on its own.
+     */
+    public long getToolTimeout() {
+        return toolTimeout;
+    }
+
+    public void setToolTimeout(long toolTimeout) {
+        this.toolTimeout = toolTimeout;
+    }
+
+    /**
+     * Per-read resource execution timeout in milliseconds. A read exceeding the timeout returns an error to the MCP
+     * client; the underlying route keeps running until it completes on its own.
+     */
+    public long getResourceTimeout() {
+        return resourceTimeout;
+    }
+
+    public void setResourceTimeout(long resourceTimeout) {
+        this.resourceTimeout = resourceTimeout;
+    }
+
+    /**
+     * Per-request prompt execution timeout in milliseconds. A request exceeding the timeout returns an error to the MCP
+     * client; the underlying route may continue running until it completes.
+     */
+    public long getPromptTimeout() {
+        return promptTimeout;
+    }
+
+    public void setPromptTimeout(long promptTimeout) {
+        this.promptTimeout = promptTimeout;
+    }
+
+    /**
+     * HTTP path where the MCP endpoint is served. Engine-owned: ignored by native engines.
+     */
+    public String getPath() {
+        return path;
+    }
+
+    public void setPath(String path) {
+        this.path = path;
+    }
+
+    /**
+     * MCP server name advertised to clients. Defaults to the CamelContext name. Engine-owned hint: native engines MAY
+     * ignore it.
+     */
+    public String getServerName() {
+        return serverName;
+    }
+
+    public void setServerName(String serverName) {
+        this.serverName = serverName;
+    }
+
+    /**
+     * MCP server display title advertised to clients in {@code serverInfo.title}. Engine-owned hint: native engines MAY
+     * ignore it.
+     */
+    public String getServerTitle() {
+        return serverTitle;
+    }
+
+    public void setServerTitle(String serverTitle) {
+        this.serverTitle = serverTitle;
+    }
+
+    /**
+     * MCP server description advertised to clients in {@code serverInfo.description}. Engine-owned hint: native engines
+     * MAY ignore it.
+     */
+    public String getServerDescription() {
+        return serverDescription;
+    }
+
+    public void setServerDescription(String serverDescription) {
+        this.serverDescription = serverDescription;
+    }
+
+    /**
+     * MCP server website URL advertised to clients in {@code serverInfo.websiteUrl}. Engine-owned hint: native engines
+     * MAY ignore it.
+     */
+    public String getServerWebsiteUrl() {
+        return serverWebsiteUrl;
+    }
+
+    public void setServerWebsiteUrl(String serverWebsiteUrl) {
+        this.serverWebsiteUrl = serverWebsiteUrl;
+    }
+
+    /**
+     * Top-level MCP instructions returned to clients on initialize. Engine-owned hint: native engines MAY ignore it.
+     */
+    public String getInstructions() {
+        return instructions;
+    }
+
+    public void setInstructions(String instructions) {
+        this.instructions = instructions;
+    }
+
+    /**
+     * Icons advertised to clients in {@code serverInfo.icons}. Engine-owned hint: native engines MAY ignore them.
+     */
+    public List<McpServerIcon> getServerIcons() {
+        return serverIcons;
+    }
+
+    public void setServerIcons(List<McpServerIcon> serverIcons) {
+        this.serverIcons = serverIcons;
+    }
+
+    /**
+     * Keep-alive ping interval in milliseconds for the Vert.x streamable transport. Dead sessions are evicted after
+     * consecutive ping failures. {@code 0} disables keep-alive pings. Engine-owned: ignored by native engines.
+     */
+    public long getSessionKeepAliveInterval() {
+        return sessionKeepAliveInterval;
+    }
+
+    public void setSessionKeepAliveInterval(long sessionKeepAliveInterval) {
+        this.sessionKeepAliveInterval = sessionKeepAliveInterval;
+    }
+
+    /**
+     * Idle TTL in milliseconds for MCP sessions managed by the Vert.x streamable transport. Sessions with no activity
+     * for longer than this interval are evicted. {@code 0} disables idle eviction. Engine-owned: ignored by native
+     * engines.
+     */
+    public long getSessionIdleTtl() {
+        return sessionIdleTtl;
+    }
+
+    public void setSessionIdleTtl(long sessionIdleTtl) {
+        this.sessionIdleTtl = sessionIdleTtl;
+    }
+
+    /**
+     * Comma-separated list of origins allowed to call the MCP endpoint, such as {@code https://app.example.com} or
+     * {@code http://localhost:*} (any port). A request without an {@code Origin} header is always served; a request
+     * with an {@code Origin} header that is not allowed is rejected with HTTP 403. Scheme and host are compared
+     * ignoring case, and a default port ({@code :80} for http, {@code :443} for https) may be left out. An entry that
+     * is not of the form {@code scheme://host[:port]}, such as {@code *}, fails the startup (see
+     * {@link McpServerOrigins}). When not set, only loopback origins are allowed. Engine-owned: ignored by native
+     * engines.
+     *
+     * @since 4.24
+     */
+    public String getAllowedOrigins() {
+        return allowedOrigins;
+    }
+
+    public void setAllowedOrigins(String allowedOrigins) {
+        this.allowedOrigins = allowedOrigins;
+    }
+
+    /**
+     * Comma-separated list of hosts allowed in the {@code Host} header of a request to the MCP endpoint, such as
+     * {@code mcp.example.com} or {@code localhost:*} (any port, or none). When set, a request whose {@code Host} header
+     * is missing or not in the list is rejected with HTTP 421 (Misdirected Request), before its body is read and before
+     * any session is created; this protects a server bound to a private address against DNS rebinding. The host is
+     * compared ignoring case. An entry that is not of the form {@code host[:port]}, such as {@code *} or an entry with
+     * a scheme, fails the startup (see {@link McpServerHosts}). When not set, the {@code Host} header is not checked.
+     * Engine-owned: ignored by native engines.
+     *
+     * @since 4.24
+     */
+    public String getAllowedHosts() {
+        return allowedHosts;
+    }
+
+    public void setAllowedHosts(String allowedHosts) {
+        this.allowedHosts = allowedHosts;
+    }
+
+    /**
+     * The MCP protocol versions served: {@code dual} (default) serves both the versions whose clients open with an
+     * {@code initialize} handshake (2025-11-25 and earlier, with a session) and protocol version 2026-07-28 (without a
+     * session) on the same endpoint, choosing for each request from the protocol version it carries; {@code legacy}
+     * serves only the former, {@code modern} only the latter (see {@link McpProtocolEra}). Serving protocol version
+     * 2026-07-28 is a preview. Engine-owned: ignored by native engines.
+     *
+     * @since 4.24
+     */
+    public String getProtocolEra() {
+        return protocolEra;
+    }
+
+    public void setProtocolEra(String protocolEra) {
+        this.protocolEra = protocolEra;
+    }
+
+    /**
+     * Whether clients that open with an {@code initialize} handshake are served without a session, as the MCP
+     * streamable HTTP transport allows: no {@code Mcp-Session-Id} is returned, each request is served on its own, the
+     * server sends them no notifications, and {@code GET} or {@code DELETE} on the endpoint is answered with HTTP 405.
+     * Clients of protocol version 2026-07-28 never get a session. Engine-owned: ignored by native engines.
+     *
+     * @since 4.24
+     */
+    public boolean isStateless() {
+        return stateless;
+    }
+
+    public void setStateless(boolean stateless) {
+        this.stateless = stateless;
+    }
+
+    /**
+     * Name of the camel-oauth profile used to authenticate OAuth bearer tokens. Supported by the Camel Main HTTP MCP
+     * engine; other engines reject this option unless they explicitly implement OAuth support.
+     */
+    public String getOauthProfile() {
+        return oauthProfile;
+    }
+
+    public void setOauthProfile(String oauthProfile) {
+        this.oauthProfile = oauthProfile;
+    }
+
+    /**
+     * Comma-separated OAuth scopes required to access the MCP HTTP endpoint. Requires an oauthProfile and an engine
+     * that explicitly supports OAuth configuration.
+     */
+    public String getRequiredScopes() {
+        return requiredScopes;
+    }
+
+    public void setRequiredScopes(String requiredScopes) {
+        this.requiredScopes = requiredScopes;
+    }
+
+    /**
+     * Canonical public HTTPS resource identifier used for RFC 9728 metadata. Requires an oauthProfile and an engine
+     * that explicitly supports OAuth configuration.
+     */
+    public String getResourceUri() {
+        return resourceUri;
+    }
+
+    public void setResourceUri(String resourceUri) {
+        this.resourceUri = resourceUri;
+    }
+}

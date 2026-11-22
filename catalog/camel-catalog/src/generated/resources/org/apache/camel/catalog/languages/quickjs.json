@@ -1,0 +1,33 @@
+{
+  "language": {
+    "kind": "language",
+    "name": "quickjs",
+    "title": "QuickJS",
+    "description": "Evaluates a JavaScript expression using QuickJS4J",
+    "deprecated": false,
+    "firstVersion": "4.23.0",
+    "label": "language,javascript",
+    "javaType": "org.apache.camel.language.quickjs.QuickjsLanguage",
+    "supportLevel": "Preview",
+    "groupId": "org.apache.camel",
+    "artifactId": "camel-quickjs",
+    "version": "4.24.0-SNAPSHOT",
+    "modelName": "quickjs",
+    "modelJavaType": "org.apache.camel.model.language.QuickjsExpression"
+  },
+  "bodyTypes": {
+    "expressionIn": { "carriers": [ "text", "bytes", "value", "map", "list", "pojo" ], "description": "A JSON copy of the body, in the variable body: bytes as Base64 text, and a POJO through Jackson. A stream fails: convert it to text first" },
+    "expressionOut": { "carriers": [ "text", "value", "map", "list", "null" ], "javaTypeOption": "resultType", "description": "The JSON value the script returns: an object or a Map as a Map, an array, a Set or a typed array as a List, a Date as its ISO text, and undefined, NaN or a function as null" }
+  },
+  "languageProperties": {
+    "engineMaxMemory": { "index": 0, "kind": "property", "displayName": "Engine Max Memory", "group": "advanced", "label": "advanced", "required": false, "type": "integer", "javaType": "long", "deprecated": false, "autowired": false, "secret": false, "defaultValue": 67108864, "description": "Recycle a worker thread's engine once its WebAssembly memory exceeds this many bytes (default 64 MB)." },
+    "engineMaxEvaluations": { "index": 1, "kind": "property", "displayName": "Engine Max Evaluations", "group": "advanced", "label": "advanced", "required": false, "type": "integer", "javaType": "int", "deprecated": false, "autowired": false, "secret": false, "defaultValue": 50000, "description": "Recycle a worker thread's engine after this many evaluations." }
+  },
+  "properties": {
+    "id": { "index": 0, "kind": "attribute", "displayName": "Id", "group": "common", "required": false, "type": "string", "javaType": "java.lang.String", "deprecated": false, "autowired": false, "secret": false, "description": "The id of this node." },
+    "expression": { "index": 1, "kind": "value", "displayName": "Expression", "group": "common", "required": true, "type": "string", "javaType": "java.lang.String", "deprecated": false, "autowired": false, "secret": false, "description": "The expression value in your chosen language syntax." },
+    "resultType": { "index": 2, "kind": "attribute", "displayName": "Result Type", "group": "common", "required": false, "type": "string", "javaType": "java.lang.String", "deprecated": false, "autowired": false, "secret": false, "description": "The class of the result type (type from output)." },
+    "trim": { "index": 3, "kind": "attribute", "displayName": "Trim", "group": "advanced", "label": "advanced", "required": false, "type": "boolean", "javaType": "java.lang.Boolean", "deprecated": false, "autowired": false, "secret": false, "defaultValue": true, "description": "Whether to trim the source code to remove leading and trailing whitespaces and line breaks." },
+    "resolveResource": { "index": 4, "kind": "attribute", "displayName": "Resolve Resource", "group": "advanced", "label": "advanced", "required": false, "type": "boolean", "javaType": "java.lang.Boolean", "deprecated": false, "autowired": false, "secret": false, "defaultValue": false, "description": "Whether a result of the expression that is a String starting with resource: is loaded as a resource and its content becomes the result, e.g. a script that returns resource:templates\/order.json. The name has no scheme and is loaded from the classpath: camel run puts the files given on the command line on the classpath and export puts them in src\/main\/resources, so the same name works in both. A name with a scheme (file:, http: ...) or with .. fails. Let the route choose the name, such as a fixed folder with a name picked by the route, and do not take it straight from the message. Off by default; the resource: prefix on the expression text itself is always resolved. Applies to the expression used as a value, not as a predicate." }
+  }
+}

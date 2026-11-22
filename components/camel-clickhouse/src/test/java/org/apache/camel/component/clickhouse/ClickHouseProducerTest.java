@@ -1,0 +1,394 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.camel.component.clickhouse;
+
+import java.io.ByteArrayInputStream;
+import java.io.File;
+import java.io.InputStream;
+import java.nio.charset.StandardCharsets;
+import java.util.List;
+import java.util.Map;
+import java.util.concurrent.CompletableFuture;
+
+import com.clickhouse.client.api.Client;
+import com.clickhouse.client.api.insert.InsertResponse;
+import com.clickhouse.client.api.insert.InsertSettings;
+import com.clickhouse.client.api.query.QueryResponse;
+import com.clickhouse.client.api.query.QuerySettings;
+import com.clickhouse.data.ClickHouseFormat;
+import org.apache.camel.CamelContext;
+import org.apache.camel.Exchange;
+import org.apache.camel.WrappedFile;
+import org.apache.camel.builder.RouteBuilder;
+import org.apache.camel.component.mock.MockEndpoint;
+import org.apache.camel.test.junit6.CamelTestSupport;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+import org.mockito.ArgumentCaptor;
+
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyList;
+import static org.mockito.ArgumentMatchers.anyString;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.times;
+import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.when;
+
+class ClickHouseProducerTest extends CamelTestSupport {
+
+    private final Client client = mock(Client.class);
+    private final InsertResponse insertResponse = mock(InsertResponse.class);
+    private final QueryResponse queryResponse = mock(QueryResponse.class);
+
+    @Override
+    protected CamelContext createCamelContext() throws Exception {
+        CamelContext context = super.createCamelContext();
+        ClickHouseComponent component = new ClickHouseComponent();
+        component.setClient(client);
+        context.addComponent("clickhouse", component);
+        return context;
+    }
+
+    @BeforeEach
+    void setupMocks() {
+        when(insertResponse.getWrittenRows()).thenReturn(3L);
+        when(client.insert(anyString(), any(InputStream.class), any(ClickHouseFormat.class), any(InsertSettings.class)))
+                .thenReturn(CompletableFuture.completedFuture(insertResponse));
+        when(client.insert(anyString(), anyList(), any(InsertSettings.class)))
+                .thenReturn(CompletableFuture.completedFuture(insertResponse));
+
+        when(queryResponse.getReadRows()).thenReturn(5L);
+        when(queryResponse.getInputStream())
+                .thenReturn(new ByteArrayInputStream("id,name\n1,alice\n".getBytes(StandardCharsets.UTF_8)));
+        when(client.query(anyString(), any(QuerySettings.class)))
+                .thenReturn(CompletableFuture.completedFuture(queryResponse));
+
+        when(client.ping()).thenReturn(true);
+    }
+
+    @Override
+    protected RouteBuilder createRouteBuilder() {
+        return new RouteBuilder() {
+            @Override
+            public void configure() {
+                from("direct:insert")
+                        .to("clickhouse://analytics.events?operation=insert&format=JSONEachRow")
+                        .to("mock:result");
+                from("direct:insertRowBinary")
+                        .to("clickhouse://analytics.events?operation=insert&format=RowBinary")
+                        .to("mock:result");
+                from("direct:insertBatched")
+                        .to("clickhouse://analytics.events?operation=insert&format=JSONEachRow&batchSize=2")
+                        .to("mock:result");
+                from("direct:query")
+                        .to("clickhouse://analytics?operation=query&format=CSV")
+                        .to("mock:result");
+                from("direct:queryRowBinary")
+                        .to("clickhouse://analytics?operation=query&format=RowBinary")
+                        .to("mock:result");
+                from("direct:queryNdjson")
+                        .to("clickhouse://analytics?operation=query&format=NDJSON")
+                        .to("mock:result");
+                from("direct:ping")
+                        .to("clickhouse://analytics?operation=ping")
+                        .to("mock:result");
+                from("direct:default")
+                        .to("clickhouse://analytics.events")
+                        .to("mock:result");
+            }
+        };
+    }
+
+    @Test
+    void insertStreamsStringBodyWithConfiguredFormat() throws Exception {
+        MockEndpoint mock = getMockEndpoint("mock:result");
+        mock.expectedMessageCount(1);
+
+        template.sendBody("direct:insert", "{\"id\":1,\"name\":\"alice\"}");
+
+        MockEndpoint.assertIsSatisfied(context);
+
+        ArgumentCaptor<String> tableCaptor = ArgumentCaptor.forClass(String.class);
+        ArgumentCaptor<ClickHouseFormat> formatCaptor = ArgumentCaptor.forClass(ClickHouseFormat.class);
+        verify(client).insert(tableCaptor.capture(), any(InputStream.class), formatCaptor.capture(),
+                any(InsertSettings.class));
+
+        assertThat(tableCaptor.getValue()).isEqualTo("events");
+        assertThat(formatCaptor.getValue()).isEqualTo(ClickHouseFormat.JSONEachRow);
+        assertThat(mock.getExchanges().get(0).getMessage().getHeader(ClickHouseConstants.WRITTEN_ROWS))
+                .isEqualTo(3L);
+    }
+
+    @Test
+    void insertStreamsByteArrayBody() throws Exception {
+        template.sendBody("direct:insertRowBinary", "row-binary-bytes".getBytes(StandardCharsets.UTF_8));
+
+        ArgumentCaptor<ClickHouseFormat> formatCaptor = ArgumentCaptor.forClass(ClickHouseFormat.class);
+        verify(client).insert(anyString(), any(InputStream.class), formatCaptor.capture(), any(InsertSettings.class));
+        assertThat(formatCaptor.getValue()).isEqualTo(ClickHouseFormat.RowBinary);
+    }
+
+    @Test
+    void insertUsesNativeListApiForListBodies() throws Exception {
+        List<Event> rows = List.of(new Event(1, "alice"), new Event(2, "bob"));
+
+        template.sendBody("direct:insert", rows);
+
+        verify(client).insert(anyString(), anyList(), any(InsertSettings.class));
+    }
+
+    @Test
+    void insertListOfMapsFailsWithClearMessage() {
+        List<Map<String, Object>> rows = List.of(Map.of("id", 1, "name", "alice"));
+
+        Exchange out = template.send("direct:insert", exchange -> exchange.getIn().setBody(rows));
+
+        assertThat(out.getException())
+                .isInstanceOf(ClickHouseException.class)
+                .hasMessageContaining("List of Maps")
+                .hasMessageContaining("JSONEachRow");
+        verify(client, never()).insert(anyString(), anyList(), any(InsertSettings.class));
+    }
+
+    @Test
+    void insertListWithoutRegisteredClassFailsWithClearMessage() {
+        // client-v2 throws a NullPointerException when no class was registered for the table
+        when(client.insert(anyString(), anyList(), any(InsertSettings.class))).thenThrow(new NullPointerException());
+
+        Exchange out = template.send("direct:insert",
+                exchange -> exchange.getIn().setBody(List.of(new Event(1, "alice"))));
+
+        assertThat(out.getException())
+                .isInstanceOf(ClickHouseException.class)
+                .hasMessageContaining(Event.class.getName())
+                .hasMessageContaining("Client.register")
+                .hasCauseInstanceOf(NullPointerException.class);
+    }
+
+    @Test
+    void insertEmptyListIsZeroRowInsert() throws Exception {
+        // client-v2 fails an empty list with "Data cannot be empty", so the client must not be called
+        when(client.insert(anyString(), anyList(), any(InsertSettings.class)))
+                .thenThrow(new IllegalArgumentException("Data cannot be empty"));
+
+        MockEndpoint mock = getMockEndpoint("mock:result");
+        mock.expectedMessageCount(1);
+        mock.expectedHeaderReceived(ClickHouseConstants.WRITTEN_ROWS, 0L);
+
+        template.sendBody("direct:insert", List.of());
+
+        MockEndpoint.assertIsSatisfied(context);
+        verify(client, never()).insert(anyString(), anyList(), any(InsertSettings.class));
+    }
+
+    @Test
+    void insertSplitsListIntoBatchesWhenBatchSizeSet() throws Exception {
+        // batchSize=2 with 5 rows -> 3 insert calls (2 + 2 + 1)
+        List<Event> rows = List.of(
+                new Event(1, "a"), new Event(2, "b"), new Event(3, "c"), new Event(4, "d"), new Event(5, "e"));
+
+        template.sendBody("direct:insertBatched", rows);
+
+        ArgumentCaptor<List> batchCaptor = ArgumentCaptor.forClass(List.class);
+        verify(client, times(3)).insert(anyString(), batchCaptor.capture(), any(InsertSettings.class));
+
+        List<List> batches = batchCaptor.getAllValues();
+        assertThat(batches).hasSize(3);
+        assertThat(batches.get(0)).hasSize(2);
+        assertThat(batches.get(1)).hasSize(2);
+        assertThat(batches.get(2)).hasSize(1);
+    }
+
+    @Test
+    void insertStreamsWrappedFileBody() throws Exception {
+        File file = File.createTempFile("clickhouse-", ".json");
+        file.deleteOnExit();
+        java.nio.file.Files.writeString(file.toPath(), "{\"id\":1,\"name\":\"alice\"}");
+
+        WrappedFile<File> wrappedFile = new WrappedFile<>() {
+            @Override
+            public File getFile() {
+                return file;
+            }
+
+            @Override
+            public Object getBody() {
+                return file;
+            }
+
+            @Override
+            public long getFileLength() {
+                return file.length();
+            }
+        };
+
+        template.sendBody("direct:insert", wrappedFile);
+
+        verify(client).insert(anyString(), any(InputStream.class), any(ClickHouseFormat.class), any(InsertSettings.class));
+    }
+
+    @Test
+    void queryReturnsResultBodyAndReadRowsHeader() throws Exception {
+        Object result = template.requestBody("direct:query", "SELECT * FROM analytics.events");
+
+        assertThat(result).isInstanceOf(String.class);
+        assertThat((String) result).contains("alice");
+
+        MockEndpoint mock = getMockEndpoint("mock:result");
+        assertThat(mock.getExchanges().get(0).getMessage().getHeader(ClickHouseConstants.READ_ROWS)).isEqualTo(5L);
+
+        ArgumentCaptor<String> sqlCaptor = ArgumentCaptor.forClass(String.class);
+        verify(client).query(sqlCaptor.capture(), any(QuerySettings.class));
+        assertThat(sqlCaptor.getValue()).isEqualTo("SELECT * FROM analytics.events");
+    }
+
+    @Test
+    void queryWithBinaryFormatReturnsBytes() throws Exception {
+        // RowBinary of (UInt32 200, String 'é'): bytes that are not valid UTF-8 on their own
+        byte[] rowBinary = { (byte) 0xC8, 0x00, 0x00, 0x00, 0x02, (byte) 0xC3, (byte) 0xA9 };
+        when(queryResponse.getInputStream()).thenReturn(new ByteArrayInputStream(rowBinary));
+
+        Object result = template.requestBody("direct:queryRowBinary", "SELECT id, name FROM analytics.events");
+
+        assertThat(result).isInstanceOf(byte[].class);
+        assertThat((byte[]) result).containsExactly(rowBinary);
+
+        ArgumentCaptor<QuerySettings> settingsCaptor = ArgumentCaptor.forClass(QuerySettings.class);
+        verify(client).query(anyString(), settingsCaptor.capture());
+        assertThat(settingsCaptor.getValue().getFormat()).isEqualTo(ClickHouseFormat.RowBinary);
+    }
+
+    @Test
+    void queryWithNdjsonFormatReturnsString() throws Exception {
+        when(queryResponse.getInputStream())
+                .thenReturn(new ByteArrayInputStream("{\"id\":1,\"name\":\"alice\"}\n".getBytes(StandardCharsets.UTF_8)));
+
+        Object result = template.requestBody("direct:queryNdjson", "SELECT id, name FROM analytics.events");
+
+        assertThat(result).isEqualTo("{\"id\":1,\"name\":\"alice\"}\n");
+    }
+
+    @Test
+    void pingReturnsBooleanBodyAndHeader() throws Exception {
+        Object result = template.requestBody("direct:ping", (Object) null);
+
+        assertThat(result).isEqualTo(true);
+        verify(client).ping();
+
+        MockEndpoint mock = getMockEndpoint("mock:result");
+        assertThat(mock.getExchanges().get(0).getMessage().getHeader(ClickHouseConstants.PING_OK)).isEqualTo(true);
+    }
+
+    @Test
+    void operationHeaderOverridesEndpointOperation() throws Exception {
+        // endpoint is configured for insert, but the header forces a ping
+        Object result = template.requestBodyAndHeader("direct:default", null,
+                ClickHouseConstants.OPERATION, "ping");
+
+        assertThat(result).isEqualTo(true);
+        verify(client).ping();
+    }
+
+    @Test
+    void formatHeaderOverridesEndpointFormat() throws Exception {
+        template.sendBodyAndHeader("direct:insert", "1\talice", ClickHouseConstants.FORMAT, "TSV");
+
+        ArgumentCaptor<ClickHouseFormat> formatCaptor = ArgumentCaptor.forClass(ClickHouseFormat.class);
+        verify(client).insert(anyString(), any(InputStream.class), formatCaptor.capture(), any(InsertSettings.class));
+
+        assertThat(formatCaptor.getValue()).isEqualTo(ClickHouseFormat.TSV);
+    }
+
+    @Test
+    void databaseAndTableHeadersAreIgnoredByDefaultForInsert() throws Exception {
+        template.sendBodyAndHeaders("direct:insert", "{\"id\":1}", Map.of(
+                ClickHouseConstants.DATABASE, "other",
+                ClickHouseConstants.TABLE, "overridden"));
+
+        ArgumentCaptor<String> tableCaptor = ArgumentCaptor.forClass(String.class);
+        ArgumentCaptor<InsertSettings> settingsCaptor = ArgumentCaptor.forClass(InsertSettings.class);
+        verify(client).insert(tableCaptor.capture(), any(InputStream.class), any(ClickHouseFormat.class),
+                settingsCaptor.capture());
+
+        assertThat(tableCaptor.getValue()).isEqualTo("events");
+        assertThat(settingsCaptor.getValue().getDatabase()).isEqualTo("analytics");
+    }
+
+    @Test
+    void databaseHeaderIsIgnoredByDefaultForQuery() throws Exception {
+        template.requestBodyAndHeader("direct:query", "SELECT count() FROM events", ClickHouseConstants.DATABASE, "other");
+
+        ArgumentCaptor<QuerySettings> settingsCaptor = ArgumentCaptor.forClass(QuerySettings.class);
+        verify(client).query(anyString(), settingsCaptor.capture());
+
+        assertThat(settingsCaptor.getValue().getDatabase()).isEqualTo("analytics");
+    }
+
+    @Test
+    void tableHeaderDoesNotStandInForAMissingTableByDefault() {
+        Exchange out = template.send("clickhouse://analytics?operation=insert", exchange -> {
+            exchange.getIn().setBody("{\"id\":1}");
+            exchange.getIn().setHeader(ClickHouseConstants.TABLE, "overridden");
+        });
+
+        assertThat(out.getException())
+                .isInstanceOf(ClickHouseException.class)
+                .hasMessageContaining("table is required")
+                .hasMessageContaining("allowDatabaseAndTableFromHeaders=true");
+        verify(client, never()).insert(anyString(), any(InputStream.class), any(ClickHouseFormat.class),
+                any(InsertSettings.class));
+    }
+
+    @Test
+    void databaseAndTableHeadersOverrideEndpointWhenAllowed() throws Exception {
+        template.sendBodyAndHeaders(
+                "clickhouse://analytics.events?operation=insert&allowDatabaseAndTableFromHeaders=true", "{\"id\":1}",
+                Map.of(ClickHouseConstants.DATABASE, "other", ClickHouseConstants.TABLE, "overridden"));
+
+        ArgumentCaptor<String> tableCaptor = ArgumentCaptor.forClass(String.class);
+        ArgumentCaptor<InsertSettings> settingsCaptor = ArgumentCaptor.forClass(InsertSettings.class);
+        verify(client).insert(tableCaptor.capture(), any(InputStream.class), any(ClickHouseFormat.class),
+                settingsCaptor.capture());
+
+        assertThat(tableCaptor.getValue()).isEqualTo("overridden");
+        assertThat(settingsCaptor.getValue().getDatabase()).isEqualTo("other");
+    }
+
+    @Test
+    void databaseHeaderOverridesQueryDatabaseWhenAllowed() throws Exception {
+        template.requestBodyAndHeader("clickhouse://analytics?operation=query&allowDatabaseAndTableFromHeaders=true",
+                "SELECT count() FROM events", ClickHouseConstants.DATABASE, "other");
+
+        ArgumentCaptor<QuerySettings> settingsCaptor = ArgumentCaptor.forClass(QuerySettings.class);
+        verify(client).query(anyString(), settingsCaptor.capture());
+
+        assertThat(settingsCaptor.getValue().getDatabase()).isEqualTo("other");
+    }
+
+    @Test
+    void queryWithoutSqlBodyFails() {
+        assertThat(template.request("direct:query", exchange -> exchange.getIn().setBody(null))
+                .getException())
+                .isInstanceOf(ClickHouseException.class)
+                .hasMessageContaining("SQL query");
+    }
+
+    public record Event(int id, String name) {
+    }
+}

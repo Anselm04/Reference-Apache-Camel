@@ -1,0 +1,111 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.camel.component.telegram.service;
+
+import java.io.InputStream;
+import java.net.URI;
+import java.net.http.HttpRequest;
+import java.net.http.HttpResponse;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutionException;
+
+import org.apache.camel.AsyncCallback;
+import org.apache.camel.Exchange;
+import org.apache.camel.component.telegram.TelegramMessage;
+import org.apache.camel.component.telegram.model.MessageResult;
+import tools.jackson.databind.ObjectMapper;
+
+abstract class TelegramMessageHandler<T extends TelegramMessage> {
+    protected final ObjectMapper mapper;
+
+    private final TelegramApiClient apiClient;
+    private final String contentType;
+    private final String uri;
+    private final Class<? extends MessageResult> resultClass;
+
+    protected TelegramMessageHandler(TelegramApiClient apiClient, String uri,
+                                     String contentType, Class<? extends MessageResult> resultClass) {
+        this.apiClient = apiClient;
+        this.mapper = apiClient.mapper();
+        this.uri = uri;
+        this.contentType = contentType;
+        this.resultClass = resultClass;
+    }
+
+    public void sendMessage(Exchange exchange, AsyncCallback callback, T message) {
+        HttpRequest.Builder builder = HttpRequest.newBuilder().uri(URI.create(uri));
+
+        // the body of this request only: the producer may send from several threads at once
+        TelegramBodyPublisher bodyPublisher = new TelegramBodyPublisher(apiClient.bufferSize());
+        addBody(bodyPublisher, message);
+
+        if (bodyPublisher.getBodyParts().size() > 1) {
+            builder.setHeader("Content-type", "multipart/form-data; boundary=\"" + bodyPublisher.getBoundary() + "\"");
+        } else {
+            if (contentType != null) {
+                builder.setHeader("Content-type", contentType);
+            }
+        }
+
+        builder.setHeader("Accept", "application/json");
+
+        builder.POST(bodyPublisher.newPublisher());
+        final TelegramAsyncHandler telegramAsyncHandler = new TelegramAsyncHandler(uri, resultClass, mapper, exchange);
+        final CompletableFuture<HttpResponse<InputStream>> sent
+                = apiClient.client().sendAsync(builder.build(), HttpResponse.BodyHandlers.ofInputStream());
+        final CompletableFuture<Object> response = sent.thenApply(telegramAsyncHandler::handleCompressedResponse);
+
+        try {
+            // the calling thread waits for the answer, so a caller sends one message after the other
+            response.get();
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            // nobody waits for the answer any more: keep the stage from writing to the completed exchange later,
+            // and abort the request. The futures of the JDK client pass the cancel of a dependent stage on to the
+            // request; the future of a custom client may not, so the one that sendAsync returned is cancelled too
+            response.cancel(true);
+            sent.cancel(true);
+            exchange.setException(new RuntimeException(e));
+        } catch (ExecutionException e) {
+            // an error status, a body that could not be read, or a request that failed without an answer
+            exchange.setException(new RuntimeException(e));
+        }
+
+        // the only place that completes the exchange. The producer returns false from process(), hence done(false)
+        callback.done(false);
+    }
+
+    protected abstract void addBody(TelegramBodyPublisher bodyPublisher, T message);
+
+    static <T> void buildTextPart(TelegramBodyPublisher bodyPublisher, String name, T value) {
+        if (value != null) {
+            TelegramBodyPublisher.MultilineBodyPart<T> bodyPart
+                    = new TelegramBodyPublisher.MultilineBodyPart<>(name, value, "text/plain");
+
+            bodyPublisher.addBodyPart(bodyPart);
+        }
+    }
+
+    void buildMediaPart(TelegramBodyPublisher bodyPublisher, String name, String fileNameWithExtension, byte[] value) {
+        TelegramBodyPublisher.MultilineBodyPart<byte[]> bodyPart
+                = new TelegramBodyPublisher.MultilineBodyPart<>(name, value, "application/octet-stream", null);
+
+        bodyPart.addHeader("filename", fileNameWithExtension);
+
+        bodyPublisher.addBodyPart(bodyPart);
+    }
+}

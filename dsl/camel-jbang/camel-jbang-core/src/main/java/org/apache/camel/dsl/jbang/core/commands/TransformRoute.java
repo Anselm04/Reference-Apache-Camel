@@ -1,0 +1,284 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.camel.dsl.jbang.core.commands;
+
+import java.awt.*;
+import java.awt.datatransfer.Clipboard;
+import java.awt.datatransfer.StringSelection;
+import java.io.FileNotFoundException;
+import java.io.InputStream;
+import java.nio.file.Files;
+import java.nio.file.NoSuchFileException;
+import java.nio.file.Path;
+import java.util.ArrayList;
+import java.util.Iterator;
+import java.util.List;
+import java.util.regex.Pattern;
+
+import javax.lang.model.SourceVersion;
+
+import org.aesh.command.CommandDefinition;
+import org.aesh.command.option.Arguments;
+import org.aesh.command.option.Mixin;
+import org.aesh.command.option.Option;
+import org.apache.camel.dsl.jbang.core.common.CliException;
+import org.apache.camel.dsl.jbang.core.common.CliExitCode;
+import org.apache.camel.dsl.jbang.core.common.CommandLineHelper;
+import org.apache.camel.dsl.jbang.core.common.CompletionCandidates;
+import org.apache.camel.dsl.jbang.run.common.CamelJBangConstants;
+import org.apache.camel.dsl.jbang.run.common.PathUtils;
+import org.apache.camel.main.KameletMain;
+import org.apache.camel.support.ResourceHelper;
+import org.apache.camel.util.IOHelper;
+import org.apache.camel.util.StopWatch;
+
+@CommandDefinition(name = "route", description = "Transform Camel routes to XML, YAML or Java format", generateHelp = true,
+                   footer = {
+                           "Examples:",
+                           "  camel transform route hello.java --format=yaml",
+                           "  camel transform route hello.xml --format=yaml",
+                           "  camel transform route hello.camel.yaml --format=java" })
+public class TransformRoute extends CamelCommand {
+
+    public static class FormatCompletionCandidates extends CompletionCandidates {
+
+        public FormatCompletionCandidates() {
+        }
+
+        @Override
+        public Iterator<String> iterator() {
+            return List.of("xml", "yaml", "java").iterator();
+        }
+    }
+
+    @Arguments(description = "The Camel file(s) to run. If no files specified then application.properties is used as source for which files to run.",
+               paramLabel = "files")
+    List<String> files = new ArrayList<>();
+
+    @Option(name = "output",
+            description = "File or directory to store transformed files. If none provide then output is printed to console. Use clipboard as name to copy content into clipboard.")
+    String output;
+
+    @Option(name = "format",
+            description = "Output format (${COMPLETION-CANDIDATES}), if only yaml files are provided, the format defaults to xml and vice versa."
+                          + " Java is converted without running the routes, one route builder class per file",
+            completer = FormatCompletionCandidates.class)
+    String format;
+
+    @Option(name = "resolve-placeholders", hasValue = false,
+            description = "Whether to resolve property placeholders in the dumped output", defaultValue = "false")
+    boolean resolvePlaceholders;
+
+    @Option(name = "uri-as-parameters", hasValue = false,
+            description = "Whether to expand URIs into separated key/value parameters (only in use for YAML format)",
+            defaultValue = "true")
+    boolean uriAsParameters = true;
+
+    @Option(name = "ignore-loading-error", hasValue = false,
+            description = "Whether to ignore route loading and compilation errors (use this with care!)")
+    boolean ignoreLoadingError;
+
+    @Option(name = "compile", hasValue = false,
+            description = "Compile and run Java routes to transform them. By default Java routes are read "
+                          + "without compiling them, and compiled only when a route cannot be read that way",
+            defaultValue = "false")
+    boolean compile;
+
+    @Mixin
+    MavenResolverMixin mavenResolver;
+
+    @Override
+    public Integer doCall() throws Exception {
+        if (format == null) {
+            // Automatically transform to xml if all files are yaml
+            if (files.stream().allMatch(file -> file.endsWith(".yaml"))) {
+                format = "xml";
+            } else {
+                format = "yaml";
+            }
+        }
+
+        if (!"xml".equals(format) && !"yaml".equals(format) && !"java".equals(format)) {
+            throw CliException.usage("--format must be xml, yaml or java, was: " + format);
+        }
+        for (String file : files) {
+            // the file it cannot find by its name: it exited 1 without saying which file, except for --format=java
+            // (CAMEL-26931)
+            if (!ResourceHelper.hasScheme(file) && !file.startsWith("github:") && !Files.exists(Path.of(file))) {
+                throw CliException.fileNotFound("File does not exist: " + file);
+            }
+        }
+        if ("java".equals(format)) {
+            return transformToJava();
+        }
+
+        Path parent = CommandLineHelper.getWorkDir();
+        Files.createDirectories(parent);
+        Path workDir = Files.createTempDirectory(parent, "transform-route-" + ProcessHandle.current().pid() + "-");
+        String dump = output;
+        // if no output then we want to print to console, so we need to write to a hidden file, and dump that file afterwards
+        if (output == null || "clipboard".equals(output)) {
+            dump = workDir.resolve("transform-output." + format).toString();
+        }
+        Files.deleteIfExists(Path.of(dump));
+        final String target = dump;
+
+        try {
+            if (!compile && !resolvePlaceholders && TransformJavaRoutes.applies(files)) {
+                // Java routes read without compiling them: in milliseconds, and no code of the project runs
+                TransformJavaRoutes.Result result = TransformJavaRoutes.transform(files, format, target, uriAsParameters);
+                if (result.transformed()) {
+                    return printDump(target);
+                }
+                // a route the parser cannot read completely (a lambda, a value known only at runtime): compile them all
+            }
+
+            Run run = new Run() {
+                @Override
+                protected void doAddInitialProperty(KameletMain main) {
+                    main.addInitialProperty("camel.main.dumpRoutes", format);
+                    main.addInitialProperty("camel.main.dumpRoutesInclude",
+                            "routes,rests,routeConfigurations,beans,dataFormats");
+                    main.addInitialProperty("camel.main.dumpRoutesLog", "false");
+                    main.addInitialProperty("camel.main.dumpRoutesResolvePlaceholders", Boolean.toString(resolvePlaceholders));
+                    main.addInitialProperty("camel.main.dumpRoutesUriAsParameters", Boolean.toString(uriAsParameters));
+                    main.addInitialProperty("camel.main.dumpRoutesOutput", target);
+                    // turn debug off as this can otherwise include source location in dump
+                    main.addInitialProperty("camel.debug.enabled", "false");
+                    main.addInitialProperty(CamelJBangConstants.TRANSFORM, "true");
+                    main.addInitialProperty("camel.component.properties.ignoreMissingProperty", "true");
+                    if (ignoreLoadingError) {
+                        // turn off bean method validator if ignore loading error
+                        main.addInitialProperty("camel.language.bean.validate", "false");
+                    }
+                }
+            };
+            run.setCamelMain(getMain());
+            run.files = files;
+            run.setWorkDir(workDir);
+            run.executionLimitOptions.maxSeconds = 1;
+            run.mavenResolver = mavenResolver;
+            Integer exit;
+            try {
+                exit = run.runTransform(ignoreLoadingError);
+            } catch (CliException | NoSuchFileException | FileNotFoundException e) {
+                throw e;
+            } catch (Exception e) {
+                // a route that cannot be read, such as invalid YAML (the message says where): not a bug of the CLI
+                throw new CliException(CliExitCode.FAILURE, "Cannot transform the routes: " + e.getMessage(), e);
+            }
+            if (exit != null && exit != 0) {
+                return exit;
+            }
+
+            return printDump(target);
+        } finally {
+            PathUtils.deleteDirectory(workDir);
+        }
+    }
+
+    /**
+     * The Java route with the class named after the file it is written to: a class must have the name of its file, and
+     * --output=Out.java got the class named after the route file (CAMEL-26931). A file name that is no class name, such
+     * as My.Route.java, keeps the class name.
+     */
+    static String withClassName(String java, String fileName, Path out) {
+        String wanted = out.getFileName().toString();
+        if (!wanted.endsWith(".java") || fileName == null || !fileName.endsWith(".java")) {
+            return java;
+        }
+        wanted = wanted.substring(0, wanted.length() - ".java".length());
+        String current = fileName.substring(0, fileName.length() - ".java".length());
+        if (wanted.equals(current) || !SourceVersion.isIdentifier(wanted) || SourceVersion.isKeyword(wanted)) {
+            return java;
+        }
+        return java.replaceFirst("\\bclass " + Pattern.quote(current) + "\\b", "class " + wanted);
+    }
+
+    /**
+     * To Java, each file is converted without running it (CAMEL-25254): read into the model by the parser of its DSL
+     * and written as a route builder class, printed, or written into the output directory (or file, for one file).
+     */
+    private Integer transformToJava() throws Exception {
+        StringBuilder all = new StringBuilder();
+        Path out = output != null && !"clipboard".equals(output) ? Path.of(output) : null;
+        boolean toDirectory = out != null && (Files.isDirectory(out) || files.size() > 1);
+        for (String f : files) {
+            RouteDslConverter.Result r = RouteDslConverter.convert(Path.of(f), "java");
+            if (!r.converted()) {
+                printer().printErr(r.refused());
+                return 1;
+            }
+            // what did not carry over goes at the top of the class, as the TUI writes it
+            String java = RouteDslConverter.withNotes(r.content(), r.notes(), "java");
+            if (out == null) {
+                all.append(java).append('\n');
+            } else if (toDirectory) {
+                Files.createDirectories(out);
+                Files.writeString(out.resolve(r.fileName()), java);
+            } else {
+                Files.writeString(out, withClassName(java, r.fileName(), out));
+            }
+        }
+        if (out == null) {
+            if ("clipboard".equals(output)) {
+                StringSelection data = new StringSelection(all.toString());
+                Toolkit.getDefaultToolkit().getSystemClipboard().setContents(data, data);
+            }
+            printer().println(all.toString().stripTrailing());
+        }
+        return 0;
+    }
+
+    private Integer printDump(String target) {
+        if (output == null || "clipboard".equals(output)) {
+            // load target file and print to console
+            String dump = waitForDumpFile(Path.of(target));
+            if (dump != null) {
+                if ("clipboard".equals(output)) {
+                    Clipboard c = Toolkit.getDefaultToolkit().getSystemClipboard();
+                    StringSelection data = new StringSelection(dump);
+                    c.setContents(data, data);
+                }
+                printer().println(dump);
+            }
+        }
+
+        return 0;
+    }
+
+    protected String waitForDumpFile(Path dumpFile) {
+        StopWatch watch = new StopWatch();
+        while (watch.taken() < 5000) {
+            try {
+                if (Files.exists(dumpFile)) {
+                    try (InputStream is = Files.newInputStream(dumpFile)) {
+                        return IOHelper.loadText(is);
+                    }
+                }
+                // give time for response to be ready
+                Thread.sleep(100);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            } catch (Exception e) {
+                // ignore
+            }
+        }
+        return null;
+    }
+
+}

@@ -1,0 +1,285 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.camel.dsl.jbang.core.commands.process;
+
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.List;
+import java.util.Map;
+import java.util.stream.Collectors;
+
+import com.github.freva.asciitable.AsciiTable;
+import com.github.freva.asciitable.Column;
+import com.github.freva.asciitable.HorizontalAlign;
+import com.github.freva.asciitable.OverflowBehaviour;
+import org.aesh.command.CommandDefinition;
+import org.aesh.command.option.Argument;
+import org.aesh.command.option.Option;
+import org.apache.camel.dsl.jbang.core.common.ListingFormat;
+import org.apache.camel.dsl.jbang.core.common.PidNameAgeCompletionCandidates;
+import org.apache.camel.dsl.jbang.core.common.ProcessHelper;
+import org.apache.camel.dsl.jbang.core.common.RowSort;
+import org.apache.camel.dsl.jbang.core.common.TerminalWidthHelper;
+import org.apache.camel.support.PatternHelper;
+import org.apache.camel.util.TimeUtils;
+import org.apache.camel.util.json.JsonArray;
+import org.apache.camel.util.json.JsonObject;
+import org.apache.camel.util.json.Jsoner;
+
+@CommandDefinition(name = "consumer", description = "Get status of Camel consumers", generateHelp = true,
+                   footer = {
+                           "Examples:",
+                           "  camel get consumer",
+                           "  camel get consumer --scheduled",
+                           "  camel get consumer --watch" })
+public class ListConsumer extends ProcessWatchCommand {
+
+    private static final RowSort<Row> ORDER = RowSort.<Row> integration(r -> r.pid, r -> r.name, r -> r.uptime);
+
+    @Argument(description = "Name or pid of running Camel integration")
+    String name = "*";
+
+    @Option(name = "sort", description = "Sort by pid, name or age", defaultValue = "pid",
+            completer = PidNameAgeCompletionCandidates.class)
+    String sort;
+
+    @Option(name = "limit", description = "Filter consumers by limiting to the given number of rows")
+    int limit;
+
+    @Option(name = "filter", description = "Filter consumers by URI")
+    String filter;
+
+    @Option(name = "scheduled", hasValue = false, description = "Filter consumer to only show scheduled based consumers")
+    boolean scheduled;
+
+    @Option(name = "short-uri", hasValue = false, description = "List endpoint URI without query parameters (short)")
+    boolean shortUri;
+
+    @Option(name = "wide-uri", hasValue = false, description = "List endpoint URI in full details")
+    boolean wideUri;
+
+    @Option(name = "mask", hasValue = false, defaultValue = "true",
+            description = "Whether to mask endpoint URIs to avoid printing sensitive information such as password or access keys")
+    boolean mask = true;
+
+    @Override
+    public Integer doProcessWatchCall() throws Exception {
+        List<Row> rows = new ArrayList<>();
+
+        // make it easier to filter
+        if (filter != null && !filter.endsWith("*")) {
+            filter += "*";
+        }
+
+        forEachIntegration(name, (ph, root) -> {
+            JsonObject context = (JsonObject) root.get("context");
+            JsonObject jo = (JsonObject) root.get("consumers");
+            if (context != null && jo != null) {
+                JsonArray array = (JsonArray) jo.get("consumers");
+                for (int i = 0; i < array.size(); i++) {
+                    JsonObject o = (JsonObject) array.get(i);
+                    Row row = new Row();
+                    row.name = context.getString("name");
+                    if ("CamelJBang".equals(row.name)) {
+                        row.name = ProcessHelper.extractName(root, ph);
+                    }
+                    row.pid = Long.toString(ph.pid());
+                    row.id = o.getString("id");
+                    row.uri = ListingFormat.masked(o.getString("uri"), mask);
+                    row.state = o.getString("state");
+                    // the console says clazz and hosted (class and hostedService before Camel 4.23)
+                    row.className = o.getStringOrDefault("clazz", o.getString("class"));
+                    row.hostedService = o.getBooleanOrDefault("hosted", o.getBooleanOrDefault("hostedService", false));
+                    row.scheduled = o.getBoolean("scheduled");
+                    row.inflight = o.getInteger("inflight");
+                    row.polling = o.getBoolean("polling");
+                    row.totalCounter = o.getLong("totalCounter");
+                    row.delay = o.getLong("delay");
+                    row.period = o.getLong("period");
+                    row.uptime = extractSince(ph);
+                    row.age = TimeUtils.printSince(row.uptime);
+                    Map<String, ?> stats = o.getMap("statistics");
+                    if (stats != null) {
+                        Object last = stats.get("lastCreatedExchangeTimestamp");
+                        if (last != null) {
+                            long time = Long.parseLong(last.toString());
+                            row.sinceLastStarted = TimeUtils.printSince(time);
+                        }
+                        last = stats.get("lastCompletedExchangeTimestamp");
+                        if (last != null) {
+                            long time = Long.parseLong(last.toString());
+                            row.sinceLastCompleted = TimeUtils.printSince(time);
+                        }
+                        last = stats.get("lastFailedExchangeTimestamp");
+                        if (last != null) {
+                            long time = Long.parseLong(last.toString());
+                            row.sinceLastFailed = TimeUtils.printSince(time);
+                        }
+                    }
+                    boolean add = true;
+                    if (filter != null) {
+                        String f = filter;
+                        boolean negate = filter.startsWith("-");
+                        if (negate) {
+                            f = f.substring(1);
+                        }
+                        boolean match = PatternHelper.matchPattern(row.uri, f);
+                        if (negate) {
+                            match = !match;
+                        }
+                        if (!match) {
+                            add = false;
+                        }
+                    }
+                    if (scheduled && !row.scheduled) {
+                        add = false;
+                    }
+                    if (add) {
+                        rows.add(row);
+                    }
+                }
+            }
+        });
+
+        // sort rows
+        rows.sort(ORDER.comparator(sort));
+
+        // the first rows after sorting
+        if (limit > 0 && rows.size() > limit) {
+            rows.subList(limit, rows.size()).clear();
+        }
+
+        if (!rows.isEmpty() || jsonOutput) {
+            printTable(rows);
+        }
+
+        return 0;
+    }
+
+    protected void printTable(List<Row> rows) {
+        if (jsonOutput) {
+            printer().println(Jsoner.serialize(rows.stream().map(r -> {
+                JsonObject jo = new JsonObject();
+                jo.put("pid", JsonValues.pid(r.pid));
+                jo.put("name", r.name);
+                jo.put("age", r.age);
+                jo.put("uptime", r.uptime);
+                jo.put("id", r.id);
+                jo.put("status", getState(r));
+                jo.put("type", getType(r));
+                jo.put("inflight", r.inflight);
+                jo.put("total", r.totalCounter);
+                jo.put("sinceLastStarted", JsonValues.text(r.sinceLastStarted));
+                jo.put("sinceLastCompleted", JsonValues.text(r.sinceLastCompleted));
+                jo.put("sinceLastFailed", JsonValues.text(r.sinceLastFailed));
+                jo.put("uri", r.uri);
+                return jo;
+            }).collect(Collectors.toList())));
+            return;
+        }
+        // Flexible column: URI (90/140)
+        // Fixed columns: PID(8)+NAME(30)+AGE(8)+ID(20)+STATUS(8)+TYPE(20)+INFLIGHT(8)+POLL(4)+PERIOD(6)+SINCE-LAST(10) ~= 122
+        int tw = terminalWidth();
+        int uriW = TerminalWidthHelper.flexWidth(tw, 122, TerminalWidthHelper.noBorderOverhead(12), 20, 90);
+        int uriWideW = TerminalWidthHelper.flexWidth(tw, 122, TerminalWidthHelper.noBorderOverhead(12), 20, 140);
+        printer().println(AsciiTable.getTable(AsciiTable.NO_BORDERS, rows, Arrays.asList(
+                new Column().header("PID").headerAlign(HorizontalAlign.CENTER).with(r -> r.pid),
+                new Column().header("NAME").dataAlign(HorizontalAlign.LEFT).maxWidth(30, OverflowBehaviour.ELLIPSIS_RIGHT)
+                        .with(r -> r.name),
+                new Column().header("AGE").headerAlign(HorizontalAlign.CENTER).with(r -> r.age),
+                new Column().header("ID").dataAlign(HorizontalAlign.LEFT).maxWidth(20, OverflowBehaviour.ELLIPSIS_RIGHT)
+                        .with(r -> r.id),
+                new Column().header("STATUS").headerAlign(HorizontalAlign.CENTER).with(this::getState),
+                new Column().header("TYPE").dataAlign(HorizontalAlign.LEFT).maxWidth(20, OverflowBehaviour.ELLIPSIS_RIGHT)
+                        .with(this::getType),
+                new Column().header("INFLIGHT").with(r -> Integer.toString(r.inflight)),
+                new Column().header("POLL").with(this::getTotal),
+                new Column().header("PERIOD").visible(scheduled).with(this::getPeriod),
+                new Column().header("SINCE-LAST").with(this::getSinceLast),
+                new Column().header("URI").visible(!wideUri).dataAlign(HorizontalAlign.LEFT)
+                        .maxWidth(uriW, OverflowBehaviour.ELLIPSIS_RIGHT)
+                        .with(this::getUri),
+                new Column().header("URI").visible(wideUri).dataAlign(HorizontalAlign.LEFT)
+                        .maxWidth(uriWideW, OverflowBehaviour.NEWLINE)
+                        .with(this::getUri))));
+    }
+
+    private String getUri(Row r) {
+        return ListingFormat.uri(r.uri, shortUri);
+    }
+
+    private String getState(Row r) {
+        if (r.polling != null && r.polling) {
+            return "Polling";
+        }
+        return r.state;
+    }
+
+    private String getType(Row r) {
+        String s = r.className;
+        if (s == null) {
+            return "";
+        }
+        if (s.endsWith("Consumer")) {
+            s = s.substring(0, s.length() - 8);
+        }
+        return s;
+    }
+
+    private String getTotal(Row r) {
+        if (r.totalCounter != null) {
+            return String.valueOf(r.totalCounter);
+        }
+        return "";
+    }
+
+    private String getPeriod(Row r) {
+        // favour using period, fallback to delay
+        if (r.period != null) {
+            return String.valueOf(r.period);
+        } else if (r.delay != null) {
+            return String.valueOf(r.delay);
+        }
+        return "";
+    }
+
+    protected String getSinceLast(Row r) {
+        return ListingFormat.sinceLast(r.sinceLastStarted, r.sinceLastCompleted, r.sinceLastFailed);
+    }
+
+    static class Row {
+        String pid;
+        String name;
+        long uptime;
+        String age;
+        String id;
+        String uri;
+        String state;
+        String className;
+        boolean hostedService;
+        boolean scheduled;
+        int inflight;
+        Boolean polling;
+        Long totalCounter;
+        Long delay;
+        Long period;
+        String sinceLastStarted;
+        String sinceLastCompleted;
+        String sinceLastFailed;
+    }
+
+}

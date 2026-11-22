@@ -1,0 +1,816 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.camel.dsl.jbang.core.commands.tui;
+
+import java.util.ArrayList;
+import java.util.List;
+
+import dev.tamboui.layout.Rect;
+import dev.tamboui.style.Style;
+import dev.tamboui.terminal.Frame;
+import dev.tamboui.text.Line;
+import dev.tamboui.text.Span;
+import dev.tamboui.tui.event.KeyEvent;
+import dev.tamboui.widgets.Clear;
+import dev.tamboui.widgets.block.Block;
+import dev.tamboui.widgets.block.BorderType;
+import dev.tamboui.widgets.block.Borders;
+import dev.tamboui.widgets.input.TextInputState;
+import dev.tamboui.widgets.paragraph.Paragraph;
+import org.apache.camel.dsl.jbang.core.commands.LlmClient;
+
+import static org.apache.camel.dsl.jbang.core.commands.tui.TuiHelper.hint;
+import static org.apache.camel.dsl.jbang.core.commands.tui.TuiHelper.hintLast;
+
+/**
+ * Central settings dialog for the Camel TUI. Exposes user preferences (theme, starting tab, default run-from-folder)
+ * backed by {@link TuiSettings}. Loading, mutating and saving go through a single {@code TuiSettings} object so all
+ * {@code camel.tui.*} keys are written together. Cycling the theme previews it instantly (like {@link ThemePopup}),
+ * Enter persists the previewed theme, Esc reverts it; the panel theme previews and reverts the same way. The starting
+ * tab is applied on the next TUI launch.
+ */
+class SettingsPopup {
+
+    static final int ROW_THEME = 0;
+    static final int ROW_START_TAB = 1;
+    static final int ROW_SELECT_TAB = 2;
+    static final int ROW_LOG_PIN = 3;
+    static final int ROW_RATE_PER = 4;
+    static final int ROW_PANEL_POSITION = 5;
+    static final int ROW_PANEL_SPACE = 6;
+    static final int ROW_PANEL_THEME = 7;
+    static final int ROW_CONFIRM_ACTIONS = 8;
+    static final int ROW_VALIDATE_ON_SAVE = 9;
+    static final int ROW_ROUTE_TREE = 10;
+    static final int ROW_FOLDER = 11;
+    static final int ROW_PROXY_HOST = 12;
+    static final int ROW_PROXY_PORT = 13;
+    static final int ROW_OSV_DATABASE = 14;
+    static final int ROW_SHELL_HISTORY = 15;
+    static final int ROW_AI_PROVIDER = 16;
+    static final int ROW_AI_MODEL = 17;
+    static final int ROW_AI_URL = 18;
+    static final int ROW_AI_TOOLS = 19;
+    static final int ROW_AI_OVERVIEW = 20;
+    static final int ROW_AI_PROMPT_HISTORY = 21;
+    static final int ROW_AI_ACP_COMMAND = 22;
+    static final int ROW_COUNT = 23;
+    /**
+     * Separator lines drawn between the row groups, after the Select Tab, Panel Theme, Default Folder and Shell History
+     * rows.
+     */
+    static final int DIVIDERS = 4;
+
+    private static final String[] LOG_PIN_OPTIONS = { "off", "25", "50", "75" };
+    private static final String[] RATE_PER_OPTIONS = { "seconds", "minutes" };
+    private static final String[] PANEL_POSITION_OPTIONS = { "bottom", "top" };
+    private static final String[] PANEL_SPACE_OPTIONS = { "move", "overlay" };
+    private static final String[] AI_TOOLS_OPTIONS
+            = { AiPanel.TOOL_MODE_AUTO, AiPanel.TOOL_MODE_CORE, AiPanel.TOOL_MODE_FULL };
+    private static final String[] AI_OVERVIEW_OPTIONS = {
+            ProjectOverviewAssist.MODE_MANUAL, ProjectOverviewAssist.MODE_AUTO, ProjectOverviewAssist.MODE_OFF };
+    private static final List<String> AI_PROVIDERS = buildAiProviderList();
+
+    private static List<String> buildAiProviderList() {
+        List<String> providers = new ArrayList<>();
+        for (LlmClient.ApiType apiType : LlmClient.ApiType.values()) {
+            providers.add(apiType.name());
+        }
+        for (AiProviderSelector.AcpPreset preset : AiProviderSelector.acpPresets()) {
+            providers.add(preset.id());
+        }
+        providers.add(AiProviderSelector.ACP_CUSTOM);
+        providers.add("auto");
+        return providers;
+    }
+
+    private boolean visible;
+    private int selectedRow;
+    /** First content line drawn, so the selected row stays inside a popup shorter than its 24 lines. */
+    private int scrollTop;
+    private int clipTop;
+    private int clipBottom;
+
+    private TuiSettings settings;
+    private int themeIndex;
+    private int startTabIndex;
+    private int selectTabIndex;
+    private int logPinIndex;
+    private int ratePerIndex;
+    private int panelPositionIndex;
+    private int panelSpaceIndex;
+    /** 0 for the main theme, else 1 + the index of the theme in {@link ThemeMode#ids()}. */
+    private int panelThemeIndex;
+    /** The panel theme when the dialog opened, restored on Esc after the row previewed others. */
+    private String originalPanelTheme;
+    private int confirmActionsIndex;
+    private int validateOnSaveIndex;
+    private int routeTreeIndex;
+    private int aiProviderIndex;
+    private int aiToolsIndex;
+    private int aiOverviewIndex;
+    private TextInputState folderInput;
+    private TextInputState proxyHostInput;
+    private TextInputState proxyPortInput;
+    private TextInputState osvDatabaseInput;
+    private TextInputState shellHistoryInput;
+    private TextInputState aiModelInput;
+    private TextInputState aiUrlInput;
+    private TextInputState aiPromptHistoryInput;
+    private TextInputState aiAcpCommandInput;
+    private List<String> tabNames = new ArrayList<>();
+
+    private List<TabRegistry.TabEntry> tabEntries;
+    private List<String> primaryTabNames = new ArrayList<>();
+    private Runnable clearScreen;
+    private MonitorContext monitorContext;
+
+    void setTabEntries(List<TabRegistry.TabEntry> tabEntries) {
+        this.tabEntries = tabEntries;
+    }
+
+    void setClearScreen(Runnable clearScreen) {
+        this.clearScreen = clearScreen;
+    }
+
+    void setMonitorContext(MonitorContext monitorContext) {
+        this.monitorContext = monitorContext;
+    }
+
+    boolean isVisible() {
+        return visible;
+    }
+
+    void open() {
+        settings = TuiSettings.load();
+
+        List<String> themeIds = ThemeMode.ids();
+        String currentTheme = settings.getThemeId() != null ? settings.getThemeId() : Theme.mode();
+        themeIndex = Math.max(0, themeIds.indexOf(currentTheme));
+
+        tabNames = new ArrayList<>();
+        if (tabEntries != null) {
+            for (TabRegistry.TabEntry entry : tabEntries) {
+                tabNames.add(entry.name());
+            }
+        }
+        String currentStartTab = settings.getStartTab() != null ? settings.getStartTab() : "Overview";
+        int idx = tabNames.indexOf(currentStartTab);
+        startTabIndex = idx >= 0 ? idx : 0;
+
+        primaryTabNames = new ArrayList<>();
+        if (tabEntries != null) {
+            for (TabRegistry.TabEntry entry : tabEntries) {
+                if (entry.tabIndex() >= 0 && entry.tabIndex() != TabRegistry.TAB_MORE) {
+                    primaryTabNames.add(entry.name());
+                }
+            }
+        }
+        String currentSelectTab = settings.getSelectTab() != null ? settings.getSelectTab() : "Log";
+        int selIdx = primaryTabNames.indexOf(currentSelectTab);
+        selectTabIndex = selIdx >= 0 ? selIdx : primaryTabNames.indexOf("Log");
+        if (selectTabIndex < 0) {
+            selectTabIndex = 0;
+        }
+
+        String currentLogPin = settings.getLogPin() != null ? settings.getLogPin() : "off";
+        logPinIndex = 0;
+        for (int i = 0; i < LOG_PIN_OPTIONS.length; i++) {
+            if (LOG_PIN_OPTIONS[i].equals(currentLogPin)) {
+                logPinIndex = i;
+                break;
+            }
+        }
+
+        String currentRatePer = settings.getRatePer() != null ? settings.getRatePer() : "seconds";
+        ratePerIndex = "minutes".equals(currentRatePer) ? 1 : 0;
+        panelPositionIndex = settings.isPanelTop() ? 1 : 0;
+        panelSpaceIndex = settings.isPanelOverlay() ? 1 : 0;
+        originalPanelTheme = Theme.panelTheme();
+        String currentPanelTheme = settings.getPanelTheme() != null ? settings.getPanelTheme() : originalPanelTheme;
+        panelThemeIndex = ThemeMode.ids().indexOf(currentPanelTheme) + 1;
+
+        confirmActionsIndex = settings.isConfirmActions() ? 1 : 0;
+        validateOnSaveIndex = settings.isValidateOnSave() ? 1 : 0;
+        routeTreeIndex = settings.isRouteTree() ? 1 : 0;
+
+        folderInput = new TextInputState(settings.getDefaultFolder() != null ? settings.getDefaultFolder() : "");
+        proxyHostInput = new TextInputState(settings.getProxyHost() != null ? settings.getProxyHost() : "");
+        proxyPortInput = new TextInputState(settings.getProxyPort() != null ? settings.getProxyPort() : "");
+        osvDatabaseInput = new TextInputState(settings.getOsvDatabase() != null ? settings.getOsvDatabase() : "");
+        shellHistoryInput = new TextInputState(settings.getShellHistory() != null ? settings.getShellHistory() : "");
+        String currentProvider = settings.getAiProvider() != null ? settings.getAiProvider() : "auto";
+        int providerIdx = AI_PROVIDERS.indexOf(currentProvider);
+        aiProviderIndex = providerIdx >= 0 ? providerIdx : AI_PROVIDERS.indexOf("auto");
+        aiModelInput = new TextInputState(settings.getAiModel() != null ? settings.getAiModel() : "");
+        aiUrlInput = new TextInputState(settings.getAiUrl() != null ? settings.getAiUrl() : "");
+        String currentTools = AiPanel.normalizeToolMode(settings.getAiTools());
+        int toolsIdx = List.of(AI_TOOLS_OPTIONS).indexOf(currentTools != null ? currentTools : AiPanel.TOOL_MODE_AUTO);
+        aiToolsIndex = Math.max(0, toolsIdx);
+        aiOverviewIndex = Math.max(0, List.of(AI_OVERVIEW_OPTIONS).indexOf(
+                ProjectOverviewAssist.normalizeMode(settings.getAiOverview())));
+        aiPromptHistoryInput = new TextInputState(
+                settings.getAiPromptHistory() != null ? settings.getAiPromptHistory() : "");
+        aiAcpCommandInput = new TextInputState(settings.getAiAcpCommand() != null ? settings.getAiAcpCommand() : "");
+        selectedRow = ROW_THEME;
+        scrollTop = 0;
+        visible = true;
+    }
+
+    void close() {
+        if (visible) {
+            Theme.revertPreview();
+            Theme.setPanelTheme(originalPanelTheme);
+            refreshTheme();
+        }
+        visible = false;
+    }
+
+    boolean handleKeyEvent(KeyEvent ke) {
+        if (!visible) {
+            return false;
+        }
+        if (ke.isCancel()) {
+            Theme.revertPreview();
+            Theme.setPanelTheme(originalPanelTheme);
+            refreshTheme();
+            visible = false;
+            return true;
+        }
+        if (ke.isConfirm()) {
+            save();
+            return true;
+        }
+        if (ke.isUp() || ke.isFocusPrevious()) {
+            selectedRow = (selectedRow - 1 + ROW_COUNT) % ROW_COUNT;
+            return true;
+        }
+        if (ke.isDown() || ke.isFocusNext()) {
+            selectedRow = (selectedRow + 1) % ROW_COUNT;
+            return true;
+        }
+        if (selectedRow == ROW_THEME) {
+            int previous = themeIndex;
+            themeIndex = cycle(ke, themeIndex, ThemeMode.ids().size());
+            if (themeIndex != previous) {
+                Theme.preview(ThemeMode.ids().get(themeIndex));
+                refreshTheme();
+            }
+            return true;
+        }
+        if (selectedRow == ROW_START_TAB) {
+            if (!tabNames.isEmpty()) {
+                startTabIndex = cycle(ke, startTabIndex, tabNames.size());
+            }
+            return true;
+        }
+        if (selectedRow == ROW_SELECT_TAB) {
+            if (!primaryTabNames.isEmpty()) {
+                selectTabIndex = cycle(ke, selectTabIndex, primaryTabNames.size());
+            }
+            return true;
+        }
+        if (selectedRow == ROW_LOG_PIN) {
+            logPinIndex = cycle(ke, logPinIndex, LOG_PIN_OPTIONS.length);
+            return true;
+        }
+        if (selectedRow == ROW_RATE_PER) {
+            ratePerIndex = cycle(ke, ratePerIndex, RATE_PER_OPTIONS.length);
+            return true;
+        }
+        if (selectedRow == ROW_PANEL_POSITION) {
+            panelPositionIndex = cycle(ke, panelPositionIndex, PANEL_POSITION_OPTIONS.length);
+            return true;
+        }
+        if (selectedRow == ROW_PANEL_SPACE) {
+            panelSpaceIndex = cycle(ke, panelSpaceIndex, PANEL_SPACE_OPTIONS.length);
+            return true;
+        }
+        if (selectedRow == ROW_PANEL_THEME) {
+            int previous = panelThemeIndex;
+            panelThemeIndex = cycle(ke, panelThemeIndex, ThemeMode.ids().size() + 1);
+            if (panelThemeIndex != previous) {
+                // previewed at once, like the theme: an open shell or AI panel shows it
+                Theme.setPanelTheme(selectedPanelTheme());
+                refreshTheme();
+            }
+            return true;
+        }
+        if (selectedRow == ROW_CONFIRM_ACTIONS) {
+            confirmActionsIndex = cycle(ke, confirmActionsIndex, 2);
+            return true;
+        }
+        if (selectedRow == ROW_VALIDATE_ON_SAVE) {
+            validateOnSaveIndex = cycle(ke, validateOnSaveIndex, 2);
+            return true;
+        }
+        if (selectedRow == ROW_ROUTE_TREE) {
+            routeTreeIndex = cycle(ke, routeTreeIndex, 2);
+            return true;
+        }
+        if (selectedRow == ROW_FOLDER) {
+            handleTextInput(ke, folderInput);
+            return true;
+        }
+        if (selectedRow == ROW_PROXY_HOST) {
+            handleTextInput(ke, proxyHostInput);
+            return true;
+        }
+        if (selectedRow == ROW_PROXY_PORT) {
+            handleTextInput(ke, proxyPortInput);
+            return true;
+        }
+        if (selectedRow == ROW_OSV_DATABASE) {
+            handleTextInput(ke, osvDatabaseInput);
+            return true;
+        }
+        if (selectedRow == ROW_SHELL_HISTORY) {
+            handleTextInput(ke, shellHistoryInput);
+            return true;
+        }
+        if (selectedRow == ROW_AI_PROVIDER) {
+            aiProviderIndex = cycle(ke, aiProviderIndex, AI_PROVIDERS.size());
+            return true;
+        }
+        if (selectedRow == ROW_AI_MODEL) {
+            handleTextInput(ke, aiModelInput);
+            return true;
+        }
+        if (selectedRow == ROW_AI_URL) {
+            handleTextInput(ke, aiUrlInput);
+            return true;
+        }
+        if (selectedRow == ROW_AI_TOOLS) {
+            aiToolsIndex = cycle(ke, aiToolsIndex, AI_TOOLS_OPTIONS.length);
+            return true;
+        }
+        if (selectedRow == ROW_AI_OVERVIEW) {
+            aiOverviewIndex = cycle(ke, aiOverviewIndex, AI_OVERVIEW_OPTIONS.length);
+            return true;
+        }
+        if (selectedRow == ROW_AI_PROMPT_HISTORY) {
+            handleTextInput(ke, aiPromptHistoryInput);
+            return true;
+        }
+        if (selectedRow == ROW_AI_ACP_COMMAND) {
+            handleTextInput(ke, aiAcpCommandInput);
+            return true;
+        }
+        return true;
+    }
+
+    /**
+     * The value a choice row moves to: Space and Right step forward, Left steps back, both wrapping around, so a row of
+     * two values toggles on any of them.
+     */
+    private static int cycle(KeyEvent ke, int index, int count) {
+        if (ke.isChar(' ') || ke.isRight()) {
+            return (index + 1) % count;
+        }
+        if (ke.isLeft()) {
+            return (index - 1 + count) % count;
+        }
+        return index;
+    }
+
+    private void save() {
+        String selectedThemeId = ThemeMode.ids().get(themeIndex);
+        settings.setThemeId(selectedThemeId);
+        if (!tabNames.isEmpty()) {
+            settings.setStartTab(tabNames.get(startTabIndex));
+        }
+        if (!primaryTabNames.isEmpty()) {
+            String selectTabValue = primaryTabNames.get(selectTabIndex);
+            settings.setSelectTab("Log".equals(selectTabValue) ? null : selectTabValue);
+        }
+        String logPinValue = LOG_PIN_OPTIONS[logPinIndex];
+        settings.setLogPin("off".equals(logPinValue) ? null : logPinValue);
+        String ratePerValue = RATE_PER_OPTIONS[ratePerIndex];
+        settings.setRatePer("seconds".equals(ratePerValue) ? null : ratePerValue);
+        if (monitorContext != null) {
+            monitorContext.ratePerMinute = "minutes".equals(ratePerValue);
+        }
+        settings.setPanelPosition(panelPositionIndex == 1 ? "top" : null);
+        settings.setPanelSpace(panelSpaceIndex == 1 ? "overlay" : null);
+        if (monitorContext != null) {
+            monitorContext.panelTop = panelPositionIndex == 1;
+            monitorContext.panelOverlay = panelSpaceIndex == 1;
+        }
+        settings.setPanelTheme(selectedPanelTheme());
+        // also when the row was not touched: the saved setting replaces a --panel-theme of this session
+        Theme.setPanelTheme(selectedPanelTheme());
+        settings.setConfirmActions(confirmActionsIndex == 1 ? "true" : "false");
+        if (monitorContext != null) {
+            monitorContext.confirmActions = confirmActionsIndex == 1;
+        }
+        settings.setValidateOnSave(validateOnSaveIndex == 1 ? "true" : "false");
+        if (monitorContext != null) {
+            monitorContext.validateOnSave = validateOnSaveIndex == 1;
+        }
+        settings.setRouteTree(routeTreeIndex == 1 ? "true" : "false");
+        if (monitorContext != null) {
+            monitorContext.routeTree = routeTreeIndex == 1;
+        }
+        settings.setDefaultFolder(stripControlChars(folderInput.text().trim()));
+        settings.setProxyHost(stripControlChars(proxyHostInput.text().trim()));
+        settings.setProxyPort(stripControlChars(proxyPortInput.text().trim()));
+        settings.setOsvDatabase(stripControlChars(osvDatabaseInput.text().trim()));
+        settings.setShellHistory(stripControlChars(shellHistoryInput.text().trim()));
+        settings.setAiProvider(AI_PROVIDERS.get(aiProviderIndex));
+        settings.setAiModel(stripControlChars(aiModelInput.text().trim()));
+        settings.setAiUrl(stripControlChars(aiUrlInput.text().trim()));
+        String aiToolsValue = AI_TOOLS_OPTIONS[aiToolsIndex];
+        settings.setAiTools(AiPanel.TOOL_MODE_AUTO.equals(aiToolsValue) ? null : aiToolsValue);
+        String aiOverviewValue = AI_OVERVIEW_OPTIONS[aiOverviewIndex];
+        settings.setAiOverview(ProjectOverviewAssist.MODE_MANUAL.equals(aiOverviewValue) ? null : aiOverviewValue);
+        settings.setAiPromptHistory(stripControlChars(aiPromptHistoryInput.text().trim()));
+        settings.setAiAcpCommand(stripControlChars(aiAcpCommandInput.text().trim()));
+        settings.save();
+        if (Theme.mode().equals(selectedThemeId)) {
+            // Already active via live preview (or unchanged): just persist and clear the preview marker.
+            Theme.confirmPreview();
+        } else {
+            // Row was never touched but disk/session state disagrees (e.g. a --theme CLI override); force it.
+            Theme.applyStartupMode(selectedThemeId);
+        }
+        refreshTheme();
+        visible = false;
+    }
+
+    void render(Frame frame, Rect area) {
+        int popupW = Math.min(70, area.width() - 4);
+        int popupH = 2 + ROW_COUNT + DIVIDERS;
+        int x = area.left() + Math.max(0, (area.width() - popupW) / 2);
+        int y = area.top() + 2;
+        Rect popup = new Rect(x, y, Math.min(popupW, area.width()), Math.min(popupH, area.height() - 2));
+
+        frame.renderWidget(Clear.INSTANCE, popup);
+
+        Block block = Block.builder()
+                .borderType(BorderType.ROUNDED).borders(Borders.ALL)
+                .title(" Settings ")
+                .build();
+        frame.renderWidget(block, popup);
+
+        int visibleLines = popup.height() - 2;
+        int contentLines = ROW_COUNT + DIVIDERS;
+        int selectedLine = lineOf(selectedRow);
+        if (selectedLine < scrollTop) {
+            scrollTop = selectedLine;
+        } else if (selectedLine >= scrollTop + visibleLines) {
+            scrollTop = selectedLine - visibleLines + 1;
+        }
+        scrollTop = Math.max(0, Math.min(scrollTop, Math.max(0, contentLines - visibleLines)));
+        clipTop = popup.top() + 1;
+        clipBottom = popup.top() + popup.height() - 2;
+
+        int innerX = popup.left() + 2;
+        int innerW = popup.width() - 4;
+        int labelW = 24;
+        int fieldW = innerW - labelW;
+        int rowY = popup.top() + 1 - scrollTop;
+
+        // --- Appearance ---
+        renderLabel(frame, innerX, rowY, labelW, "Theme:", selectedRow == ROW_THEME);
+        renderValue(frame, innerX + labelW, rowY, fieldW, ThemeMode.values()[themeIndex].label(), selectedRow == ROW_THEME);
+        rowY++;
+
+        renderLabel(frame, innerX, rowY, labelW, "Starting Tab:", selectedRow == ROW_START_TAB);
+        renderValue(frame, innerX + labelW, rowY, fieldW, currentTabLabel(), selectedRow == ROW_START_TAB);
+        rowY++;
+
+        renderLabel(frame, innerX, rowY, labelW, "Select Tab:", selectedRow == ROW_SELECT_TAB);
+        renderValue(frame, innerX + labelW, rowY, fieldW, currentSelectTabLabel(), selectedRow == ROW_SELECT_TAB);
+        rowY++;
+
+        renderDivider(frame, innerX, rowY, innerW);
+        rowY++;
+
+        // --- Display ---
+        String logPinLabel = "off".equals(LOG_PIN_OPTIONS[logPinIndex])
+                ? "off"
+                : LOG_PIN_OPTIONS[logPinIndex] + "%";
+        renderLabel(frame, innerX, rowY, labelW, "Log Pin:", selectedRow == ROW_LOG_PIN);
+        renderValue(frame, innerX + labelW, rowY, fieldW, logPinLabel, selectedRow == ROW_LOG_PIN);
+        rowY++;
+
+        renderLabel(frame, innerX, rowY, labelW, "Rate per:", selectedRow == ROW_RATE_PER);
+        renderValue(frame, innerX + labelW, rowY, fieldW, RATE_PER_OPTIONS[ratePerIndex], selectedRow == ROW_RATE_PER);
+        rowY++;
+
+        renderLabel(frame, innerX, rowY, labelW, "Panel Position:", selectedRow == ROW_PANEL_POSITION);
+        renderValue(frame, innerX + labelW, rowY, fieldW, PANEL_POSITION_OPTIONS[panelPositionIndex],
+                selectedRow == ROW_PANEL_POSITION);
+        rowY++;
+
+        renderLabel(frame, innerX, rowY, labelW, "Panel Space:", selectedRow == ROW_PANEL_SPACE);
+        renderValue(frame, innerX + labelW, rowY, fieldW, PANEL_SPACE_OPTIONS[panelSpaceIndex],
+                selectedRow == ROW_PANEL_SPACE);
+        rowY++;
+
+        renderLabel(frame, innerX, rowY, labelW, "Panel Theme:", selectedRow == ROW_PANEL_THEME);
+        renderValue(frame, innerX + labelW, rowY, fieldW, panelThemeLabel(), selectedRow == ROW_PANEL_THEME);
+        rowY++;
+
+        renderDivider(frame, innerX, rowY, innerW);
+        rowY++;
+
+        // --- Editor ---
+        renderLabel(frame, innerX, rowY, labelW, "Confirm Actions:", selectedRow == ROW_CONFIRM_ACTIONS);
+        renderValue(frame, innerX + labelW, rowY, fieldW, confirmActionsIndex == 1 ? "on" : "off",
+                selectedRow == ROW_CONFIRM_ACTIONS);
+        rowY++;
+
+        renderLabel(frame, innerX, rowY, labelW, "Validate on Save:", selectedRow == ROW_VALIDATE_ON_SAVE);
+        renderValue(frame, innerX + labelW, rowY, fieldW, validateOnSaveIndex == 1 ? "on" : "off",
+                selectedRow == ROW_VALIDATE_ON_SAVE);
+        rowY++;
+
+        renderLabel(frame, innerX, rowY, labelW, "Route Tree:", selectedRow == ROW_ROUTE_TREE);
+        renderValue(frame, innerX + labelW, rowY, fieldW, routeTreeIndex == 1 ? "on" : "off",
+                selectedRow == ROW_ROUTE_TREE);
+        rowY++;
+
+        renderLabel(frame, innerX, rowY, labelW, "Default Folder:", selectedRow == ROW_FOLDER);
+        renderFolder(frame, innerX + labelW, rowY, fieldW, selectedRow == ROW_FOLDER);
+        rowY++;
+
+        renderDivider(frame, innerX, rowY, innerW);
+        rowY++;
+
+        // --- Network ---
+        renderLabel(frame, innerX, rowY, labelW, "Proxy Host:", selectedRow == ROW_PROXY_HOST);
+        renderTextInput(frame, innerX + labelW, rowY, fieldW, proxyHostInput,
+                selectedRow == ROW_PROXY_HOST, "proxy.corp.com");
+        rowY++;
+
+        renderLabel(frame, innerX, rowY, labelW, "Proxy Port:", selectedRow == ROW_PROXY_PORT);
+        renderTextInput(frame, innerX + labelW, rowY, fieldW, proxyPortInput,
+                selectedRow == ROW_PROXY_PORT, "(8080)");
+        rowY++;
+
+        renderLabel(frame, innerX, rowY, labelW, "OSV Database:", selectedRow == ROW_OSV_DATABASE);
+        renderTextInput(frame, innerX + labelW, rowY, fieldW, osvDatabaseInput,
+                selectedRow == ROW_OSV_DATABASE, "(OSV.dev API) default, a URL or a file");
+        rowY++;
+
+        renderLabel(frame, innerX, rowY, labelW, "Shell History:", selectedRow == ROW_SHELL_HISTORY);
+        renderTextInput(frame, innerX + labelW, rowY, fieldW, shellHistoryInput,
+                selectedRow == ROW_SHELL_HISTORY, "(100)");
+        rowY++;
+
+        renderDivider(frame, innerX, rowY, innerW);
+        rowY++;
+
+        // --- AI ---
+        renderAiRows(frame, innerX, rowY, labelW, fieldW);
+    }
+
+    /** The AI group, the last rows of the dialog, from line {@code firstY} on. */
+    private void renderAiRows(Frame frame, int innerX, int firstY, int labelW, int fieldW) {
+        int rowY = firstY;
+        renderLabel(frame, innerX, rowY, labelW, "AI Provider:", selectedRow == ROW_AI_PROVIDER);
+        renderValue(frame, innerX + labelW, rowY, fieldW, AI_PROVIDERS.get(aiProviderIndex),
+                selectedRow == ROW_AI_PROVIDER);
+        rowY++;
+
+        renderLabel(frame, innerX, rowY, labelW, "AI Model:", selectedRow == ROW_AI_MODEL);
+        renderTextInput(frame, innerX + labelW, rowY, fieldW, aiModelInput, selectedRow == ROW_AI_MODEL, "(auto)");
+        rowY++;
+
+        renderLabel(frame, innerX, rowY, labelW, "AI Base URL:", selectedRow == ROW_AI_URL);
+        renderTextInput(frame, innerX + labelW, rowY, fieldW, aiUrlInput, selectedRow == ROW_AI_URL, "(auto)");
+        rowY++;
+
+        renderLabel(frame, innerX, rowY, labelW, "AI Tools:", selectedRow == ROW_AI_TOOLS);
+        renderValue(frame, innerX + labelW, rowY, fieldW, aiToolsLabel(), selectedRow == ROW_AI_TOOLS);
+        rowY++;
+
+        renderLabel(frame, innerX, rowY, labelW, "AI Overview:", selectedRow == ROW_AI_OVERVIEW);
+        renderValue(frame, innerX + labelW, rowY, fieldW, aiOverviewLabel(), selectedRow == ROW_AI_OVERVIEW);
+        rowY++;
+
+        renderLabel(frame, innerX, rowY, labelW, "AI History:", selectedRow == ROW_AI_PROMPT_HISTORY);
+        renderTextInput(frame, innerX + labelW, rowY, fieldW, aiPromptHistoryInput,
+                selectedRow == ROW_AI_PROMPT_HISTORY, "(100)");
+        rowY++;
+
+        renderLabel(frame, innerX, rowY, labelW, "ACP Command:", selectedRow == ROW_AI_ACP_COMMAND);
+        renderTextInput(frame, innerX + labelW, rowY, fieldW, aiAcpCommandInput,
+                selectedRow == ROW_AI_ACP_COMMAND, "(none)");
+    }
+
+    void renderFooter(List<Span> spans) {
+        if (selectedRow == ROW_THEME || selectedRow == ROW_START_TAB || selectedRow == ROW_SELECT_TAB
+                || selectedRow == ROW_LOG_PIN || selectedRow == ROW_RATE_PER
+                || selectedRow == ROW_PANEL_POSITION || selectedRow == ROW_PANEL_SPACE
+                || selectedRow == ROW_PANEL_THEME || selectedRow == ROW_CONFIRM_ACTIONS || selectedRow == ROW_VALIDATE_ON_SAVE
+                || selectedRow == ROW_ROUTE_TREE
+                || selectedRow == ROW_AI_PROVIDER || selectedRow == ROW_AI_TOOLS || selectedRow == ROW_AI_OVERVIEW) {
+            hint(spans, "Space", "cycle");
+        }
+        hint(spans, "Enter", "save");
+        hintLast(spans, "Esc", "cancel");
+    }
+
+    // ---- Helpers ----
+
+    private void refreshTheme() {
+        if (clearScreen != null) {
+            clearScreen.run();
+        }
+    }
+
+    private String currentTabLabel() {
+        if (tabEntries == null || tabEntries.isEmpty()) {
+            return "Overview";
+        }
+        TabRegistry.TabEntry entry = tabEntries.get(Math.min(startTabIndex, tabEntries.size() - 1));
+        return entry.icon() + " " + entry.name();
+    }
+
+    private String currentSelectTabLabel() {
+        if (tabEntries == null || primaryTabNames.isEmpty()) {
+            return "Log";
+        }
+        String name = primaryTabNames.get(Math.min(selectTabIndex, primaryTabNames.size() - 1));
+        for (TabRegistry.TabEntry entry : tabEntries) {
+            if (entry.name().equals(name)) {
+                return entry.icon() + " " + name;
+            }
+        }
+        return name;
+    }
+
+    private void handleTextInput(KeyEvent ke, TextInputState active) {
+        FormHelper.handleTextInput(ke, active);
+    }
+
+    private static String stripControlChars(String s) {
+        if (s == null) {
+            return null;
+        }
+        StringBuilder sb = new StringBuilder(s.length());
+        for (int i = 0; i < s.length(); i++) {
+            char ch = s.charAt(i);
+            if (ch >= 0x20 && ch != 0x7F) {
+                sb.append(ch);
+            }
+        }
+        return sb.toString();
+    }
+
+    /**
+     * The content line a row is drawn on, counting the dividers that render draws after the Select Tab, Panel Theme,
+     * Default Folder and Shell History rows.
+     */
+    static int lineOf(int row) {
+        return row + (row > ROW_SELECT_TAB ? 1 : 0) + (row > ROW_PANEL_THEME ? 1 : 0) + (row > ROW_FOLDER ? 1 : 0)
+               + (row > ROW_SHELL_HISTORY ? 1 : 0);
+    }
+
+    /** True when a scrolled line falls outside the popup's inner area and must not be drawn. */
+    private boolean clipped(int y) {
+        return y < clipTop || y > clipBottom;
+    }
+
+    private void renderDivider(Frame frame, int x, int y, int w) {
+        if (clipped(y)) {
+            return;
+        }
+        frame.renderWidget(Paragraph.from(Line.from(Span.styled("─".repeat(w), Style.EMPTY.dim()))), new Rect(x, y, w, 1));
+    }
+
+    private void renderLabel(Frame frame, int x, int y, int w, String label, boolean selected) {
+        if (clipped(y)) {
+            return;
+        }
+        FormHelper.renderLabel(frame, x, y, w, label, selected);
+    }
+
+    private void renderValue(Frame frame, int x, int y, int w, String text, boolean selected) {
+        if (clipped(y)) {
+            return;
+        }
+        Style style = selected ? Style.EMPTY.bold() : Style.EMPTY;
+        frame.renderWidget(Paragraph.from(Line.from(Span.styled("[" + text + "]", style))), new Rect(x, y, w, 1));
+    }
+
+    private void renderFolder(Frame frame, int x, int y, int w, boolean active) {
+        renderTextInput(frame, x, y, w, folderInput, active, "/path/to/folder");
+    }
+
+    private void renderTextInput(
+            Frame frame, int x, int y, int w, TextInputState input, boolean active,
+            String placeholder) {
+        if (clipped(y)) {
+            return;
+        }
+        FormHelper.renderTextField(frame, new Rect(x, y, w, 1), input, active, placeholder);
+    }
+
+    // ---- Test accessors ----
+
+    int selectedRow() {
+        return selectedRow;
+    }
+
+    String selectedThemeId() {
+        return ThemeMode.ids().get(themeIndex);
+    }
+
+    String selectedStartTab() {
+        return tabNames.isEmpty() ? null : tabNames.get(startTabIndex);
+    }
+
+    String selectedSelectTab() {
+        return primaryTabNames.isEmpty() ? null : primaryTabNames.get(selectTabIndex);
+    }
+
+    String selectedLogPin() {
+        return LOG_PIN_OPTIONS[logPinIndex];
+    }
+
+    String selectedPanelPosition() {
+        return PANEL_POSITION_OPTIONS[panelPositionIndex];
+    }
+
+    String selectedPanelSpace() {
+        return PANEL_SPACE_OPTIONS[panelSpaceIndex];
+    }
+
+    /** The theme id the Panel Theme row has, or {@code null} for the main theme. */
+    String selectedPanelTheme() {
+        return panelThemeIndex == 0 ? null : ThemeMode.ids().get(panelThemeIndex - 1);
+    }
+
+    private String panelThemeLabel() {
+        return panelThemeIndex == 0 ? "same as Theme" : ThemeMode.values()[panelThemeIndex - 1].label();
+    }
+
+    String folderText() {
+        return folderInput != null ? folderInput.text() : "";
+    }
+
+    String selectedAiProvider() {
+        return AI_PROVIDERS.get(aiProviderIndex);
+    }
+
+    String selectedAiTools() {
+        return AI_TOOLS_OPTIONS[aiToolsIndex];
+    }
+
+    private String aiToolsLabel() {
+        return switch (AI_TOOLS_OPTIONS[aiToolsIndex]) {
+            case AiPanel.TOOL_MODE_CORE -> "core (troubleshooting only)";
+            case AiPanel.TOOL_MODE_FULL -> "full (all tools)";
+            default -> "auto (core if local model)";
+        };
+    }
+
+    String selectedAiOverview() {
+        return AI_OVERVIEW_OPTIONS[aiOverviewIndex];
+    }
+
+    private String aiOverviewLabel() {
+        return switch (AI_OVERVIEW_OPTIONS[aiOverviewIndex]) {
+            case ProjectOverviewAssist.MODE_AUTO -> "auto (explain when out of date)";
+            case ProjectOverviewAssist.MODE_OFF -> "off (no AI-assisted hints)";
+            default -> "manual (/overview)";
+        };
+    }
+
+    List<String> aiProviderOptionsForTesting() {
+        return AI_PROVIDERS;
+    }
+
+    String aiModelText() {
+        return aiModelInput != null ? aiModelInput.text() : "";
+    }
+
+    String aiUrlText() {
+        return aiUrlInput != null ? aiUrlInput.text() : "";
+    }
+
+    String shellHistoryText() {
+        return shellHistoryInput != null ? shellHistoryInput.text() : "";
+    }
+
+    String aiPromptHistoryText() {
+        return aiPromptHistoryInput != null ? aiPromptHistoryInput.text() : "";
+    }
+}

@@ -1,0 +1,213 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.camel.dsl.jbang.core.commands.process;
+
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.List;
+import java.util.StringJoiner;
+import java.util.stream.Collectors;
+
+import com.github.freva.asciitable.AsciiTable;
+import com.github.freva.asciitable.Column;
+import com.github.freva.asciitable.HorizontalAlign;
+import com.github.freva.asciitable.OverflowBehaviour;
+import org.aesh.command.CommandDefinition;
+import org.aesh.command.option.Argument;
+import org.aesh.command.option.Option;
+import org.apache.camel.dsl.jbang.core.common.CopyableRow;
+import org.apache.camel.dsl.jbang.core.common.ListingFormat;
+import org.apache.camel.dsl.jbang.core.common.PidNameAgeCompletionCandidates;
+import org.apache.camel.dsl.jbang.core.common.ProcessHelper;
+import org.apache.camel.dsl.jbang.core.common.RowSort;
+import org.apache.camel.dsl.jbang.core.common.TerminalWidthHelper;
+import org.apache.camel.util.TimeUtils;
+import org.apache.camel.util.json.JsonArray;
+import org.apache.camel.util.json.JsonObject;
+import org.apache.camel.util.json.Jsoner;
+
+@CommandDefinition(name = "service", description = "Get services of Camel integrations", generateHelp = true,
+                   footer = {
+                           "Examples:",
+                           "  camel get service",
+                           "  camel get service --metadata" })
+public class ListService extends ProcessWatchCommand {
+
+    private static final RowSort<Row> ORDER = RowSort.<Row> integration(r -> r.pid, r -> r.name, r -> r.uptime);
+
+    @Argument(description = "Name or pid of running Camel integration")
+    String name = "*";
+
+    @Option(name = "sort", description = "Sort by pid, name or age", defaultValue = "pid",
+            completer = PidNameAgeCompletionCandidates.class)
+    String sort;
+
+    @Option(name = "metadata", hasValue = false, description = "Show service metadata (only available for some services)")
+    boolean metadata;
+
+    @Option(name = "short-uri", hasValue = false, description = "List endpoint URI without query parameters (short)")
+    boolean shortUri;
+
+    @Option(name = "wide-uri", hasValue = false, description = "List endpoint URI in full details")
+    boolean wideUri;
+
+    @Option(name = "mask", hasValue = false, defaultValue = "true",
+            description = "Whether to mask endpoint URIs to avoid printing sensitive information such as password or access keys")
+    boolean mask = true;
+
+    @Override
+    public Integer doProcessWatchCall() throws Exception {
+        List<Row> rows = new ArrayList<>();
+
+        forEachIntegration(name, (ph, root) -> {
+            // there must be a status file for the running Camel integration
+            Row row = new Row();
+            JsonObject context = (JsonObject) root.get("context");
+            if (context == null) {
+                return;
+            }
+            row.name = context.getString("name");
+            if ("CamelJBang".equals(row.name)) {
+                row.name = ProcessHelper.extractName(root, ph);
+            }
+            row.pid = Long.toString(ph.pid());
+            row.uptime = extractSince(ph);
+            row.age = TimeUtils.printSince(row.uptime);
+
+            JsonObject jo = (JsonObject) root.get("services");
+            if (jo != null) {
+                JsonArray arr = (JsonArray) jo.get("services");
+                if (arr != null) {
+                    for (int i = 0; i < arr.size(); i++) {
+                        row = row.copy();
+                        jo = (JsonObject) arr.get(i);
+                        row.component = jo.getString("component");
+                        row.direction = jo.getString("direction");
+                        row.hosted = jo.getBooleanOrDefault("hosted", false);
+                        row.protocol = jo.getString("protocol");
+                        row.serviceUrl = ListingFormat.masked(jo.getString("serviceUrl"), mask);
+                        row.endpointUri = ListingFormat.masked(jo.getString("endpointUri"), mask);
+                        row.hits = jo.getLongOrDefault("hits", 0);
+                        row.routeId = jo.getString("routeId");
+                        row.metadata = jo.getMap("metadata");
+                        rows.add(row);
+                    }
+                }
+            }
+        });
+
+        // sort rows
+        rows.sort(ORDER.comparator(sort));
+
+        if (!rows.isEmpty() || jsonOutput) {
+            if (jsonOutput) {
+                printer().println(Jsoner.serialize(rows.stream().map(r -> {
+                    JsonObject jo = new JsonObject();
+                    jo.put("pid", JsonValues.pid(r.pid));
+                    jo.put("name", r.name);
+                    jo.put("component", r.component);
+                    jo.put("direction", r.direction);
+                    jo.put("routeId", getRouteId(r));
+                    jo.put("protocol", getProtocol(r));
+                    jo.put("service", getService(r));
+                    jo.put("total", r.hits);
+                    jo.put("endpoint", r.endpointUri);
+                    return jo;
+                }).collect(Collectors.toList())));
+            } else {
+                // Flexible column: ENDPOINT (90/140)
+                // Fixed columns: PID(8)+NAME(30)+COMPONENT(10)+DIR(3)+ROUTE(8)+PROTOCOL(8)+SERVICE(10)+METADATA(10)+TOTAL(5) ~= 92
+                int tw = terminalWidth();
+                int epW = TerminalWidthHelper.flexWidth(tw, 92, TerminalWidthHelper.noBorderOverhead(11), 20, 90);
+                int epWideW = TerminalWidthHelper.flexWidth(tw, 92, TerminalWidthHelper.noBorderOverhead(11), 20, 140);
+                printer().println(AsciiTable.getTable(AsciiTable.NO_BORDERS, rows, Arrays.asList(
+                        new Column().header("PID").headerAlign(HorizontalAlign.CENTER).with(r -> r.pid),
+                        new Column().header("NAME").dataAlign(HorizontalAlign.LEFT)
+                                .maxWidth(30, OverflowBehaviour.ELLIPSIS_RIGHT)
+                                .with(r -> r.name),
+                        new Column().header("COMPONENT").dataAlign(HorizontalAlign.LEFT).with(r -> r.component),
+                        new Column().header("DIR").dataAlign(HorizontalAlign.LEFT).with(r -> r.direction),
+                        new Column().header("ROUTE").dataAlign(HorizontalAlign.LEFT).with(this::getRouteId),
+                        new Column().header("PROTOCOL").dataAlign(HorizontalAlign.LEFT).with(this::getProtocol),
+                        new Column().header("SERVICE").dataAlign(HorizontalAlign.LEFT).with(this::getService),
+                        new Column().header("METADATA").visible(metadata).dataAlign(HorizontalAlign.LEFT)
+                                .with(this::getMetadata),
+                        new Column().header("TOTAL").dataAlign(HorizontalAlign.RIGHT).with(r -> "" + r.hits),
+                        new Column().header("ENDPOINT").visible(!wideUri).dataAlign(HorizontalAlign.LEFT)
+                                .maxWidth(epW, OverflowBehaviour.ELLIPSIS_RIGHT)
+                                .with(this::getUri),
+                        new Column().header("ENDPOINT").visible(wideUri).dataAlign(HorizontalAlign.LEFT)
+                                .maxWidth(epWideW, OverflowBehaviour.NEWLINE)
+                                .with(this::getUri))));
+            }
+        }
+
+        return 0;
+    }
+
+    private String getRouteId(Row r) {
+        if (r.routeId != null) {
+            return r.routeId;
+        }
+        return "";
+    }
+
+    private String getUri(Row r) {
+        String u = r.endpointUri;
+        if (shortUri) {
+            int pos = u.indexOf('?');
+            if (pos > 0) {
+                u = u.substring(0, pos);
+            }
+        }
+        return u;
+    }
+
+    private String getProtocol(Row r) {
+        return r.protocol;
+    }
+
+    private String getService(Row r) {
+        return r.serviceUrl;
+    }
+
+    private String getMetadata(Row r) {
+        if (r.metadata != null) {
+            StringJoiner sj = new StringJoiner(" ");
+            r.metadata.forEach((k, v) -> sj.add(k + "=" + v));
+            return sj.toString();
+        }
+        return "";
+    }
+
+    private static class Row extends CopyableRow<Row> {
+        String pid;
+        String name;
+        String age;
+        long uptime;
+        String component;
+        String direction;
+        boolean hosted;
+        String protocol;
+        String serviceUrl;
+        String endpointUri;
+        long hits;
+        String routeId;
+        JsonObject metadata;
+    }
+
+}

@@ -1,0 +1,358 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.camel.component.salesforce.api.utils;
+
+import java.io.IOException;
+import java.lang.reflect.Modifier;
+import java.util.Arrays;
+import java.util.Collections;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Set;
+import java.util.stream.Collectors;
+
+import org.apache.camel.component.salesforce.api.FieldsToNullPropertyFilter;
+import org.apache.camel.component.salesforce.api.dto.AbstractDTOBase;
+import org.apache.camel.component.salesforce.api.dto.AbstractQueryRecordsBase;
+import org.apache.camel.component.salesforce.api.dto.Address;
+import org.apache.camel.component.salesforce.api.dto.GeoLocation;
+import org.apache.camel.component.salesforce.api.dto.GlobalObjects;
+import org.apache.camel.component.salesforce.api.dto.PickListValue;
+import org.apache.camel.component.salesforce.api.dto.SObject;
+import org.apache.camel.component.salesforce.api.dto.SObjectDescription;
+import org.apache.camel.component.salesforce.api.dto.SObjectField;
+import org.apache.camel.support.scan.DefaultPackageScanClassResolver;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import tools.jackson.databind.BeanDescription;
+import tools.jackson.databind.ObjectMapper;
+import tools.jackson.databind.SerializationConfig;
+import tools.jackson.databind.SerializationFeature;
+import tools.jackson.databind.ValueSerializer;
+import tools.jackson.databind.cfg.DateTimeFeature;
+import tools.jackson.databind.cfg.EnumFeature;
+import tools.jackson.databind.json.JsonMapper;
+import tools.jackson.databind.jsonFormatVisitors.JsonValueFormat;
+import tools.jackson.databind.module.SimpleModule;
+import tools.jackson.databind.ser.BeanPropertyWriter;
+import tools.jackson.databind.ser.PropertyWriter;
+import tools.jackson.databind.ser.ValueSerializerModifier;
+import tools.jackson.databind.ser.std.NullSerializer;
+import tools.jackson.databind.ser.std.SimpleFilterProvider;
+import tools.jackson.module.jsonSchema.jakarta.JsonSchema;
+import tools.jackson.module.jsonSchema.jakarta.JsonSchemaGenerator;
+import tools.jackson.module.jsonSchema.jakarta.types.ArraySchema;
+import tools.jackson.module.jsonSchema.jakarta.types.BooleanSchema;
+import tools.jackson.module.jsonSchema.jakarta.types.IntegerSchema;
+import tools.jackson.module.jsonSchema.jakarta.types.NullSchema;
+import tools.jackson.module.jsonSchema.jakarta.types.NumberSchema;
+import tools.jackson.module.jsonSchema.jakarta.types.ObjectSchema;
+import tools.jackson.module.jsonSchema.jakarta.types.SimpleTypeSchema;
+import tools.jackson.module.jsonSchema.jakarta.types.StringSchema;
+
+import static java.util.stream.Collectors.joining;
+
+/**
+ * Factory class for creating {@linkplain ObjectMapper}
+ */
+public final class JsonUtils {
+
+    public static final String SCHEMA4 = "http://json-schema.org/draft-04/schema#";
+    public static final String DEFAULT_ID_PREFIX = "urn:jsonschema:org:apache:camel:component:salesforce:dto";
+
+    private static final String API_DTO_ID = "org:urn:jsonschema:org:apache:camel:component:salesforce:api:dto";
+
+    private static final Logger LOG = LoggerFactory.getLogger(JsonUtils.class);
+
+    private JsonUtils() {
+
+    }
+
+    public static ObjectMapper createObjectMapper() {
+        SimpleFilterProvider filterProvider
+                = new SimpleFilterProvider().addFilter("fieldsToNull", new FieldsToNullPropertyFilter());
+        // Salesforce API wire format: Jackson 2 defaults, dates as text, keep the offset read
+        return JsonMapper.builderWithJackson2Defaults()
+                .filterProvider(filterProvider)
+                .disable(DateTimeFeature.WRITE_DATES_AS_TIMESTAMPS)
+                .disable(DateTimeFeature.ADJUST_DATES_TO_CONTEXT_TIME_ZONE)
+                .addModule(new TimeModule())
+                .build();
+    }
+
+    public static String getBasicApiJsonSchema() {
+        ObjectMapper mapper = createSchemaObjectMapper();
+        JsonSchemaGenerator schemaGen = new JsonSchemaGenerator(mapper);
+
+        Set<Class<?>> schemaClasses = new HashSet<>();
+        try (DefaultPackageScanClassResolver packageScanClassResolver = new DefaultPackageScanClassResolver()) {
+
+            // get non-abstract extensions of AbstractDTOBase
+            schemaClasses.addAll(packageScanClassResolver.findByFilter(
+                    type -> !Modifier.isAbstract(type.getModifiers()) && AbstractDTOBase.class.isAssignableFrom(type),
+                    "org.apache.camel.component.salesforce.api.dto"));
+
+            // get non-abstract extensions of AbstractDTOBase
+            schemaClasses.addAll(packageScanClassResolver.findByFilter(
+                    type -> !Modifier.isAbstract(type.getModifiers()) && AbstractDTOBase.class.isAssignableFrom(type),
+                    "org.apache.camel.component.salesforce.api.dto"));
+        } catch (IOException ie) {
+            LOG.warn("Some exception happened while parsing the schema", ie);
+        }
+
+        Set<JsonSchema> allSchemas = new HashSet<>();
+        for (Class<?> aClass : schemaClasses) {
+            JsonSchema jsonSchema = schemaGen.generateSchema(aClass);
+            allSchemas.add(jsonSchema);
+        }
+
+        return getJsonSchemaString(mapper, allSchemas, API_DTO_ID);
+    }
+
+    public static String getJsonSchemaString(ObjectMapper mapper, Set<JsonSchema> allSchemas, String id) {
+        JsonSchema rootSchema = getJsonSchemaAsSchema(allSchemas, id);
+
+        return mapper.writeValueAsString(rootSchema);
+    }
+
+    public static JsonSchema getJsonSchemaAsSchema(Set<JsonSchema> allSchemas, String id) {
+        ObjectSchema rootSchema = new ObjectSchema();
+        rootSchema.set$schema(SCHEMA4);
+        rootSchema.setId(id);
+        @SuppressWarnings({ "unchecked", "rawtypes" })
+        Set<Object> tmp = (Set) allSchemas;
+        rootSchema.setOneOf(tmp);
+
+        return rootSchema;
+    }
+
+    public static String getSObjectJsonSchema(SObjectDescription description) {
+        return getSObjectJsonSchema(description, true);
+    }
+
+    public static JsonSchema getSObjectJsonSchemaAsJson(SObjectDescription description) {
+        return getSObjectJsonSchemaAsSchema(description, true);
+    }
+
+    public static String getSObjectJsonSchema(SObjectDescription description, boolean addQuerySchema) {
+        ObjectMapper schemaObjectMapper = createSchemaObjectMapper();
+        return getJsonSchemaString(schemaObjectMapper,
+                getSObjectJsonSchema(schemaObjectMapper, description, DEFAULT_ID_PREFIX, addQuerySchema), DEFAULT_ID_PREFIX);
+    }
+
+    public static JsonSchema getSObjectJsonSchemaAsSchema(SObjectDescription description, boolean addQuerySchema) {
+        ObjectMapper schemaObjectMapper = createSchemaObjectMapper();
+        return getJsonSchemaAsSchema(getSObjectJsonSchema(schemaObjectMapper, description, DEFAULT_ID_PREFIX, addQuerySchema),
+                DEFAULT_ID_PREFIX);
+    }
+
+    public static Set<JsonSchema> getSObjectJsonSchema(
+            ObjectMapper objectMapper, SObjectDescription description, String idPrefix, boolean addQuerySchema) {
+        Set<JsonSchema> allSchemas = new HashSet<>();
+
+        // generate SObject schema from description
+        ObjectSchema sobjectSchema = new ObjectSchema();
+        sobjectSchema.setId(idPrefix + ":" + description.getName());
+        sobjectSchema.setTitle(description.getLabel());
+
+        SimpleTypeSchema addressSchema = null;
+        SimpleTypeSchema geoLocationSchema = null;
+
+        for (SObjectField field : description.getFields()) {
+
+            SimpleTypeSchema fieldSchema = new NullSchema();
+            String soapType = field.getSoapType();
+
+            switch (soapType.substring(soapType.indexOf(':') + 1)) {
+                case "ID": // mapping for tns:ID SOAP type
+                case "string":
+                case "base64Binary":
+                    // Salesforce maps any types like string, picklist, reference,
+                    // etc. to string
+                case "anyType":
+                    fieldSchema = new StringSchema();
+                    break;
+
+                case "integer":
+                case "int":
+                case "long":
+                case "short":
+                case "byte":
+                case "unsignedInt":
+                case "unsignedShort":
+                case "unsignedByte":
+                    fieldSchema = new IntegerSchema();
+                    break;
+
+                case "decimal":
+                case "float":
+                case "double":
+                    fieldSchema = new NumberSchema();
+                    break;
+
+                case "boolean":
+                    fieldSchema = new BooleanSchema();
+                    break;
+
+                case "date":
+                    fieldSchema = new StringSchema();
+                    ((StringSchema) fieldSchema).setFormat(JsonValueFormat.DATE);
+                    break;
+                case "dateTime":
+                case "g":
+                    fieldSchema = new StringSchema();
+                    ((StringSchema) fieldSchema).setFormat(JsonValueFormat.DATE_TIME);
+                    break;
+                case "time":
+                    fieldSchema = new StringSchema();
+                    ((StringSchema) fieldSchema).setFormat(JsonValueFormat.TIME);
+                    break;
+
+                case "address":
+                    if (addressSchema == null) {
+                        addressSchema = getSchemaFromClass(objectMapper, Address.class);
+                    }
+                    fieldSchema = addressSchema;
+                    break;
+
+                case "location":
+                    if (geoLocationSchema == null) {
+                        geoLocationSchema = getSchemaFromClass(objectMapper, GeoLocation.class);
+                    }
+                    fieldSchema = geoLocationSchema;
+                    break;
+
+                default:
+                    throw new IllegalArgumentException("Unsupported type " + soapType);
+            }
+
+            List<PickListValue> picklistValues = field.getPicklistValues();
+            switch (field.getType()) {
+                case "picklist":
+                    fieldSchema.asStringSchema()
+                            .setEnums(picklistValues == null
+                                    ? Collections.emptySet() : picklistValues.stream().map(PickListValue::getValue).distinct()
+                                            .collect(Collectors.toSet()));
+                    break;
+
+                case "multipicklist":
+                    // TODO regex needs more work to not allow values not separated
+                    // by ','
+                    fieldSchema.asStringSchema()
+                            .setPattern(picklistValues == null
+                                    ? "" : picklistValues.stream().map(val -> "(,?(" + val.getValue() + "))").distinct()
+                                            .collect(joining("|", "(", ")")));
+                    break;
+
+                default:
+                    // nothing to fix
+            }
+
+            // additional field properties
+            fieldSchema.setTitle(field.getLabel());
+            fieldSchema.setDefault(field.getDefaultValue());
+            if (field.isUpdateable() != null) {
+                fieldSchema.setReadonly(!field.isUpdateable());
+            }
+
+            final String descriptionText = Arrays
+                    .asList(new Object[] { "unique", field.isUnique() }, new Object[] { "idLookup", field.isIdLookup() },
+                            new Object[] { "autoNumber", field.isAutoNumber() },
+                            new Object[] { "calculated", field.isCalculated() })
+                    .stream().filter(ary -> Boolean.TRUE.equals(ary[1])).map(ary -> String.valueOf(ary[0]))
+                    .collect(Collectors.joining(","));
+            // JSON schema currently does not support the above attributes so
+            // we'll store this information
+            // in the description
+            fieldSchema.setDescription(descriptionText);
+
+            // add property to sobject schema
+            if (field.isNillable()) {
+                sobjectSchema.putOptionalProperty(field.getName(), fieldSchema);
+            } else {
+                sobjectSchema.putProperty(field.getName(), fieldSchema);
+            }
+        }
+
+        // add sobject schema to root schema
+        allSchemas.add(sobjectSchema);
+
+        if (addQuerySchema) {
+            // add a simple query schema for this sobject for lookups, etc.
+            ObjectSchema queryRecords = getSchemaFromClass(objectMapper, AbstractQueryRecordsBase.class);
+            queryRecords.setId(idPrefix + ":QueryRecords" + description.getName());
+
+            ObjectSchema refSchema = new ObjectSchema();
+            refSchema.set$ref(sobjectSchema.getId());
+
+            ArraySchema recordsProperty = new ArraySchema();
+            recordsProperty.setItems(new ArraySchema.SingleItems(refSchema));
+            queryRecords.putProperty("records", recordsProperty);
+
+            allSchemas.add(queryRecords);
+        }
+
+        return allSchemas;
+    }
+
+    public static ObjectMapper createSchemaObjectMapper() {
+        return createObjectMapper().rebuild()
+                .enable(EnumFeature.WRITE_ENUMS_USING_TO_STRING)
+                .enable(SerializationFeature.INDENT_OUTPUT)
+                .build();
+    }
+
+    private static ObjectSchema getSchemaFromClass(ObjectMapper objectMapper, Class<?> type) {
+        return new JsonSchemaGenerator(objectMapper).generateSchema(type).asObjectSchema();
+    }
+
+    public static JsonSchema getGlobalObjectsJsonSchemaAsSchema(final GlobalObjects globalObjects) {
+        final Set<JsonSchema> allSchemas = new HashSet<>();
+
+        for (SObject sobject : globalObjects.getSobjects()) {
+            // generate SObject schema from description
+            ObjectSchema sobjectSchema = new ObjectSchema();
+            sobjectSchema.setId(DEFAULT_ID_PREFIX + ":" + sobject.getName());
+            sobjectSchema.setTitle(sobject.getLabel());
+
+            allSchemas.add(sobjectSchema);
+        }
+
+        return getJsonSchemaAsSchema(allSchemas, DEFAULT_ID_PREFIX + ":GlobalObjects");
+    }
+
+    public static ObjectMapper withNullSerialization(final ObjectMapper objectMapper) {
+        final SimpleModule nullSerialization = new SimpleModule("salesforce-null-serialization");
+        nullSerialization.setSerializerModifier(new ValueSerializerModifier() {
+            @Override
+            public ValueSerializer<?> modifySerializer(
+                    final SerializationConfig config, final BeanDescription.Supplier beanDesc,
+                    final ValueSerializer<?> serializer) {
+                for (final PropertyWriter writer : (Iterable<PropertyWriter>) serializer::properties) {
+                    if (writer instanceof BeanPropertyWriter) {
+                        ((BeanPropertyWriter) writer).assignNullSerializer(NullSerializer.instance);
+                    }
+                }
+
+                return serializer;
+            }
+        });
+
+        return objectMapper.rebuild().addModule(nullSerialization).build();
+    }
+
+}

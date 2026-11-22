@@ -1,0 +1,135 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.camel.dsl.jbang.core.commands.version;
+
+import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.StandardOpenOption;
+import java.util.List;
+
+import org.apache.camel.dsl.jbang.core.commands.CamelCommandBaseTestSupport;
+import org.apache.camel.dsl.jbang.core.commands.CamelJBangMain;
+import org.apache.camel.dsl.jbang.core.commands.UserConfigHelper;
+import org.apache.camel.dsl.jbang.core.common.CommandLineHelper;
+import org.apache.camel.dsl.jbang.core.common.InstallDetector;
+import org.junit.jupiter.api.Assertions;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+
+class VersionGetTest extends CamelCommandBaseTestSupport {
+
+    @BeforeEach
+    @Override
+    public void setup() throws Exception {
+        super.setup();
+        useTestHomeDir();
+    }
+
+    @Test
+    public void shouldPrintVersions() throws Exception {
+        UserConfigHelper.createUserConfig("");
+        createJBangVersionFile("0.100");
+
+        VersionGet command = createCommand();
+        command.doCall();
+
+        List<String> lines = printer.getLines();
+        Assertions.assertTrue(lines.get(0).startsWith("JBang version:"));
+        Assertions.assertTrue(lines.get(1).startsWith("Camel CLI version:"));
+    }
+
+    @Test
+    public void shouldPrintUserProperties() throws Exception {
+        UserConfigHelper.createUserConfig("""
+                camel-version=latest
+                foo=bar
+                kamelets-version=greatest
+                """);
+        createJBangVersionFile("0.101");
+
+        VersionGet command = createCommand();
+        command.doCall();
+
+        List<String> lines = printer.getLines();
+        Assertions.assertEquals(5, lines.size());
+        Assertions.assertTrue(lines.get(0).startsWith("JBang version:"));
+        Assertions.assertTrue(lines.get(1).startsWith("Camel CLI version:"));
+        Assertions.assertEquals("User configuration:", lines.get(2));
+        Assertions.assertEquals("camel-version = latest", lines.get(3));
+        Assertions.assertEquals("kamelets-version = greatest", lines.get(4));
+    }
+
+    @Test
+    public void shouldPrintOnlyTheKameletsVersion() throws Exception {
+        UserConfigHelper.createUserConfig("""
+                kamelets-version=4.18.0
+                """);
+        createJBangVersionFile("0.101");
+
+        VersionGet command = createCommand();
+        command.doCall();
+
+        List<String> lines = printer.getLines();
+        Assertions.assertEquals("User configuration:", lines.get(2));
+        Assertions.assertEquals("kamelets-version = 4.18.0", lines.get(3));
+    }
+
+    @Test
+    public void shouldPrintTheNightlyBuildAndWhenItWasBuilt() throws Exception {
+        UserConfigHelper.createUserConfig("");
+        Path versions = InstallDetector.webInstallerVersionsRoot();
+        String saved = System.getProperty("camel.launcher.jar");
+        System.setProperty("camel.launcher.jar",
+                versions.resolve("4.24.0-20261108.143653-24/lib/camel-launcher-4.24.0-SNAPSHOT.jar").toString());
+        try {
+            VersionGet command = createCommand();
+            command.doCall();
+        } finally {
+            if (saved != null) {
+                System.setProperty("camel.launcher.jar", saved);
+            } else {
+                System.clearProperty("camel.launcher.jar");
+            }
+        }
+
+        // where JBang is installed, a "JBang version:" line comes first
+        List<String> lines = printer.getLines();
+        int cli = 0;
+        while (cli < lines.size() && !lines.get(cli).startsWith("Camel CLI version:")) {
+            cli++;
+        }
+        Assertions.assertTrue(cli < lines.size() - 1, String.join("\n", lines));
+        Assertions.assertEquals("Nightly build: 4.24.0-20261108.143653-24 (built 2026-11-08 14:36:53 UTC)",
+                lines.get(cli + 1));
+    }
+
+    private void createJBangVersionFile(String version) throws IOException {
+        Path jBangDir = CommandLineHelper.getHomeDir().resolve(".jbang/cache");
+        if (!jBangDir.toFile().exists()) {
+            jBangDir.toFile().mkdirs();
+        }
+
+        Files.writeString(jBangDir.resolve("version.txt"), version,
+                StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING);
+    }
+
+    private VersionGet createCommand() {
+        return new CamelJBangMain().withPrinter(printer).command(new VersionGet());
+    }
+
+}

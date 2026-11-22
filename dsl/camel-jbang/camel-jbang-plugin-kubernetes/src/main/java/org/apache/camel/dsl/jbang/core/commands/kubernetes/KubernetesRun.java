@@ -1,0 +1,1019 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.camel.dsl.jbang.core.commands.kubernetes;
+
+import java.io.File;
+import java.io.FileFilter;
+import java.io.FileInputStream;
+import java.io.IOException;
+import java.io.InputStream;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Map;
+import java.util.Properties;
+import java.util.Set;
+import java.util.StringJoiner;
+import java.util.concurrent.TimeUnit;
+
+import io.fabric8.kubernetes.api.model.Pod;
+import io.fabric8.kubernetes.client.KubernetesClient;
+import io.fabric8.kubernetes.client.KubernetesClientBuilder;
+import io.fabric8.kubernetes.client.KubernetesClientTimeoutException;
+import io.fabric8.kubernetes.client.vertx5.Vertx5HttpClientFactory;
+import io.vertx.core.Vertx;
+import io.vertx.core.VertxOptions;
+import io.vertx.core.file.FileSystemOptions;
+import org.aesh.command.CommandDefinition;
+import org.aesh.command.option.Arguments;
+import org.aesh.command.option.Mixin;
+import org.aesh.command.option.Option;
+import org.aesh.command.option.OptionList;
+import org.apache.camel.CamelContext;
+import org.apache.camel.dsl.jbang.core.commands.CommandHelper;
+import org.apache.camel.dsl.jbang.core.commands.MavenResolverMixin;
+import org.apache.camel.dsl.jbang.core.commands.QuarkusPlatformMixin;
+import org.apache.camel.dsl.jbang.core.commands.RunHelper;
+import org.apache.camel.dsl.jbang.core.commands.kubernetes.traits.BaseTrait;
+import org.apache.camel.dsl.jbang.core.commands.kubernetes.traits.MountTrait;
+import org.apache.camel.dsl.jbang.core.commands.kubernetes.traits.TraitHelper;
+import org.apache.camel.dsl.jbang.core.commands.kubernetes.traits.model.Traits;
+import org.apache.camel.dsl.jbang.core.common.CliException;
+import org.apache.camel.dsl.jbang.core.common.RuntimeCompletionCandidates;
+import org.apache.camel.dsl.jbang.core.common.RuntimeTypeConverter;
+import org.apache.camel.dsl.jbang.run.common.MavenCommand;
+import org.apache.camel.dsl.jbang.run.common.Printer;
+import org.apache.camel.dsl.jbang.run.common.QuarkusHelper.QuarkusPlatformBom;
+import org.apache.camel.dsl.jbang.run.common.RuntimeType;
+import org.apache.camel.dsl.jbang.run.common.SourceScheme;
+import org.apache.camel.impl.DefaultCamelContext;
+import org.apache.camel.support.FileWatcherResourceReloadStrategy;
+import org.apache.camel.util.FileUtil;
+import org.apache.camel.util.IOHelper;
+import org.apache.camel.util.ObjectHelper;
+import org.apache.camel.util.concurrent.ThreadHelper;
+
+import static org.apache.camel.dsl.jbang.core.commands.kubernetes.KubernetesHelper.getPodPhase;
+
+@CommandDefinition(name = "run", description = "Run Camel application on Kubernetes", generateHelp = true)
+public class KubernetesRun extends KubernetesBaseCommand {
+
+    @Arguments(description = "The Camel file(s) to run. If no files specified then application.properties is used as source for which files to run.",
+               paramLabel = "files")
+    public List<String> files = new ArrayList<>();
+
+    @Option(name = "service-account", description = "The service account used to run the application.")
+    String serviceAccount;
+
+    @OptionList(name = "prop", aliases = { "property" }, valueSeparator = OptionList.NO_SEPARATOR,
+                description = "Add a runtime property or properties from a file (syntax: [my-key=my-value|file:/path/to/my-conf.properties|/path/to/my-conf.properties].")
+    String[] properties;
+
+    @OptionList(name = "config", valueSeparator = OptionList.NO_SEPARATOR,
+                description = "Add a runtime configuration from a ConfigMap or a Secret (syntax: [configmap|secret]:name[/key], where name represents the configmap/secret name and key optionally represents the configmap/secret key to be filtered).")
+    String[] configs;
+
+    @OptionList(name = "resource", valueSeparator = OptionList.NO_SEPARATOR,
+                description = "Add a runtime resource from a Configmap or a Secret (syntax: [configmap|secret]:name[/key][@path], where name represents the configmap/secret name, key optionally represents the configmap/secret key to be filtered and path represents the destination path).")
+    String[] resources;
+
+    @Option(name = "open-api", description = "Add an OpenAPI spec (syntax: [configmap|file]:name).")
+    String openApi;
+
+    @OptionList(name = "env", valueSeparator = OptionList.NO_SEPARATOR,
+                description = "Set an environment variable in the integration container, for instance \"-e MY_VAR=my-value\".")
+    String[] envVars;
+
+    @OptionList(name = "volume", valueSeparator = OptionList.NO_SEPARATOR,
+                description = "Mount a volume into the integration container, for instance \"-v pvcname:/container/path\".")
+    String[] volumes;
+
+    @OptionList(name = "connect", valueSeparator = OptionList.NO_SEPARATOR,
+                description = "A Service that the integration should bind to, specified as [[apigroup/]version:]kind:[namespace/]name.")
+    String[] connects;
+
+    @OptionList(name = "annotation", valueSeparator = OptionList.NO_SEPARATOR,
+                description = "Add an annotation to the integration. Use name values pairs like \"--annotation my.company=hello\".")
+    String[] annotations;
+
+    @OptionList(name = "label", valueSeparator = OptionList.NO_SEPARATOR,
+                description = "Add a label to the integration. Use name values pairs like \"--label my.company=hello\".")
+    String[] labels;
+
+    @OptionList(name = "trait", valueSeparator = OptionList.NO_SEPARATOR,
+                description = "Add a trait configuration to the integration. Use name values pairs like \"--trait trait.name.config=hello\".")
+    String[] traits;
+
+    @Option(name = "wait", hasValue = false, description = "Wait for the deployment to become ready.")
+    boolean wait;
+
+    @Option(name = "logs", hasValue = false, description = "Print logs after Camel application has been started.")
+    boolean logs;
+
+    @Option(name = "reload", aliases = { "dev" }, hasValue = false,
+            description = "Enables dev mode (live reload when source files are updated and saved)")
+    boolean dev;
+
+    @Option(name = "quiet", hasValue = false, description = "Quiet output - only show errors for build/deploy.")
+    boolean quiet;
+
+    @Option(name = "verbose", hasValue = false, description = "Verbose output of build/deploy progress")
+    boolean verbose;
+
+    @Option(name = "cleanup", hasValue = false,
+            description = "Automatically removes deployment when process is stopped. Only in combination with --dev, --reload option.",
+            defaultValue = "true")
+    boolean cleanup = true;
+
+    @Option(name = "output", description = "Just output the generated integration custom resource (supports: yaml or json).")
+    String output;
+
+    // Export options
+
+    @Option(name = "image", description = "The image name to be built.")
+    String image;
+
+    @Option(name = "image-registry", description = "The image registry to hold the app container image.")
+    String imageRegistry;
+
+    @Option(name = "image-group", description = "The image registry group used to push images to.")
+    String imageGroup;
+
+    // no default value, so that detectCluster() can tell an explicit value from the default
+    @Option(name = "image-builder", description = "The image builder used to build the container image (e.g. docker, jib, s2i)."
+                                                  + " Default is jib, or docker on Minikube unless --disable-auto is set.")
+    String imageBuilder;
+
+    @Option(name = "cluster-type",
+            description = "The target cluster type (${COMPLETION-CANDIDATES}). Special configurations may be applied to different cluster types such as Kind or Minikube.",
+            completer = ClusterTypeCompletionCandidates.class, converter = ClusterTypeConverter.class)
+    String clusterType;
+
+    @Option(name = "image-build", hasValue = false, description = "Whether to build container image as part of the run.",
+            defaultValue = "true")
+    boolean imageBuild = true;
+
+    // no default value, so that detectCluster() can tell an explicit value from the default
+    @Option(name = "image-push", hasValue = false,
+            description = "Whether to push image to given image registry as part of the run."
+                          + " Default is true, or false on Minikube with the docker image builder unless --disable-auto is set.")
+    Boolean imagePush;
+
+    @OptionList(name = "image-platform", valueSeparator = OptionList.NO_SEPARATOR,
+                description = "List of target platforms. Each platform is defined using os and architecture (e.g. linux/amd64).")
+    String[] imagePlatforms;
+
+    @Option(name = "base-image",
+            description = "The base image that is used to build the container image from (default is mirror.gcr.io/library/eclipse-temurin:<java-version>).")
+    String baseImage;
+
+    @Option(name = "registry-mirror",
+            description = "Optional Docker registry mirror where to pull images from when building the container image.")
+    String registryMirror;
+
+    // Export base options
+    @Mixin
+    MavenResolverMixin mavenResolver;
+
+    @OptionList(name = "dep", aliases = { "dependency" }, valueSeparator = ',', description = "Add additional dependencies")
+    List<String> dependencies = new ArrayList<>();
+
+    @Option(name = "runtime", description = "Runtime (${COMPLETION-CANDIDATES})", defaultValue = "quarkus",
+            completer = RuntimeCompletionCandidates.class, converter = RuntimeTypeConverter.class)
+    RuntimeType runtime = RuntimeType.quarkus;
+
+    @Option(name = "gav", description = "The Maven group:artifact:version")
+    String gav;
+
+    @OptionList(name = "exclude", valueSeparator = OptionList.NO_SEPARATOR, description = "Exclude files by name or pattern")
+    List<String> excludes = new ArrayList<>();
+
+    @OptionList(name = "resource-dir", aliases = { "resource-dirs" }, valueSeparator = ',',
+                description = "Additional resource directories to include in src/main/resources (recursive, preserving structure)")
+    List<String> resourceDirs = new ArrayList<>();
+
+    @Option(name = "package-scan-jars", hasValue = false,
+            description = "Whether to automatic package scan JARs for custom Spring or Quarkus beans making them available for Camel CLI",
+            defaultValue = "false")
+    boolean packageScanJars;
+
+    @Option(name = "maven-settings",
+            description = "Optional location of Maven settings.xml file to configure servers, repositories, mirrors and proxies."
+                          + " If set to \"false\", not even the default ~/.m2/settings.xml will be used.")
+    String mavenSettings;
+
+    @Option(name = "maven-settings-security",
+            description = "Optional location of Maven settings-security.xml file to decrypt settings.xml")
+    String mavenSettingsSecurity;
+
+    @Option(name = "maven-central-enabled", hasValue = false,
+            description = "Whether downloading JARs from Maven Central repository is enabled")
+    boolean mavenCentralEnabled = true;
+
+    @Option(name = "maven-apache-snapshot-enabled", hasValue = false,
+            description = "Whether downloading JARs from ASF Maven Snapshot repository is enabled")
+    boolean mavenApacheSnapshotEnabled = true;
+
+    @Option(name = "java-version", aliases = { "java" }, description = "Java version", defaultValue = "21")
+    String javaVersion = "21";
+
+    @Option(name = "camel-version", description = "To export using a different Camel version than the default version.")
+    String camelVersion;
+
+    @Option(name = "kamelets-version", description = "Apache Camel Kamelets version")
+    String kameletsVersion;
+
+    @Option(name = "profile", description = "Profile to export (dev, test, or prod).", inherited = true)
+    String profile;
+
+    @Option(name = "local-kamelet-dir", description = "Local directory for loading Kamelets (takes precedence)")
+    String localKameletDir;
+
+    @Option(name = "spring-boot-version", description = "Spring Boot version", defaultValue = RuntimeType.SPRING_BOOT_VERSION)
+    String springBootVersion = RuntimeType.SPRING_BOOT_VERSION;
+
+    @Option(name = "camel-spring-boot-version", description = "Camel version to use with Spring Boot")
+    String camelSpringBootVersion;
+
+    @Mixin
+    protected QuarkusPlatformMixin quarkusPlatform;
+
+    @Option(name = "package-name",
+            description = "For Java source files should they have the given package name. By default the package name is computed from the Maven GAV. "
+                          + "Use false to turn off and not include package name in the Java source files.")
+    String packageName;
+
+    @OptionList(name = "build-property", valueSeparator = OptionList.NO_SEPARATOR,
+                description = "Maven properties, ex. --build-property=prop1=foo")
+    List<String> buildProperties = new ArrayList<>();
+
+    @Option(name = "disable-auto", hasValue = false,
+            description = "Disable automatic cluster type detection and automatic settings for cluster.")
+    boolean disableAuto = false;
+
+    @Option(name = "skip-plugins", hasValue = false, description = "Skip plugins during export", defaultValue = "false")
+    boolean skipPlugins = false;
+
+    // DevMode/Reload state
+    private CamelContext devModeContext;
+    private Thread devModeShutdownTask;
+    private int devModeReloadCount;
+    // detectCluster() runs again on every dev mode reload, the Minikube docker-env hint is printed only once
+    private boolean dockerEnvHintPrinted;
+
+    private KubernetesPodLogs reusablePodLogs;
+    private Printer quietPrinter;
+    private Traits computedTraits;
+
+    public KubernetesRun() {
+        this(null);
+    }
+
+    public KubernetesRun(List<String> files) {
+        if (files != null) {
+            this.files.addAll(files);
+        }
+        projectNameSuppliers.add(() -> projectNameFromImage(() -> image));
+        projectNameSuppliers.add(() -> projectNameFromGav(() -> gav));
+        projectNameSuppliers.add(() -> projectNameFromFilePath(this::firstFilePath));
+    }
+
+    private String firstFilePath() {
+        return !files.isEmpty() ? files.get(0) : null;
+    }
+
+    public Integer doCall() throws Exception {
+        String projectName = getProjectName();
+        computedTraits = TraitHelper.parseTraits(traits);
+
+        Path baseDir = Path.of(".");
+        if (files.size() == 1) {
+            String name = FileUtil.stripTrailingSeparator(files.get(0));
+            if (getScheme(name) == null) {
+                Path first = Path.of(name);
+                if (Files.isDirectory(first)) {
+                    baseDir = first;
+                    RunHelper.dirToFiles(name, files);
+                }
+            }
+        }
+        // merge the properties from files
+        if (properties != null) {
+            properties = mergeProperties(properties);
+        }
+        // when user sets configuration or resources from configmap/secret
+        // the projected properties files must be set in the app runtime
+        setPropertiesLocation();
+
+        String workingDir = getIndexedWorkingDir(projectName);
+        KubernetesExport export = configureExport(workingDir, baseDir);
+        boolean cronEnabled = computedTraits.getCronjob() != null
+                && Boolean.TRUE.equals(computedTraits.getCronjob().getEnabled());
+        if (cronEnabled) {
+            // disable observability-services as CronJob doesn't use the container probes
+            export.setObserve(false);
+        }
+        int exit = export.export();
+        if (exit != 0) {
+            printer().printErr("Project export failed!");
+            return exit;
+        }
+
+        if (output != null) {
+            boolean ksvcEnabled = computedTraits.getKnativeService() != null
+                    && Boolean.TRUE.equals(computedTraits.getKnativeService().getEnabled());
+
+            exit = buildProjectOutput(workingDir);
+            if (exit != 0) {
+                printer().printErr("Project build failed!");
+                return exit;
+            }
+
+            Path manifestPath;
+            switch (output) {
+                case "yaml" -> {
+                    if (ksvcEnabled) {
+                        // trick the clusterType to be able to read from the jkube source directory
+                        manifestPath = KubernetesHelper.resolveKubernetesManifestPath("service",
+                                Paths.get(workingDir, "src/main/jkube"));
+                    } else {
+                        manifestPath = KubernetesHelper.resolveKubernetesManifestPath(clusterType,
+                                Paths.get(workingDir, "target/kubernetes"));
+                    }
+                }
+                case "json" ->
+                    manifestPath = KubernetesHelper.resolveKubernetesManifestPath(clusterType,
+                            Paths.get(workingDir, "target/kubernetes"),
+                            "json");
+                default -> {
+                    printer().printErr("Unsupported output format '%s' (supported: yaml, json)".formatted(output));
+                    return 1;
+                }
+            }
+
+            try (InputStream is = Files.newInputStream(manifestPath)) {
+                super.printer().println(IOHelper.loadText(is));
+            }
+
+            return 0;
+        }
+
+        exit = deployProject(workingDir, false);
+        if (exit != 0) {
+            printer().printErr("Project deploy failed!");
+            return exit;
+        }
+
+        if (dev || wait || logs) {
+            waitForRunningPod(projectName);
+        }
+
+        if (dev) {
+            setupDevMode(projectName, workingDir, baseDir);
+        }
+
+        if (dev || logs) {
+            startPodLogging(projectName);
+        }
+
+        return 0;
+    }
+
+    String getRunPlatformDir() {
+        return ".camel-jbang-run";
+    }
+
+    private String getIndexedWorkingDir(String projectName) {
+        var workingDir = getRunPlatformDir() + File.separator + projectName;
+        if (devModeReloadCount > 0) {
+            workingDir += "-%03d".formatted(devModeReloadCount);
+        }
+        return workingDir;
+    }
+
+    private KubernetesExport configureExport(String workingDir, Path baseDir) {
+        detectCluster();
+
+        final QuarkusPlatformBom quarkusPlatformBoms;
+        if (runtime == RuntimeType.quarkus) {
+            quarkusPlatformBoms
+                    = quarkusPlatform.resolve(
+                            camelVersion,
+                            mavenResolver.downloader()::resolveArtifact,
+                            mavenResolver.download(),
+                            mavenResolver.fresh());
+        } else {
+            quarkusPlatformBoms
+                    = new QuarkusPlatformBom(null, null, camelVersion, quarkusPlatform.quarkusExtensionRegistryBaseUri());
+        }
+
+        KubernetesExport.ExportConfigurer configurer = new KubernetesExport.ExportConfigurer(
+                runtime,
+                baseDir,
+                quarkusPlatformBoms.quarkusBom().getVersion(),
+                files,
+                name,
+                gav,
+                mavenResolver.repos(),
+                dependencies,
+                excludes,
+                mavenSettings,
+                mavenSettingsSecurity,
+                mavenCentralEnabled,
+                mavenApacheSnapshotEnabled,
+                javaVersion,
+                camelVersion,
+                kameletsVersion,
+                profile,
+                localKameletDir,
+                springBootVersion,
+                camelSpringBootVersion,
+                quarkusPlatformBoms.quarkusBom().getGroupId(),
+                quarkusPlatformBoms.quarkusBom().getArtifactId(),
+                quarkusPlatformBoms.quarkusExtensionRegistryBaseUri(),
+                openApi,
+                workingDir,
+                packageName,
+                buildProperties,
+                true,
+                true,
+                false,
+                false,
+                mavenResolver.download(),
+                packageScanJars,
+                (quiet || output != null),
+                true,
+                "info",
+                verbose,
+                skipPlugins,
+                resourceDirs,
+                quarkusPlatformBoms.quarkusCamelBom().getGroupId(),
+                quarkusPlatformBoms.quarkusCamelBom().getArtifactId(),
+                quarkusPlatformBoms.quarkusCamelBom().getVersion());
+        KubernetesExport export = getMain().command(new KubernetesExport(configurer));
+
+        export.image = image;
+        export.imageRegistry = imageRegistry;
+        export.imageGroup = imageGroup;
+        export.imagePush = imagePush;
+        export.imageBuilder = imageBuilder;
+        export.imagePlatforms = imagePlatforms;
+        export.baseImage = baseImage;
+        export.registryMirror = registryMirror;
+        export.clusterType = clusterType;
+        export.serviceAccount = serviceAccount;
+        export.setApplicationProperties(properties);
+        export.configs = configs;
+        export.resources = resources;
+        export.envVars = envVars;
+        export.volumes = volumes;
+        export.connects = connects;
+        export.annotations = annotations;
+        export.labels = labels;
+        export.traits = traits;
+
+        return export;
+    }
+
+    private void setupDevMode(String projectName, String workingDir, Path baseDir) throws Exception {
+        String firstPath = firstFilePath();
+
+        String watchDir = ".";
+        FileFilter filter = null;
+        if (firstPath != null) {
+            String filePath = FileUtil.onlyPath(SourceScheme.onlyName(firstPath));
+            if (filePath != null) {
+                watchDir = filePath;
+            }
+
+            filter = pathname -> files.stream()
+                    .map(FileUtil::stripPath)
+                    .anyMatch(name -> name.equals(pathname.getName()));
+        }
+
+        FileWatcherResourceReloadStrategy reloadStrategy = new FileWatcherResourceReloadStrategy(watchDir);
+        reloadStrategy.setResourceReload((name, resource) -> {
+            synchronized (this) {
+
+                printer().printf("Reloading project due to file change: %s%n", FileUtil.stripPath(name));
+
+                devModeReloadCount += 1;
+
+                String reloadWorkingDir = getIndexedWorkingDir(projectName);
+                devModeContext.close();
+
+                // Re-export updated project
+                //
+                KubernetesExport export = configureExport(reloadWorkingDir, baseDir);
+                int exit = export.export();
+                if (exit != 0) {
+                    printer().printErr("Project (re)export failed for: %s".formatted(reloadWorkingDir));
+                    return;
+                }
+
+                reusablePodLogs.retryForReload = true;
+                try {
+
+                    // Undeploy/Delete current project
+                    //
+                    KubernetesDelete deleteCommand = getMain().command(new KubernetesDelete());
+                    deleteCommand.name = projectName;
+                    deleteCommand.namespace = namespace;
+                    deleteCommand.doCall();
+
+                    // Re-deploy updated project
+                    //
+                    exit = deployProject(reloadWorkingDir, true);
+                    if (exit != 0) {
+                        printer().printErr("Project redeploy failed for: %s".formatted(reloadWorkingDir));
+                        return;
+                    }
+
+                    waitForRunningPod(projectName);
+
+                } finally {
+                    reusablePodLogs.retryForReload = false;
+                }
+
+                // Recursively setup --dev mode for updated project
+                //
+                Runtime.getRuntime().removeShutdownHook(devModeShutdownTask);
+                setupDevMode(projectName, reloadWorkingDir, baseDir);
+
+                printer().printf("Project reloaded: %s%n", reloadWorkingDir);
+            }
+        });
+        if (filter != null) {
+            reloadStrategy.setFileFilter(filter);
+        }
+
+        devModeContext = new DefaultCamelContext(false);
+        devModeContext.addService(reloadStrategy);
+        devModeContext.start();
+
+        if (cleanup) {
+            installShutdownHook(projectName, workingDir);
+        }
+    }
+
+    private void startPodLogging(String projectName) throws Exception {
+        try {
+            reusablePodLogs = getMain().command(new KubernetesPodLogs());
+            if (!ObjectHelper.isEmpty(namespace)) {
+                reusablePodLogs.namespace = namespace;
+            }
+            reusablePodLogs.name = projectName;
+            reusablePodLogs.doCall();
+        } catch (Exception e) {
+            printer().printErr("Failed to read pod logs", e);
+            throw e;
+        }
+    }
+
+    private void waitForRunningPod(String projectName) {
+        if (!quiet) {
+            String kubectlCmd = "kubectl get pod";
+            kubectlCmd += " -l %s=%s".formatted(BaseTrait.KUBERNETES_LABEL_NAME, projectName);
+            if (!ObjectHelper.isEmpty(namespace)) {
+                kubectlCmd += " -n %s".formatted(namespace);
+            }
+            printer().println("Run: " + kubectlCmd);
+        }
+        Pod pod;
+        try {
+            pod = client(Pod.class).withLabel(BaseTrait.KUBERNETES_LABEL_NAME, projectName)
+                    .waitUntilCondition(it -> "Running".equals(getPodPhase(it)), 10, TimeUnit.MINUTES);
+        } catch (KubernetesClientTimeoutException e) {
+            throw CliException.timeout("The pod of " + projectName + " is not running after 10 minutes");
+        }
+        printer().println(String.format("Pod '%s' in phase %s", pod.getMetadata().getName(), getPodPhase(pod)));
+    }
+
+    private void installShutdownHook(String projectName, String workingDir) {
+        devModeShutdownTask = new Thread(() -> {
+            KubernetesDelete deleteCommand = getMain().command(new KubernetesDelete());
+            deleteCommand.name = projectName;
+            deleteCommand.namespace = namespace;
+            // the client does not close a Vertx instance that is passed to it
+            var vertx = createVertxForShutdownHook();
+            try (var client = createKubernetesClientForShutdownHook(vertx)) {
+                KubernetesHelper.setKubernetesClient(client);
+                deleteCommand.doCall();
+                CommandHelper.cleanExportDir(workingDir, false);
+            } catch (Exception e) {
+                throw new RuntimeException(e);
+            } finally {
+                // close() returns before Vert.x is closed, and its daemon threads would not keep the JVM running
+                try {
+                    vertx.close().await(5, TimeUnit.SECONDS);
+                } catch (Exception e) {
+                    printer().printErr("Failed to close Vert.x - %s".formatted(e.getMessage()));
+                }
+            }
+        });
+        devModeShutdownTask.setName(ThreadHelper.resolveThreadName(null, "CamelShutdownInterceptor"));
+        Runtime.getRuntime().addShutdownHook(devModeShutdownTask);
+    }
+
+    // KubernetesClientVertx can no longer be used in ShutdownHook
+    // https://issues.apache.org/jira/browse/CAMEL-21621
+    private Vertx createVertxForShutdownHook() {
+        System.setProperty("vertx.disableDnsResolver", "true");
+        return Vertx.vertx((new VertxOptions())
+                .setFileSystemOptions((new FileSystemOptions())
+                        .setFileCachingEnabled(false)
+                        .setClassPathResolvingEnabled(false))
+                .setUseDaemonThread(true));
+    }
+
+    private KubernetesClient createKubernetesClientForShutdownHook(Vertx vertx) {
+        return new KubernetesClientBuilder()
+                .withHttpClientFactory(new Vertx5HttpClientFactory(vertx))
+                .build();
+    }
+
+    // build the project locally to generate the artifacts in the target directory, but don't deploy it.
+    private Integer buildProjectOutput(String workingDir) throws IOException, InterruptedException {
+        printer().println("Building Camel application ...");
+
+        // Run build via Maven
+        ProcessBuilder pb = new ProcessBuilder();
+        List<String> args = new ArrayList<>();
+
+        args.add(MavenCommand.wrapper(Path.of(workingDir)).toString());
+        if (quiet || !verbose) {
+            args.add("--quiet");
+        }
+        args.add("--file");
+        args.add(new File(workingDir, "pom.xml").getAbsolutePath());
+
+        if (!ObjectHelper.isEmpty(namespace)) {
+            args.add("-Djkube.namespace=%s".formatted(namespace));
+        }
+
+        // skip image build and push because we only want to build the Kubernetes manifest
+        args.add("-Djkube.skip.build=true");
+        args.add("-Djkube.skip.push=true");
+        // suppress maven transfer progress
+        args.add("-ntp");
+
+        if (computedTraits.getKnativeService() != null
+                && Boolean.TRUE.equals(computedTraits.getKnativeService().getEnabled())) {
+            // by default jkube creates a Deployment manifest and it doesn't support knative controller yet.
+            // however when knative-service is enabled the knative-service trait generates a src/main/jkube/service.yml
+            // and there is no need for the regular Deployment as the knative Service manifest, once deployed
+            // will generate the regular Deployment, so we have to disable the jkube resources task to not run and not generate the deployment.yml
+            args.add("-Djkube.skip.resource=true");
+        }
+
+        args.add("package");
+
+        printer().println("Run: " + String.join(" ", args));
+
+        pb.command(args.toArray(String[]::new));
+
+        useKubeConfig(pb);
+        Path log = mavenOutput(pb);
+        try {
+            Process p = pb.start();
+            // wait for that process to exit as we run in foreground
+            int exit = p.waitFor();
+            if (exit != 0) {
+                printer().printErr("Build failed!");
+                printMavenOutput(log);
+                return exit;
+            }
+            return 0;
+        } finally {
+            removeMavenOutput(log);
+        }
+    }
+
+    private Integer deployProject(String workingDir, boolean reload) throws Exception {
+
+        printer().println("Deploying to %s ...".formatted(clusterType));
+
+        // Run build via Maven
+        ProcessBuilder pb = new ProcessBuilder();
+        List<String> args = new ArrayList<>();
+
+        args.add(MavenCommand.wrapper(Path.of(workingDir)).toString());
+        if (quiet || !verbose) {
+            args.add("--quiet");
+        }
+        // suppress maven transfer progress
+        args.add("-ntp");
+        args.add("-DskipTests");
+        args.add("--file");
+        args.add(new File(workingDir, "pom.xml").getAbsolutePath());
+
+        if (!imageBuild) {
+            args.add("-Djkube.skip.build=true");
+        }
+
+        if (imagePush) {
+            args.add("-Djkube.%s.push=true".formatted(imageBuilder));
+            args.add("-Djkube.skip.push=false");
+        }
+
+        if (!ObjectHelper.isEmpty(namespace)) {
+            args.add("-Djkube.namespace=%s".formatted(namespace));
+        }
+
+        boolean isOpenshift = ClusterType.OPENSHIFT.isEqualTo(clusterType);
+        var prefix = isOpenshift ? "oc" : "k8s";
+        if (computedTraits.getKnativeService() != null
+                && Boolean.TRUE.equals(computedTraits.getKnativeService().getEnabled())) {
+            // by default jkube creates a Deployment manifest and it doesn't support knative controller yet.
+            // however when knative-service is enabled the knative-service trait generates a src/main/jkube/service.yml
+            // and there is no need for the regular Deployment as the knative Service manifest, once deployed
+            // will generate the regular Deployment, so we have to disable the jkube resources task to not run and not generate the deployment.yml
+            // apply the knative service manifest and specify the knative service.yml
+            args.add("-Djkube.skip.resource=true");
+            // run the "package" task instead of k8s:deploy
+            args.add("package");
+            args.add(prefix + ":apply");
+            if (isOpenshift) {
+                args.add("-Djkube.openshiftManifest=src/main/jkube/service.yml");
+            } else {
+                args.add("-Djkube.kubernetesManifest=src/main/jkube/service.yml");
+            }
+            if (ClusterType.MINIKUBE.isEqualTo(clusterType) && !disableAuto) {
+                KubernetesHelper.skipKnativeImageTagResolutionInMinikube();
+            }
+        } else {
+            args.add(prefix + ":deploy");
+        }
+
+        printer().println("Run: " + String.join(" ", args));
+
+        pb.command(args.toArray(String[]::new));
+
+        useKubeConfig(pb);
+        Path log = mavenOutput(pb);
+        try {
+            Process p = pb.start();
+            // wait for that process to exit as we run in foreground
+            int exit = p.waitFor();
+            if (exit != 0) {
+                printer().printErr("Deployment to %s failed!".formatted(clusterType));
+                printMavenOutput(log);
+                return exit;
+            }
+            return 0;
+        } finally {
+            removeMavenOutput(log);
+        }
+    }
+
+    /**
+     * Shows the output of Maven with --verbose, and keeps it in a log file otherwise, for when it fails.
+     *
+     * @return the log file, or <tt>null</tt> with --verbose
+     */
+    /**
+     * The Kubernetes client of the JKube plugin reads KUBECONFIG: the cluster of --kube-config, when it is given
+     * (CAMEL-26934: the build deployed to the current context).
+     */
+    void useKubeConfig(ProcessBuilder pb) {
+        if (kubeConfig != null) {
+            pb.environment().put("KUBECONFIG", Path.of(kubeConfig).toAbsolutePath().toString());
+        }
+    }
+
+    private Path mavenOutput(ProcessBuilder pb) throws IOException {
+        if (!quiet && verbose) {
+            pb.inheritIO(); // run in foreground (with IO so logs are visible)
+            return null;
+        }
+        Path log = Files.createTempFile("camel-kubernetes-", ".log");
+        log.toFile().deleteOnExit();
+        pb.redirectErrorStream(true);
+        pb.redirectOutput(log.toFile());
+        return log;
+    }
+
+    /**
+     * Removes the log of Maven once it has ended: camel kubernetes run --dev builds and deploys again on every change.
+     */
+    private static void removeMavenOutput(Path log) {
+        if (log != null) {
+            try {
+                Files.deleteIfExists(log);
+            } catch (IOException e) {
+                // removed when the JVM exits
+            }
+        }
+    }
+
+    /**
+     * Prints the end of the output of Maven when it failed (it was hidden, as no --verbose was given).
+     */
+    private void printMavenOutput(Path log) {
+        if (log == null) {
+            return;
+        }
+        try {
+            List<String> lines = Files.readAllLines(log);
+            printer().printDiagnostic(String.join(System.lineSeparator(),
+                    lines.subList(Math.max(0, lines.size() - 30), lines.size())));
+        } catch (IOException e) {
+            // no output to show
+        }
+    }
+
+    void detectCluster() {
+        boolean explicitClusterType = clusterType != null;
+        if (!disableAuto && !explicitClusterType) {
+            if (verbose) {
+                printer().print("Automatic Kubernetes cluster detection... ");
+            }
+            this.clusterType = KubernetesHelper.discoverClusterType(client()).name();
+            if (verbose) {
+                printer().println(this.clusterType);
+            }
+        }
+        if (clusterType == null) {
+            this.clusterType = ClusterType.KUBERNETES.name();
+        }
+        if (!disableAuto) {
+            // Apply per-cluster defaults for the resolved cluster type (explicit or detected),
+            // but keep the image options the user has set
+            if (ClusterType.MINIKUBE.isEqualTo(clusterType)) {
+                if (imageBuilder == null) {
+                    this.imageBuilder = "docker";
+                }
+                // the docker builder builds straight into the Minikube Docker daemon, so there is nothing to push;
+                // other builders (jib) still push, as the image would otherwise not reach the cluster
+                if (imagePush == null && "docker".equals(imageBuilder)) {
+                    this.imagePush = false;
+                }
+                // the detection only returns Minikube when its Docker environment is active, and tells the user otherwise
+                if (explicitClusterType && !dockerEnvHintPrinted && imageBuild && output == null
+                        && "docker".equals(imageBuilder)
+                        && Boolean.FALSE.equals(imagePush) && !KubernetesHelper.isMinikubeDockerEnv()) {
+                    printer().println("The Minikube Docker environment is not active: run \"eval $(minikube docker-env)\""
+                                      + " so that the image is built in the Docker daemon of Minikube.");
+                    dockerEnvHintPrinted = true;
+                }
+            } else if (ClusterType.OPENSHIFT.isEqualTo(clusterType)) {
+                if (ObjectHelper.isEmpty(imageGroup)) {
+                    this.imageGroup = client().getNamespace();
+                }
+            }
+        }
+        if (imageBuilder == null) {
+            this.imageBuilder = "jib";
+        }
+        if (imagePush == null) {
+            this.imagePush = true;
+        }
+    }
+
+    /**
+     * The properties of --property: a key=value, or the properties of a file (file:path, or a path). A key=value is a
+     * property also when its value is a path, such as camel.server.path=/api, which was taken for a file that does not
+     * exist and silently left out (CAMEL-26934).
+     *
+     * @throws CliException with exit code 66 for a properties file that does not exist
+     */
+    static String[] mergeProperties(String[] properties) throws IOException {
+        List<String> definiteProperties = new ArrayList<>();
+        for (String p : properties) {
+            int eq = p.indexOf('=');
+            String key = eq > 0 ? p.substring(0, eq) : null;
+            boolean keyValue = key != null && !key.contains("/") && !key.contains(File.separator);
+            if (p.startsWith("file:") || !keyValue) {
+                String filename = p.startsWith("file:") ? p.substring("file:".length()) : p;
+                File f = new File(filename);
+                if (!f.isFile()) {
+                    // the hint only when it may have been meant as a property, not for file:path (review)
+                    String hint = p.startsWith("file:") ? "" : " (a property is given as key=value)";
+                    throw CliException.fileNotFound("Properties file does not exist: " + filename + hint);
+                }
+                Properties prop = new Properties();
+                try (FileInputStream input = new FileInputStream(f)) {
+                    prop.load(input);
+                }
+                prop.forEach((k, v) -> definiteProperties.add(k + "=" + v));
+            } else {
+                definiteProperties.add(p);
+            }
+        }
+        return definiteProperties.toArray(new String[0]);
+    }
+
+    /*
+     * When a configmap/secret is projected as a properties file and mounted into the running pod
+     * and the properties file must be set at runtime to be discovered by the camel runtime
+     * with the camel.component.properties.location property.
+     * This is only for the --config parameter as the --resource are for any file type, not configurations.
+     */
+    private void setPropertiesLocation() {
+        if (configs != null) {
+            StringJoiner propertiesLocation = new StringJoiner(",");
+            for (String c : configs) {
+                if (c.startsWith("configmap:")) {
+                    String name = c.substring("configmap:".length());
+                    // in case the user has set a property to filter from the configmap, the "name" var is
+                    // the configmap name and the projected file.
+                    if (name.contains("/")) {
+                        propertiesLocation.add("file:" + MountTrait.CONF_DIR + MountTrait.CONFIGMAPS + "/" + name);
+                    } else {
+                        // we have to inspect the configmap and retrieve the key names, as they are
+                        // mapped to the mounted file names.
+                        Set<String> configmapKeys = retrieveConfigmapKeys(name);
+                        configmapKeys.forEach(key -> propertiesLocation
+                                .add("file:" + MountTrait.CONF_DIR + MountTrait.CONFIGMAPS + "/" + name + "/" + key));
+                    }
+                } else if (c.startsWith("secret:")) {
+                    String name = c.substring("secret:".length());
+                    if (name.contains("/")) {
+                        propertiesLocation.add("file:" + MountTrait.CONF_DIR + MountTrait.SECRETS + "/" + name);
+                    } else {
+                        Set<String> secretKeys = retrieveSecretKeys(name);
+                        secretKeys.forEach(key -> propertiesLocation
+                                .add("file:" + MountTrait.CONF_DIR + MountTrait.SECRETS + "/" + name + "/" + key));
+                    }
+                }
+            }
+            if (propertiesLocation.length() > 0) {
+                List<String> definiteProperties = new ArrayList<>();
+                definiteProperties.add("camel.component.properties.ignore-missing-location=true");
+                definiteProperties.add("camel.component.properties.location=" + propertiesLocation);
+                if (properties != null && properties.length > 0) {
+                    for (String s : properties) {
+                        definiteProperties.add(s);
+                    }
+                }
+                properties = definiteProperties.toArray(new String[definiteProperties.size()]);
+            }
+        }
+    }
+
+    private Set<String> retrieveConfigmapKeys(String name) {
+        KubernetesClient client = client();
+        String ns = "default";
+        if (namespace != null || client.getNamespace() != null) {
+            ns = namespace != null ? namespace : client.getNamespace();
+        }
+        var cm = client.configMaps().inNamespace(ns).withName(name).get();
+        if (cm == null) {
+            printer().printf("ConfigMap '%s' not found in namespace '%s'%n", name, ns);
+            return Set.of();
+        }
+        Map<String, String> data = cm.getData();
+        if (data == null) {
+            return Set.of();
+        }
+        return data.keySet();
+    }
+
+    private Set<String> retrieveSecretKeys(String name) {
+        KubernetesClient client = client();
+        String ns = "default";
+        if (namespace != null || client.getNamespace() != null) {
+            ns = namespace != null ? namespace : client.getNamespace();
+        }
+        var secret = client.secrets().inNamespace(ns).withName(name).get();
+        if (secret == null) {
+            printer().printf("Secret '%s' not found in namespace '%s'%n", name, ns);
+            return Set.of();
+        }
+        Map<String, String> data = secret.getData();
+        if (data == null) {
+            return Set.of();
+        }
+        return data.keySet();
+    }
+
+    @Override
+    protected Printer printer() {
+        if (quiet || output != null) {
+            if (quietPrinter == null) {
+                quietPrinter = new Printer.QuietPrinter(super.printer());
+            }
+
+            CommandHelper.setPrinter(quietPrinter);
+            return quietPrinter;
+        }
+        return super.printer();
+    }
+
+}

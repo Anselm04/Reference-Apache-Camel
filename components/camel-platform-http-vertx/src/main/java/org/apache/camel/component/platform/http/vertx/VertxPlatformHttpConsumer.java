@@ -1,0 +1,695 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.camel.component.platform.http.vertx;
+
+import java.io.File;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Locale;
+import java.util.Map;
+import java.util.Set;
+import java.util.regex.Pattern;
+
+import jakarta.activation.DataHandler;
+
+import io.vertx.core.Context;
+import io.vertx.core.Future;
+import io.vertx.core.Handler;
+import io.vertx.core.MultiMap;
+import io.vertx.core.Promise;
+import io.vertx.core.Vertx;
+import io.vertx.core.http.Cookie;
+import io.vertx.core.http.CookieSameSite;
+import io.vertx.core.http.HttpMethod;
+import io.vertx.ext.auth.User;
+import io.vertx.ext.web.FileUpload;
+import io.vertx.ext.web.ParsedHeaderValue;
+import io.vertx.ext.web.Route;
+import io.vertx.ext.web.RoutingContext;
+import io.vertx.ext.web.handler.TimeoutHandler;
+import io.vertx.ext.web.impl.RouteImpl;
+import org.apache.camel.Exchange;
+import org.apache.camel.ExchangePattern;
+import org.apache.camel.ExchangePropertyKey;
+import org.apache.camel.Message;
+import org.apache.camel.Processor;
+import org.apache.camel.Suspendable;
+import org.apache.camel.attachment.AttachmentMessage;
+import org.apache.camel.attachment.CamelFileDataSource;
+import org.apache.camel.component.platform.http.PlatformHttpEndpoint;
+import org.apache.camel.component.platform.http.cookie.CookieConfiguration;
+import org.apache.camel.component.platform.http.cookie.CookieHandler;
+import org.apache.camel.component.platform.http.spi.Method;
+import org.apache.camel.component.platform.http.spi.PlatformHttpConsumer;
+import org.apache.camel.component.platform.http.spi.PlatformHttpSecurityHandler;
+import org.apache.camel.http.base.HttpHelper;
+import org.apache.camel.spi.HeaderFilterStrategy;
+import org.apache.camel.spi.RestRegistry;
+import org.apache.camel.spi.RestRegistry.RestService;
+import org.apache.camel.support.DefaultConsumer;
+import org.apache.camel.support.PluginHelper;
+import org.apache.camel.util.FileUtil;
+import org.apache.camel.util.IOHelper;
+import org.apache.camel.util.MimeTypeHelper;
+import org.apache.camel.util.ObjectHelper;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import static org.apache.camel.component.platform.http.vertx.VertxPlatformHttpRouter.PLATFORM_HTTP_ROUTER_NAME_ZERO;
+import static org.apache.camel.component.platform.http.vertx.VertxPlatformHttpSupport.isFormUrlEncoded;
+import static org.apache.camel.component.platform.http.vertx.VertxPlatformHttpSupport.isMultiPartFormData;
+import static org.apache.camel.component.platform.http.vertx.VertxPlatformHttpSupport.populateCamelHeaders;
+import static org.apache.camel.component.platform.http.vertx.VertxPlatformHttpSupport.writeResponse;
+import static org.apache.camel.util.CollectionHelper.appendEntry;
+
+/**
+ * A {@link org.apache.camel.Consumer} for the {@link org.apache.camel.component.platform.http.spi.PlatformHttpEngine}
+ * based on Vert.x Web.
+ */
+public class VertxPlatformHttpConsumer extends DefaultConsumer
+        implements PlatformHttpConsumer, Suspendable {
+
+    private static final Logger LOGGER = LoggerFactory.getLogger(VertxPlatformHttpConsumer.class);
+    private static final Pattern PATH_PARAMETER_PATTERN = Pattern.compile("\\{([^/}]+)\\}");
+    private static final String PRE_AUTHENTICATED_EXCHANGE = VertxPlatformHttpConsumer.class.getName()
+                                                             + ".preAuthenticatedExchange";
+    private static final String AUTHORIZATION = "Authorization";
+    private static final long HTTP2_INTERNAL_ERROR = 2;
+
+    private final List<Handler<RoutingContext>> handlers;
+    private final String fileNameExtWhitelist;
+    private final boolean muteExceptions;
+    private final boolean handleWriteResponseError;
+    private final PlatformHttpSecurityHandler securityHandler;
+    private final List<Route> routes = new ArrayList<>();
+    private RestRegistry restRegistry;
+    private Set<Method> methods;
+    private String path;
+    private VertxPlatformHttpRouter router;
+    private HttpRequestBodyHandler httpRequestBodyHandler;
+    private CookieConfiguration cookieConfiguration;
+    private final String routerName;
+
+    public VertxPlatformHttpConsumer(PlatformHttpEndpoint endpoint,
+                                     Processor processor,
+                                     List<Handler<RoutingContext>> handlers,
+                                     String routerName) {
+        this(endpoint, processor, handlers, routerName, null);
+    }
+
+    public VertxPlatformHttpConsumer(PlatformHttpEndpoint endpoint,
+                                     Processor processor,
+                                     List<Handler<RoutingContext>> handlers,
+                                     String routerName,
+                                     PlatformHttpSecurityHandler securityHandler) {
+        super(endpoint, processor);
+
+        this.handlers = handlers;
+        this.fileNameExtWhitelist
+                = endpoint.getFileNameExtWhitelist() == null ? null : endpoint.getFileNameExtWhitelist().toLowerCase(Locale.US);
+        this.muteExceptions = endpoint.isMuteException();
+        this.handleWriteResponseError = endpoint.isHandleWriteResponseError();
+        this.routerName = routerName;
+        this.securityHandler = securityHandler;
+    }
+
+    @Override
+    public PlatformHttpEndpoint getEndpoint() {
+        return (PlatformHttpEndpoint) super.getEndpoint();
+    }
+
+    @Override
+    protected void doInit() throws Exception {
+        super.doInit();
+
+        // camel-rest is optional
+        restRegistry = PluginHelper.getRestRegistry(getEndpoint().getCamelContext());
+
+        methods = Method.parseList(getEndpoint().getHttpMethodRestrict());
+        path = configureEndpointPath(getEndpoint());  // in vertx-web we should replace path parameters from {xxx} to :xxx syntax
+        router = VertxPlatformHttpRouter.lookup(getEndpoint().getCamelContext(), routerName);
+        if (router == null) {
+            // dynamic assigned port number, then lookup using -0
+            router = VertxPlatformHttpRouter.lookup(getEndpoint().getCamelContext(), PLATFORM_HTTP_ROUTER_NAME_ZERO);
+        }
+        if (router == null) {
+            throw new IllegalArgumentException("No PlatformHttpEngine created and setup in registry with name: " + routerName);
+        }
+        if (!getEndpoint().isHttpProxy() && getEndpoint().isUseStreaming()) {
+            httpRequestBodyHandler = new StreamingHttpRequestBodyHandler(router.bodyHandler());
+        } else if (!getEndpoint().isHttpProxy() && !getEndpoint().isUseBodyHandler()) {
+            httpRequestBodyHandler = new NoOpHttpRequestBodyHandler(router.bodyHandler());
+        } else {
+            httpRequestBodyHandler = new DefaultHttpRequestBodyHandler(router.bodyHandler());
+        }
+        if (getEndpoint().isUseCookieHandler()) {
+            cookieConfiguration = getEndpoint().getCookieConfiguration();
+        }
+    }
+
+    @Override
+    protected void doStart() throws Exception {
+        super.doStart();
+
+        boolean catchAll = false;
+        if (restRegistry != null && startRestServicesContractFirst()) {
+            // rest-dsl contract-first using multiple routers per api endpoint
+            boolean routeUnmatchedToCamel = "camel".equalsIgnoreCase(getEndpoint().getUnmatchedRequestHandling());
+            if (!routeUnmatchedToCamel) {
+                return;
+            }
+            // unmatchedRequestHandling=camel: fall through and also register a catch-all route
+            catchAll = true;
+        }
+
+        // standard http consumer using a single router
+        final Route newRoute = router.route(path);
+        if (catchAll) {
+            // evaluate the catch-all after all other routes on the router so it cannot shadow
+            // operation routes of other consumers
+            // The call to .last() must stay the first call after router.route(path) for this to work
+            newRoute.last();
+        }
+        if (getEndpoint().getRequestTimeout() > 0) {
+            newRoute.handler(TimeoutHandler.create(getEndpoint().getRequestTimeout()));
+        }
+        if (getEndpoint().getCamelContext().getRestConfiguration().isEnableCORS() && getEndpoint().getConsumes() != null) {
+            ((RouteImpl) newRoute).setEmptyBodyPermittedWithConsumes(true);
+        }
+        if (!methods.equals(Method.getAll())) {
+            methods.forEach(m -> newRoute.method(HttpMethod.valueOf(m.name())));
+        }
+        if (getEndpoint().getComponent().isServerRequestValidation()) {
+            if (getEndpoint().getConsumes() != null) {
+                //comma separated contentTypes has to be registered one by one
+                for (String c : getEndpoint().getConsumes().split(",")) {
+                    newRoute.consumes(c);
+                }
+            }
+            if (getEndpoint().getProduces() != null) {
+                //comma separated contentTypes has to be registered one by one
+                for (String p : getEndpoint().getProduces().split(",")) {
+                    newRoute.produces(p);
+                }
+            }
+        }
+        configureSecurityHandler(newRoute);
+        httpRequestBodyHandler.configureRoute(newRoute);
+        for (Handler<RoutingContext> handler : handlers) {
+            newRoute.handler(handler);
+        }
+        newRoute.handler(this::handleRequest);
+        this.routes.add(newRoute);
+    }
+
+    @Override
+    protected void doStop() throws Exception {
+        this.routes.forEach(Route::remove);
+        this.routes.clear();
+        super.doStop();
+    }
+
+    /**
+     * Special start logic for Rest DSL with contract-first, which need to use fine-grained vertx router to make this
+     * consistent with Camel, otherwise there is only 1 vertx router to handle all the API endpoints (coarse grained)
+     * which distorts the observability in vertx and camel-quarkus.
+     *
+     * @return true if in rest-dsl contract-first mode, false if standard mode
+     */
+    protected boolean startRestServicesContractFirst() throws Exception {
+        boolean matched = false;
+        for (var r : restRegistry.listAllRestServices()) {
+            // rest-dsl contract-first we need to create a new unique router per API endpoint
+            String target = path;
+            if (target.endsWith("*")) {
+                target = target.substring(0, target.length() - 1);
+            }
+            if (r.isContractFirst() && target.equals(r.getBasePath())) {
+                matched = true;
+                String u = buildNormalizedEndpoint(r);
+                u = configureEndpointPath(u); // in vertx-web we should replace path parameters from {xxx} to :xxx syntax
+                String v = r.getMethod();
+                String c = r.getConsumes();
+                String p = r.getProduces();
+
+                Route sr = router.route(u);
+                sr.method(HttpMethod.valueOf(v));
+                if (getEndpoint().getComponent().isServerRequestValidation()) {
+                    if (c != null) {
+                        for (String cc : c.split(",")) {
+                            sr.consumes(cc);
+                        }
+                    }
+                    if (p != null) {
+                        for (String pp : p.split(",")) {
+                            sr.produces(pp);
+                        }
+                    }
+                }
+                configureSecurityHandler(sr);
+                httpRequestBodyHandler.configureRoute(sr);
+                for (Handler<RoutingContext> handler : handlers) {
+                    sr.handler(handler);
+                }
+                sr.handler(this::handleRequest);
+                this.routes.add(sr);
+            }
+        }
+        for (var r : restRegistry.listAllRestSpecifications()) {
+            // rest-dsl contract-first we need to see if there is an api spec
+            // that should be exposed via a vertx http router
+            String target = path;
+            if (target.endsWith("*")) {
+                target = target.substring(0, target.length() - 1);
+            }
+            if (r.isSpecification() && target.equals(r.getBasePath())) {
+                String u = buildNormalizedEndpoint(r);
+                String v = r.getMethod();
+                String p = r.getProduces();
+
+                Route sr = router.route(u);
+                sr.method(HttpMethod.valueOf(v));
+                if (getEndpoint().getComponent().isServerRequestValidation()) {
+                    if (p != null) {
+                        for (String pp : p.split(",")) {
+                            sr.produces(pp);
+                        }
+                    }
+                }
+                configureSecurityHandler(sr);
+                httpRequestBodyHandler.configureRoute(sr);
+                for (Handler<RoutingContext> handler : handlers) {
+                    sr.handler(handler);
+                }
+                sr.handler(this::handleRequest);
+                this.routes.add(sr);
+            }
+        }
+        return matched;
+    }
+
+    static String buildNormalizedEndpoint(RestService restService) {
+        String base = restService.getBasePath();
+        if (base.endsWith("/")) {
+            base = base.substring(0, base.length() - 1);
+        }
+        String u = base + restService.getBaseUrl();
+        return u;
+    }
+
+    private String configureEndpointPath(PlatformHttpEndpoint endpoint) {
+        String path = endpoint.getPath();
+        if (endpoint.isMatchOnUriPrefix() && !path.endsWith("*")) {
+            path += "*";
+        }
+        return configureEndpointPath(path);
+    }
+
+    private String configureEndpointPath(String path) {
+        // Transform from the Camel path param syntax /path/{key} to vert.x web's /path/:key
+        return PATH_PARAMETER_PATTERN.matcher(path).replaceAll(":$1");
+    }
+
+    protected void handleRequest(RoutingContext ctx) {
+        if (isSuspended()) {
+            handleSuspend(ctx);
+            return;
+        }
+
+        final Vertx vertx = ctx.vertx();
+        final Exchange exchange = getOrCreateExchange(ctx);
+        exchange.setPattern(ExchangePattern.InOut);
+
+        //
+        // We do not know if any of the processing logic of the route is synchronous or not so we
+        // need to process the request on a thread on the Vert.x worker pool.
+        //
+        // As example, assuming the platform-http component is configured as the transport provider
+        // for the rest dsl, then the following code may result in a blocking operation that could
+        // block Vert.x event-loop for too long if the target service takes long to respond, as
+        // example in case the service is a knative service scaled to zero that could take some time
+        // to become available:
+        //
+        //     rest("/results")
+        //         .get("/{id}")
+        //         .route()
+        //             .removeHeaders("*", "CamelHttpPath")
+        //             .to("rest:get:?bridgeEndpoint=true");
+        //
+
+        // Note: any logic that needs to interrogate HTTP headers not provided by RoutingContext.parsedHeaders, should
+        // be done inside of the following onComplete block, to ensure that the HTTP request is fully processed.
+        processHttpRequest(exchange, ctx).onComplete(result -> {
+            if (result.failed()) {
+                handleFailure(exchange, ctx, result.cause());
+                return;
+            }
+
+            if (getEndpoint().isHttpProxy()) {
+                handleProxy(ctx, exchange);
+            }
+
+            if (getEndpoint().isUseBodyHandler()) {
+                populateMultiFormData(ctx, exchange.getIn(), getEndpoint().getHeaderFilterStrategy());
+            }
+
+            processExchange(vertx, exchange).onComplete(processExchangeResult -> {
+                if (processExchangeResult.succeeded()) {
+                    writeResponse(ctx, exchange, getEndpoint().getHeaderFilterStrategy(), muteExceptions)
+                            .onComplete(writeResponseResult -> {
+                                if (writeResponseResult.succeeded()) {
+                                    handleExchangeComplete(exchange);
+                                } else {
+                                    handleFailure(exchange, ctx, writeResponseResult.cause());
+                                }
+                            });
+                } else {
+                    handleFailure(exchange, ctx, processExchangeResult.cause());
+                }
+            });
+        });
+    }
+
+    private void handleExchangeComplete(Exchange exchange) {
+        doneUoW(exchange);
+        releaseExchange(exchange, false);
+    }
+
+    private void handleFailure(Exchange exchange, RoutingContext ctx, Throwable failure) {
+        // A failed response write is reported before Vert.x has processed the connection close, so the response may
+        // not be flagged as closed yet
+        boolean responseWriteFailed = failure instanceof ResponseWriteException;
+        if (responseWriteFailed) {
+            failure = failure.getCause();
+        }
+
+        if (responseWriteFailed || ctx.response().closed()) {
+            LOGGER.debug("Client closed the connection of platform-http endpoint {} before the response completed",
+                    getEndpoint().getPath(), failure);
+        } else {
+            getExceptionHandler().handleException(
+                    "Failed handling platform-http endpoint " + getEndpoint().getPath(),
+                    failure);
+            if (!ctx.response().headWritten()) {
+                ctx.fail(failure);
+            } else if (!ctx.response().ended() && !ctx.response().closed()) {
+                // The response has already started, so there is no error status left to send, and failing the
+                // routing context would only log the failure a second time as an unhandled router exception.
+                // Reset it directly instead: the client still has to be told that the response it is reading is
+                // truncated, rather than being left waiting for a body that will never be completed.
+                ctx.response().reset(HTTP2_INTERNAL_ERROR);
+            }
+        }
+
+        if (handleWriteResponseError && failure != null) {
+            Exception existing = exchange.getException();
+            if (existing != null) {
+                failure.addSuppressed(existing);
+            }
+            exchange.setProperty(Exchange.EXCEPTION_CAUGHT, failure);
+            exchange.setException(failure);
+        }
+        handleExchangeComplete(exchange);
+    }
+
+    /**
+     * Routes the exchange, starting on a thread of the Vert.x worker pool, as the first steps of the route may block.
+     * The returned future completes on the context of the request, when the route is done.
+     * <p>
+     * With the endpoint option {@code synchronous=true} the worker thread runs the route with the synchronous
+     * processor, so it is held until the route completes, and the worker pool bounds the requests in flight.
+     * <p>
+     * Otherwise (the default) the route runs with the asynchronous processor, and the worker thread is not held until
+     * the route completes: when the route continues on another thread, such as a vertx-http producer that completes its
+     * exchange on a worker thread of the same Vert.x, a worker thread waiting for the route could be the one that the
+     * other thread needs, and with every worker thread waiting no request would ever complete.
+     */
+    private Future<Void> processExchange(Vertx vertx, Exchange exchange) {
+        if (getEndpoint().isSynchronous()) {
+            return vertx.executeBlocking(() -> {
+                createUoW(exchange);
+                getProcessor().process(exchange);
+                return null;
+            }, false);
+        }
+
+        Context context = vertx.getOrCreateContext();
+        Promise<Void> done = Promise.promise();
+        vertx.executeBlocking(() -> {
+            createUoW(exchange);
+            getAsyncProcessor().process(exchange, doneSync -> context.runOnContext(v -> done.tryComplete()));
+            return null;
+        }, false).onFailure(done::tryFail);
+        return done.future();
+    }
+
+    private void configureSecurityHandler(Route route) {
+        if (securityHandler != null) {
+            route.handler(this::handleSecurity);
+        }
+    }
+
+    private void handleSecurity(RoutingContext ctx) {
+        if (isSuspended()) {
+            handleSuspend(ctx);
+            return;
+        }
+
+        ctx.request().pause();
+        Exchange exchange = createExchange(false);
+        exchange.setPattern(ExchangePattern.InOut);
+        Message in = initializeHttpMessage(exchange, ctx);
+        populateCamelHeaders(ctx, in.getHeaders(), exchange, getEndpoint().getHeaderFilterStrategy());
+
+        ctx.vertx().executeBlocking(() -> securityHandler.authenticate(getEndpoint(), exchange), false)
+                .onComplete(result -> {
+                    if (result.failed()) {
+                        ctx.request().resume();
+                        handleFailure(exchange, ctx, result.cause());
+                    } else if (Boolean.TRUE.equals(result.result())) {
+                        exchange.getMessage().reset();
+                        ctx.put(PRE_AUTHENTICATED_EXCHANGE, exchange);
+                        ctx.next();
+                        ctx.request().resume();
+                    } else {
+                        ctx.request().resume();
+                        writeResponse(ctx, exchange, getEndpoint().getHeaderFilterStrategy(), muteExceptions)
+                                .onComplete(writeResponseResult -> {
+                                    if (writeResponseResult.succeeded()) {
+                                        releaseExchange(exchange, false);
+                                    } else {
+                                        handleFailure(exchange, ctx, writeResponseResult.cause());
+                                    }
+                                });
+                    }
+                });
+    }
+
+    private Exchange getOrCreateExchange(RoutingContext ctx) {
+        Exchange exchange = ctx.get(PRE_AUTHENTICATED_EXCHANGE);
+        return exchange != null ? exchange : createExchange(false);
+    }
+
+    private static void handleSuspend(RoutingContext ctx) {
+        ctx.response().setStatusCode(503);
+        ctx.end();
+    }
+
+    private static void handleProxy(RoutingContext ctx, Exchange exchange) {
+        exchange.getExchangeExtension().setStreamCacheDisabled(true);
+        final MultiMap httpHeaders = ctx.request().headers();
+        exchange.getMessage().setHeader(Exchange.HTTP_HOST, httpHeaders.get("Host"));
+        exchange.getMessage().removeHeader("Proxy-Connection");
+    }
+
+    /**
+     * The charset parameter of the request Content-Type, whose name is case-insensitive (RFC 9110), or null when there
+     * is none or its value is empty ({@code charset=}, {@code charset=""}), as in UndertowHelper and NettyHttpHelper.
+     */
+    private static String charsetParameter(ParsedHeaderValue contentType) {
+        for (Map.Entry<String, String> parameter : contentType.parameters().entrySet()) {
+            if ("charset".equalsIgnoreCase(parameter.getKey())) {
+                String name = IOHelper.normalizeCharset(parameter.getValue());
+                return ObjectHelper.isEmpty(name) ? null : name;
+            }
+        }
+        return null;
+    }
+
+    protected Future<Void> processHttpRequest(Exchange exchange, RoutingContext ctx) {
+        // reuse existing http message if pooled
+        Message in = initializeHttpMessage(exchange, ctx);
+
+        final String charset = charsetParameter(ctx.parsedHeaders().contentType());
+        if (charset != null) {
+            exchange.setProperty(ExchangePropertyKey.CHARSET_NAME, charset);
+            in.setHeader(Exchange.HTTP_CHARACTER_ENCODING, charset);
+        }
+
+        User user = ctx.user();
+        if (user != null) {
+            in.setHeader(VertxPlatformHttpConstants.AUTHENTICATED_USER, user);
+        }
+        if (getEndpoint().isUseCookieHandler()) {
+            exchange.setProperty(Exchange.COOKIE_HANDLER, new VertxCookieHandler(ctx));
+        }
+
+        return populateCamelMessage(ctx, exchange, in);
+    }
+
+    private Message initializeHttpMessage(Exchange exchange, RoutingContext ctx) {
+        Message in = exchange.getIn();
+        if (in instanceof HttpMessage hm) {
+            hm.init(exchange, ctx.request(), ctx.response());
+        } else {
+            in = new HttpMessage(exchange, ctx.request(), ctx.response());
+            exchange.setMessage(in);
+        }
+        return in;
+    }
+
+    protected Future<Void> populateCamelMessage(RoutingContext ctx, Exchange exchange, Message message) {
+        final HeaderFilterStrategy headerFilterStrategy = getEndpoint().getHeaderFilterStrategy();
+        populateCamelHeaders(ctx, message.getHeaders(), exchange, headerFilterStrategy);
+        if (getEndpoint().isStripUriPrefix()) {
+            String httpPath = (String) message.getHeader(Exchange.HTTP_PATH);
+            message.setHeader(Exchange.HTTP_PATH, HttpHelper.stripUriPrefix(httpPath, getEndpoint().getPath()));
+        }
+        if (securityHandler != null || Boolean.TRUE.equals(ctx.get(VertxPlatformHttpServer.AUTHENTICATED_BY_SERVER))) {
+            // the credential has been checked by Camel (the security handler of the endpoint, or the authentication
+            // configured on the server), so it is not passed on to the route
+            message.removeHeader(AUTHORIZATION);
+        }
+        return httpRequestBodyHandler.handle(ctx, message);
+    }
+
+    private void populateMultiFormData(
+            RoutingContext ctx, Message message, HeaderFilterStrategy headerFilterStrategy) {
+        final boolean isMultipartFormData = isMultiPartFormData(ctx);
+        if (isFormUrlEncoded(ctx) || isMultipartFormData) {
+            final MultiMap formData = ctx.request().formAttributes();
+            final Map<String, Object> body = new HashMap<>();
+            for (String key : formData.names()) {
+                for (String value : formData.getAll(key)) {
+                    if (headerFilterStrategy != null
+                            && !headerFilterStrategy.applyFilterToExternalHeaders(key, value, message.getExchange())) {
+                        appendEntry(message.getHeaders(), key, value);
+                        if (getEndpoint().isPopulateBodyWithForm()) {
+                            appendEntry(body, key, value);
+                        }
+                    }
+                }
+            }
+
+            if (!body.isEmpty()) {
+                message.setBody(body);
+            }
+
+            if (isMultipartFormData) {
+                populateAttachments(ctx.fileUploads(), message);
+            }
+        }
+    }
+
+    protected void populateAttachments(List<FileUpload> uploads, Message message) {
+        message.setHeader(Exchange.ATTACHMENTS_SIZE, uploads.size());
+        for (FileUpload upload : uploads) {
+            final String name = upload.name();
+            final String fileName = upload.fileName();
+
+            LOGGER.trace("HTTP attachment {} = {}", name, fileName);
+
+            // is the file name accepted - shared with the http bindings so the whitelist matches whole
+            // comma-separated extension tokens, not a substring: a whitelist of "txt" must not accept an upload
+            // named "evil.x" just because "txt".contains("x") (CAMEL-24652)
+            boolean accepted = HttpHelper.isFileNameExtWhitelisted(fileNameExtWhitelist, fileName);
+            if (accepted) {
+                final File localFile = new File(upload.uploadedFileName());
+                final AttachmentMessage attachmentMessage = message.getExchange().getMessage(AttachmentMessage.class);
+                attachmentMessage.addAttachment(name, new DataHandler(new CamelFileDataSource(localFile, fileName)));
+
+                // populate body in case there is only one attachment
+                if (uploads.size() == 1) {
+                    message.setHeader(Exchange.FILE_PATH, localFile.getAbsolutePath());
+                    message.setHeader(Exchange.FILE_LENGTH, upload.size());
+                    // FILE_NAME is a Camel control header consumed by file/ftp producers; the raw
+                    // client-supplied multipart filename may contain path segments, so reduce it to a
+                    // leaf name (CAMEL-24293)
+                    message.setHeader(Exchange.FILE_NAME, FileUtil.stripPath(upload.fileName()));
+                    String ct = MimeTypeHelper.probeMimeType(upload.fileName());
+                    if (ct == null) {
+                        ct = upload.contentType();
+                    }
+                    if (ct != null) {
+                        message.setHeader(Exchange.FILE_CONTENT_TYPE, ct);
+                    }
+                    message.setBody(localFile);
+                }
+            } else {
+                LOGGER.debug(
+                        "Cannot add file as attachment: {} because the file is not accepted according to fileNameExtWhitelist: {}",
+                        fileName, fileNameExtWhitelist);
+            }
+        }
+    }
+
+    class VertxCookieHandler implements CookieHandler {
+
+        private final RoutingContext routingContext;
+
+        VertxCookieHandler(RoutingContext routingContext) {
+            this.routingContext = routingContext;
+        }
+
+        @Override
+        public void addCookie(String name, String value) {
+            Cookie cookie = Cookie.cookie(name, value)
+                    .setPath(cookieConfiguration.getCookiePath())
+                    .setDomain(cookieConfiguration.getCookieDomain())
+                    .setSecure(cookieConfiguration.isCookieSecure())
+                    .setHttpOnly(cookieConfiguration.isCookieHttpOnly())
+                    .setSameSite(getSameSite(cookieConfiguration.getCookieSameSite()));
+            if (cookieConfiguration.getCookieMaxAge() != null) {
+                cookie.setMaxAge(cookieConfiguration.getCookieMaxAge());
+            }
+            routingContext.response().addCookie(cookie);
+        }
+
+        private CookieSameSite getSameSite(CookieConfiguration.CookieSameSite sameSite) {
+            for (CookieSameSite css : CookieSameSite.values()) {
+                // 'Strict', 'Lax', or 'None'
+                if (css.toString().equals(sameSite.getValue())) {
+                    return css;
+                }
+            }
+            return null;
+        }
+
+        @Override
+        public String removeCookie(String name) {
+            Cookie cookie = routingContext.response().removeCookie(name);
+            return cookie == null ? null : cookie.getValue();
+        }
+
+        @Override
+        public String getCookieValue(String name) {
+            Cookie cookie = routingContext.request().getCookie(name);
+            return cookie == null ? null : cookie.getValue();
+        }
+    }
+}

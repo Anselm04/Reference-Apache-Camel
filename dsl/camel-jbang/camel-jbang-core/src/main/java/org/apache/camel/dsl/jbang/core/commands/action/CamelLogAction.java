@@ -1,0 +1,691 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.camel.dsl.jbang.core.commands.action;
+
+import java.io.IOException;
+import java.io.LineNumberReader;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.text.ParseException;
+import java.text.SimpleDateFormat;
+import java.util.ArrayDeque;
+import java.util.ArrayList;
+import java.util.Comparator;
+import java.util.Date;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.Iterator;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Queue;
+import java.util.Set;
+import java.util.StringJoiner;
+import java.util.concurrent.ArrayBlockingQueue;
+import java.util.regex.Pattern;
+
+import org.aesh.command.CommandDefinition;
+import org.aesh.command.option.Argument;
+import org.aesh.command.option.Mixin;
+import org.aesh.command.option.Option;
+import org.aesh.command.option.OptionList;
+import org.apache.camel.dsl.jbang.core.commands.CommandHelper;
+import org.apache.camel.dsl.jbang.core.commands.DurationMixin;
+import org.apache.camel.dsl.jbang.core.common.CliException;
+import org.apache.camel.dsl.jbang.core.common.CommandLineHelper;
+import org.apache.camel.dsl.jbang.core.common.CompletionCandidates;
+import org.apache.camel.dsl.jbang.core.common.EnvironmentHelper;
+import org.apache.camel.dsl.jbang.core.common.ProcessHelper;
+import org.apache.camel.dsl.jbang.run.common.PreviousRun;
+import org.apache.camel.util.IOHelper;
+import org.apache.camel.util.StopWatch;
+import org.apache.camel.util.StringHelper;
+import org.apache.camel.util.TimeUtils;
+import org.apache.camel.util.json.JsonObject;
+import org.jline.jansi.Ansi;
+
+@CommandDefinition(name = "log", description = "Tail logs from running Camel integrations", generateHelp = true,
+                   footer = {
+                           "Examples:",
+                           "  camel log hello",
+                           "  camel log *",
+                           "  camel log hello --tail=50",
+                           "  camel log hello --previous" })
+public class CamelLogAction extends ActionBaseCommand {
+
+    private static final int NAME_MAX_WIDTH = 25;
+    private static final int NAME_MIN_WIDTH = 10;
+
+    private static final String TIMESTAMP_MAIN = "yyyy-MM-dd HH:mm:ss.SSS";
+    private static final String TIMESTAMP_SB = "yyyy-MM-dd'T'HH:mm:ss.SSSXXX";
+
+    public static class PrefixCompletionCandidates extends CompletionCandidates {
+
+        public PrefixCompletionCandidates() {
+        }
+
+        @Override
+        public Iterator<String> iterator() {
+            return List.of("auto", "true", "false").iterator();
+        }
+    }
+
+    @Argument(description = "Name or pid of running Camel integration, or of the run that ended with --previous. (default selects all)")
+    String name = "*";
+
+    @Option(name = "logging-color", hasValue = false, description = "Use colored logging", defaultValue = "true")
+    boolean loggingColor = true;
+
+    @Option(name = "timestamp", hasValue = false, description = "Print timestamp.", defaultValue = "true")
+    boolean timestamp = true;
+
+    @Option(name = "follow", hasValue = false,
+            description = "Keep following and outputting new log lines (press enter to exit)."
+                          + " Without an interactive terminal the default is false, unless --duration is given.",
+            defaultValue = "true")
+    boolean follow = true;
+
+    @Mixin
+    DurationMixin durationOption = new DurationMixin();
+
+    @Option(name = "startup", hasValue = false,
+            description = "Only shows logs from the starting phase to make it quick to look at how Camel was started.",
+            defaultValue = "false")
+    boolean startup;
+
+    @Option(name = "prefix",
+            description = "Print prefix with running Camel integration name. auto=only prefix when running multiple integrations. true=always prefix. false=prefix off.",
+            defaultValue = "auto", completer = PrefixCompletionCandidates.class)
+    String prefix = "auto";
+
+    @Option(name = "tail",
+            description = "The number of lines from the end of the logs to show. Use -1 to read from the beginning. Use 0 to read only new lines. Defaults to showing all logs from beginning.",
+            defaultValue = "-1")
+    int tail = -1;
+
+    @Option(name = "since",
+            description = "Return logs newer than a relative duration like 5s, 2m, or 1h. The value is in seconds if no unit specified.")
+    String since;
+
+    @OptionList(name = "find", valueSeparator = OptionList.NO_SEPARATOR, optionalValue = true,
+                description = "Find and highlight matching text (ignore case).")
+    String[] find;
+
+    @OptionList(name = "grep", valueSeparator = OptionList.NO_SEPARATOR, optionalValue = true,
+                description = "Filter logs to only output lines matching text (ignore case).")
+    String[] grep;
+
+    @Option(name = "previous", hasValue = false,
+            description = "Print the log of the previous run of the integration instead: the last run of that name that ended,"
+                          + " such as one that failed to start (like kubectl logs --previous).",
+            defaultValue = "false")
+    boolean previous;
+
+    String findAnsi;
+    Pattern[] grepPatterns;
+    Pattern[] findPatterns;
+
+    private int nameMaxWidth;
+    private boolean prefixShown;
+    private final SimpleDateFormat sdfMain = new SimpleDateFormat(TIMESTAMP_MAIN);
+    private final SimpleDateFormat sdfSB = new SimpleDateFormat(TIMESTAMP_SB);
+
+    private final Map<String, Ansi.Color> colors = new HashMap<>();
+
+    @Override
+    public Integer doCall() throws Exception {
+        if (loggingColor && colorsStripped()) {
+            // the console would take the colors out of each line, which is many times slower than to print the lines
+            // without colors, and gives the same output
+            loggingColor = false;
+        }
+        // a previous run has ended, so there is nothing to follow
+        follow = !previous && isFollowing(follow, durationOption.getDuration());
+        if (follow && EnvironmentHelper.isEmbedded()) {
+            follow = false;
+            printer().printTip("press F3 to switch to the Log tab for live log streaming");
+        }
+
+        Map<Long, Row> rows = new LinkedHashMap<>();
+
+        try {
+            // before reading, as an integration that starts later is read with them too
+            if (find != null) {
+                findAnsi = Ansi.ansi().fg(Ansi.Color.BLACK).bg(Ansi.Color.YELLOW).a("$0").reset().toString();
+                findPatterns = quoteAndCompilePatterns(find);
+            }
+            if (grep != null) {
+                findAnsi = Ansi.ansi().fg(Ansi.Color.BLACK).bg(Ansi.Color.YELLOW).a("$0").reset().toString();
+                grepPatterns = quoteAndCompilePatterns(grep);
+            }
+
+            if (previous) {
+                previousRun(rows);
+            } else {
+                // find new pids
+                updatePids(rows);
+                if (rows.isEmpty() && !follow) {
+                    // shown once: a name that matches no running integration is not found
+                    findRunning();
+                }
+            }
+            if (!rows.isEmpty()) {
+                // read existing log files (skip by tail/since)
+                Date limit = null;
+                if (since != null) {
+                    long millis;
+                    if (StringHelper.isDigit(since)) {
+                        // is in seconds by default
+                        millis = TimeUtils.toMilliSeconds(since) * 1000;
+                    } else {
+                        millis = TimeUtils.toMilliSeconds(since);
+                    }
+                    limit = new Date(System.currentTimeMillis() - millis);
+                }
+                if (startup) {
+                    follow = false;
+                    // only log startup logs until Camel was started
+                    tailStartupLogFiles(rows);
+                    dumpLogFiles(rows, 0);
+                } else if (tail != 0) {
+                    // dump existing log lines
+                    tailLogFiles(rows, tail, limit);
+                    dumpLogFiles(rows, tail);
+                }
+            }
+
+            if (follow) {
+                boolean waitMessage = true;
+                // until Enter is pressed, or the --duration has passed
+                CommandHelper.RunUntil running = CommandHelper.RunUntil.start(durationOption.getDuration());
+                StopWatch watch = new StopWatch();
+                do {
+                    if (rows.isEmpty()) {
+                        if (waitMessage) {
+                            printer().println("Waiting for logs ...");
+                            waitMessage = false;
+                        }
+                        Thread.sleep(500);
+                        updatePids(rows);
+                    } else {
+                        waitMessage = true;
+                        if (watch.taken() > 500) {
+                            // check for new logs
+                            updatePids(rows);
+                            watch.restart();
+                        }
+                        int lines = readLogFiles(rows);
+                        if (lines > 0) {
+                            dumpLogFiles(rows, 0);
+                        } else {
+                            Thread.sleep(100);
+                        }
+                    }
+                } while (running.isRunning());
+            }
+
+            return 0;
+        } finally {
+            // the readers of the logs, also when camel log runs in the JVM of the shell or the TUI (CAMEL-26911)
+            rows.values().forEach(r -> IOHelper.close(r.reader));
+        }
+    }
+
+    /**
+     * The previous run of the integration (CAMEL-25784): the one that matches the name, after a line on stderr that
+     * says which run it was and how it ended.
+     *
+     * @throws CliException with exit code 3 when no previous run, or more than one, matches
+     */
+    private void previousRun(Map<Long, Row> rows) {
+        boolean all = name == null || name.isBlank() || "*".equals(name);
+        List<PreviousRun.Info> found = PreviousRun.find(name);
+        if (found.isEmpty()) {
+            throw CliException.notFound(all ? "No previous run of a Camel integration" : "No previous run matches: " + name);
+        }
+        if (found.size() > 1) {
+            StringJoiner names = new StringJoiner(", ");
+            found.forEach(i -> names.add(i.name()));
+            throw CliException.notFound((all ? "There are " : "Name " + name + " matches ") + found.size()
+                                        + " previous runs: " + names + ". Specify the name of one.");
+        }
+        PreviousRun.Info info = found.get(0);
+        printer().printDiagnostic(info.describe());
+        Row row = new Row();
+        row.pid = Long.toString(info.pid());
+        row.name = info.name();
+        row.file = info.log();
+        nameMaxWidth = Math.max(NAME_MIN_WIDTH, Math.min(NAME_MAX_WIDTH, row.name.length()));
+        rows.put(info.pid(), row);
+    }
+
+    /**
+     * Fails when a name given matches no running integration, saying where the log of its previous run is, which tells
+     * why it is not running.
+     */
+    private void findRunning() {
+        try {
+            if (findProcesses(name).isEmpty()) {
+                // nothing runs: the newest previous run (findAll is newest first)
+                List<PreviousRun.Info> found = PreviousRun.findAll();
+                if (!found.isEmpty()) {
+                    printer().printTip(previousRunHint(found.get(0)));
+                }
+            }
+        } catch (CliException e) {
+            List<PreviousRun.Info> found = PreviousRun.find(name);
+            if (found.size() != 1) {
+                throw e;
+            }
+            throw CliException.notFound(e.getMessage() + ". " + previousRunHint(found.get(0)));
+        }
+    }
+
+    private static String previousRunHint(PreviousRun.Info info) {
+        return "camel log " + info.name() + " --previous prints the log of its previous run, which " + info.howItEnded();
+    }
+
+    private void updatePids(Map<Long, Row> rows) {
+        List<Long> pids = findPids(name);
+        ProcessHandle.allProcesses()
+                .filter(ph -> pids.contains(ph.pid()))
+                .forEach(ph -> {
+                    JsonObject root = loadStatus(ph.pid());
+                    if (root != null) {
+                        Row row = new Row();
+                        row.pid = Long.toString(ph.pid());
+                        JsonObject context = (JsonObject) root.get("context");
+                        if (context == null) {
+                            return;
+                        }
+                        row.name = context.getString("name");
+                        if ("CamelJBang".equals(row.name)) {
+                            row.name = ProcessHelper.extractName(root, ph);
+                        }
+                        int len = row.name.length();
+                        if (len < NAME_MIN_WIDTH) {
+                            len = NAME_MIN_WIDTH;
+                        }
+                        if (len > NAME_MAX_WIDTH) {
+                            len = NAME_MAX_WIDTH;
+                        }
+                        if (len > nameMaxWidth) {
+                            nameMaxWidth = len;
+                        }
+                        if (!rows.containsKey(ph.pid())) {
+                            rows.put(ph.pid(), row);
+                        }
+                    }
+                });
+
+        // remove pids that are no long active from the rows
+        Set<Long> remove = new HashSet<>();
+        for (long pid : rows.keySet()) {
+            if (!pids.contains(pid)) {
+                remove.add(pid);
+            }
+        }
+        for (long pid : remove) {
+            // the integration has stopped: its log is not read anymore
+            Row row = rows.remove(pid);
+            if (row != null) {
+                IOHelper.close(row.reader);
+            }
+        }
+    }
+
+    private int readLogFiles(Map<Long, Row> rows) throws Exception {
+        int lines = 0;
+
+        for (Row row : rows.values()) {
+            if (row.reader == null) {
+                Path file = logFile(row);
+                if (Files.exists(file)) {
+                    row.reader = new LineNumberReader(Files.newBufferedReader(file));
+                    if (tail == 0) {
+                        // only read new lines so forward to end of reader
+                        long size = Files.size(file);
+                        row.reader.skip(size);
+                    }
+                }
+            }
+            if (row.reader != null) {
+                String line;
+                do {
+                    try {
+                        line = row.reader.readLine();
+                        if (line != null) {
+                            line = alignTimestamp(line);
+                            boolean valid = true;
+                            if (grep != null) {
+                                valid = isValidGrep(line);
+                            }
+                            if (valid) {
+                                lines++;
+                                // switch fifo to be unlimited as we use it for new log lines
+                                if (row.fifo == null || row.fifo instanceof ArrayBlockingQueue) {
+                                    row.fifo = new ArrayDeque<>();
+                                }
+                                row.fifo.offer(line);
+                            }
+                        }
+                    } catch (IOException e) {
+                        // ignore
+                        line = null;
+                    }
+                } while (line != null);
+            }
+        }
+
+        return lines;
+    }
+
+    private void dumpLogFiles(Map<Long, Row> rows, int tail) {
+        Set<String> names = new HashSet<>();
+        // the records of the logs: a line with a timestamp, and the lines after it without one, such as a stack trace
+        List<LogRecord> records = new ArrayList<>();
+        final SimpleDateFormat sdf = new SimpleDateFormat(TIMESTAMP_MAIN);
+        for (Row row : rows.values()) {
+            Queue<String> queue = row.fifo;
+            if (queue != null) {
+                LogRecord current = null;
+                for (String l : queue) {
+                    names.add(row.name);
+                    String timestamp = timestampOf(sdf, l);
+                    if (current == null || timestamp != null) {
+                        current = new LogRecord(timestamp, new ArrayList<>());
+                        records.add(current);
+                    }
+                    current.lines().add(row.name + "| " + l);
+                }
+                row.fifo.clear();
+            }
+        }
+
+        // only sort if there are multiple Camels running
+        if (names.size() > 1) {
+            // by the time of the records, which keeps a stack trace with its record (CAMEL-26911); the sort is stable,
+            // so the records of a log at the same time stay in order
+            records.sort(Comparator.comparing(LogRecord::timestamp, Comparator.nullsFirst(Comparator.naturalOrder())));
+        }
+        List<String> lines = new ArrayList<>();
+        for (LogRecord r : records) {
+            lines.addAll(r.lines());
+        }
+        if (tail > 0) {
+            // cut according to tail
+            int pos = lines.size() - tail;
+            if (pos > 0) {
+                lines = lines.subList(pos, lines.size());
+            }
+        }
+        lines.forEach(l -> {
+            String name = StringHelper.before(l, "| ");
+            String line = StringHelper.after(l, "| ");
+            printLine(name, rows.size(), line);
+        });
+    }
+
+    protected void printLine(String name, int pids, String line) {
+        if (!prefixShown) {
+            // compute whether to show prefix or not
+            if ("false".equals(prefix) || "auto".equals(prefix) && pids <= 1) {
+                name = null;
+            }
+        }
+        prefixShown = name != null;
+
+        if (!timestamp) {
+            // after timestamp is after 2 sine-space
+            int pos = line.indexOf(' ');
+            pos = line.indexOf(' ', pos + 1);
+            if (pos != -1) {
+                line = line.substring(pos + 1);
+            }
+        }
+        if (loggingColor) {
+            if (name != null) {
+                Ansi.Color color = colors.get(name);
+                if (color == null) {
+                    // grab a new color
+                    int idx = (colors.size() % 6) + 1;
+                    color = Ansi.Color.values()[idx];
+                    colors.put(name, color);
+                }
+                String n = String.format("%-" + nameMaxWidth + "s", name);
+                String prefix = Ansi.ansi().fg(color).a(n).a("| ").reset().toString();
+                printColored(prefix);
+            }
+        } else {
+            line = unescapeAnsi(line);
+            if (name != null) {
+                String n = String.format("%-" + nameMaxWidth + "s", name);
+                printer().print(n);
+                printer().print("| ");
+            }
+        }
+        if (find != null || grep != null) {
+            boolean dashes = line.contains(" --- ");
+            String before = null;
+            String after = line;
+            if (dashes) {
+                before = StringHelper.before(line, "---");
+                after = StringHelper.after(line, "---", line);
+            }
+            if (findPatterns != null) {
+                for (Pattern p : findPatterns) {
+                    after = p.matcher(after).replaceAll(findAnsi);
+                }
+            }
+            if (grepPatterns != null) {
+                for (Pattern p : grepPatterns) {
+                    after = p.matcher(after).replaceAll(findAnsi);
+                }
+            }
+            line = before != null ? before + "---" + after : after;
+        }
+        if (loggingColor) {
+            printlnColored(line);
+        } else {
+            printer().println(line);
+        }
+    }
+
+    /**
+     * A record of a log: a line with its timestamp, and the lines after it without a timestamp.
+     */
+    private record LogRecord(String timestamp, List<String> lines) {
+    }
+
+    /**
+     * The timestamp at the start of a line of a log, or null for a line without one (such as a line of a stack trace).
+     */
+    private String timestampOf(SimpleDateFormat sdf, String line) {
+        String t = StringHelper.before(unescapeAnsi(line), "  ");
+        if (t == null) {
+            return null;
+        }
+        try {
+            sdf.parse(t);
+            return t;
+        } catch (ParseException e) {
+            return null;
+        }
+    }
+
+    private static Path logFile(Row row) {
+        return row.file != null ? row.file : logFile(row.pid, row.name);
+    }
+
+    private static Path logFile(String pid, String appName) {
+        Path parent = CommandLineHelper.getCamelDir();
+        Path pidLog = parent.resolve(pid + ".log");
+        if (!Files.exists(pidLog) && appName != null) {
+            Path nameLog = parent.resolve(appName + ".log");
+            if (Files.exists(nameLog)) {
+                return nameLog;
+            }
+        }
+        return pidLog;
+    }
+
+    private void tailStartupLogFiles(Map<Long, Row> rows) throws Exception {
+        for (Row row : rows.values()) {
+            Path log = logFile(row);
+            if (Files.exists(log)) {
+                row.fifo = new ArrayDeque<>();
+                row.reader = new LineNumberReader(Files.newBufferedReader(log));
+                String line;
+                do {
+                    line = row.reader.readLine();
+                    if (line != null) {
+                        row.fifo.offer(line);
+                        boolean found = line.contains("AbstractCamelContext") && line.contains("Apache Camel ")
+                                && line.contains(" started in ") && line.contains("(build:");
+                        if (found) {
+                            line = null;
+                        }
+                    }
+                } while (line != null);
+            }
+        }
+    }
+
+    private void tailLogFiles(Map<Long, Row> rows, int tail, Date limit) throws Exception {
+        for (Row row : rows.values()) {
+            Path log = logFile(row);
+            if (Files.exists(log)) {
+                row.reader = new LineNumberReader(Files.newBufferedReader(log));
+                String line;
+                if (tail <= 0) {
+                    row.fifo = new ArrayDeque<>();
+                } else {
+                    row.fifo = new ArrayBlockingQueue<>(tail);
+                }
+                do {
+                    line = row.reader.readLine();
+                    if (line != null) {
+                        line = alignTimestamp(line);
+                        boolean valid = isValidSince(limit, line);
+                        if (valid && grep != null) {
+                            valid = isValidGrep(line);
+                        }
+                        if (valid) {
+                            while (!row.fifo.offer(line)) {
+                                row.fifo.poll();
+                            }
+                        }
+                    }
+                } while (line != null);
+            }
+        }
+    }
+
+    private String alignTimestamp(String line) {
+        // if using spring boot then adjust the timestamp to uniform camel-main style
+        String ts = StringHelper.before(line, "  ");
+        if (ts != null && ts.contains("T")) {
+            SimpleDateFormat sdf = sdfSB;
+            try {
+                // the log can be in color or not so we need to unescape always
+                sdf.parse(unescapeAnsi(ts));
+                int dot = ts.indexOf('.');
+                if (dot != -1) {
+                    int pos1 = dot + 3; // skip millis and timezone
+                    int pos2 = dot + 9;
+                    if (pos2 < ts.length()) {
+                        ts = ts.substring(0, pos1) + ts.substring(pos2);
+                        String after = StringHelper.after(line, "  ");
+                        ts = ts.replace('T', ' ');
+                        return ts + "  " + after;
+                    }
+                }
+            } catch (Exception e) {
+                // ignore
+            }
+        }
+        return line;
+    }
+
+    private boolean isValidSince(Date limit, String line) {
+        if (limit == null) {
+            return true;
+        }
+        // the log can be in color or not so we need to unescape always
+        line = unescapeAnsi(line);
+        String ts = StringHelper.before(line, "  ");
+        if (ts != null && !ts.isBlank()) {
+            SimpleDateFormat sdf = sdfMain;
+            try {
+                Date row = sdf.parse(ts);
+                return row.compareTo(limit) >= 0;
+            } catch (ParseException e) {
+                // ignore
+            }
+        }
+        return false;
+    }
+
+    private boolean isValidGrep(String line) {
+        if (grep == null) {
+            return true;
+        }
+        // the log can be in color or not so we need to unescape always
+        line = unescapeAnsi(line);
+        String after = StringHelper.after(line, "---", line);
+        for (Pattern p : grepPatterns) {
+            if (p.matcher(after).find()) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private String unescapeAnsi(String line) {
+        // unescape ANSI colors
+        StringBuilder sb = new StringBuilder();
+        boolean escaping = false;
+        char[] arr = line.toCharArray();
+        for (int i = 0; i < arr.length; i++) {
+            char ch = arr[i];
+            if (escaping) {
+                if (ch == 'm') {
+                    escaping = false;
+                }
+                continue;
+            }
+            char ch2 = i < arr.length - 1 ? arr[i + 1] : 0;
+            if (ch == 27 && ch2 == '[') {
+                escaping = true;
+                continue;
+            }
+
+            sb.append(ch);
+        }
+        return sb.toString();
+    }
+
+    private static class Row {
+        String pid;
+        String name;
+        // the log of a previous run, else the log of the running integration
+        Path file;
+        Queue<String> fifo;
+        LineNumberReader reader;
+    }
+
+}

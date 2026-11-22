@@ -1,0 +1,552 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.camel.impl.engine;
+
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+
+import org.apache.camel.Endpoint;
+import org.apache.camel.Exchange;
+import org.apache.camel.ExchangePropertyKey;
+import org.apache.camel.Message;
+import org.apache.camel.Route;
+import org.apache.camel.StreamCache;
+import org.apache.camel.spi.CamelEvent;
+import org.apache.camel.spi.CamelEvent.ExchangeCompletedEvent;
+import org.apache.camel.spi.CamelEvent.ExchangeFailedEvent;
+import org.apache.camel.spi.CamelEvent.ExchangeSendingEvent;
+import org.apache.camel.spi.CamelEvent.ExchangeSentEvent;
+import org.apache.camel.spi.CamelEvent.RouteAddedEvent;
+import org.apache.camel.spi.CamelEvent.RouteRemovedEvent;
+import org.apache.camel.spi.EndpointUtilizationStatistics;
+import org.apache.camel.spi.MessageSizeStrategy;
+import org.apache.camel.spi.RuntimeEndpointRegistry;
+import org.apache.camel.support.DefaultEndpointUtilizationStatistics;
+import org.apache.camel.support.EndpointSizeStatistics;
+import org.apache.camel.support.EventNotifierSupport;
+import org.apache.camel.support.ExchangeHelper;
+import org.apache.camel.support.LRUCacheFactory;
+import org.apache.camel.support.RoutePolicySupport;
+import org.apache.camel.support.service.ServiceHelper;
+import org.apache.camel.util.ObjectHelper;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+public class DefaultRuntimeEndpointRegistry extends EventNotifierSupport implements RuntimeEndpointRegistry {
+
+    private static final Logger LOG = LoggerFactory.getLogger(DefaultRuntimeEndpointRegistry.class);
+
+    // route id -> endpoint urls
+    private Map<String, Set<String>> inputs;
+    private Map<String, Map<String, String>> outputs;
+    private int limit = 1000;
+    private boolean enabled = true;
+    private volatile boolean extended;
+    private volatile boolean messageSizeEnabled;
+    private EndpointUtilizationStatistics inputUtilization;
+    private EndpointUtilizationStatistics outputUtilization;
+    private EndpointSizeStatistics inputSizeStats;
+    private EndpointSizeStatistics outputSizeStats;
+    private final RoutePolicySupport consumerHits = new ConsumerHits();
+
+    @Override
+    public boolean isEnabled() {
+        return enabled;
+    }
+
+    @Override
+    public void setEnabled(boolean enabled) {
+        this.enabled = enabled;
+    }
+
+    @Override
+    public List<String> getAllEndpoints(boolean includeInputs) {
+        List<String> answer = new ArrayList<>();
+        if (includeInputs) {
+            for (Map.Entry<String, Set<String>> entry : inputs.entrySet()) {
+                answer.addAll(entry.getValue());
+            }
+        }
+        for (Map.Entry<String, Map<String, String>> entry : outputs.entrySet()) {
+            answer.addAll(entry.getValue().keySet());
+        }
+        return Collections.unmodifiableList(answer);
+    }
+
+    @Override
+    public List<String> getEndpointsPerRoute(String routeId, boolean includeInputs) {
+        List<String> answer = new ArrayList<>();
+        if (includeInputs) {
+            Set<String> uris = inputs.get(routeId);
+            if (uris != null) {
+                answer.addAll(uris);
+            }
+        }
+        Map<String, String> uris = outputs.get(routeId);
+        if (uris != null) {
+            answer.addAll(uris.keySet());
+        }
+        return Collections.unmodifiableList(answer);
+    }
+
+    @Override
+    public List<Statistic> getEndpointStatistics() {
+        List<Statistic> answer = new ArrayList<>();
+
+        // inputs
+        for (Map.Entry<String, Set<String>> entry : inputs.entrySet()) {
+            String routeId = entry.getKey();
+            for (String uri : entry.getValue()) {
+                Long hits = getHits(routeId, uri, inputUtilization);
+                EndpointSizeStatistics.SizeStats sizeStats = getSizeStats(routeId, uri, inputSizeStats);
+                answer.add(new EndpointRuntimeStatistics(uri, routeId, "in", hits, sizeStats));
+            }
+        }
+
+        // outputs
+        for (Map.Entry<String, Map<String, String>> entry : outputs.entrySet()) {
+            String routeId = entry.getKey();
+            for (String uri : entry.getValue().keySet()) {
+                Long hits = getHits(routeId, uri, outputUtilization);
+                EndpointSizeStatistics.SizeStats sizeStats = getSizeStats(routeId, uri, outputSizeStats);
+                answer.add(new EndpointRuntimeStatistics(uri, routeId, "out", hits, sizeStats));
+            }
+        }
+
+        return answer;
+    }
+
+    private Long getHits(String routeId, String uri, EndpointUtilizationStatistics statistics) {
+        Long hits = 0L;
+        if (extended) {
+            String key = asUtilizationKey(routeId, uri);
+            if (key != null) {
+                hits = statistics.getStatistics().get(key);
+                if (hits == null) {
+                    hits = 0L;
+                }
+            }
+        }
+        return hits;
+    }
+
+    @Override
+    public int getLimit() {
+        return limit;
+    }
+
+    @Override
+    public void setLimit(int limit) {
+        this.limit = limit;
+    }
+
+    @Override
+    public void clear() {
+        inputs.clear();
+        outputs.clear();
+        reset();
+    }
+
+    @Override
+    public void reset() {
+        // its safe to call clear as reset
+        if (inputUtilization != null) {
+            inputUtilization.clear();
+        }
+        if (outputUtilization != null) {
+            outputUtilization.clear();
+        }
+        if (inputSizeStats != null) {
+            inputSizeStats.clear();
+        }
+        if (outputSizeStats != null) {
+            outputSizeStats.clear();
+        }
+    }
+
+    @Override
+    public int size() {
+        int total = inputs.values().size();
+        total += outputs.values().size();
+        return total;
+    }
+
+    @Override
+    protected void doInit() throws Exception {
+        ObjectHelper.notNull(getCamelContext(), "camelContext", this);
+
+        if (inputs == null) {
+            inputs = new HashMap<>();
+        }
+        if (outputs == null) {
+            outputs = new HashMap<>();
+        }
+        if (getCamelContext().getManagementStrategy() != null
+                && getCamelContext().getManagementStrategy().getManagementAgent() != null) {
+            extended = getCamelContext().getManagementStrategy().getManagementAgent().getStatisticsLevel().isExtended();
+        }
+        if (extended) {
+            inputUtilization = new DefaultEndpointUtilizationStatistics(limit);
+            outputUtilization = new DefaultEndpointUtilizationStatistics(limit);
+        }
+        messageSizeEnabled = extended && getCamelContext().isMessageSize() != null && getCamelContext().isMessageSize();
+        if (messageSizeEnabled) {
+            inputSizeStats = new EndpointSizeStatistics(limit);
+            outputSizeStats = new EndpointSizeStatistics(limit);
+        }
+        if (extended) {
+            // the input hits of a route are counted when an exchange enters it through its consumer, as the route
+            // counts its exchanges, and the replies of an InOut consumer when the exchange is done there: the copies
+            // EIPs make inside a route (circuit breaker, split, multicast, recipient list) have their own unit of work,
+            // created and completed events, but are no input and no reply, and an exchange that comes from another
+            // route over direct is one without an ExchangeCreatedEvent.
+            // One shared instance for all routes: ConsumerHits keeps no per-route state, the counts live in the
+            // thread-safe inputUtilization and outputUtilization
+            getCamelContext().addRoutePolicyFactory((context, routeId, route) -> consumerHits);
+            LOG.debug(
+                    "Runtime endpoint registry is in extended mode gathering usage statistics of all incoming and outgoing endpoints (cache limit: {})",
+                    limit);
+        } else {
+            LOG.debug(
+                    "Runtime endpoint registry is in normal mode gathering information of all incoming and outgoing endpoints (cache limit: {})",
+                    limit);
+        }
+        ServiceHelper.initService(inputUtilization, outputUtilization);
+    }
+
+    @Override
+    protected void doStart() throws Exception {
+        ServiceHelper.startService(inputUtilization, outputUtilization);
+    }
+
+    @Override
+    protected void doStop() throws Exception {
+        clear();
+        ServiceHelper.stopService(inputUtilization, outputUtilization);
+    }
+
+    @Override
+    public void notify(CamelEvent event) throws Exception {
+        if (event instanceof RouteAddedEvent rse) {
+            Endpoint endpoint = rse.getRoute().getEndpoint();
+            String routeId = rse.getRoute().getId();
+
+            // a HashSet is fine for inputs as we only have a limited number of those
+            Set<String> uris = new HashSet<>();
+            uris.add(endpoint.getEndpointUri());
+            // some components (e.g. rest-openapi) delegate to an underlying consumer (e.g. platform-http) whose
+            // endpoint URI differs from the route's logical endpoint URI; include the consumer's URI so that
+            // ExchangeCreatedEvent hits recorded under the consumer URI are matched when looking up statistics
+            if (rse.getRoute().getConsumer() != null) {
+                String consumerUri = rse.getRoute().getConsumer().getEndpoint().getEndpointUri();
+                if (!endpoint.getEndpointUri().equals(consumerUri)) {
+                    uris.add(consumerUri);
+                }
+            }
+            inputs.put(routeId, uris);
+            // use a LRUCache for outputs as we could potential have unlimited uris if dynamic routing is in use
+            // and therefore need to have the limit in use
+            if (limit <= 0) {
+                throw new IllegalArgumentException("limit must be greater than 0");
+            }
+            outputs.put(routeId, LRUCacheFactory.newLRUCache(limit));
+        } else if (event instanceof RouteRemovedEvent rse) {
+            String routeId = rse.getRoute().getId();
+            inputs.remove(routeId);
+            outputs.remove(routeId);
+            if (extended) {
+                String uri = rse.getRoute().getEndpoint().getEndpointUri();
+                String key = asUtilizationKey(routeId, uri);
+                if (key != null) {
+                    inputUtilization.remove(key);
+                    if (messageSizeEnabled) {
+                        inputSizeStats.remove(key);
+                    }
+                }
+                if (rse.getRoute().getConsumer() != null) {
+                    String consumerUri = rse.getRoute().getConsumer().getEndpoint().getEndpointUri();
+                    if (!uri.equals(consumerUri)) {
+                        String consumerKey = asUtilizationKey(routeId, consumerUri);
+                        if (consumerKey != null) {
+                            inputUtilization.remove(consumerKey);
+                            if (messageSizeEnabled) {
+                                inputSizeStats.remove(consumerKey);
+                            }
+                        }
+                    }
+                }
+            }
+        } else if (event instanceof ExchangeSendingEvent ese) {
+            Endpoint endpoint = ese.getEndpoint();
+            Exchange exchange = ese.getExchange();
+            String routeId = ExchangeHelper.getRouteId(exchange);
+            String uri = endpoint.getEndpointUri();
+
+            Map<String, String> uris = outputs.get(routeId);
+            if (uris != null) {
+                uris.putIfAbsent(uri, uri);
+            }
+            if (extended) {
+                String key = asUtilizationKey(routeId, uri);
+                if (key != null) {
+                    outputUtilization.onHit(key);
+                    if (messageSizeEnabled) {
+                        // Record the request body size being sent to the endpoint.
+                        // ExchangeSentEvent will also fire after the producer completes
+                        // and record the max of request vs response body size.
+                        Message message = exchange.getIn();
+                        MessageSizeStrategy strategy = getCamelContext().getMessageSizeStrategy();
+                        long bodySize = strategy.computeBodySize(message);
+                        long headersSize = strategy.computeHeadersSize(message);
+                        // Store the request body size so ExchangeSentEvent can compare
+                        exchange.setProperty("CamelMessageBodySizeSending", bodySize);
+                        exchange.setProperty("CamelMessageHeadersSizeSending", headersSize);
+                        // reset stream cache so the body is re-readable when sending
+                        if (message.getBody() instanceof StreamCache sc) {
+                            sc.reset();
+                        }
+                    }
+                }
+            }
+        } else if (extended && messageSizeEnabled && event instanceof ExchangeSentEvent ese) {
+            // Record the max of request and response body size.
+            // For SQL SELECT the response (List<Map>) is the meaningful payload.
+            // For SQL INSERT the request (the data being inserted) is the meaningful payload.
+            // Taking the max ensures the most relevant size is reported in both cases.
+            Endpoint endpoint = ese.getEndpoint();
+            Exchange exchange = ese.getExchange();
+            String routeId = ExchangeHelper.getRouteId(exchange);
+            String uri = endpoint.getEndpointUri();
+            String key = asUtilizationKey(routeId, uri);
+            if (key != null) {
+                MessageSizeStrategy strategy = getCamelContext().getMessageSizeStrategy();
+                long responseBodySize = strategy.computeBodySize(exchange.getMessage());
+                long responseHeadersSize = strategy.computeHeadersSize(exchange.getMessage());
+                if (exchange.getMessage().getBody() instanceof StreamCache sc) {
+                    sc.reset();
+                }
+                Long requestBodySize = exchange.getProperty("CamelMessageBodySizeSending", Long.class);
+                Long requestHeadersSize = exchange.getProperty("CamelMessageHeadersSizeSending", Long.class);
+                long bodySize = Math.max(responseBodySize, requestBodySize != null ? requestBodySize : 0);
+                long headersSize = Math.max(responseHeadersSize, requestHeadersSize != null ? requestHeadersSize : 0);
+                outputSizeStats.onHit(key, bodySize, headersSize);
+                // cleanup temporary properties
+                exchange.removeProperty("CamelMessageBodySizeSending");
+                exchange.removeProperty("CamelMessageHeadersSizeSending");
+            }
+        } else if (event instanceof ExchangeCompletedEvent || event instanceof ExchangeFailedEvent) {
+            // an InOut consumer sends a reply back when the exchange completes: its endpoint is an output of the route
+            // (the hits are counted by the route policy, as the copies EIPs make complete as well)
+            Exchange exchange = ((CamelEvent.ExchangeEvent) event).getExchange();
+            Endpoint endpoint = exchange.getFromEndpoint();
+            if (endpoint != null && exchange.getPattern() != null && exchange.getPattern().isOutCapable()) {
+                Map<String, String> uris = outputs.get(exchange.getFromRouteId());
+                if (uris != null) {
+                    uris.putIfAbsent(endpoint.getEndpointUri(), endpoint.getEndpointUri());
+                }
+            }
+        }
+    }
+
+    @Override
+    public boolean isDisabled() {
+        return !enabled;
+    }
+
+    @Override
+    public boolean isEnabled(CamelEvent event) {
+        return event instanceof ExchangeSendingEvent
+                || event instanceof ExchangeSentEvent
+                || event instanceof ExchangeCompletedEvent
+                || event instanceof ExchangeFailedEvent
+                || event instanceof RouteAddedEvent
+                || event instanceof RouteRemovedEvent;
+    }
+
+    private EndpointSizeStatistics.SizeStats getSizeStats(String routeId, String uri, EndpointSizeStatistics statistics) {
+        if (messageSizeEnabled && statistics != null) {
+            String key = asUtilizationKey(routeId, uri);
+            if (key != null) {
+                return statistics.getStats(key);
+            }
+        }
+        return null;
+    }
+
+    /**
+     * Counts an input hit of the route the exchange enters, under the URI of the route's consumer (which differs from
+     * the endpoint of the route when a component delegates to another consumer, as rest-openapi does to platform-http).
+     */
+    private void onRouteInput(Route route, Exchange exchange) {
+        Endpoint endpoint = route.getConsumer() != null ? route.getConsumer().getEndpoint() : route.getEndpoint();
+        String key = endpoint != null ? asUtilizationKey(route.getRouteId(), endpoint.getEndpointUri()) : null;
+        if (key == null || inputUtilization == null) {
+            return;
+        }
+        inputUtilization.onHit(key);
+        if (messageSizeEnabled) {
+            Message message = exchange.getIn();
+            MessageSizeStrategy strategy = getCamelContext().getMessageSizeStrategy();
+            long bodySize = strategy.computeBodySize(message);
+            long headersSize = strategy.computeHeadersSize(message);
+            inputSizeStats.onHit(key, bodySize, headersSize);
+            exchange.setProperty(ExchangePropertyKey.MESSAGE_BODY_SIZE, bodySize);
+            exchange.setProperty(ExchangePropertyKey.MESSAGE_HEADERS_SIZE, headersSize);
+            // reset stream cache so the body is re-readable during routing
+            if (message.getBody() instanceof StreamCache sc) {
+                sc.reset();
+            }
+        }
+    }
+
+    /**
+     * An InOut consumer sends a reply when the exchange it created is done in its route: an out hit of the consumer's
+     * endpoint. Not for a route the exchange came to over direct (its consumer sends no reply of its own), nor for the
+     * copies EIPs make inside a route, which are done in their own unit of work but never in the route.
+     */
+    private void onRouteReply(Route route, Exchange exchange) {
+        Endpoint endpoint = exchange.getFromEndpoint();
+        String routeId = route.getRouteId();
+        if (endpoint == null || exchange.getPattern() == null || !exchange.getPattern().isOutCapable()
+                || !routeId.equals(exchange.getFromRouteId())) {
+            return;
+        }
+        String key = asUtilizationKey(routeId, endpoint.getEndpointUri());
+        if (key == null || outputUtilization == null) {
+            return;
+        }
+        outputUtilization.onHit(key);
+        if (messageSizeEnabled) {
+            Message message = exchange.getMessage();
+            MessageSizeStrategy strategy = getCamelContext().getMessageSizeStrategy();
+            long bodySize = strategy.computeBodySize(message);
+            long headersSize = strategy.computeHeadersSize(message);
+            outputSizeStats.onHit(key, bodySize, headersSize);
+            // reset stream cache so the body is re-readable
+            if (message.getBody() instanceof StreamCache sc) {
+                sc.reset();
+            }
+        }
+    }
+
+    /**
+     * The route policy of every route in extended mode: an exchange that begins in a route is an input hit, and the
+     * reply of an InOut consumer when it is done there an out hit.
+     */
+    private final class ConsumerHits extends RoutePolicySupport {
+
+        @Override
+        public void onExchangeBegin(Route route, Exchange exchange) {
+            if (extended && enabled) {
+                onRouteInput(route, exchange);
+            }
+        }
+
+        @Override
+        public void onExchangeDone(Route route, Exchange exchange) {
+            if (extended && enabled) {
+                onRouteReply(route, exchange);
+            }
+        }
+
+        @Override
+        public String toString() {
+            return "RuntimeEndpointRegistryConsumerHits";
+        }
+    }
+
+    private static String asUtilizationKey(String routeId, String uri) {
+        if (routeId == null || uri == null) {
+            return null;
+        } else {
+            return routeId + "|" + uri;
+        }
+    }
+
+    private static final class EndpointRuntimeStatistics implements Statistic {
+
+        private final String uri;
+        private final String routeId;
+        private final String direction;
+        private final long hits;
+        private final EndpointSizeStatistics.SizeStats sizeStats;
+
+        private EndpointRuntimeStatistics(String uri, String routeId, String direction, long hits,
+                                          EndpointSizeStatistics.SizeStats sizeStats) {
+            this.uri = uri;
+            this.routeId = routeId;
+            this.direction = direction;
+            this.hits = hits;
+            this.sizeStats = sizeStats;
+        }
+
+        @Override
+        public String getUri() {
+            return uri;
+        }
+
+        @Override
+        public String getRouteId() {
+            return routeId;
+        }
+
+        @Override
+        public String getDirection() {
+            return direction;
+        }
+
+        @Override
+        public long getHits() {
+            return hits;
+        }
+
+        @Override
+        public long getMinBodySize() {
+            return sizeStats != null ? sizeStats.getMinBodySize() : -1;
+        }
+
+        @Override
+        public long getMaxBodySize() {
+            return sizeStats != null ? sizeStats.getMaxBodySize() : -1;
+        }
+
+        @Override
+        public long getMeanBodySize() {
+            return sizeStats != null ? sizeStats.getMeanBodySize() : -1;
+        }
+
+        @Override
+        public long getMinHeadersSize() {
+            return sizeStats != null ? sizeStats.getMinHeadersSize() : -1;
+        }
+
+        @Override
+        public long getMaxHeadersSize() {
+            return sizeStats != null ? sizeStats.getMaxHeadersSize() : -1;
+        }
+
+        @Override
+        public long getMeanHeadersSize() {
+            return sizeStats != null ? sizeStats.getMeanHeadersSize() : -1;
+        }
+    }
+}

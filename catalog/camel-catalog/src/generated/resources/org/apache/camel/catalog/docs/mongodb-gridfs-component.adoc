@@ -1,0 +1,218 @@
+= MongoDB GridFS Component
+:doctitle: MongoDB GridFS
+:shortname: mongodb-gridfs
+:artifactid: camel-mongodb-gridfs
+:description: Interact with MongoDB GridFS.
+:since: 2.18
+:supportlevel: Stable
+:tabs-sync-option:
+:component-header: Both producer and consumer are supported
+
+*Since Camel {since}*
+
+*{component-header}*
+
+Maven users will need to add the following dependency to their `pom.xml`
+for this component:
+
+[source,xml]
+----
+<dependency>
+    <groupId>org.apache.camel</groupId>
+    <artifactId>camel-mongodb-gridfs</artifactId>
+    <version>x.y.z</version>
+    <!-- use the same version as your Camel core version -->
+</dependency>
+----
+
+== URI format
+
+----
+mongodb-gridfs:connectionBean?database=databaseName&bucket=bucketName[&moreOptions...]
+----
+
+// component options: START
+include::partial$component-configure-options.adoc[]
+include::partial$component-endpoint-options.adoc[]
+include::partial$component-endpoint-headers.adoc[]
+// component options: END
+
+
+== Usage
+
+=== GridFS operations - producer endpoint
+
+The `operation` option, or the `CamelGridFsOperation` header when the option is not set, chooses the operation:
+`create` (the default), `remove`, `findOne`, `listAll` or `count`. Another operation fails the exchange with an
+`IllegalArgumentException` that lists the supported operations.
+
+==== count
+
+Returns the total number of files in the collection, returning a Long
+as the message body.
+
+._Java-only: using ProducerTemplate to invoke the count operation_
+[source,java]
+----
+// from("direct:count").to("mongodb-gridfs?database=tickets&operation=count");
+Long result = template.requestBody("direct:count", "irrelevantBody", Long.class);
+----
+
+You can provide a filename header to provide a count of files matching
+that filename.
+
+._Java-only: using ProducerTemplate with filename header_
+[source,java]
+----
+Map<String, Object> headers = new HashMap<String, Object>();
+headers.put(Exchange.FILE_NAME, "filename.txt");
+Long count = template.requestBodyAndHeaders("direct:count", "irrelevantBody", headers, Long.class);
+----
+
+==== listAll
+
+Returns a Reader that lists all the filenames and their IDs in a tab
+separated stream. The ID of a file is the hex string of its ObjectId.
+
+----
+// from("direct:listAll").to("mongodb-gridfs?database=tickets&operation=listAll");
+Reader result = template.requestBodyAndHeader("direct:listAll", "irrelevantBody");
+
+filename1.txt   665f1c2e8b3e4a5d6c7b8a90
+filename2.txt   665f1c2e8b3e4a5d6c7b8a91
+----
+
+==== findOne
+
+Finds a file in the GridFS system and sets the body to an InputStream of
+the content. Also provides the metadata has headers. It uses
+`Exchange.FILE_NAME` from the incoming headers to determine the file to find.
+
+._Java-only: using ProducerTemplate to find a file by name_
+[source,java]
+----
+// from("direct:findOne").to("mongodb-gridfs?database=tickets&operation=findOne");
+Map<String, Object> headers = new HashMap<String, Object>();
+headers.put(Exchange.FILE_NAME, "filename.txt");
+InputStream result = template.requestBodyAndHeaders("direct:findOne", "irrelevantBody", headers);
+----
+
+==== create
+
+Create a new file in the GridFs database. It uses the
+`Exchange.FILE_NAME` from the incoming headers for the name and the body
+contents (as an InputStream) as the content.
+
+._Java-only: using ProducerTemplate to create a file_
+[source,java]
+----
+// from("direct:create").to("mongodb-gridfs?database=tickets&operation=create");
+Map<String, Object> headers = new HashMap<String, Object>();
+headers.put(Exchange.FILE_NAME, "filename.txt");
+InputStream stream = ... the data for the file ...
+template.requestBodyAndHeaders("direct:create", stream, headers);
+----
+
+==== remove
+
+Removes a file from the GridFS database.
+
+._Java-only: using ProducerTemplate to remove a file_
+[source,java]
+----
+// from("direct:remove").to("mongodb-gridfs?database=tickets&operation=remove");
+Map<String, Object> headers = new HashMap<String, Object>();
+headers.put(Exchange.FILE_NAME, "filename.txt");
+template.requestBodyAndHeaders("direct:remove", "", headers);
+----
+
+=== GridFS consumer
+
+The consumer polls the bucket for new files, as the `queryStrategy` option chooses, and routes one message per file.
+The body is a stream of the content of the file, which is closed when the exchange is done. The `CamelFileName`,
+`CamelFileLength`, `CamelFileLastModified` (the upload date), `CamelFileContentType` and `CamelGridFsMetadata` headers
+describe the file.
+
+When the exchange of a file fails, the consumer reports the failure to its exception handler (which logs it, unless
+the `exceptionHandler` or `bridgeErrorHandler` option is set) and leaves the file as it was, so that the next poll
+offers it again:
+
+* With a file attribute (`FileAttribute`, `TimeStampAndFileAttribute` and `PersistentTimestampAndFileAttribute`), the
+  file is not marked as processed, and the poll goes on with the other files.
+* With `TimeStamp` and `PersistentTimestamp`, the files are routed in the order of their upload date, and the poll stops
+  at the file that failed: the timestamp stays before that file, so the next poll offers it again, and then the files
+  uploaded after it. A file that always fails holds back the files after it.
+
+Only the first failure of a file is reported to the exception handler: when the file fails again at the next poll, the
+consumer logs the failure at `DEBUG`. A file is reported again when it fails after a poll that routed it or did not
+offer it.
+
+A failure that the route handles, such as with a dead letter channel or `onException` with `handled(true)`, does not
+fail the exchange: the file is then done.
+
+== Examples
+
+=== Example route
+
+The following route defined in Spring XML executes the operation
+xref:mongodb-gridfs-component.adoc[*findOne*] on a collection.
+
+*Get a file from GridFS*
+
+[tabs]
+====
+Java::
++
+[source,java]
+----
+from("direct:start")
+    .to("mongodb-gridfs:mongoBean?database={{mongodb.database}}&operation=findOne")
+    .to("direct:result");
+----
+
+XML::
++
+[source,xml]
+----
+<route>
+  <from uri="direct:start" />
+  <!-- using bean 'mongoBean' defined above -->
+  <to uri="mongodb-gridfs:mongoBean?database={{mongodb.database}}&amp;operation=findOne" />
+  <to uri="direct:result" />
+</route>
+----
+
+YAML::
++
+[source,yaml]
+----
+- route:
+    from:
+      uri: direct:start
+      steps:
+        - to:
+            uri: mongodb-gridfs:mongoBean
+            parameters:
+              database: "{{mongodb.database}}"
+              operation: findOne
+        - to:
+            uri: direct:result
+----
+====
+
+=== Configuration of a database in Spring XML
+
+The following Spring XML creates a bean defining the connection to a
+MongoDB instance.
+
+[source,xml]
+----
+<beans xmlns="http://www.springframework.org/schema/beans"
+    xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+    xsi:schemaLocation="http://www.springframework.org/schema/beans http://www.springframework.org/schema/beans/spring-beans.xsd">
+    <bean id="mongoBean" class="com.mongodb.Mongo">
+        <constructor-arg name="host" value="${mongodb.host}" />
+        <constructor-arg name="port" value="${mongodb.port}" />
+    </bean>
+</beans>
+----

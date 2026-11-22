@@ -1,0 +1,439 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.camel.component.ai.resource;
+
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.TreeMap;
+import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.locks.ReentrantLock;
+
+import org.apache.camel.CamelContext;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+/**
+ * CamelContext-scoped registry mapping tags to {@link AiResourceSpec} instances. Adapters that expose Camel routes as
+ * AI resources (today {@code camel-mcp-server}) read from this registry to discover resources registered via the
+ * {@code ai-resource} consumer endpoint.
+ * <p>
+ * Each {@link CamelContext} gets its own registry instance, registered as a context plugin. Use
+ * {@link #getOrCreate(CamelContext)} to obtain the instance for a given context.
+ * <p>
+ * Adapters that need to react to resources appearing or disappearing (e.g. to push MCP {@code resources/list_changed}
+ * notifications) can register an {@link AiResourceRegistryListener} instead of polling.
+ *
+ * @since 4.23
+ */
+public final class AiResourceRegistry {
+
+    private static final Logger LOG = LoggerFactory.getLogger(AiResourceRegistry.class);
+
+    private static final ReentrantLock FACTORY_LOCK = new ReentrantLock();
+
+    private final ReentrantLock lock = new ReentrantLock();
+    private final Map<String, Set<AiResourceSpec>> resources = new HashMap<>();
+    private final Set<AiResourceSpec> defaultResources = new LinkedHashSet<>();
+    private final Map<String, Set<AiResourceTemplateSpec>> resourceTemplates = new HashMap<>();
+    private final Set<AiResourceTemplateSpec> defaultResourceTemplates = new LinkedHashSet<>();
+    private final List<AiResourceRegistryListener> listeners = new CopyOnWriteArrayList<>();
+
+    AiResourceRegistry() {
+    }
+
+    /**
+     * Returns the {@link AiResourceRegistry} for the given {@link CamelContext}, creating and registering one as a
+     * context plugin if it does not yet exist.
+     */
+    public static AiResourceRegistry getOrCreate(CamelContext context) {
+        FACTORY_LOCK.lock();
+        try {
+            AiResourceRegistry registry = context.getCamelContextExtension()
+                    .getContextPlugin(AiResourceRegistry.class);
+            if (registry == null) {
+                registry = new AiResourceRegistry();
+                context.getCamelContextExtension()
+                        .addContextPlugin(AiResourceRegistry.class, registry);
+            }
+            return registry;
+        } finally {
+            FACTORY_LOCK.unlock();
+        }
+    }
+
+    public void put(String tag, AiResourceSpec spec) {
+        boolean added;
+        lock.lock();
+        try {
+            Set<AiResourceSpec> set = resources.computeIfAbsent(tag, k -> new LinkedHashSet<>());
+            for (AiResourceSpec existing : set) {
+                if (existing.getUri().equals(spec.getUri()) && existing != spec) {
+                    throw new IllegalArgumentException(
+                            "Duplicate resource uri '" + spec.getUri() + "' under tag '" + tag
+                                                       + "': resource uris must be unique per tag");
+                }
+            }
+            added = set.add(spec);
+        } finally {
+            lock.unlock();
+        }
+        if (added) {
+            notifyRegistered(tag, spec);
+        }
+    }
+
+    public void remove(String tag, AiResourceSpec spec) {
+        boolean removed = false;
+        lock.lock();
+        try {
+            Set<AiResourceSpec> set = resources.get(tag);
+            if (set != null) {
+                removed = set.remove(spec);
+                if (set.isEmpty()) {
+                    resources.remove(tag);
+                }
+            }
+        } finally {
+            lock.unlock();
+        }
+        if (removed) {
+            notifyDeregistered(tag, spec);
+        }
+    }
+
+    public void putDefault(AiResourceSpec spec) {
+        boolean added;
+        lock.lock();
+        try {
+            for (AiResourceSpec existing : defaultResources) {
+                if (existing.getUri().equals(spec.getUri()) && existing != spec) {
+                    throw new IllegalArgumentException(
+                            "Duplicate resource uri '" + spec.getUri()
+                                                       + "' in the default pool: resource uris must be unique");
+                }
+            }
+            added = defaultResources.add(spec);
+        } finally {
+            lock.unlock();
+        }
+        if (added) {
+            notifyRegistered(null, spec);
+        }
+    }
+
+    public void removeDefault(AiResourceSpec spec) {
+        boolean removed;
+        lock.lock();
+        try {
+            removed = defaultResources.remove(spec);
+        } finally {
+            lock.unlock();
+        }
+        if (removed) {
+            notifyDeregistered(null, spec);
+        }
+    }
+
+    /**
+     * Registers a URI template under a tag. Tagged templates must not overlap anywhere in this registry. A conflicting
+     * registration fails route startup rather than depending on adapter selection or iteration order.
+     */
+    public void putTemplate(String tag, AiResourceTemplateSpec spec) {
+        boolean added;
+        lock.lock();
+        try {
+            for (Map.Entry<String, Set<AiResourceTemplateSpec>> entry : resourceTemplates.entrySet()) {
+                for (AiResourceTemplateSpec existing : entry.getValue()) {
+                    // The same route specification may intentionally be registered under several tags.
+                    if (existing == spec) {
+                        continue;
+                    }
+
+                    if (existing.getUriTemplate().equals(spec.getUriTemplate())) {
+                        throw new IllegalArgumentException(
+                                "Duplicate resource uriTemplate '" + spec.getUriTemplate()
+                                                           + "' already registered under tag '" + entry.getKey()
+                                                           + "': uri templates must be unique");
+                    }
+
+                    if (existing.overlaps(spec)) {
+                        throw new IllegalArgumentException(
+                                "Overlapping resource uriTemplate '" + spec.getUriTemplate()
+                                                           + "' under tag '" + tag
+                                                           + "' with existing template '" + existing.getUriTemplate()
+                                                           + "' under tag '" + entry.getKey()
+                                                           + "': resource templates must not match the same URI");
+                    }
+                }
+            }
+
+            Set<AiResourceTemplateSpec> set = resourceTemplates.computeIfAbsent(tag, key -> new LinkedHashSet<>());
+            added = set.add(spec);
+        } finally {
+            lock.unlock();
+        }
+
+        if (added) {
+            notifyTemplateRegistered(tag, spec);
+        }
+    }
+
+    /**
+     * Removes a URI template from a tag.
+     */
+    public void removeTemplate(String tag, AiResourceTemplateSpec spec) {
+        boolean removed = false;
+        lock.lock();
+        try {
+            Set<AiResourceTemplateSpec> set = resourceTemplates.get(tag);
+            if (set != null) {
+                removed = set.remove(spec);
+                if (set.isEmpty()) {
+                    resourceTemplates.remove(tag);
+                }
+            }
+        } finally {
+            lock.unlock();
+        }
+        if (removed) {
+            notifyTemplateDeregistered(tag, spec);
+        }
+    }
+
+    /**
+     * Registers a template in the default pool. Exact duplicates are rejected within this pool. The default pool
+     * remains separate from tagged templates and is not published by camel-mcp-server.
+     */
+    public void putDefaultTemplate(AiResourceTemplateSpec spec) {
+        boolean added;
+        lock.lock();
+        try {
+            for (AiResourceTemplateSpec existing : defaultResourceTemplates) {
+                if (existing.getUriTemplate().equals(spec.getUriTemplate()) && existing != spec) {
+                    throw new IllegalArgumentException(
+                            "Duplicate resource uriTemplate '" + spec.getUriTemplate()
+                                                       + "' in the default pool: uri templates must be unique");
+                }
+            }
+            // Cross-pool overlap checks belong to adapters, which know the templates they expose.
+            added = defaultResourceTemplates.add(spec);
+        } finally {
+            lock.unlock();
+        }
+        if (added) {
+            notifyTemplateRegistered(null, spec);
+        }
+    }
+
+    /**
+     * Removes a template from the default pool.
+     */
+    public void removeDefaultTemplate(AiResourceTemplateSpec spec) {
+        boolean removed;
+        lock.lock();
+        try {
+            removed = defaultResourceTemplates.remove(spec);
+        } finally {
+            lock.unlock();
+        }
+        if (removed) {
+            notifyTemplateDeregistered(null, spec);
+        }
+    }
+
+    /**
+     * Adds a listener notified on resource registration changes. See {@link AiResourceRegistryListener} for the
+     * callback contract; add the listener before reading a snapshot to observe current state without missing events.
+     */
+    public void addListener(AiResourceRegistryListener listener) {
+        listeners.add(listener);
+    }
+
+    public void removeListener(AiResourceRegistryListener listener) {
+        listeners.remove(listener);
+    }
+
+    private void notifyRegistered(String tag, AiResourceSpec spec) {
+        for (AiResourceRegistryListener listener : listeners) {
+            try {
+                listener.resourceRegistered(tag, spec);
+            } catch (Exception e) {
+                LOG.warn("AiResourceRegistryListener {} failed on resourceRegistered for resource '{}': {}",
+                        listener, spec.getUri(), e.getMessage(), e);
+            }
+        }
+    }
+
+    private void notifyDeregistered(String tag, AiResourceSpec spec) {
+        for (AiResourceRegistryListener listener : listeners) {
+            try {
+                listener.resourceDeregistered(tag, spec);
+            } catch (Exception e) {
+                LOG.warn("AiResourceRegistryListener {} failed on resourceDeregistered for resource '{}': {}",
+                        listener, spec.getUri(), e.getMessage(), e);
+            }
+        }
+    }
+
+    private void notifyTemplateRegistered(String tag, AiResourceTemplateSpec spec) {
+        for (AiResourceRegistryListener listener : listeners) {
+            try {
+                listener.resourceTemplateRegistered(tag, spec);
+            } catch (Exception e) {
+                LOG.warn("AiResourceRegistryListener {} failed on resourceTemplateRegistered for template '{}': {}",
+                        listener, spec.getUriTemplate(), e.getMessage(), e);
+            }
+        }
+    }
+
+    private void notifyTemplateDeregistered(String tag, AiResourceTemplateSpec spec) {
+        for (AiResourceRegistryListener listener : listeners) {
+            try {
+                listener.resourceTemplateDeregistered(tag, spec);
+            } catch (Exception e) {
+                LOG.warn("AiResourceRegistryListener {} failed on resourceTemplateDeregistered for template '{}': {}",
+                        listener, spec.getUriTemplate(), e.getMessage(), e);
+            }
+        }
+    }
+
+    /**
+     * Returns resources registered for a specific tag, merged with the default pool (resources with no tags).
+     */
+    public Set<AiResourceSpec> getResourcesByTag(String tag) {
+        lock.lock();
+        try {
+            Set<AiResourceSpec> result = new LinkedHashSet<>(defaultResources);
+            Set<AiResourceSpec> tagged = resources.get(tag);
+            if (tagged != null) {
+                result.addAll(tagged);
+            }
+            return result;
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    /**
+     * Returns all resources across all tags and the default pool.
+     */
+    public Set<AiResourceSpec> getAllResources() {
+        lock.lock();
+        try {
+            Set<AiResourceSpec> result = new LinkedHashSet<>(defaultResources);
+            for (Set<AiResourceSpec> tagged : resources.values()) {
+                result.addAll(tagged);
+            }
+            return result;
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    public Map<String, Set<AiResourceSpec>> getResources() {
+        lock.lock();
+        try {
+            Map<String, Set<AiResourceSpec>> snapshot = new LinkedHashMap<>();
+            for (Map.Entry<String, Set<AiResourceSpec>> entry : resources.entrySet()) {
+                snapshot.put(entry.getKey(), new LinkedHashSet<>(entry.getValue()));
+            }
+            return Map.copyOf(snapshot);
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    public Set<AiResourceSpec> getDefaultResources() {
+        lock.lock();
+        try {
+            return new LinkedHashSet<>(defaultResources);
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    /**
+     * Returns templates registered for a tag, merged with templates in the default pool.
+     */
+    public Set<AiResourceTemplateSpec> getResourceTemplatesByTag(String tag) {
+        lock.lock();
+        try {
+            Set<AiResourceTemplateSpec> result = new LinkedHashSet<>(defaultResourceTemplates);
+            Set<AiResourceTemplateSpec> tagged = resourceTemplates.get(tag);
+            if (tagged != null) {
+                result.addAll(tagged);
+            }
+            return result;
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    /**
+     * Returns all templates across all tags and the default pool.
+     */
+    public Set<AiResourceTemplateSpec> getAllResourceTemplates() {
+        lock.lock();
+        try {
+            Set<AiResourceTemplateSpec> result = new LinkedHashSet<>(defaultResourceTemplates);
+            for (Set<AiResourceTemplateSpec> tagged : resourceTemplates.values()) {
+                result.addAll(tagged);
+            }
+            return result;
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    /**
+     * Returns a snapshot of the tag-to-template-spec mapping. Tags are sorted lexicographically and each value set is a
+     * defensive copy.
+     *
+     * @since 4.24
+     */
+    public Map<String, Set<AiResourceTemplateSpec>> getResourceTemplates() {
+        lock.lock();
+        try {
+            Map<String, Set<AiResourceTemplateSpec>> snapshot = new TreeMap<>();
+            for (Map.Entry<String, Set<AiResourceTemplateSpec>> entry : resourceTemplates.entrySet()) {
+                snapshot.put(entry.getKey(), new LinkedHashSet<>(entry.getValue()));
+            }
+            return Collections.unmodifiableMap(snapshot);
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    /**
+     * Returns a snapshot of the default (untagged) resource templates.
+     *
+     * @since 4.24
+     */
+    public Set<AiResourceTemplateSpec> getDefaultResourceTemplates() {
+        lock.lock();
+        try {
+            return new LinkedHashSet<>(defaultResourceTemplates);
+        } finally {
+            lock.unlock();
+        }
+    }
+}

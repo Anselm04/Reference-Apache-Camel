@@ -1,0 +1,322 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.camel.component.docker;
+
+import java.util.HashMap;
+import java.util.Map;
+
+import org.apache.camel.RuntimeCamelException;
+import org.apache.camel.spi.Metadata;
+import org.apache.camel.spi.UriParam;
+import org.apache.camel.spi.UriParams;
+import org.apache.camel.spi.UriPath;
+
+@UriParams
+public class DockerConfiguration implements Cloneable {
+
+    @UriPath(enums = "events,stats,auth,info,ping,version,imagebuild,imagecreate,imageinspect,imagelist,imagepull,imagepush,"
+                     + "imageremove,imagesearch,imagetag,containerattach,containercommit,containercopyfile,containercreate,containerdiff,"
+                     + "inspectcontainer,containerkill,containerlist,containerlog,containerpause,containerrestart,containerremove,containerstart,"
+                     + "containerstop,containertop,containerunpause,containerwait,execcreate,execstart,networkconnect,networkcreate,networkremove")
+    @Metadata(required = true)
+    private DockerOperation operation;
+    @UriParam(defaultValue = "localhost")
+    @Metadata(required = true)
+    private String host = DockerConstants.DEFAULT_HOST;
+    @UriParam(defaultValue = "2375")
+    private Integer port = 2375;
+    @UriParam(label = "security", security = "secret")
+    private String username;
+    @UriParam(label = "security", security = "secret")
+    private String password;
+    @UriParam
+    private String email;
+    @UriParam(label = "advanced", defaultValue = "https://index.docker.io/v1/")
+    private String serverAddress = "https://index.docker.io/v1/";
+    @UriParam
+    private Integer requestTimeout;
+    @UriParam(label = "security")
+    private boolean secure;
+    @UriParam(label = "security")
+    private String certPath;
+    @UriParam(label = "advanced", defaultValue = "100")
+    private Integer maxTotalConnections = 100;
+    @UriParam(label = "advanced", defaultValue = "100")
+    private Integer maxPerRouteConnections = 100;
+    @UriParam(label = "advanced")
+    @Metadata(deprecationNote = "Not used: nothing reads this option when the Docker client is built")
+    @Deprecated
+    private boolean loggingFilter;
+    @UriParam(label = "advanced")
+    @Metadata(deprecationNote = "Not used: nothing reads this option when the Docker client is built")
+    @Deprecated
+    private boolean followRedirectFilter;
+    @UriParam(label = "security", defaultValue = "false")
+    private boolean tlsVerify;
+    @UriParam(label = "producer,security", defaultValue = "false", security = "insecure:dev", insecureValue = "true")
+    private boolean allowConnectionAndCredentialsFromHeaders;
+    @UriParam(label = "advanced", defaultValue = "false")
+    private boolean socket;
+    @UriParam(label = "advanced", defaultValue = "com.github.dockerjava.netty.NettyDockerCmdExecFactory")
+    private String cmdExecFactory = DockerConstants.DEFAULT_CMD_EXEC_FACTORY;
+    @UriParam(label = "advanced")
+    private Map<String, Object> parameters = new HashMap<>();
+
+    public String getHost() {
+        return host;
+    }
+
+    /**
+     * Docker host. In socket mode (socket=true), the path of the unix socket of the Docker daemon, where the default
+     * localhost means /var/run/docker.sock. A host with a tcp:// or unix:// scheme (such as tcp://myhost:2376 or
+     * unix:///var/run/docker.sock) is used as is, and then the port and socket options are not used.
+     */
+    public void setHost(String host) {
+        this.host = host;
+    }
+
+    public Integer getPort() {
+        return port;
+    }
+
+    /**
+     * Docker port
+     */
+    public void setPort(Integer port) {
+        this.port = port;
+    }
+
+    public String getUsername() {
+        return username;
+    }
+
+    /**
+     * User name to authenticate with
+     */
+    public void setUsername(String username) {
+        this.username = username;
+    }
+
+    public String getPassword() {
+        return password;
+    }
+
+    /**
+     * Password to authenticate with
+     */
+    public void setPassword(String password) {
+        this.password = password;
+    }
+
+    public String getEmail() {
+        return email;
+    }
+
+    /**
+     * Email address associated with the user
+     */
+    public void setEmail(String email) {
+        this.email = email;
+    }
+
+    public String getServerAddress() {
+        return serverAddress;
+    }
+
+    /**
+     * Server address for docker registry.
+     */
+    public void setServerAddress(String serverAddress) {
+        this.serverAddress = serverAddress;
+    }
+
+    public Integer getRequestTimeout() {
+        return requestTimeout;
+    }
+
+    /**
+     * Request timeout for response (in seconds)
+     */
+    public void setRequestTimeout(Integer requestTimeout) {
+        this.requestTimeout = requestTimeout;
+    }
+
+    public boolean isSecure() {
+        return secure;
+    }
+
+    /**
+     * Use HTTPS communication
+     */
+    public void setSecure(boolean secure) {
+        this.secure = secure;
+    }
+
+    public String getCertPath() {
+        return certPath;
+    }
+
+    /**
+     * Location containing the SSL certificate chain
+     */
+    public void setCertPath(String certPath) {
+        this.certPath = certPath;
+    }
+
+    public Integer getMaxTotalConnections() {
+        return maxTotalConnections;
+    }
+
+    /**
+     * Maximum total connections
+     */
+    public void setMaxTotalConnections(Integer maxTotalConnections) {
+        this.maxTotalConnections = maxTotalConnections;
+    }
+
+    public Integer getMaxPerRouteConnections() {
+        return maxPerRouteConnections;
+    }
+
+    /**
+     * Maximum route connections
+     */
+    public void setMaxPerRouteConnections(Integer maxPerRouteConnections) {
+        this.maxPerRouteConnections = maxPerRouteConnections;
+    }
+
+    /**
+     * Whether to use logging filter
+     *
+     * @deprecated Not used: nothing reads this option when the Docker client is built
+     */
+    @Deprecated
+    public boolean isLoggingFilter() {
+        return loggingFilter;
+    }
+
+    /**
+     * Whether to use logging filter
+     *
+     * @deprecated Not used: nothing reads this option when the Docker client is built
+     */
+    @Deprecated
+    public void setLoggingFilter(boolean loggingFilterEnabled) {
+        this.loggingFilter = loggingFilterEnabled;
+    }
+
+    /**
+     * Whether to follow redirect filter
+     *
+     * @deprecated Not used: nothing reads this option when the Docker client is built
+     */
+    @Deprecated
+    public boolean isFollowRedirectFilter() {
+        return followRedirectFilter;
+    }
+
+    /**
+     * Whether to follow redirect filter
+     *
+     * @deprecated Not used: nothing reads this option when the Docker client is built
+     */
+    @Deprecated
+    public void setFollowRedirectFilter(boolean followRedirectFilterEnabled) {
+        this.followRedirectFilter = followRedirectFilterEnabled;
+    }
+
+    public Map<String, Object> getParameters() {
+        return parameters;
+    }
+
+    /**
+     * Additional configuration parameters as key/value pairs
+     */
+    public void setParameters(Map<String, Object> parameters) {
+        this.parameters = parameters;
+    }
+
+    public DockerOperation getOperation() {
+        return operation;
+    }
+
+    /**
+     * Which operation to use
+     */
+    public void setOperation(DockerOperation operation) {
+        this.operation = operation;
+    }
+
+    public boolean isTlsVerify() {
+        return tlsVerify;
+    }
+
+    /**
+     * Check TLS
+     */
+    public void setTlsVerify(boolean tlsVerify) {
+        this.tlsVerify = tlsVerify;
+    }
+
+    public boolean isAllowConnectionAndCredentialsFromHeaders() {
+        return allowConnectionAndCredentialsFromHeaders;
+    }
+
+    /**
+     * Whether to allow overriding the connection and credential settings of the endpoint with the CamelDockerHost,
+     * CamelDockerPort, CamelDockerSocketEnabled, CamelDockerSecure, CamelDockerTlsVerify, CamelDockerCertPath,
+     * CamelDockerCmdExecFactory, CamelDockerUsername, CamelDockerPassword and CamelDockerServerAddress headers.
+     * Disabled by default; enable it only when the header source is trusted, since it lets a message choose the Docker
+     * daemon that the client connects to and how, and the registry that receives the username and password of the
+     * endpoint.
+     */
+    public void setAllowConnectionAndCredentialsFromHeaders(boolean allowConnectionAndCredentialsFromHeaders) {
+        this.allowConnectionAndCredentialsFromHeaders = allowConnectionAndCredentialsFromHeaders;
+    }
+
+    public boolean isSocket() {
+        return socket;
+    }
+
+    /**
+     * Socket connection mode. When enabled, connects to the unix socket of the Docker daemon, whose path is given by
+     * the host option (the default localhost means /var/run/docker.sock), and the port is not used. When disabled,
+     * connects over TCP to the host and port.
+     */
+    public void setSocket(boolean socket) {
+        this.socket = socket;
+    }
+
+    public String getCmdExecFactory() {
+        return cmdExecFactory;
+    }
+
+    /**
+     * The fully qualified class name of the DockerCmdExecFactory implementation to use
+     */
+    public void setCmdExecFactory(String cmdExecFactory) {
+        this.cmdExecFactory = cmdExecFactory;
+    }
+
+    public DockerConfiguration copy() {
+        try {
+            return (DockerConfiguration) clone();
+        } catch (CloneNotSupportedException e) {
+            throw new RuntimeCamelException(e);
+        }
+    }
+}

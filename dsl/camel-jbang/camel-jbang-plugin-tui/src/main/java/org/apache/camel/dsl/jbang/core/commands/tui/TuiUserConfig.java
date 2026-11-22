@@ -1,0 +1,166 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.camel.dsl.jbang.core.commands.tui;
+
+import java.io.IOException;
+import java.io.UncheckedIOException;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
+
+import org.apache.camel.dsl.jbang.core.common.CommandLineHelper;
+import org.apache.camel.dsl.jbang.run.common.Printer;
+
+/**
+ * Central read/write for the Camel TUI's per-user preferences ({@code camel.tui.*}) across the Camel CLI configuration
+ * files, applying <em>per-key</em> precedence between the local ({@code ./camel-cli.properties}) and global
+ * ({@code ~/.camel-cli.properties}) files.
+ * <p>
+ * A key's home is the file where it currently lives: a key present in the local file is treated as a project-level
+ * override and is both read from and written back to the local file; every other key is personal state and is read from
+ * and written to the global file. This keeps a project's deliberately committed overrides (for example a pinned
+ * starting tab) intact, while never redirecting a user's personal preferences (theme, last folder, ...) into an
+ * unrelated project's config just because a local file happens to exist for other CLI settings.
+ * <p>
+ * Note: if the same key exists in <em>both</em> files (an unusual hand-edited state), the local copy wins for reads and
+ * is the one updated on writes; the stale global copy is left as-is.
+ */
+final class TuiUserConfig {
+
+    /** A printer that discards everything — safe for TUI operations where stderr goes to the TUI screen. */
+    private static final Printer SILENT_PRINTER = new Printer() {
+        @Override
+        public void println() {
+        }
+
+        @Override
+        public void println(String line) {
+        }
+
+        @Override
+        public void print(String output) {
+        }
+
+        @Override
+        public void printf(String format, Object... args) {
+        }
+
+        @Override
+        public void printDiagnostic(String line) {
+        }
+
+        @Override
+        public void printErr(String message) {
+        }
+    };
+
+    /** The settings of a session started with --defaults, kept in memory only; null for the files. */
+    private static volatile Map<String, String> session;
+
+    private TuiUserConfig() {
+    }
+
+    /**
+     * Starts from the default settings and saves nothing (--defaults): a key reads as unset until the session sets it,
+     * and stays set for the session only. It holds for the whole JVM, so the browser sessions of --web follow it too.
+     */
+    static void useDefaults() {
+        if (session == null) {
+            session = new ConcurrentHashMap<>();
+        }
+    }
+
+    /** Back to the files, after a test of {@link #useDefaults()}. */
+    static void resetForTesting() {
+        session = null;
+    }
+
+    /**
+     * Reads a single {@code camel.tui.*} key. Returns the local value when the key is present in the local file,
+     * otherwise the global value, otherwise {@code null}. Propagates a {@link RuntimeException} on an I/O failure so
+     * the caller can decide whether to fall back or log.
+     */
+    static String read(String key) {
+        Map<String, String> inMemory = session;
+        if (inMemory != null) {
+            return inMemory.get(key);
+        }
+        boolean local = livesInLocal(key);
+        String[] holder = { null };
+        boolean ok = CommandLineHelper.loadProperties(props -> holder[0] = props.getProperty(key), local,
+                SILENT_PRINTER);
+        if (!ok) {
+            throw new RuntimeException("Could not parse TUI user config file");
+        }
+        return holder[0];
+    }
+
+    /**
+     * Writes a single {@code camel.tui.*} key back to its home file (the local file when the key is already a local
+     * override, otherwise the global file). A blank or {@code null} value removes the key. Other keys in the target
+     * file are preserved. Propagates a {@link RuntimeException} on failure so the caller can log.
+     */
+    static void write(String key, String value) {
+        Map<String, String> inMemory = session;
+        if (inMemory != null) {
+            String trimmed = trimToNull(value);
+            if (trimmed == null) {
+                inMemory.remove(key);
+            } else {
+                inMemory.put(key, trimmed);
+            }
+            return;
+        }
+        boolean local = livesInLocal(key);
+        try {
+            CommandLineHelper.createPropertyFile(local);
+        } catch (IOException e) {
+            throw new UncheckedIOException(e);
+        }
+        String trimmed = trimToNull(value);
+        boolean ok = CommandLineHelper.loadProperties(props -> {
+            if (trimmed == null) {
+                props.remove(key);
+            } else {
+                props.setProperty(key, trimmed);
+            }
+            CommandLineHelper.storeProperties(props, SILENT_PRINTER, local);
+        }, local, SILENT_PRINTER);
+        if (!ok) {
+            // malformed file — do not overwrite; throw so TUI callers (which catch RuntimeException) know
+            throw new RuntimeException("Could not update TUI preference '" + key + "': config file is malformed.");
+        }
+    }
+
+    private static boolean livesInLocal(String key) {
+        if (!CommandLineHelper.hasLocalUserConfig()) {
+            return false;
+        }
+        boolean[] present = { false };
+        // Use getProperty (overridden by OrderedProperties) instead of containsKey
+        // (inherited from Hashtable and always empty in OrderedProperties).
+        CommandLineHelper.loadProperties(props -> present[0] = props.getProperty(key) != null, true);
+        return present[0];
+    }
+
+    private static String trimToNull(String value) {
+        if (value == null) {
+            return null;
+        }
+        String trimmed = value.trim();
+        return trimmed.isEmpty() ? null : trimmed;
+    }
+}

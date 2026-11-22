@@ -1,0 +1,29 @@
+{
+  "transformer": {
+    "kind": "transformer",
+    "name": "milvus:embeddings",
+    "title": "Milvus (Embeddings)",
+    "description": "Prepares the message to become an object writable by Milvus component",
+    "deprecated": false,
+    "javaType": "org.apache.camel.component.milvus.transform.MilvusEmbeddingsDataTypeTransformer",
+    "groupId": "org.apache.camel",
+    "artifactId": "camel-milvus",
+    "version": "4.24.0-SNAPSHOT"
+  },
+  "bodyTypes": {
+    "transformerIn": {
+      "carriers": [
+        "text",
+        "pojo"
+      ],
+      "description": "A LangChain4j TextSegment, or a String the converter of camel-langchain4j-embeddings turns into one; the embedding comes from the CamelLangChain4jEmbeddingsVector header, and the CamelMilvusAction header must be INSERT or UPSERT. A null body or no embedding fails"
+    },
+    "transformerOut": {
+      "carriers": [
+        "pojo"
+      ],
+      "description": "An InsertParam for INSERT or an UpsertParam for UPSERT"
+    }
+  }
+}
+

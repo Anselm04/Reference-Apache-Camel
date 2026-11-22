@@ -1,0 +1,407 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.camel.dsl.jbang.core.commands.mcp;
+
+import java.util.List;
+
+import jakarta.enterprise.context.ApplicationScoped;
+
+import io.quarkiverse.mcp.server.Prompt;
+import io.quarkiverse.mcp.server.PromptArg;
+import io.quarkiverse.mcp.server.PromptMessage;
+import org.apache.camel.dsl.jbang.core.commands.ai.ChaosExplorePlaybook;
+
+/**
+ * MCP Prompt definitions that provide structured multi-step workflows for LLMs.
+ * <p>
+ * Prompts guide the LLM through orchestrating multiple existing tools in the correct sequence, rather than requiring it
+ * to discover the workflow on its own.
+ */
+@ApplicationScoped
+public class PromptDefinitions {
+
+    /**
+     * Guided workflow for building a Camel integration from requirements.
+     */
+    @Prompt(name = "camel_build_integration",
+            description = "Guided workflow to build a Camel integration: "
+                          + "analyze requirements, discover components and EIPs, "
+                          + "generate a YAML route, validate it, and run a security check.")
+    public List<PromptMessage> buildIntegration(
+            @PromptArg(name = "requirements",
+                       description = "Natural-language description of what the integration should do") String requirements,
+            @PromptArg(name = "runtime", description = "Target runtime: main, spring-boot, or quarkus (default: main)",
+                       required = false) String runtime) {
+
+        String resolvedRuntime = runtime != null && !runtime.isBlank() ? runtime : "main";
+
+        String instructions = """
+                You are building a Camel integration for the "%s" runtime.
+
+                ## Requirements
+                %s
+
+                ## Workflow
+
+                Follow these steps in order:
+
+                ### Step 1: Identify components
+                Analyze the requirements above and identify the Camel components needed.
+                Call `camel_catalog_find` with the protocol or product (kind="component") to find matching components.
+
+                ### Step 2: Identify EIPs
+                Determine which Enterprise Integration Patterns are needed (e.g., split, aggregate, filter, choice, switch).
+                Call `camel_catalog_find` with kind="eip" and a term such as fan-out, dedup or retry to find \
+                matching patterns; `camel_catalog_sample` gives a validated YAML sample of one.
+
+                ### Step 3: Get component details
+                For each component you selected, call `camel_catalog_doc` with the component name \
+                to get its endpoint options, required parameters, and URI syntax.
+
+                ### Step 4: Build the route
+                Using the gathered information, write a complete YAML route definition. \
+                Use correct component URI syntax and required options from the documentation.
+
+                ### Step 5: Validate
+                Call `camel_validate_source` with the generated YAML route as content and a .yaml file name \
+                to check the schema, endpoint URIs and expressions.
+                If validation fails, fix the issues and re-validate.
+
+                ### Step 6: Security review
+                Call `camel_route_harden_context` with the generated route and format="yaml" \
+                to identify security concerns. Address any critical or high-severity findings.
+
+                ### Step 7: Present result
+                Present the final YAML route along with:
+                - A brief explanation of each component and EIP used
+                - Any security recommendations from Step 6
+                - Instructions for running the route (e.g., with camel-jbang)
+                """.formatted(resolvedRuntime, requirements);
+
+        return List.of(PromptMessage.withUserRole(instructions));
+    }
+
+    /**
+     * Guided workflow for migrating a Camel project to a new version.
+     */
+    @Prompt(name = "camel_migrate_project",
+            description = "Guided workflow to migrate a Camel project: "
+                          + "analyze the pom.xml, check compatibility, "
+                          + "get OpenRewrite recipes, search migration guides, "
+                          + "and produce a migration summary.")
+    public List<PromptMessage> migrateProject(
+            @PromptArg(name = "pomContent",
+                       description = "Optional: project's pom.xml content. If omitted, the LLM uses the pom.xml already in its conversation context.",
+                       required = false) String pomContent,
+            @PromptArg(name = "targetVersion", description = "Target Camel version to migrate to (e.g., 4.18.0)",
+                       required = false) String targetVersion) {
+
+        String versionNote = targetVersion != null && !targetVersion.isBlank()
+                ? "Target version: " + targetVersion
+                : "Target version: latest stable (determine from camel_version_list)";
+
+        String pomNote = pomContent != null && !pomContent.isBlank()
+                ? "A pom.xml has been supplied as the `pomContent` argument to this prompt."
+                : "Use the project's pom.xml from your conversation context.";
+
+        String instructions
+                = """
+                        You are migrating a Camel project to a newer version.
+
+                        %s
+                        %s
+
+                        ## Workflow
+
+                        1. **Analyze**: call `camel_migration_analyze` with the pom.xml to detect runtime, \
+                        Camel version, Java version, and component dependencies.
+                        2. **Target version**: if not specified, call `camel_version_list` with the detected runtime \
+                        (use `lts=true` for LTS releases).
+                        3. **Compatibility** (based on detected runtime):
+                           - **wildfly** or **karaf**: call `camel_migration_wildfly_karaf` with the pom, target runtime, and target version.
+                           - **main**, **spring-boot**, or **quarkus**: call `camel_migration_compatibility` \
+                        with `currentVersion`, `targetVersion`, `runtime`, and `javaVersion`.
+                        4. **Recipes**: call `camel_migration_recipes` with `runtime`, `currentVersion`, `targetVersion`, \
+                        `javaVersion`, and `dryRun=true` to get the OpenRewrite Maven commands. For **quarkus**, also pass \
+                        `quarkusPlatformVersion`: the Quarkus version `camel_version_list` with `runtime=quarkus` reports \
+                        for the target version (otherwise the update goes to the latest Quarkus platform).
+                        5. **Breaking changes**: for each detected component, call `camel_migration_guide_search` \
+                        with the current and target Camel versions as `currentVersion` and `targetVersion` \
+                        to find renames and API changes.
+                        6. **Summary**: report current state, target state, blockers, breaking changes, \
+                        migration commands, and manual steps that OpenRewrite cannot automate.
+                        """
+                        .formatted(versionNote, pomNote);
+
+        return List.of(PromptMessage.withUserRole(instructions));
+    }
+
+    /**
+     * Guided workflow for a security review of a Camel route.
+     */
+    @Prompt(name = "camel_security_review",
+            description = "Guided workflow to perform a security audit of a Camel route: "
+                          + "analyze security-sensitive components, check for vulnerabilities, "
+                          + "and produce an actionable audit checklist.")
+    public List<PromptMessage> securityReview(
+            @PromptArg(name = "route", description = "The Camel route content to review") String route,
+            @PromptArg(name = "format", description = "Route format: yaml, xml, or java (default: yaml)",
+                       required = false) String format) {
+
+        String resolvedFormat = format != null && !format.isBlank() ? format : "yaml";
+
+        String instructions = """
+                You are performing a security audit of a Camel route.
+
+                ## Route (format: %s)
+                ```
+                %s
+                ```
+
+                ## Workflow
+
+                Follow these steps in order:
+
+                ### Step 1: Analyze security
+                Call `camel_route_harden_context` with the route above and format="%s".
+                This returns security-sensitive components, vulnerabilities, and risk levels.
+
+                ### Step 2: Understand route structure
+                Call `camel_route_context` with the route and format="%s".
+                This returns the components and EIPs used, helping you understand the full data flow.
+
+                ### Step 3: Produce audit checklist
+                Using the results from Steps 1 and 2, produce a structured security audit report:
+
+                **Critical Issues** (must fix before production):
+                - List all critical-severity concerns from the security analysis
+                - For each: describe the issue, the affected component, and the specific fix
+
+                **Warnings** (should fix):
+                - List all high and medium-severity concerns
+                - For each: describe the risk and the recommended mitigation
+
+                **Positive Findings** (already secured):
+                - List all positive security findings (TLS enabled, property placeholders used, etc.)
+
+                **Recommendations**:
+                - Provide actionable, prioritized recommendations based on the specific components used
+                - Reference the relevant security best practices for each component
+                - Include specific configuration examples where applicable
+
+                **Compliance Notes**:
+                - Note any components that handle PII or sensitive data
+                - Flag any components that communicate over the network without encryption
+                """.formatted(resolvedFormat, route, resolvedFormat, resolvedFormat);
+
+        return List.of(PromptMessage.withUserRole(instructions));
+    }
+
+    /**
+     * Guided workflow for diagnosing issues with a running Camel route.
+     */
+    @Prompt(name = "camel_diagnose_route",
+            description = "Guided workflow to diagnose issues with a running Camel route: "
+                          + "gather runtime state, errors, health, message history, "
+                          + "and produce a root cause analysis with actionable fixes.")
+    public List<PromptMessage> diagnoseRoute(
+            @PromptArg(name = "routeId",
+                       description = "Route ID to diagnose (optional — if omitted, diagnoses all routes with issues)",
+                       required = false) String routeId,
+            @PromptArg(name = "symptom",
+                       description = "Description of the observed problem (e.g., 'messages are not being processed', "
+                                     + "'high error rate', 'route is suspended')",
+                       required = false) String symptom) {
+
+        String routeFilter = routeId != null && !routeId.isBlank() ? routeId : "*";
+        String symptomNote = symptom != null && !symptom.isBlank()
+                ? "Reported symptom: " + symptom
+                : "No specific symptom reported — perform a general health diagnosis.";
+
+        String instructions = """
+                You are diagnosing a running Camel application.
+
+                %s
+                Target route(s): %s
+
+                ## Workflow
+
+                Follow these steps in order:
+
+                ### Step 1: Gather context
+                Call `camel_runtime_context` to understand the application state (version, uptime, total exchanges).
+                Call `camel_runtime_routes` to see all routes, their states, and error counts.
+
+                ### Step 2: Check health
+                Call `camel_runtime_health` to see if any health checks are failing.
+                Note any DOWN or UNKNOWN health statuses.
+
+                ### Step 3: Collect errors
+                Call `camel_get_errors` to get the failed exchanges with their stack traces.
+                Call `camel_runtime_history` to see the message history trace of the last completed exchange.
+
+                ### Step 4: Inspect route details
+                Call `camel_runtime_route_dump` with routeId="%s" to see the route definition.
+                Call `camel_runtime_top` to identify slow or failing processors.
+                Call `camel_runtime_inflight` to check for stuck exchanges.
+                Call `camel_runtime_blocked` to check for blocked exchanges.
+
+                ### Step 5: Check infrastructure
+                Call `camel_runtime_memory` to check for memory pressure or excessive GC.
+                Call `camel_runtime_endpoints` to verify all endpoints are reachable.
+
+                ### Step 6: Advanced diagnostics (if needed)
+                If circuit breakers are involved, call `camel_runtime_circuit_breakers`.
+                If datasources are involved, call `camel_runtime_datasources`.
+                If the issue involves timing, call `camel_runtime_spans` for trace data.
+                If the issue involves metrics, call `camel_runtime_metrics`.
+
+                ### Step 7: Root cause analysis
+                Synthesize the gathered data into a structured diagnosis:
+
+                **Summary**: One-sentence description of the root cause.
+
+                **Evidence**: List the specific data points that led to this conclusion:
+                - Which tools provided the key evidence
+                - Specific values that indicate the problem (error counts, timing, states)
+
+                **Root Cause**: Detailed explanation of what is going wrong and why.
+
+                **Immediate Actions**: Steps to take right now to mitigate:
+                - Route actions (stop, restart, suspend)
+                - Configuration changes
+                - Resource adjustments
+
+                **Permanent Fix**: What needs to change in the route definition or configuration \
+                to prevent recurrence. Include specific code examples if applicable.
+
+                **Monitoring**: What to watch going forward to detect this issue early.
+                """.formatted(symptomNote, routeFilter, routeFilter);
+
+        return List.of(PromptMessage.withUserRole(instructions));
+    }
+
+    /**
+     * Guided workflow for optimizing a running Camel application's performance.
+     */
+    @Prompt(name = "camel_optimize_route",
+            description = "Guided workflow to optimize a Camel application's performance: "
+                          + "analyze throughput, identify bottlenecks, review resource usage, "
+                          + "and produce prioritized optimization recommendations.")
+    public List<PromptMessage> optimizeRoute(
+            @PromptArg(name = "routeId",
+                       description = "Route ID to optimize (optional — if omitted, analyzes all routes)",
+                       required = false) String routeId,
+            @PromptArg(name = "goal",
+                       description = "Optimization goal: throughput, latency, memory, or general (default: general)",
+                       required = false) String goal) {
+
+        String routeFilter = routeId != null && !routeId.isBlank() ? routeId : "*";
+        String resolvedGoal = goal != null && !goal.isBlank() ? goal : "general";
+
+        String instructions = """
+                You are optimizing a running Camel application for: **%s**.
+
+                Target route(s): %s
+
+                ## Workflow
+
+                Follow these steps in order:
+
+                ### Step 1: Baseline performance
+                Call `camel_runtime_context` to get overall exchange statistics (total, completed, failed, mean time).
+                Call `camel_runtime_routes` to get per-route throughput and timing data.
+                Call `camel_runtime_top` to identify the slowest processors.
+
+                ### Step 2: Resource analysis
+                Call `camel_runtime_memory` to assess JVM memory usage, GC frequency, and thread counts.
+                Call `camel_runtime_consumers` to check consumer configuration and polling strategies.
+                Call `camel_runtime_endpoints` to review endpoint usage patterns.
+
+                ### Step 3: Route structure analysis
+                Call `camel_runtime_route_analysis` with routeId="%s" to get route structure and anti-pattern hints.
+                Call `camel_runtime_eip_stats` to understand EIP usage and processor performance distribution.
+
+                ### Step 4: Infrastructure checks
+                Call `camel_runtime_metrics` for detailed Micrometer metrics (if available).
+                Call `camel_runtime_datasources` if database access is involved.
+                Call `camel_runtime_circuit_breakers` if resilience patterns are in use.
+
+                ### Step 5: Route inspection
+                Call `camel_runtime_route_dump` with routeId="%s" and format="yaml" to see the full definition.
+                Call `camel_runtime_route_source` to read the source file it was loaded from.
+
+                ### Step 6: Optimization report
+                Produce a structured optimization report:
+
+                **Current Performance Baseline**:
+                - Overall throughput (exchanges/sec)
+                - Mean and max processing time
+                - Error rate
+                - Resource utilization (memory, threads)
+
+                **Bottlenecks Identified** (ordered by impact):
+                For each bottleneck:
+                - What: the specific processor, endpoint, or pattern
+                - Impact: how much time or throughput it costs
+                - Evidence: the specific metrics that revealed it
+
+                **Optimization Recommendations** (ordered by priority):
+
+                For each recommendation:
+                1. **Change**: What to modify (with specific code examples)
+                2. **Expected Impact**: Estimated improvement
+                3. **Risk**: What could go wrong
+                4. **Effort**: Low/Medium/High
+
+                Common optimizations to evaluate:
+                - **Parallelism**: Can `split` with `parallelProcessing` or `threads` EIP help?
+                - **Batching**: Should messages be batched with `aggregate`?
+                - **Caching**: Can frequently-accessed data be cached?
+                - **Connection pooling**: Are connection pools properly sized?
+                - **Async processing**: Can synchronous calls be made asynchronous?
+                - **Backpressure**: Is `throttle` or `circuitBreaker` needed?
+                - **Serialization**: Is a more efficient data format available?
+
+                **Trade-offs**: Note any trade-offs between the optimization goal \
+                and other qualities (e.g., throughput vs. latency, performance vs. reliability).
+                """.formatted(resolvedGoal, routeFilter, routeFilter, routeFilter);
+
+        return List.of(PromptMessage.withUserRole(instructions));
+    }
+
+    /**
+     * Let there be chaos (CAMEL-26787): the AI explores chaos on a running integration by itself for a time budget, one
+     * experiment per call, and reports at the end. The playbook is the one of camel cmd chaos-explore.
+     */
+    @Prompt(name = "camel_chaos_explore",
+            description = "Let there be chaos: explore by yourself how a running Camel application copes with faults, "
+                          + "for a time budget: start a chaos exploration, run one experiment per call (rules, traffic "
+                          + "and the wait for the verdict), and report what held and what broke, with hints. "
+                          + "Needs camel-chaos switched on (camel run --chaos).")
+    public List<PromptMessage> chaosExplore(
+            @PromptArg(name = "budget", description = "How long to explore, such as 10m or 1h (default 10m, at most 2h)",
+                       required = false) String budget,
+            @PromptArg(name = "focus", description = "What to explore, such as a route id (default: all routes)",
+                       required = false) String focus,
+            @PromptArg(name = "name", description = "Name or PID of the Camel application (default: the only one"
+                                                    + " running, or the only one with chaos switched on)",
+                       required = false) String name) {
+        return List.of(PromptMessage.withUserRole(
+                ChaosExplorePlaybook.text(ChaosExplorePlaybook.MCP, name, budget, focus, false)));
+    }
+}

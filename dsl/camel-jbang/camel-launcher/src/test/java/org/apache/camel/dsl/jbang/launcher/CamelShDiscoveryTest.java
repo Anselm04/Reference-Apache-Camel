@@ -1,0 +1,610 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.camel.dsl.jbang.launcher;
+
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
+import java.util.HashMap;
+import java.util.Map;
+
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.condition.DisabledOnOs;
+import org.junit.jupiter.api.condition.OS;
+import org.junit.jupiter.api.io.TempDir;
+
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertTrue;
+
+/**
+ * Verifies the shared Java 21+ discovery contract implemented in camel.sh. POSIX only; the Windows batch equivalent
+ * lives in {@link CamelBatDiscoveryTest}.
+ */
+@DisabledOnOs(OS.WINDOWS)
+class CamelShDiscoveryTest {
+
+    private static final Path SCRIPT = Paths.get("src/main/resources/bin/camel.sh");
+
+    private static final String JAVA21 = "openjdk version \"21.0.3\" 2024-04-16";
+    private static final String JAVA25 = "openjdk version \"25\" 2025-09-16";
+    private static final String JAVA17 = "openjdk version \"17.0.2\" 2022-01-18";
+    private static final String JAVA11 = "openjdk version \"11.0.20\" 2023-07-18";
+    private static final String JAVA8 = "java version \"1.8.0_202\"";
+    private static final String GARBAGE = "totally not a java banner";
+
+    private Path home(Path base) throws Exception {
+        return FakeJava.newLauncherHome(base, SCRIPT);
+    }
+
+    private String pathWithNonqualifyingJava(Path base) throws Exception {
+        Path pathDir = base.resolve("path-shadow");
+        FakeJava.writeFakeJava(pathDir, "java", GARBAGE, 0, "PATH-REJECTED");
+        return pathDir + ":/usr/bin:/bin";
+    }
+
+    @Test
+    void skipsSourcesAndJavadocJars(@TempDir Path base) throws Exception {
+        Path h = home(Files.createDirectories(base.resolve("launcher with spaces")));
+        Files.writeString(FakeJava.lib(h).resolve("camel-launcher-9.9.9-sources.jar"), "sources");
+        Files.writeString(FakeJava.lib(h).resolve("camel-launcher-zzz-sources.jar"), "sources");
+        Files.writeString(FakeJava.lib(h).resolve("camel-launcher-9.9.9-javadoc.jar"), "javadoc");
+        Files.writeString(FakeJava.lib(h).resolve("camel-launcher-zzz-javadoc.jar"), "javadoc");
+        Path java = FakeJava.writeFakeJava(base, "java", JAVA21, 0, "JAVACMD");
+        Map<String, String> env = new HashMap<>();
+        env.put("LC_ALL", "C");
+        env.put("JAVACMD", java.toString());
+
+        FakeJava.Result r = FakeJava.run(h.resolve("camel.sh"), env, "hawtio");
+
+        assertEquals(0, r.exitCode(), r.stderr());
+        assertTrue(r.stdout().contains(FakeJava.lib(h).resolve("camel-launcher-9.9.9.jar").toString()), r.stdout());
+        assertFalse(r.stdout().contains("-sources.jar"), r.stdout());
+        assertFalse(r.stdout().contains("-javadoc.jar"), r.stdout());
+    }
+
+    @Test
+    void acceptsJava21ViaJavacmd(@TempDir Path base) throws Exception {
+        Path h = home(base);
+        Path java = FakeJava.writeFakeJava(base, "java", JAVA21, 0, "JAVACMD");
+        Map<String, String> env = new HashMap<>();
+        env.put("JAVACMD", java.toString());
+
+        FakeJava.Result r = FakeJava.run(h.resolve("camel.sh"), env, "version");
+
+        assertEquals(0, r.exitCode(), r.stderr());
+        assertTrue(r.stdout().contains("RAN=JAVACMD"), r.stdout());
+        // Probe output must not leak to the user during a normal invocation.
+        assertFalse(r.stdout().contains("openjdk version"), "probe banner leaked to stdout");
+        assertFalse(r.stderr().contains("openjdk version"), "probe banner leaked to stderr");
+    }
+
+    @Test
+    void acceptsJava21(@TempDir Path base) throws Exception {
+        Path h = home(base);
+        Path java = FakeJava.writeFakeJava(base, "java", JAVA21, 0, "JAVACMD");
+        Map<String, String> env = new HashMap<>();
+        env.put("JAVACMD", java.toString());
+
+        FakeJava.Result r = FakeJava.run(h.resolve("camel.sh"), env, "version");
+
+        assertEquals(0, r.exitCode(), r.stderr());
+        assertTrue(r.stdout().contains("RAN=JAVACMD"));
+    }
+
+    @Test
+    void precedenceJavacmdBeatsJavaHomeAndPath(@TempDir Path base) throws Exception {
+        Path h = home(base);
+        Path first = FakeJava.writeFakeJava(base.resolve("j1"), "java", JAVA21, 0, "JAVACMD");
+        Path jhomeBin = base.resolve("jh/bin");
+        FakeJava.writeFakeJava(jhomeBin, "java", JAVA21, 0, "JAVAHOME");
+        Path pathDir = base.resolve("pd");
+        FakeJava.writeFakeJava(pathDir, "java", JAVA21, 0, "PATH");
+
+        Map<String, String> env = new HashMap<>();
+        env.put("JAVACMD", first.toString());
+        env.put("JAVA_HOME", base.resolve("jh").toString());
+        env.put("PATH", pathDir + ":/usr/bin:/bin");
+
+        FakeJava.Result r = FakeJava.run(h.resolve("camel.sh"), env, "version");
+
+        assertEquals(0, r.exitCode(), r.stderr());
+        assertTrue(r.stdout().contains("RAN=JAVACMD"), r.stdout());
+    }
+
+    @Test
+    void honorsJavaHomeWhenOnlySourceLikeSdkman(@TempDir Path base) throws Exception {
+        // SDKMAN provides Java by exporting JAVA_HOME (candidate #2) with no JAVACMD set.
+        Path h = home(base);
+        Path jhomeBin = base.resolve("jh/bin");
+        FakeJava.writeFakeJava(jhomeBin, "java", JAVA21, 0, "JAVAHOME");
+
+        Map<String, String> env = new HashMap<>();
+        env.put("JAVA_HOME", base.resolve("jh").toString());
+        env.put("PATH", pathWithNonqualifyingJava(base));
+
+        FakeJava.Result r = FakeJava.run(h.resolve("camel.sh"), env, "version");
+
+        assertEquals(0, r.exitCode(), r.stderr());
+        assertTrue(r.stdout().contains("RAN=JAVAHOME"), r.stdout());
+    }
+
+    @Test
+    void skipsInvalidJavacmdFallsBackToJavaHome(@TempDir Path base) throws Exception {
+        Path h = home(base);
+        Path jhomeBin = base.resolve("jh/bin");
+        FakeJava.writeFakeJava(jhomeBin, "java", JAVA21, 0, "JAVAHOME");
+
+        Map<String, String> env = new HashMap<>();
+        env.put("JAVACMD", base.resolve("does-not-exist").toString());
+        env.put("JAVA_HOME", base.resolve("jh").toString());
+
+        FakeJava.Result r = FakeJava.run(h.resolve("camel.sh"), env, "version");
+
+        assertEquals(0, r.exitCode(), r.stderr());
+        assertTrue(r.stdout().contains("RAN=JAVAHOME"), r.stdout());
+    }
+
+    @Test
+    void skipsNonExecutableJavacmdFallsBackToJavaHome(@TempDir Path base) throws Exception {
+        Path h = home(base);
+        Path nonExecutable = base.resolve("non-executable-java");
+        Files.writeString(nonExecutable, "#!/bin/sh\nexit 0\n");
+        assertFalse(Files.isExecutable(nonExecutable), "test candidate must not be executable");
+        Path jhomeBin = base.resolve("jh/bin");
+        FakeJava.writeFakeJava(jhomeBin, "java", JAVA21, 0, "JAVAHOME");
+
+        Map<String, String> env = new HashMap<>();
+        env.put("JAVACMD", nonExecutable.toString());
+        env.put("JAVA_HOME", base.resolve("jh").toString());
+
+        FakeJava.Result r = FakeJava.run(h.resolve("camel.sh"), env, "version");
+
+        assertEquals(0, r.exitCode(), r.stderr());
+        assertTrue(r.stdout().contains("RAN=JAVAHOME"), r.stdout());
+    }
+
+    @Test
+    void skipsOldJavaHomeFallsBackToPath(@TempDir Path base) throws Exception {
+        Path h = home(base);
+        Path jhomeBin = base.resolve("jh/bin");
+        FakeJava.writeFakeJava(jhomeBin, "java", JAVA11, 0, "JAVAHOME"); // too old
+        Path pathDir = base.resolve("pd");
+        FakeJava.writeFakeJava(pathDir, "java", JAVA21, 0, "PATH");
+
+        Map<String, String> env = new HashMap<>();
+        env.put("JAVA_HOME", base.resolve("jh").toString());
+        env.put("PATH", pathDir + ":/usr/bin:/bin");
+
+        FakeJava.Result r = FakeJava.run(h.resolve("camel.sh"), env, "version");
+
+        assertEquals(0, r.exitCode(), r.stderr());
+        assertTrue(r.stdout().contains("RAN=PATH"), r.stdout());
+        assertFalse(r.stdout().contains(JAVA11), "rejected probe banner leaked to stdout");
+        assertFalse(r.stderr().contains(JAVA11), "rejected probe banner leaked to stderr");
+    }
+
+    @Test
+    void precedenceJavaHomeBeatsPath(@TempDir Path base) throws Exception {
+        Path h = home(base);
+        Path jhomeBin = base.resolve("jh/bin");
+        FakeJava.writeFakeJava(jhomeBin, "java", JAVA21, 0, "JAVAHOME");
+        Path pathDir = base.resolve("pd");
+        FakeJava.writeFakeJava(pathDir, "java", JAVA21, 0, "PATH");
+
+        Map<String, String> env = new HashMap<>();
+        env.put("JAVA_HOME", base.resolve("jh").toString());
+        env.put("PATH", pathDir + ":/usr/bin:/bin");
+
+        FakeJava.Result r = FakeJava.run(h.resolve("camel.sh"), env, "version");
+
+        assertEquals(0, r.exitCode(), r.stderr());
+        assertTrue(r.stdout().contains("RAN=JAVAHOME"), r.stdout());
+    }
+
+    @Test
+    void precedencePathBeatsCamelFallbackJava(@TempDir Path base) throws Exception {
+        Path h = home(base);
+        Path pathDir = base.resolve("pd");
+        FakeJava.writeFakeJava(pathDir, "java", JAVA21, 0, "PATH");
+        Path fallback = FakeJava.writeFakeJava(base.resolve("fb"), "java", JAVA21, 0, "FALLBACK");
+
+        Map<String, String> env = new HashMap<>();
+        env.put("PATH", pathDir + ":/usr/bin:/bin");
+        env.put("CAMEL_FALLBACK_JAVA", fallback.toString());
+
+        FakeJava.Result r = FakeJava.run(h.resolve("camel.sh"), env, "version");
+
+        assertEquals(0, r.exitCode(), r.stderr());
+        assertTrue(r.stdout().contains("RAN=PATH"), r.stdout());
+    }
+
+    @Test
+    void usesCamelFallbackJavaWhenNothingElseQualifies(@TempDir Path base) throws Exception {
+        Path h = home(base);
+        Path fb = FakeJava.writeFakeJava(base.resolve("fb"), "java", JAVA21, 0, "FALLBACK");
+
+        Map<String, String> env = new HashMap<>();
+        env.put("PATH", pathWithNonqualifyingJava(base));
+        env.put("CAMEL_FALLBACK_JAVA", fb.toString());
+
+        FakeJava.Result r = FakeJava.run(h.resolve("camel.sh"), env, "version");
+
+        assertEquals(0, r.exitCode(), r.stderr());
+        assertTrue(r.stdout().contains("RAN=FALLBACK"), r.stdout());
+    }
+
+    @Test
+    void rejectsWhenNoCandidateQualifies(@TempDir Path base) throws Exception {
+        Path h = home(base);
+        Path old = FakeJava.writeFakeJava(base.resolve("old"), "java", JAVA8, 0, "OLD");
+
+        Map<String, String> env = new HashMap<>();
+        env.put("JAVACMD", old.toString());
+        env.put("PATH", pathWithNonqualifyingJava(base));
+
+        FakeJava.Result r = FakeJava.run(h.resolve("camel.sh"), env, "version");
+
+        assertEquals(1, r.exitCode());
+        assertTrue(r.stderr().contains("21"), "diagnostic must state the Java 21 minimum: " + r.stderr());
+        assertTrue(r.stderr().toLowerCase().contains("java"), r.stderr());
+    }
+
+    @Test
+    void rejectsUnparseableCandidate(@TempDir Path base) throws Exception {
+        Path h = home(base);
+        Path garbage = FakeJava.writeFakeJava(base.resolve("g"), "java", GARBAGE, 0, "GARBAGE");
+
+        Map<String, String> env = new HashMap<>();
+        env.put("JAVACMD", garbage.toString());
+        env.put("PATH", pathWithNonqualifyingJava(base));
+
+        FakeJava.Result r = FakeJava.run(h.resolve("camel.sh"), env, "version");
+
+        assertEquals(1, r.exitCode());
+    }
+
+    @Test
+    void skipsUnparseableJavacmdFallsBackToJavaHome(@TempDir Path base) throws Exception {
+        Path h = home(base);
+        Path garbage = FakeJava.writeFakeJava(base.resolve("g"), "java", GARBAGE, 0, "GARBAGE");
+        Path jhomeBin = base.resolve("jh/bin");
+        FakeJava.writeFakeJava(jhomeBin, "java", JAVA21, 0, "JAVAHOME");
+
+        Map<String, String> env = new HashMap<>();
+        env.put("JAVACMD", garbage.toString());
+        env.put("JAVA_HOME", base.resolve("jh").toString());
+
+        FakeJava.Result r = FakeJava.run(h.resolve("camel.sh"), env, "version");
+
+        assertEquals(0, r.exitCode(), r.stderr());
+        assertTrue(r.stdout().contains("RAN=JAVAHOME"), r.stdout());
+        assertFalse(r.stdout().contains(GARBAGE), "rejected probe banner leaked to stdout");
+        assertFalse(r.stderr().contains(GARBAGE), "rejected probe banner leaked to stderr");
+    }
+
+    @Test
+    void parsesLegacyOneDotEightAsMajorEight(@TempDir Path base) throws Exception {
+        // 1.8.0_202 must resolve to major 8 and therefore be rejected.
+        Path h = home(base);
+        Path java8 = FakeJava.writeFakeJava(base.resolve("j8"), "java", JAVA8, 0, "J8");
+
+        Map<String, String> env = new HashMap<>();
+        env.put("JAVACMD", java8.toString());
+        env.put("PATH", pathWithNonqualifyingJava(base));
+
+        FakeJava.Result r = FakeJava.run(h.resolve("camel.sh"), env, "version");
+
+        assertEquals(1, r.exitCode(), "Java 8 must be rejected: " + r.stdout());
+    }
+
+    @Test
+    void readsTheVersionFromTheReleaseFileOfTheJdk(@TempDir Path base) throws Exception {
+        // the banner of -version is not a Java version: the version comes from the release file, without -version
+        Path h = home(base);
+        Path java = FakeJava.writeFakeJava(base.resolve("jdk/bin"), "java", GARBAGE, 0, "RELEASE");
+        Files.writeString(base.resolve("jdk/release"), "IMPLEMENTOR=\"Test\"\nJAVA_VERSION=\"21.0.3\"\n");
+
+        Map<String, String> env = new HashMap<>();
+        env.put("JAVACMD", java.toString());
+        env.put("PATH", pathWithNonqualifyingJava(base));
+
+        FakeJava.Result r = FakeJava.run(h.resolve("camel.sh"), env, "version");
+
+        assertEquals(0, r.exitCode(), r.stderr());
+        assertTrue(r.stdout().contains("RAN=RELEASE"), r.stdout());
+    }
+
+    @Test
+    void rejectsAnOldJavaFromTheReleaseFileOfTheJdk(@TempDir Path base) throws Exception {
+        Path h = home(base);
+        Path old = FakeJava.writeFakeJava(base.resolve("jdk/bin"), "java", JAVA21, 0, "OLD");
+        Files.writeString(base.resolve("jdk/release"), "JAVA_VERSION=\"17.0.2\"\n");
+        Path pathDir = base.resolve("pd");
+        FakeJava.writeFakeJava(pathDir, "java", JAVA21, 0, "PATH");
+
+        Map<String, String> env = new HashMap<>();
+        env.put("JAVACMD", old.toString());
+        env.put("PATH", pathDir + ":/usr/bin:/bin");
+
+        FakeJava.Result r = FakeJava.run(h.resolve("camel.sh"), env, "version");
+
+        assertEquals(0, r.exitCode(), r.stderr());
+        assertTrue(r.stdout().contains("RAN=PATH"), r.stdout());
+    }
+
+    @Test
+    void runsJavaVersionWhenTheReleaseFileHasNoVersion(@TempDir Path base) throws Exception {
+        Path h = home(base);
+        Path java = FakeJava.writeFakeJava(base.resolve("jdk/bin"), "java", JAVA21, 0, "BANNER");
+        Files.writeString(base.resolve("jdk/release"), "IMPLEMENTOR=\"Test\"\n");
+
+        Map<String, String> env = new HashMap<>();
+        env.put("JAVACMD", java.toString());
+        env.put("PATH", pathWithNonqualifyingJava(base));
+
+        FakeJava.Result r = FakeJava.run(h.resolve("camel.sh"), env, "version");
+
+        assertEquals(0, r.exitCode(), r.stderr());
+        assertTrue(r.stdout().contains("RAN=BANNER"), r.stdout());
+    }
+
+    @Test
+    void handlesSpacesAndUnicodeInJavaPath(@TempDir Path base) throws Exception {
+        Path h = home(base);
+        Path dir = base.resolve("spa ce/über");
+        Path java = FakeJava.writeFakeJava(dir, "java", JAVA21, 0, "UNICODE");
+
+        Map<String, String> env = new HashMap<>();
+        env.put("JAVACMD", java.toString());
+
+        FakeJava.Result r = FakeJava.run(h.resolve("camel.sh"), env, "version");
+
+        assertEquals(0, r.exitCode(), r.stderr());
+        assertTrue(r.stdout().contains("RAN=UNICODE"), r.stdout());
+    }
+
+    @Test
+    void preservesArgumentsWithSpaces(@TempDir Path base) throws Exception {
+        Path h = home(base);
+        Path java = FakeJava.writeFakeJava(base, "java", JAVA21, 0, "ARGS");
+        Map<String, String> env = new HashMap<>();
+        env.put("JAVACMD", java.toString());
+
+        FakeJava.Result r = FakeJava.run(h.resolve("camel.sh"), env, "run", "my route.yaml");
+
+        assertEquals(0, r.exitCode(), r.stderr());
+        assertTrue(r.stdout().contains("|run|my route.yaml|"), r.stdout());
+    }
+
+    @Test
+    void usesAClassDataSharingArchivePerCommand(@TempDir Path base) throws Exception {
+        Path h = home(base);
+        Path java = FakeJava.writeFakeJava(base, "java", JAVA21, 0, "ARGS");
+        Path cache = base.resolve("cache dir");
+        Map<String, String> env = new HashMap<>();
+        env.put("JAVACMD", java.toString());
+        env.put("XDG_CACHE_HOME", cache.toString());
+
+        FakeJava.Result r = FakeJava.run(h.resolve("camel.sh"), env, "version");
+
+        String hash = FakeJava.cksumHash(FakeJava.basedir(h).toString());
+        Path archives = cache.resolve("camel-cli/cds/9.9.9/" + hash);
+        assertEquals(0, r.exitCode(), r.stderr());
+        assertTrue(r.stdout().contains("|-XX:+AutoCreateSharedArchive|-XX:SharedArchiveFile=" + archives.resolve("version.jsa")
+                                       + "|-Xlog:cds*=off|-jar|"),
+                r.stdout());
+        assertTrue(Files.isDirectory(archives), "the JVM does not start without the directory of the archive");
+    }
+
+    @Test
+    void usesTheArchiveOfCamelWithoutACommand(@TempDir Path base) throws Exception {
+        Path h = home(base);
+        Path java = FakeJava.writeFakeJava(base, "java", JAVA21, 0, "ARGS");
+        Path cache = base.resolve("cache");
+        Map<String, String> env = new HashMap<>();
+        env.put("JAVACMD", java.toString());
+        env.put("XDG_CACHE_HOME", cache.toString());
+
+        FakeJava.Result r = FakeJava.run(h.resolve("camel.sh"), env, "--help");
+
+        String hash = FakeJava.cksumHash(FakeJava.basedir(h).toString());
+        assertTrue(
+                r.stdout()
+                        .contains("-XX:SharedArchiveFile=" + cache.resolve("camel-cli/cds/9.9.9/" + hash + "/camel.jsa") + "|"),
+                r.stdout());
+    }
+
+    @Test
+    void usesTheCacheDirectoryInTheHomeDirectory(@TempDir Path base) throws Exception {
+        Path h = home(base);
+        Path java = FakeJava.writeFakeJava(base, "java", JAVA21, 0, "ARGS");
+        Path userHome = Files.createDirectories(base.resolve("home"));
+        Map<String, String> env = new HashMap<>();
+        env.put("JAVACMD", java.toString());
+        env.put("HOME", userHome.toString());
+
+        FakeJava.Result r = FakeJava.run(h.resolve("camel.sh"), env, "get");
+
+        String hash = FakeJava.cksumHash(FakeJava.basedir(h).toString());
+        assertTrue(
+                r.stdout().contains(
+                        "-XX:SharedArchiveFile=" + userHome.resolve(".cache/camel-cli/cds/9.9.9/" + hash + "/get.jsa")),
+                r.stdout());
+    }
+
+    @Test
+    void removesAnEmptyArchive(@TempDir Path base) throws Exception {
+        // the JVM does not replace an empty archive, which it leaves when it stops while writing one
+        Path h = home(base);
+        Path java = FakeJava.writeFakeJava(base, "java", JAVA21, 0, "ARGS");
+        Path cache = base.resolve("cache");
+        String hash = FakeJava.cksumHash(FakeJava.basedir(h).toString());
+        Path archive = Files.createDirectories(cache.resolve("camel-cli/cds/9.9.9/" + hash)).resolve("version.jsa");
+        Files.createFile(archive);
+        Map<String, String> env = new HashMap<>();
+        env.put("JAVACMD", java.toString());
+        env.put("XDG_CACHE_HOME", cache.toString());
+
+        FakeJava.Result r = FakeJava.run(h.resolve("camel.sh"), env, "version");
+
+        assertTrue(r.stdout().contains("-XX:SharedArchiveFile=" + archive), r.stdout());
+        assertFalse(Files.exists(archive));
+    }
+
+    @Test
+    void twoInstallDirectoriesGetDistinctArchives(@TempDir Path base) throws Exception {
+        // Two installs of the same version (e.g. SDKMAN + Homebrew) must get separate CDS archives
+        Path h1 = home(Files.createDirectories(base.resolve("install-a")));
+        Path h2 = home(Files.createDirectories(base.resolve("install-b")));
+        Path java = FakeJava.writeFakeJava(base, "java", JAVA21, 0, "ARGS");
+        Path cache = base.resolve("cache");
+        Map<String, String> env1 = new HashMap<>();
+        env1.put("JAVACMD", java.toString());
+        env1.put("XDG_CACHE_HOME", cache.toString());
+        Map<String, String> env2 = new HashMap<>(env1);
+
+        FakeJava.Result r1 = FakeJava.run(h1.resolve("camel.sh"), env1, "version");
+        FakeJava.Result r2 = FakeJava.run(h2.resolve("camel.sh"), env2, "version");
+
+        String hash1 = FakeJava.cksumHash(FakeJava.basedir(h1).toString());
+        String hash2 = FakeJava.cksumHash(FakeJava.basedir(h2).toString());
+        assertFalse(hash1.equals(hash2), "different install dirs must produce different hashes");
+        assertTrue(r1.stdout().contains("cds/9.9.9/" + hash1 + "/version.jsa"), r1.stdout());
+        assertTrue(r2.stdout().contains("cds/9.9.9/" + hash2 + "/version.jsa"), r2.stdout());
+    }
+
+    @Test
+    void noArchiveWhenTurnedOffOrJavaOptsHaveCdsOptions(@TempDir Path base) throws Exception {
+        Path h = home(base);
+        Path java = FakeJava.writeFakeJava(base, "java", JAVA21, 0, "ARGS");
+        Path cache = base.resolve("cache");
+        for (Map.Entry<String, String> setting : Map.of(
+                "CAMEL_CDS", "false",
+                "JAVA_OPTS", "-Xshare:off").entrySet()) {
+            Map<String, String> env = new HashMap<>();
+            env.put("JAVACMD", java.toString());
+            env.put("XDG_CACHE_HOME", cache.toString());
+            env.put(setting.getKey(), setting.getValue());
+
+            FakeJava.Result r = FakeJava.run(h.resolve("camel.sh"), env, "version");
+
+            assertEquals(0, r.exitCode(), r.stderr());
+            assertFalse(r.stdout().contains("SharedArchiveFile"), setting + ": " + r.stdout());
+        }
+    }
+
+    @Test
+    void noArchiveWithoutACacheDirectory(@TempDir Path base) throws Exception {
+        Path h = home(base);
+        Path java = FakeJava.writeFakeJava(base, "java", JAVA21, 0, "ARGS");
+        // a file where the cache directory would be
+        Path cache = Files.writeString(base.resolve("cache"), "not a directory");
+        Map<String, String> env = new HashMap<>();
+        env.put("JAVACMD", java.toString());
+        env.put("XDG_CACHE_HOME", cache.toString());
+
+        FakeJava.Result r = FakeJava.run(h.resolve("camel.sh"), env, "version");
+
+        assertEquals(0, r.exitCode(), r.stderr());
+        assertFalse(r.stdout().contains("SharedArchiveFile"), r.stdout());
+        assertTrue(r.stdout().contains("ARGS=-Xmx512m|-jar|"), r.stdout());
+    }
+
+    @Test
+    void defaultsHeapWhenJavaOptsUnset(@TempDir Path base) throws Exception {
+        Path h = home(base);
+        Path java = FakeJava.writeFakeJava(base, "java", JAVA21, 0, "HEAP");
+        Map<String, String> env = new HashMap<>();
+        env.put("JAVACMD", java.toString());
+
+        FakeJava.Result r = FakeJava.run(h.resolve("camel.sh"), env, "version");
+
+        assertTrue(r.stdout().contains("-Xmx512m"), "default heap must be applied: " + r.stdout());
+    }
+
+    @Test
+    void preservesJavaOptsWhenSet(@TempDir Path base) throws Exception {
+        Path h = home(base);
+        Path java = FakeJava.writeFakeJava(base, "java", JAVA21, 0, "OPTS");
+        Map<String, String> env = new HashMap<>();
+        env.put("JAVACMD", java.toString());
+        env.put("JAVA_OPTS", "-Dcamel.test=1 -Xmx256m");
+
+        FakeJava.Result r = FakeJava.run(h.resolve("camel.sh"), env, "version");
+
+        assertTrue(r.stdout().contains("-Dcamel.test=1"), r.stdout());
+        assertTrue(r.stdout().contains("-Xmx256m"), r.stdout());
+        assertFalse(r.stdout().contains("-Xmx512m"), "default heap must not be added when JAVA_OPTS set");
+    }
+
+    @Test
+    void preservesChildExitCode(@TempDir Path base) throws Exception {
+        Path h = home(base);
+        Path java = FakeJava.writeFakeJava(base, "java", JAVA21, 42, "EXIT");
+        Map<String, String> env = new HashMap<>();
+        env.put("JAVACMD", java.toString());
+
+        FakeJava.Result r = FakeJava.run(h.resolve("camel.sh"), env, "version");
+
+        assertEquals(42, r.exitCode(), "child exit code must be propagated");
+    }
+
+    @Test
+    void preservesChildStdinStdoutAndStderr(@TempDir Path base) throws Exception {
+        Path h = home(base);
+        Path java = FakeJava.writeFakeJava(base, "java", JAVA21, 0, "STDIO");
+        Map<String, String> env = new HashMap<>();
+        env.put("JAVACMD", java.toString());
+
+        FakeJava.Result r = FakeJava.runWithInput(h.resolve("camel.sh"), env, "route input\n", "version");
+
+        assertEquals(0, r.exitCode(), r.stderr());
+        assertTrue(r.stdout().contains("RAN=STDIO"), r.stdout());
+        assertTrue(r.stdout().contains("route input"), "stdin did not reach child stdout: " + r.stdout());
+        assertTrue(r.stderr().contains("STDERR=STDIO"), "child stderr was not preserved: " + r.stderr());
+    }
+
+    @Test
+    void probeCannotConsumeChildStdin(@TempDir Path base) throws Exception {
+        Path h = home(base);
+        Path java = FakeJava.writeFakeJava(base, "java", JAVA21, 0, "PROBE-STDIN");
+        Files.writeString(java, "#!/bin/sh\n"
+                                + "if [ \"$1\" = \"-version\" ]; then\n"
+                                + "  IFS= read -r ignored\n"
+                                + "  echo '" + JAVA21 + "' 1>&2\n"
+                                + "  exit 0\n"
+                                + "fi\n"
+                                + "echo 'RAN=PROBE-STDIN'\n"
+                                + "cat\n");
+        Map<String, String> env = new HashMap<>();
+        env.put("JAVACMD", java.toString());
+
+        FakeJava.Result r = FakeJava.runWithInput(h.resolve("camel.sh"), env, "route input\n", "version");
+
+        assertEquals(0, r.exitCode(), r.stderr());
+        assertTrue(r.stdout().contains("RAN=PROBE-STDIN"), r.stdout());
+        assertTrue(r.stdout().contains("route input"), "version probe consumed child stdin: " + r.stdout());
+    }
+
+    @Test
+    void scriptItselfIsExecutableFixture(@TempDir Path base) throws Exception {
+        Path h = home(base);
+        assertTrue(Files.exists(h.resolve("camel.sh")));
+        assertTrue(Files.isExecutable(h.resolve("camel.sh")));
+    }
+}

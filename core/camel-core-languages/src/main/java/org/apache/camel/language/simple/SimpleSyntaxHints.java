@@ -1,0 +1,691 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.camel.language.simple;
+
+import java.util.List;
+import java.util.Locale;
+import java.util.Map;
+import java.util.Set;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+
+/**
+ * Hints that turn a Simple parser error into a message that says what to write (CAMEL-24703). Every consumer of the
+ * parser (routes at startup, the catalog validator, camel validate, the TUI and the MCP tools) shows the message, so a
+ * hint here reaches humans and AI agents alike.
+ */
+public final class SimpleSyntaxHints {
+
+    public static final String OPERATORS = "==, =~, !=, !=~, <, <=, >, >=, equals, !equals, contains, !contains, ~~, !~~, "
+                                           + "regex, !regex, in, !in, is, !is, range, !range, startsWith, !startsWith, "
+                                           + "endsWith, !endsWith, && and ||";
+
+    /** The value forms an operator accepts on its right hand side. */
+    public static final String VALUE_FORMS = "a quoted literal 'x', a number, true, false, null, or a function ${...}";
+
+    /** Function names a model is likely to write, for the did-you-mean suggestion. */
+    static final List<String> FUNCTIONS = List.of("body", "bodyAs", "mandatoryBodyAs", "bodyOneLine", "prettyBody",
+            "originalBody", "header", "headerAs", "headers", "exchangeProperty", "exchangePropertyAs",
+            "variable", "variableAs", "variables", "exception", "exchange", "camelContext",
+            "camelId", "routeId", "routeGroup", "stepId", "id", "messageTimestamp", "threadName", "threadId",
+            "hostname", "date", "date-with-timezone", "random", "skip", "collate", "join", "sum", "average", "min",
+            "max", "abs", "ceil", "floor", "replace", "substring", "substringBefore", "substringAfter",
+            "substringBetween", "contains", "pad", "concat", "val", "length", "size", "empty", "newEmpty", "iif",
+            "hash", "convertTo", "throwException", "assert", "load", "uuid", "env", "sys", "sysenv", "ref", "bean",
+            "properties", "propertiesExist", "type", "messageAs", "messageHistory", "logExchange", "pretty",
+            "toJson", "toPrettyJson", "jq", "jsonpath", "xpath", "simpleJsonpath", "semantic", "function", "list", "map",
+            "range", "split", "sort", "distinct", "reverse", "shuffle", "forEach", "filter", "listAdd", "listRemove",
+            "mapAdd", "mapRemove", "setHeader", "setVariable", "uppercase", "lowercase", "trim", "capitalize",
+            "normalizeWhitespace", "quote", "unquote", "safeQuote", "escape", "isEmpty", "isAlpha", "isAlphaNumeric",
+            "isNumeric", "not", "kindOfType", "file", "null");
+
+    /** Functions that are called with parentheses, so a suggestion without arguments adds them. */
+    private static final Set<String> CALLED_WITH_PARENTHESES = Set.of("uppercase", "lowercase", "trim", "size", "average");
+
+    /**
+     * Functions that delegate to another language, all of them written {@code ${name(exp)}}. Unlike {@code bean:} or
+     * {@code date:} they take no colon form, which is the mistake CAMEL-24845 is about.
+     */
+    static final Set<String> QUERY_FUNCTIONS = Set.of("jq", "jsonpath", "xpath", "simpleJsonpath", "semantic");
+
+    /** Names from older Camel versions or other languages that a model still writes. */
+    static final Map<String, String> ALIASES = Map.ofEntries(
+            Map.entry("property", "exchangeProperty"),
+            Map.entry("in.body", "body"),
+            Map.entry("out.body", "body"),
+            Map.entry("in.header", "header"),
+            Map.entry("out.header", "header"),
+            Map.entry("in.headers", "headers"),
+            Map.entry("var", "variable"),
+            Map.entry("prop", "exchangeProperty"),
+            Map.entry("json", "jsonpath"),
+            Map.entry("upper", "uppercase"),
+            Map.entry("toUpperCase", "uppercase"),
+            Map.entry("lower", "lowercase"),
+            Map.entry("toLowerCase", "lowercase"),
+            Map.entry("padding", "pad"),
+            Map.entry("now", "date:now:yyyy-MM-dd'T'HH:mm:ss"),
+            Map.entry("timestamp", "messageTimestamp"),
+            Map.entry("avg", "average"),
+            Map.entry("count", "size"));
+
+    /** The functions of the file language, as written after file:: name.noext is ${file:name.noext}. */
+    static final List<String> FILE_FUNCTIONS = List.of("name", "name.noext", "name.noext.single", "name.ext",
+            "name.ext.single", "ext", "onlyname", "onlyname.noext", "onlyname.noext.single", "parent", "path", "absolute",
+            "absolute.path", "length", "size", "modified");
+
+    /** The file functions a hint lists, after "the" or "The". */
+    private static final String FILE_FUNCTIONS_TEXT = "file: functions describe the file being consumed: ${file:name},"
+                                                      + " ${file:name.noext}, ${file:onlyname}, ${file:onlyname.noext},"
+                                                      + " ${file:ext}, ${file:parent}, ${file:size} and ${file:modified}";
+
+    private static final String[] OPERATOR_WORDS = {
+            "==", "!=", ">=", "<=", ">", "<", "=~", "!=~", "~~", "!~~", "contains",
+            "!contains", "regex", "!regex", "in", "!in", "is", "!is", "range", "!range", "startsWith", "!startsWith",
+            "endsWith", "!endsWith", "equals", "!equals", "&&", "||" };
+
+    private SimpleSyntaxHints() {
+    }
+
+    /** The whole word (up to whitespace on both sides) around the index in the expression. */
+    public static String wordAt(String expression, int index) {
+        if (expression == null || expression.isEmpty()) {
+            return "";
+        }
+        int start = Math.min(Math.max(index, 0), expression.length());
+        int end = start;
+        while (start > 0 && !Character.isWhitespace(expression.charAt(start - 1))) {
+            start--;
+        }
+        while (end < expression.length() && !Character.isWhitespace(expression.charAt(end))) {
+            end++;
+        }
+        return expression.substring(start, end);
+    }
+
+    /**
+     * The same negation with its function in braces, or null when the text is not a negated name: {@code !x} is
+     * {@code !${x}}. The parser otherwise reports it as a missing predicate next to the operator (CAMEL-24984).
+     */
+    private static String negatedFunction(String word) {
+        if (word.length() < 2 || word.charAt(0) != '!' || word.startsWith("!${")) {
+            return null;
+        }
+        String rest = word.substring(1);
+        // !=, !contains and the other negated operators are words of their own, not a negated function
+        if (rest.charAt(0) == '=' || rest.charAt(0) == '$') {
+            return null;
+        }
+        for (String op : new String[] { "contains", "endsWith", "equals", "in", "is", "range", "regex", "startsWith", "~~" }) {
+            if (rest.equals(op)) {
+                return null;
+            }
+        }
+        return "!${" + rest + "}";
+    }
+
+    /** The message for a token the grammar does not know at the given index. */
+    public static String unexpectedToken(String expression, int index) {
+        String word = wordAt(expression, index);
+        if (word.isEmpty()) {
+            return "Unexpected token at location " + index;
+        }
+        String lower = word.toLowerCase(Locale.ROOT);
+        switch (lower) {
+            case "=":
+            case "===":
+            case "=<":
+            case "=>":
+                return "Unknown operator " + word + ": did you mean ==? Operators are " + OPERATORS;
+            case "<>":
+            case "=!=":
+            case "!==":
+            case "~=":
+                return "Unknown operator " + word + ": did you mean !=? Operators are " + OPERATORS;
+            case "and":
+            case "&":
+                return "Unknown operator " + word + ": use && for and, and || for or";
+            case "or":
+            case "|":
+                return "Unknown operator " + word + ": use || for or, and && for and";
+            case "not":
+            case "!":
+                return "Unknown operator " + word + ": ! negates a function and is written directly in front of it, "
+                       + "e.g. !${body.isEmpty()}; a comparison negates its operator instead, e.g. != or !contains";
+            default:
+        }
+        String name = functionName(word);
+        if (isKnownFunction(name)) {
+            String rewrite = expression.replace(word, "${" + word + "}");
+            return "Unexpected token " + word + ": text outside ${...} is a literal, functions are written as ${body}, "
+                   + "${header.name}; did you mean " + rewrite + "?";
+        }
+        // ${body.lines}.size() > 0: the method after the closing brace of the function
+        int start = Math.min(Math.max(index, 0), expression.length());
+        while (start > 0 && !Character.isWhitespace(expression.charAt(start - 1))) {
+            start--;
+        }
+        int close = word.startsWith("${") ? closingBrace(word) : -1;
+        String after = close > 0 ? afterFunction(expression, start + close + 1) : null;
+        if (after != null) {
+            return "Unexpected token " + word + ": " + after;
+        }
+        return "Unexpected token " + word + ": text outside ${...} must be " + VALUE_FORMS + ", or an operator ("
+               + OPERATORS + ")";
+    }
+
+    /** The functions whose value can be read further with a field, a method or an index, as ${body.lines.size()}. */
+    private static final Pattern READ_FURTHER = Pattern.compile(
+            "(?:in\\.)?(?:body|headers?|exchangeProperty|variables?|exception)(?:[.\\[?].*)?"
+                                                                + "|(?:mandatoryB|b)odyAs\\(.*|messageAs\\(.*");
+
+    /** A path that reads further: .lines, ?.lines, .size(), [0] or ['sku'], one after the other. */
+    private static final Pattern PATH = Pattern.compile(
+            "(?:\\??\\.[A-Za-z_]\\w*(?:\\([^()]*\\))?|\\[[^\\]]*])+");
+
+    /**
+     * A method, a field or an index written right after the closing brace of a function, as in ${body.lines}.size():
+     * the parser reads it as text, not as part of the function (r27 of the local-model benchmark, 18 calls of the
+     * expression tool with it in one step). The hint writes it inside the braces: ${body.lines.size()}. Null when the
+     * text at the index does not follow a function whose value can be read further, or is a filter, which Simple does
+     * not have.
+     *
+     * @param  expression the expression
+     * @param  index      the index of the first character after the closing brace of the function
+     * @return            the hint, or null
+     */
+    public static String afterFunction(String expression, int index) {
+        if (expression == null || index < 3 || index >= expression.length() || expression.charAt(index - 1) != '}') {
+            return null;
+        }
+        // the ${ that the brace closes
+        int depth = 0;
+        int open = -1;
+        for (int i = index - 1; i > 0 && open < 0; i--) {
+            char c = expression.charAt(i);
+            if (c == '}') {
+                depth++;
+            } else if (c == '{' && expression.charAt(i - 1) == '$' && --depth == 0) {
+                open = i - 1;
+            }
+        }
+        String rest = expression.substring(index);
+        Matcher path = PATH.matcher(rest);
+        if (open < 0 || !path.lookingAt() || rest.matches("(?s)\\??\\.[?^$!]\\[.*|\\[\\?\\(.*")) {
+            return null;
+        }
+        String inner = expression.substring(open + 2, index - 1);
+        if (!READ_FURTHER.matcher(inner).matches()) {
+            return null;
+        }
+        String written = path.group();
+        String what = written.endsWith(")") ? "method" : written.endsWith("]") ? "index" : "field";
+        return "the " + what + " " + written + " is outside the function, as text after its closing brace: write it inside"
+               + " the braces, ${" + inner + written + "}";
+    }
+
+    /** The index of the brace that closes the ${ the text starts with, or -1. */
+    private static int closingBrace(String text) {
+        int depth = 0;
+        for (int i = 0; i < text.length(); i++) {
+            if (text.startsWith("${", i)) {
+                depth++;
+                i++;
+            } else if (text.charAt(i) == '}' && --depth == 0) {
+                return i;
+            }
+        }
+        return -1;
+    }
+
+    /** The message when an operator has no usable value next to it. */
+    public static String unsupportedOperand(String kind, Object operator, String expression, int index) {
+        String word = wordAt(expression, index);
+        String negated = negatedFunction(word);
+        if (negated != null) {
+            return "! negates a function, which is written as ${ }: " + word + " is written as " + negated;
+        }
+        if ("Logical".equals(kind)) {
+            return kind + " operator " + operator + " needs a predicate on the right hand side, e.g. ${header.foo} == 'bar'"
+                   + (word.isEmpty() ? "" : "; was: " + word);
+        }
+        if (word.isEmpty() || word.equals(String.valueOf(operator))) {
+            return kind + " operator " + operator + " needs a value on the right hand side: " + VALUE_FORMS;
+        }
+        return kind + " operator " + operator + " does not accept " + word + " on the right hand side: write it as "
+               + VALUE_FORMS + (isKnownFunction(functionName(word)) ? ", e.g. ${" + word + "}" : ", e.g. '" + word + "'");
+    }
+
+    /** The comparison operators, with the spaces they must be surrounded by. */
+    private static final String[] SPACED_OPERATORS = {
+            " >= ", " <= ", " > ", " < ", " == ", " != ", " =~ ", " !=~ ",
+            " contains ", " !contains ", " ~~ ", " !~~ ", " regex ", " !regex ",
+            " in ", " !in ", " is ", " !is ", " range ", " !range ",
+            " startsWith ", " !startsWith ", " endsWith ", " !endsWith ", " equals ", " !equals " };
+
+    /**
+     * Wraps the function references of a predicate written inside {@code ${ }} so that it can be parsed as one:
+     * {@code body != null && body.size() > 0} becomes {@code ${body} != null && ${body.size()} > 0}.
+     * <p>
+     * Each comparison is wrapped, not only the first, so that a compound condition reads the way it looks (CAMEL-24920,
+     * CAMEL-24921). An operator counts only when whitespace surrounds it outside quotes, brackets and parentheses,
+     * which is what keeps {@code ${header.Content-Length}} and {@code ${date:now:yyyy-MM-dd}} a plain function, and an
+     * operator in an index or an argument, as in {@code ${iif(header.a > 0, 'x', 'y')}}, where it is.
+     */
+    public static String wrapFunctions(String text) {
+        StringBuilder answer = new StringBuilder();
+        int from = 0;
+        for (int at = logicalOperator(text, 0); at >= 0; at = logicalOperator(text, from)) {
+            // the operator matched with its trailing space, so the next space is at most two characters away
+            int end = text.indexOf(' ', at + 1);
+            answer.append(wrapComparison(text.substring(from, at).trim()));
+            answer.append(' ').append(text, at, end).append(' ');
+            from = end + 1;
+        }
+        answer.append(wrapComparison(text.substring(from).trim()));
+        return answer.toString();
+    }
+
+    /**
+     * The index of the next logical operator ({@code &&} or {@code ||}) outside quotes, or -1. Simple has no word
+     * forms: {@code and} and {@code or} are refused by the parser with a message that says so.
+     */
+    private static int logicalOperator(String text, int from) {
+        boolean single = false;
+        boolean dubble = false;
+        int depth = 0;
+        for (int i = from; i < text.length(); i++) {
+            char c = text.charAt(i);
+            if (c == '\'' && !dubble) {
+                single = !single;
+            } else if (c == '"' && !single) {
+                dubble = !dubble;
+            } else if (!single && !dubble && (c == '(' || c == '[')) {
+                depth++;
+            } else if (!single && !dubble && (c == ')' || c == ']')) {
+                depth--;
+            } else if (!single && !dubble && depth == 0 && c == ' ') {
+                for (String op : new String[] { "&& ", "|| " }) {
+                    if (text.startsWith(op, i + 1)) {
+                        return i + 1;
+                    }
+                }
+            }
+        }
+        return -1;
+    }
+
+    /** Wraps the left hand side of one comparison with {@code ${ }} when it is a function reference. */
+    private static String wrapComparison(String text) {
+        // the first operator outside quotes, so ${body == 'a > b'} is compared with ==
+        String first = null;
+        int firstAt = -1;
+        for (String op : SPACED_OPERATORS) {
+            int at = indexOutsideQuotes(text, op);
+            if (at > 0 && (firstAt < 0 || at < firstAt)) {
+                firstAt = at;
+                first = op;
+            }
+        }
+        if (first != null) {
+            return wrapComparison(text, first, firstAt);
+        }
+        for (String op : SPACED_OPERATORS) {
+            if (text.endsWith(op.stripTrailing())) {
+                // the operator ends the text: wrap what is there, so the parser says what is missing after it
+                int at = text.length() - op.stripTrailing().length();
+                if (at > 0) {
+                    return wrapComparison(text, op, at);
+                }
+            }
+        }
+        if (text.length() > 1 && text.charAt(0) == '!' && !text.startsWith("!${")) {
+            // a negated function on its own, such as !body.isEmpty(): the predicate parser reads a ! in front of
+            // a ${ }, so give it that form (CAMEL-24984)
+            return "!${" + text.substring(1).trim() + "}";
+        }
+        return text;
+    }
+
+    private static String wrapComparison(String text, String op, int at) {
+        String left = text.substring(0, at).trim();
+        String right = at + op.length() <= text.length() ? text.substring(at + op.length()).trim() : "";
+        if (!left.startsWith("${") && !left.startsWith("'") && !left.startsWith("\"")
+                && !isNumeric(left) && !"true".equalsIgnoreCase(left)
+                && !"false".equalsIgnoreCase(left) && !"null".equalsIgnoreCase(left)) {
+            left = "${" + left + "}";
+        }
+        return left + op + right;
+    }
+
+    /**
+     * The index of the text outside single and double quotes, brackets and parentheses, or -1: an operator inside them
+     * belongs to an index or an argument, as in {@code body.?[qty < 1].size() > 0}, which was split at the {@code <}
+     * and reported as {@code ${body.?[qty} < 1].size() > 0}, text that was never written.
+     */
+    private static int indexOutsideQuotes(String text, String find) {
+        boolean single = false;
+        boolean dubble = false;
+        int depth = 0;
+        for (int i = 0; i < text.length(); i++) {
+            char c = text.charAt(i);
+            if (c == '\'' && !dubble) {
+                single = !single;
+            } else if (c == '"' && !single) {
+                dubble = !dubble;
+            } else if (!single && !dubble && (c == '(' || c == '[')) {
+                depth++;
+            } else if (!single && !dubble && (c == ')' || c == ']')) {
+                depth--;
+            } else if (!single && !dubble && depth == 0 && text.startsWith(find, i)) {
+                return i;
+            }
+        }
+        return -1;
+    }
+
+    /** The elvis operator, with the spaces it must be surrounded by. */
+    private static final String SPACED_ELVIS = " ?: ";
+
+    /**
+     * The elvis operator written inside {@code ${ }}, as the same expression with the operator after the function:
+     * {@code header.a ?: 'x'} is {@code ${header.a} ?: 'x'}, and {@code header.a ?: ${header.b} ?: 'x'} is
+     * {@code ${header.a} ?: ${header.b} ?: 'x'}; null when the text has no elvis operator (CAMEL-26401).
+     * <p>
+     * Like the other operators it counts only with a space on both sides, outside quotes, brackets, parentheses and
+     * nested functions, so {@code ${header.a ?:10}} is a header named {@code a ?:10}, as {@code ?:10} after the braces
+     * is text, and {@code ${body.replace('a ?: b', '')}} is a function. The default value of a property is text too:
+     * {@code ${properties:msg:which ?: none}}.
+     */
+    public static String elvisOutside(String function) {
+        int at = elvisIndex(function);
+        if (at <= 0 || at + SPACED_ELVIS.length() >= function.length()) {
+            return null;
+        }
+        String head = function.substring(0, at);
+        if (head.isBlank() || head.startsWith("properties:") && head.indexOf(':', 11) > 0) {
+            return null;
+        }
+        return "${" + head + "}" + function.substring(at);
+    }
+
+    /** The index of the first spaced elvis operator outside quotes, brackets, parentheses and nested functions. */
+    private static int elvisIndex(String text) {
+        boolean single = false;
+        boolean dubble = false;
+        int depth = 0;
+        for (int i = 0; i < text.length(); i++) {
+            char c = text.charAt(i);
+            if (c == '\'' && !dubble) {
+                single = !single;
+            } else if (c == '"' && !single) {
+                dubble = !dubble;
+            } else if (!single && !dubble && (c == '(' || c == '[' || c == '{')) {
+                // a { opens a nested ${ } function
+                depth++;
+            } else if (!single && !dubble && (c == ')' || c == ']' || c == '}')) {
+                depth--;
+            } else if (!single && !dubble && depth == 0 && text.startsWith(SPACED_ELVIS, i)) {
+                return i;
+            }
+        }
+        return -1;
+    }
+
+    private static boolean isNumeric(String text) {
+        if (text == null || text.isEmpty()) {
+            return false;
+        }
+        try {
+            Double.parseDouble(text);
+            return true;
+        } catch (NumberFormatException e) {
+            return false;
+        }
+    }
+
+    /**
+     * When an operator is written inside the function (${body == 'x'}), the rewrite with the operator outside, else
+     * null.
+     */
+    public static String operatorsOutside(String function) {
+        int best = -1;
+        String bestOp = null;
+        for (String op : OPERATOR_WORDS) {
+            // an operator inside quotes belongs to a literal, such as the argument of ${uppercase('a') == 'A'}: the
+            // first one outside quotes, brackets and parentheses is the operator, so a function with a quoted argument
+            // can be compared
+            int i = indexOutsideQuotes(function, " " + op + " ");
+            if (i > 0 && (best < 0 || i < best)) {
+                best = i;
+                bestOp = op;
+            }
+        }
+        if (bestOp == null) {
+            return null;
+        }
+        // an operator inside an argument list that may hold a predicate (iif, filter, forEach), or inside a key such as
+        // ${header[order in progress]}, is not at the top level, so indexOutsideQuotes has skipped it
+        String head = function.substring(0, best);
+        if (head.startsWith("properties:") && head.indexOf(':', 11) > 0) {
+            // the operator word is in the default value: ${properties:msg:value is not set}
+            return null;
+        }
+        return "${" + head + "}" + function.substring(best);
+    }
+
+    /** A hint for an unknown function, or null. */
+    public static String unknownFunction(String function) {
+        if (function == null) {
+            return null;
+        }
+        String trimmed = function.trim();
+        if (!trimmed.equals(function)) {
+            return "remove the spaces: ${" + trimmed + "}";
+        }
+        String rewrite = operatorsOutside(function);
+        if (rewrite != null) {
+            return "operators go outside the function: " + rewrite;
+        }
+        String bare = function.contains("(") ? function.substring(0, function.indexOf('(')) : function;
+        bare = bare.contains(".") ? bare.substring(0, bare.indexOf('.')) : bare;
+        if (bare.equals("simple")) {
+            // ${simple} in a log message or a simple: expression: the text is already simple
+            return "simple is the language, not a function: the text is already a simple expression, write the values"
+                   + " with ${body}, ${header.name}, ${date:now:HH:mm:ss} and leave the rest as plain text";
+        }
+        if (bare.matches("groovy|xquery|mvel|ognl|spel|js|python|java|constant|tokenize|method")) {
+            return bare + " is a language, not a simple function: another language cannot be nested inside ${...}; write"
+                   + " the expression with its own key, for example " + bare + ": \"...\"";
+        }
+        // ${jsonpath:$.status}: written the way bean: and date: are, but these functions take parentheses (CAMEL-24845)
+        int colon = function.indexOf(':');
+        if (colon > 0 && QUERY_FUNCTIONS.contains(function.substring(0, colon))) {
+            return parentheses(function.substring(0, colon), function.substring(colon + 1));
+        }
+        if (QUERY_FUNCTIONS.contains(bare)) {
+            // ${jsonpath}: a simple function of its own since QueryLanguageFunctionFactory, not a nested language
+            return parentheses(bare, "exp");
+        }
+        if (function.matches(".*\\S\\s+[-+*/%]\\s+\\S.*")) {
+            // ${exchangeCounter % 3}, ${header.total * 2}: there is no arithmetic in simple
+            return "simple has no arithmetic operators (+ - * / %): compute the value in a groovy expression"
+                   + " (groovy: \"...\") or in a bean, and use the result here";
+        }
+        String name = functionName(function);
+        String rest = function.substring(name.length());
+        String alias = ALIASES.get(name);
+        if (alias == null && name.contains(".")) {
+            alias = ALIASES.get(name.substring(0, name.indexOf('.')));
+            if (alias != null) {
+                alias = alias + name.substring(name.indexOf('.'));
+            }
+        }
+        if (alias != null) {
+            if (rest.isEmpty() && CALLED_WITH_PARENTHESES.contains(alias)) {
+                rest = "()";
+            }
+            if (rest.startsWith(":") && QUERY_FUNCTIONS.contains(alias)) {
+                // ${json:$.status}: the alias resolves to jsonpath, so the argument moves into parentheses too
+                return parentheses(alias, rest.substring(1));
+            }
+            return "did you mean ${" + alias + rest + "}?";
+        }
+        for (String f : FUNCTIONS) {
+            if (f.equalsIgnoreCase(name) && !f.equals(name)) {
+                return "function names are case sensitive: ${" + f + rest + "}";
+            }
+        }
+        String closest = closest(name);
+        if (closest != null && !closest.equals(name)) {
+            // a suggestion that repeats the rejected text teaches nothing, and the reader writes it again (CAMEL-24845)
+            return "did you mean ${" + closest + rest + "}?";
+        }
+        return "the functions are documented on the simple language page (functions)";
+    }
+
+    /**
+     * The hint for a file: function the file language does not have: the function meant, such as ${file:name.noext} for
+     * ${file:noext} or ${file:name:noext}, and the usual ones. A path, such as ${file:data/stock.json}, is a file to
+     * read, which the file: functions do not do.
+     *
+     * @param remainder the text after file:, such as noext
+     */
+    public static String unknownFileFunction(String remainder) {
+        String text = remainder != null ? remainder.strip() : "";
+        // name:noext, name_noext, Name.NoExt: the separators and the case of a function name written another way
+        String normalized = text.toLowerCase(Locale.ROOT).replaceAll("[:_\\- ]+", ".").replaceAll("\\.{2,}", ".")
+                .replaceAll("^\\.|\\.$", "");
+        if ("noext".equals(normalized)) {
+            // the name without the extension: ${file:name.noext} has the folders below the starting directory too
+            return "did you mean ${file:name.noext}, the file name without its extension? ${file:onlyname.noext} also"
+                   + " leaves out its folders. The " + FILE_FUNCTIONS_TEXT;
+        }
+        String meant = closestFileFunction(normalized);
+        if (meant != null) {
+            return "did you mean ${file:" + meant + "}? The " + FILE_FUNCTIONS_TEXT;
+        }
+        if (text.contains("/") || text.contains("\\") || text.matches(".+\\.[A-Za-z0-9]{1,5}")) {
+            return "the " + FILE_FUNCTIONS_TEXT + "; they do not read a file. To read a file into the body use the poll"
+                   + " EIP with a file: endpoint";
+        }
+        return "the " + FILE_FUNCTIONS_TEXT;
+    }
+
+    /** The file function a name written another way means: nameNoExt, absolutepath, a letter or two off; or null. */
+    private static String closestFileFunction(String normalized) {
+        if (normalized.isEmpty()) {
+            return null;
+        }
+        if (FILE_FUNCTIONS.contains(normalized)) {
+            return normalized;
+        }
+        String compact = normalized.replace(".", "");
+        for (String f : FILE_FUNCTIONS) {
+            if (f.replace(".", "").equals(compact)) {
+                return f;
+            }
+        }
+        String best = null;
+        int bestDistance = Integer.MAX_VALUE;
+        int threshold = Math.max(2, normalized.length() / 3);
+        for (String f : FILE_FUNCTIONS) {
+            int d = distance(normalized, f);
+            if (d <= threshold && d < bestDistance) {
+                best = f;
+                bestDistance = d;
+            }
+        }
+        return best;
+    }
+
+    /** The did-you-mean for a function whose argument was written after a colon instead of in parentheses. */
+    private static String parentheses(String name, String argument) {
+        if ("semantic".equals(name)) {
+            argument = "'" + ("exp".equals(argument) ? "evaluationName" : argument) + "'";
+        }
+        return "the argument goes in parentheses: did you mean ${" + name + "(" + argument + ")}?";
+    }
+
+    static String functionName(String function) {
+        int end = 0;
+        while (end < function.length()) {
+            char ch = function.charAt(end);
+            if (ch == '(' || ch == ':' || ch == '[' || ch == '?' || Character.isWhitespace(ch)) {
+                break;
+            }
+            if (ch == '.' && !function.startsWith("in.", 0) && !function.startsWith("out.", 0)
+                    && !function.startsWith("date-with", 0)) {
+                // header.foo and exchangeProperty.foo: the name is the part before the dot; in.body keeps its dot
+                break;
+            }
+            end++;
+        }
+        return function.substring(0, end);
+    }
+
+    static boolean isKnownFunction(String name) {
+        return !name.isEmpty() && (FUNCTIONS.contains(name) || ALIASES.containsKey(name));
+    }
+
+    static String closest(String name) {
+        if (name.length() < 3) {
+            return null;
+        }
+        // bodyxxx, headerz: a known function name followed by something that is not OGNL
+        String prefix = null;
+        for (String f : FUNCTIONS) {
+            if (f.length() >= 3 && name.startsWith(f) && (prefix == null || f.length() > prefix.length())) {
+                prefix = f;
+            }
+        }
+        if (prefix != null) {
+            return prefix;
+        }
+        String best = null;
+        int bestDistance = Integer.MAX_VALUE;
+        int threshold = Math.max(2, name.length() / 3);
+        String lower = name.toLowerCase(Locale.ROOT);
+        for (String f : FUNCTIONS) {
+            int d = distance(lower, f.toLowerCase(Locale.ROOT));
+            if (d <= threshold && (d < bestDistance || d == bestDistance && f.length() < best.length())) {
+                best = f;
+                bestDistance = d;
+            }
+        }
+        return best;
+    }
+
+    static int distance(String a, String b) {
+        int[] prev = new int[b.length() + 1];
+        int[] cur = new int[b.length() + 1];
+        for (int j = 0; j <= b.length(); j++) {
+            prev[j] = j;
+        }
+        for (int i = 1; i <= a.length(); i++) {
+            cur[0] = i;
+            for (int j = 1; j <= b.length(); j++) {
+                int cost = a.charAt(i - 1) == b.charAt(j - 1) ? 0 : 1;
+                cur[j] = Math.min(Math.min(cur[j - 1] + 1, prev[j] + 1), prev[j - 1] + cost);
+            }
+            int[] t = prev;
+            prev = cur;
+            cur = t;
+        }
+        return prev[b.length()];
+    }
+}

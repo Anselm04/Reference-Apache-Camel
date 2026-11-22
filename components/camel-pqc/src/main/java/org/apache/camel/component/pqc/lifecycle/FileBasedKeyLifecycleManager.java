@@ -1,0 +1,819 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.camel.component.pqc.lifecycle;
+
+import java.io.BufferedInputStream;
+import java.io.File;
+import java.io.IOException;
+import java.io.ObjectInputStream;
+import java.io.UncheckedIOException;
+import java.nio.channels.FileChannel;
+import java.nio.channels.FileLock;
+import java.nio.channels.OverlappingFileLockException;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
+import java.nio.file.StandardOpenOption;
+import java.nio.file.attribute.PosixFileAttributeView;
+import java.nio.file.attribute.PosixFilePermissions;
+import java.security.KeyFactory;
+import java.security.KeyPair;
+import java.security.PrivateKey;
+import java.security.PublicKey;
+import java.security.spec.PKCS8EncodedKeySpec;
+import java.security.spec.X509EncodedKeySpec;
+import java.time.Duration;
+import java.time.Instant;
+import java.util.ArrayList;
+import java.util.Base64;
+import java.util.Date;
+import java.util.List;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.stream.Stream;
+
+import com.fasterxml.jackson.annotation.JsonCreator;
+import com.fasterxml.jackson.annotation.JsonProperty;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import tools.jackson.databind.ObjectMapper;
+import tools.jackson.databind.SerializationFeature;
+import tools.jackson.databind.json.JsonMapper;
+
+/**
+ * File-based implementation of KeyLifecycleManager. Stores private keys in PKCS#8 format, public keys in X.509 format,
+ * and metadata as JSON. This is consistent with the encoding used by {@link AwsSecretsManagerKeyLifecycleManager} and
+ * {@link HashicorpVaultKeyLifecycleManager}.
+ * <p/>
+ * For backward compatibility, keys stored in the legacy Java serialization format are automatically migrated to the new
+ * standard format on first read.
+ */
+public class FileBasedKeyLifecycleManager implements KeyLifecycleManager {
+
+    private static final Logger LOG = LoggerFactory.getLogger(FileBasedKeyLifecycleManager.class);
+    private static final String METADATA_SUFFIX = ".metadata";
+
+    private static final String LOCK_SUFFIX = ".lock";
+
+    private final Path keyDirectory;
+    private final ObjectMapper objectMapper;
+    private final ConcurrentHashMap<String, KeyPair> keyCache = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<String, KeyMetadata> metadataCache = new ConcurrentHashMap<>();
+    /**
+     * The lock files held in this JVM, by their real path, with the manager that holds each. A manager that would take
+     * a lock another manager in this JVM already holds is refused here, before a second channel is opened on the file:
+     * a second channel is what must never exist, see {@link #openAndLock(String)}.
+     */
+    private static final ConcurrentHashMap<Path, FileBasedKeyLifecycleManager> JVM_CLAIMS = new ConcurrentHashMap<>();
+    /**
+     * Channels that turned out to hold a lock taken through another channel on the same file, see
+     * {@link #openAndLockChannel(String, Path)}. They stay referenced for the life of the JVM: closing them, or letting
+     * the garbage collector close them, would drop that other lock.
+     */
+    private static final List<FileChannel> FOREIGN_LOCK_CHANNELS = new CopyOnWriteArrayList<>();
+    private final ConcurrentHashMap<String, StatefulClaim> statefulClaims = new ConcurrentHashMap<>();
+
+    public FileBasedKeyLifecycleManager(String keyDirectoryPath) throws IOException {
+        this.keyDirectory = Paths.get(keyDirectoryPath).toAbsolutePath().normalize();
+        this.objectMapper = JsonMapper.builderWithJackson2Defaults()
+                .enable(SerializationFeature.INDENT_OUTPUT)
+                .build();
+        Files.createDirectories(keyDirectory);
+        restrictToOwner(keyDirectory);
+        LOG.info("Initialized FileBasedKeyLifecycleManager with directory: {}", keyDirectory);
+        loadExistingKeys();
+    }
+
+    @Override
+    public KeyPair generateKeyPair(String algorithm, String keyId) throws Exception {
+        return generateKeyPair(algorithm, keyId, null);
+    }
+
+    @Override
+    public KeyPair generateKeyPair(String algorithm, String keyId, Object parameterSpec) throws Exception {
+        LOG.info("Generating key pair for algorithm: {}, keyId: {}", algorithm, keyId);
+
+        KeyPair keyPair = KeyAlgorithmSupport.generateKeyPair(algorithm, parameterSpec);
+
+        // Create metadata
+        KeyMetadata metadata = new KeyMetadata(keyId, algorithm);
+        metadata.setDescription("Generated on " + new Date());
+
+        // Store the key
+        storeKey(keyId, keyPair, metadata);
+
+        LOG.info("Generated key pair: {}", metadata);
+        return keyPair;
+    }
+
+    @Override
+    public byte[] exportKey(KeyPair keyPair, KeyFormat format, boolean includePrivate) throws Exception {
+        return KeyFormatConverter.exportKeyPair(keyPair, format, includePrivate);
+    }
+
+    @Override
+    public byte[] exportPublicKey(KeyPair keyPair, KeyFormat format) throws Exception {
+        return KeyFormatConverter.exportPublicKey(keyPair.getPublic(), format);
+    }
+
+    @Override
+    public KeyPair importKey(byte[] keyData, KeyFormat format, String algorithm) throws Exception {
+        // Try to import as private key first (which includes public key)
+        try {
+            PrivateKey privateKey = KeyFormatConverter.importPrivateKey(keyData, format,
+                    KeyAlgorithmSupport.getAlgorithmName(algorithm));
+            // For PQC algorithms, we need to derive the public key
+            // This is algorithm-specific and may require regeneration
+            LOG.warn("Importing private key only - public key derivation may be needed");
+            return new KeyPair(null, privateKey);
+        } catch (Exception e) {
+            // Try as public key only
+            PublicKey publicKey = KeyFormatConverter.importPublicKey(keyData, format,
+                    KeyAlgorithmSupport.getAlgorithmName(algorithm));
+            return new KeyPair(publicKey, null);
+        }
+    }
+
+    @Override
+    public KeyPair rotateKey(String oldKeyId, String newKeyId, String algorithm) throws Exception {
+        LOG.info("Rotating key from {} to {}", oldKeyId, newKeyId);
+
+        // Get old key metadata
+        KeyMetadata oldMetadata = getKeyMetadata(oldKeyId);
+        if (oldMetadata == null) {
+            throw new IllegalArgumentException("Old key not found: " + oldKeyId);
+        }
+
+        // Mark old key as deprecated
+        oldMetadata.setStatus(KeyMetadata.KeyStatus.DEPRECATED);
+        updateKeyMetadata(oldKeyId, oldMetadata);
+
+        // Generate new key
+        KeyPair newKeyPair = generateKeyPair(algorithm, newKeyId);
+
+        LOG.info("Key rotation completed: {} -> {}", oldKeyId, newKeyId);
+        return newKeyPair;
+    }
+
+    @Override
+    public void storeKey(String keyId, KeyPair keyPair, KeyMetadata metadata) throws Exception {
+        // Store private key in PKCS#8 format
+        Path privateKeyFile = getPrivateKeyFile(keyId);
+        byte[] privateKeyBytes = keyPair.getPrivate().getEncoded();
+        String privateKeyBase64 = Base64.getEncoder().encodeToString(privateKeyBytes);
+        KeyFileData privateData = new KeyFileData(privateKeyBase64, "PKCS8", metadata.getAlgorithm());
+        writePrivateKeyFile(privateKeyFile, objectMapper.writeValueAsString(privateData));
+
+        // Store public key in X.509 format
+        Path publicKeyFile = getPublicKeyFile(keyId);
+        byte[] publicKeyBytes = keyPair.getPublic().getEncoded();
+        String publicKeyBase64 = Base64.getEncoder().encodeToString(publicKeyBytes);
+        KeyFileData publicData = new KeyFileData(publicKeyBase64, "X509", metadata.getAlgorithm());
+        Files.writeString(publicKeyFile, objectMapper.writeValueAsString(publicData),
+                StandardCharsets.UTF_8,
+                StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING);
+
+        // Store metadata as JSON
+        Path metadataFile = getMetadataFile(keyId);
+        MetadataFileData metadataData = MetadataFileData.fromKeyMetadata(metadata);
+        Files.writeString(metadataFile, objectMapper.writeValueAsString(metadataData),
+                StandardCharsets.UTF_8,
+                StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING);
+
+        // Remove legacy .key file if it exists (migration cleanup)
+        Files.deleteIfExists(getLegacyKeyFile(keyId));
+
+        // Update caches
+        keyCache.put(keyId, keyPair);
+        metadataCache.put(keyId, metadata);
+
+        LOG.debug("Stored key and metadata for: {}", keyId);
+    }
+
+    @Override
+    public KeyPair getKey(String keyId) throws Exception {
+        if (keyCache.containsKey(keyId)) {
+            return keyCache.get(keyId);
+        }
+
+        Path privateKeyFile = getPrivateKeyFile(keyId);
+        Path publicKeyFile = getPublicKeyFile(keyId);
+
+        // Check for new format first
+        if (Files.exists(privateKeyFile) && Files.exists(publicKeyFile)) {
+            KeyPair keyPair = readStandardKeyPair(keyId, privateKeyFile, publicKeyFile);
+            keyCache.put(keyId, keyPair);
+            return keyPair;
+        }
+
+        // Fall back to legacy format for migration
+        Path legacyKeyFile = getLegacyKeyFile(keyId);
+        if (Files.exists(legacyKeyFile)) {
+            return migrateLegacyKey(keyId);
+        }
+
+        throw new IllegalArgumentException("Key not found: " + keyId);
+    }
+
+    @Override
+    public KeyMetadata getKeyMetadata(String keyId) throws Exception {
+        if (metadataCache.containsKey(keyId)) {
+            return metadataCache.get(keyId);
+        }
+
+        Path metadataFile = getMetadataFile(keyId);
+        if (!Files.exists(metadataFile)) {
+            return null;
+        }
+
+        // Detect the format from the raw bytes: a JSON document starts with '{', whereas a legacy
+        // Java-serialized file is binary (and not valid UTF-8), so it must not be read as a String first.
+        byte[] content = Files.readAllBytes(metadataFile);
+        if (isJsonContent(content)) {
+            MetadataFileData data = objectMapper.readValue(content, MetadataFileData.class);
+            KeyMetadata metadata = data.toKeyMetadata();
+            metadataCache.put(keyId, metadata);
+            return metadata;
+        } else {
+            // Legacy format - read via ObjectInputStream and migrate
+            return migrateLegacyMetadata(keyId);
+        }
+    }
+
+    @Override
+    public void updateKeyMetadata(String keyId, KeyMetadata metadata) throws Exception {
+        Path metadataFile = getMetadataFile(keyId);
+        MetadataFileData metadataData = MetadataFileData.fromKeyMetadata(metadata);
+        Files.writeString(metadataFile, objectMapper.writeValueAsString(metadataData),
+                StandardCharsets.UTF_8,
+                StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING);
+        metadataCache.put(keyId, metadata);
+    }
+
+    @Override
+    public void deleteKey(String keyId) throws Exception {
+        Files.deleteIfExists(getPrivateKeyFile(keyId));
+        Files.deleteIfExists(getPublicKeyFile(keyId));
+        Files.deleteIfExists(getMetadataFile(keyId));
+        Files.deleteIfExists(getLegacyKeyFile(keyId));
+        keyCache.remove(keyId);
+        metadataCache.remove(keyId);
+        LOG.info("Deleted key: {}", keyId);
+    }
+
+    /**
+     * Lists the keys by scanning the key directory for metadata files.
+     * <p/>
+     * Returning the cache alone would hide any key file written after start-up - by another process, by an operator
+     * restoring a backup, or by a sidecar. That matters directly for {@link KeyRotationScheduler}, which drives
+     * entirely off this method and would otherwise stop rotating anything it had not seen at boot. Note that the scan
+     * finds such a key, but the metadata of a key this process already knows still comes from the cache, so a status
+     * another process wrote for it is not picked up until a restart.
+     * <p/>
+     * A file that cannot be read is logged and skipped rather than failing the call: one corrupt or half-written
+     * metadata file must not stop every other key from being listed, and so rotated.
+     */
+    @Override
+    public List<KeyMetadata> listKeys() throws Exception {
+        List<KeyMetadata> keys = new ArrayList<>();
+        try (Stream<Path> files = Files.list(keyDirectory)) {
+            for (Path file : files.filter(path -> path.toString().endsWith(METADATA_SUFFIX)).sorted().toList()) {
+                String name = file.getFileName().toString();
+                String keyId = name.substring(0, name.length() - METADATA_SUFFIX.length());
+                try {
+                    KeyMetadata metadata = getKeyMetadata(keyId);
+                    if (metadata != null) {
+                        keys.add(metadata);
+                    }
+                } catch (Exception e) {
+                    LOG.warn("Failed to read key metadata, skipping: {}", file, e);
+                }
+            }
+        }
+        return keys;
+    }
+
+    @Override
+    public boolean needsRotation(String keyId, Duration maxAge, long maxUsage) throws Exception {
+        KeyMetadata metadata = getKeyMetadata(keyId);
+        if (metadata == null) {
+            return false;
+        }
+
+        if (metadata.needsRotation()) {
+            return true;
+        }
+
+        if (maxAge != null && metadata.getAgeInDays() > maxAge.toDays()) {
+            return true;
+        }
+
+        if (maxUsage > 0 && metadata.getUsageCount() >= maxUsage) {
+            return true;
+        }
+
+        return false;
+    }
+
+    @Override
+    public void expireKey(String keyId) throws Exception {
+        KeyMetadata metadata = getKeyMetadata(keyId);
+        if (metadata != null) {
+            metadata.setStatus(KeyMetadata.KeyStatus.EXPIRED);
+            updateKeyMetadata(keyId, metadata);
+            LOG.info("Expired key: {}", keyId);
+        }
+    }
+
+    @Override
+    public void revokeKey(String keyId, String reason) throws Exception {
+        KeyMetadata metadata = getKeyMetadata(keyId);
+        if (metadata != null) {
+            metadata.setStatus(KeyMetadata.KeyStatus.REVOKED);
+            metadata.setDescription((metadata.getDescription() != null ? metadata.getDescription() + "; " : "")
+                                    + "Revoked: " + reason);
+            updateKeyMetadata(keyId, metadata);
+            LOG.info("Revoked key: {} - {}", keyId, reason);
+        }
+    }
+
+    private KeyPair readStandardKeyPair(String keyId, Path privateKeyFile, Path publicKeyFile) throws Exception {
+        String privateJson = Files.readString(privateKeyFile, StandardCharsets.UTF_8);
+        KeyFileData privateData = objectMapper.readValue(privateJson, KeyFileData.class);
+        byte[] privateKeyBytes = Base64.getDecoder().decode(privateData.key());
+        PKCS8EncodedKeySpec privateSpec = new PKCS8EncodedKeySpec(privateKeyBytes);
+
+        String publicJson = Files.readString(publicKeyFile, StandardCharsets.UTF_8);
+        KeyFileData publicData = objectMapper.readValue(publicJson, KeyFileData.class);
+        byte[] publicKeyBytes = Base64.getDecoder().decode(publicData.key());
+        X509EncodedKeySpec publicSpec = new X509EncodedKeySpec(publicKeyBytes);
+
+        String algorithm = privateData.algorithm();
+        String algorithmName = KeyAlgorithmSupport.getAlgorithmName(algorithm);
+        String provider = KeyAlgorithmSupport.determineProvider(algorithm);
+
+        KeyFactory keyFactory;
+        if (provider != null) {
+            keyFactory = KeyFactory.getInstance(algorithmName, provider);
+        } else {
+            keyFactory = KeyFactory.getInstance(algorithmName);
+        }
+
+        PrivateKey privateKey = keyFactory.generatePrivate(privateSpec);
+        PublicKey publicKey = keyFactory.generatePublic(publicSpec);
+        return new KeyPair(publicKey, privateKey);
+    }
+
+    /**
+     * Migrates a legacy Java-serialized key file to the new PKCS#8/X.509 JSON format.
+     */
+    @SuppressWarnings("java:S4508")
+    private KeyPair migrateLegacyKey(String keyId) throws Exception {
+        LOG.info("Migrating legacy key format to PKCS#8/X.509 for keyId: {}", keyId);
+        Path legacyKeyFile = getLegacyKeyFile(keyId);
+
+        KeyPair keyPair;
+        try (ObjectInputStream ois = new ObjectInputStream(new BufferedInputStream(Files.newInputStream(legacyKeyFile)))) {
+            ois.setObjectInputFilter(KeyMetadataCodec.KEY_PAIR_FILTER);
+            keyPair = (KeyPair) ois.readObject();
+        }
+
+        // Read or migrate metadata
+        KeyMetadata metadata = getKeyMetadata(keyId);
+        if (metadata == null) {
+            metadata = new KeyMetadata(keyId, "UNKNOWN");
+            metadata.setDescription("Migrated from legacy format");
+        }
+
+        // Re-store in the new format (this also removes the legacy .key file)
+        storeKey(keyId, keyPair, metadata);
+        LOG.info("Successfully migrated key to PKCS#8/X.509 format: {}", keyId);
+        return keyPair;
+    }
+
+    /**
+     * Migrates a legacy Java-serialized metadata file to JSON format.
+     */
+    @SuppressWarnings("java:S4508")
+    private KeyMetadata migrateLegacyMetadata(String keyId) throws Exception {
+        LOG.info("Migrating legacy metadata format to JSON for keyId: {}", keyId);
+        Path metadataFile = getMetadataFile(keyId);
+
+        KeyMetadata metadata;
+        try (ObjectInputStream ois = new ObjectInputStream(new BufferedInputStream(Files.newInputStream(metadataFile)))) {
+            ois.setObjectInputFilter(KeyMetadataCodec.METADATA_FILTER);
+            metadata = (KeyMetadata) ois.readObject();
+        }
+
+        // Re-store in JSON format
+        MetadataFileData metadataData = MetadataFileData.fromKeyMetadata(metadata);
+        Files.writeString(metadataFile, objectMapper.writeValueAsString(metadataData),
+                StandardCharsets.UTF_8,
+                StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING);
+
+        metadataCache.put(keyId, metadata);
+        LOG.info("Successfully migrated metadata to JSON format: {}", keyId);
+        return metadata;
+    }
+
+    private void loadExistingKeys() {
+        try (Stream<Path> files = Files.list(keyDirectory)) {
+            files.filter(path -> path.toString().endsWith(METADATA_SUFFIX))
+                    .forEach(path -> {
+                        try {
+                            String keyId = path.getFileName().toString().replace(METADATA_SUFFIX, "");
+                            KeyMetadata metadata = getKeyMetadata(keyId);
+                            if (metadata != null) {
+                                LOG.debug("Loaded existing key: {}", metadata);
+                            }
+                        } catch (Exception e) {
+                            LOG.warn("Failed to load key metadata: {}", path, e);
+                        }
+                    });
+        } catch (IOException e) {
+            LOG.warn("Failed to list existing keys", e);
+        }
+    }
+
+    /**
+     * Writes the private key, restricting the file to its owner first so the content is never briefly readable by
+     * everyone. A file left behind by an earlier version is tightened here too, since it is opened for truncation
+     * rather than recreated and would otherwise keep whatever permissions the umask gave it.
+     */
+    private void writePrivateKeyFile(Path file, String content) throws IOException {
+        if (!Files.exists(file)) {
+            Files.createFile(file);
+        }
+        restrictToOwner(file);
+        Files.writeString(file, content, StandardCharsets.UTF_8,
+                StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING);
+    }
+
+    /**
+     * Restricts a path to its owner. Private keys are stored unencrypted, so the common 022 umask - which leaves them
+     * world readable - is not an acceptable default for them.
+     */
+    private static void restrictToOwner(Path path) {
+        boolean directory = Files.isDirectory(path);
+        try {
+            if (Files.getFileAttributeView(path, PosixFileAttributeView.class) != null) {
+                Files.setPosixFilePermissions(path,
+                        PosixFilePermissions.fromString(directory ? "rwx------" : "rw-------"));
+                return;
+            }
+            // Not a POSIX file system: fall back to the java.io.File flags, which do the same job less precisely
+            File file = path.toFile();
+            file.setReadable(false, false);
+            file.setWritable(false, false);
+            file.setReadable(true, true);
+            file.setWritable(true, true);
+            if (directory) {
+                file.setExecutable(false, false);
+                file.setExecutable(true, true);
+            }
+        } catch (IOException | UnsupportedOperationException e) {
+            LOG.warn("Cannot restrict permissions on {}; it may be readable by other users on this host", path, e);
+        }
+    }
+
+    private Path getPrivateKeyFile(String keyId) {
+        return resolveKeyFile(keyId, ".private.json");
+    }
+
+    private Path getPublicKeyFile(String keyId) {
+        return resolveKeyFile(keyId, ".public.json");
+    }
+
+    private Path getMetadataFile(String keyId) {
+        return resolveKeyFile(keyId, METADATA_SUFFIX);
+    }
+
+    private Path getLegacyKeyFile(String keyId) {
+        return resolveKeyFile(keyId, ".key");
+    }
+
+    /**
+     * Takes an exclusive {@link FileLock} on a lock file in the key directory, so that a second process reading the
+     * same key directory - two containers on one volume, say - cannot sign from the same one-time index.
+     * <p/>
+     * The lock file is named from the fingerprint of the public key, so the claim follows the key material: the same
+     * key signed under two names, or under no name at all, contends for one file. A key whose public key gives no
+     * encoding is claimed under its name instead.
+     * <p/>
+     * The lock lives as long as the channel, which this manager keeps open, so the operating system releases it if the
+     * process dies without releasing the claim. Every claim counts as a holder of the key, so producers that share this
+     * manager do not release each other's claim: the key is given back when the last holder releases it.
+     */
+    @Override
+    public boolean claimStatefulKey(String keyId, PublicKey publicKey) throws IOException {
+        String lockName = lockName(keyId, publicKey);
+        String label = keyLabel(keyId, lockName);
+        // compute so the whole open-lock-store sequence happens once per key: a plain containsKey check followed by
+        // a separate put lets two concurrent first-time signers both open a channel, and the loser then finds the
+        // file locked for no reason. A claim on a key this manager already holds adds a holder instead.
+        try {
+            statefulClaims.compute(lockName, (name, claim) -> {
+                if (claim != null) {
+                    claim.holders.incrementAndGet();
+                    return claim;
+                }
+                return openAndLock(name, keyId, label);
+            });
+        } catch (UncheckedIOException e) {
+            throw e.getCause();
+        }
+        return true;
+    }
+
+    /**
+     * Takes the lock file of a key for this manager and returns the claim that holds it.
+     * <p/>
+     * One channel per lock file per JVM. On this platform closing any descriptor of a file releases the lock this
+     * process holds through every other descriptor, while {@code FileLock.isValid()} keeps reporting {@code true}, and
+     * a descriptor the garbage collector closes behind a forgotten channel does the same. So the file is registered in
+     * {@link #JVM_CLAIMS} first, under its real path, and a second manager of the same directory is refused there,
+     * before any channel is opened. A channel is only ever closed here when this process holds no lock on the file.
+     * <p/>
+     * Taking a new lock also drops the cached keys and metadata: the next read comes from the store, which is how a
+     * producer that waited for the claim resumes from the index the previous owner reached.
+     */
+    private StatefulClaim openAndLock(String lockName, String keyId, String label) {
+        Path lockFile = resolveKeyFile(lockName, LOCK_SUFFIX);
+        Path lockPath = realPath(lockFile);
+        FileChannel[] opened = new FileChannel[1];
+        JVM_CLAIMS.compute(lockPath, (path, holder) -> {
+            if (holder != null) {
+                throw new IllegalStateException(
+                        "The stateful key " + label + " is already claimed in this JVM through " + lockPath
+                                                + ". A stateful signature key must have a single owner: share the"
+                                                + " KeyLifecycleManager instance rather than the key directory.");
+            }
+            opened[0] = openAndLockChannel(label, lockFile);
+            return this;
+        });
+
+        // The store may have moved on while the previous owner held the key: read it again rather than from cache.
+        // Both caches go, not only the entry of the name the claim was made under: the key may be read back under
+        // another name, or the claim may have no name at all, and claims are rare.
+        keyCache.clear();
+        metadataCache.clear();
+        LOG.info("Claimed the stateful key {} through {}", label, lockFile);
+        return new StatefulClaim(lockPath, opened[0]);
+    }
+
+    /**
+     * Opens the lock file and takes the exclusive lock on it, returning the channel that holds the lock.
+     */
+    private static FileChannel openAndLockChannel(String label, Path lockFile) {
+        FileChannel channel;
+        try {
+            channel = FileChannel.open(lockFile, StandardOpenOption.CREATE, StandardOpenOption.WRITE);
+            restrictToOwner(lockFile);
+        } catch (IOException e) {
+            throw new UncheckedIOException(e);
+        }
+
+        FileLock lock;
+        try {
+            lock = channel.tryLock();
+        } catch (OverlappingFileLockException e) {
+            // A lock on this file is held through a channel this class did not open. The channel is kept, not
+            // closed: closing it, now or when the garbage collector gets to it, would drop that lock.
+            FOREIGN_LOCK_CHANNELS.add(channel);
+            throw new IllegalStateException(
+                    "The stateful key " + label + " is locked in this JVM through " + lockFile
+                                            + " outside of any FileBasedKeyLifecycleManager. A stateful signature key"
+                                            + " must have a single owner.",
+                    e);
+        } catch (IOException e) {
+            // No lock was taken on this channel, so closing it cannot drop one
+            closeQuietly(channel);
+            throw new UncheckedIOException(e);
+        }
+
+        if (lock == null) {
+            // Held by another process, so this one holds no lock on the file and may close its channel
+            closeQuietly(channel);
+            throw new IllegalStateException(
+                    "The stateful key " + label + " is held by another process through " + lockFile
+                                            + ". Signing from it here would hand out a one-time index twice, which"
+                                            + " breaks the key. Give each process its own stateful key, or stop the"
+                                            + " other one.");
+        }
+
+        return channel;
+    }
+
+    /**
+     * Releases the claim by closing the channel that holds the lock, once the last holder has released it.
+     * <p/>
+     * The lock file itself is left behind on purpose. Deleting it would be unsafe: another process can already have the
+     * same file open and locked, and unlinking it lets a third process create a fresh file at that path and lock that
+     * instead - two owners, each holding a valid lock on a different inode. An empty {@code .lock} file per stateful
+     * key is the cost of that safety.
+     */
+    @Override
+    public void releaseStatefulKey(String keyId, PublicKey publicKey) {
+        String lockName = lockName(keyId, publicKey);
+        StatefulClaim[] released = new StatefulClaim[1];
+        statefulClaims.computeIfPresent(lockName, (name, claim) -> {
+            if (claim.holders.decrementAndGet() > 0) {
+                LOG.debug("The stateful key {} stays claimed, {} holders remain", keyLabel(keyId, name),
+                        claim.holders.get());
+                return claim;
+            }
+            released[0] = claim;
+            return null;
+        });
+        if (released[0] != null) {
+            // closing the channel releases the lock it holds, and only then is the file free for the next manager
+            closeQuietly(released[0].channel);
+            JVM_CLAIMS.remove(released[0].lockPath, this);
+            LOG.info("Released the claim on the stateful key {}", keyLabel(keyId, lockName));
+        }
+    }
+
+    /**
+     * The name of the lock file of a key: the fingerprint of its public key, so that the claim follows the key material
+     * whatever name the key is stored under, or the name when the key gives no encoding to fingerprint.
+     */
+    private static String lockName(String keyId, PublicKey publicKey) {
+        String fingerprint = KeyLifecycleManager.fingerprint(publicKey);
+        if (fingerprint != null) {
+            return fingerprint;
+        }
+        if (keyId != null && !keyId.isBlank()) {
+            return keyId;
+        }
+        throw new IllegalArgumentException(
+                "A stateful key is claimed by its public key, or by its name when the key gives no encoding; neither was given");
+    }
+
+    /**
+     * How a key is referred to in messages: its name when it has one, otherwise the fingerprint it is claimed under.
+     */
+    private static String keyLabel(String keyId, String lockName) {
+        return keyId != null ? "'" + keyId + "'" : "with fingerprint " + lockName;
+    }
+
+    /**
+     * The real path of a lock file, so that two managers that reach one directory through different paths, a symbolic
+     * link say, are known to hold the same file.
+     */
+    private static Path realPath(Path lockFile) {
+        try {
+            return lockFile.getParent().toRealPath().resolve(lockFile.getFileName());
+        } catch (IOException e) {
+            return lockFile.toAbsolutePath().normalize();
+        }
+    }
+
+    /**
+     * A claimed lock file: the channel holding its lock, and how many holders have claimed it.
+     */
+    private static final class StatefulClaim {
+        private final Path lockPath;
+        private final FileChannel channel;
+        private final AtomicInteger holders = new AtomicInteger(1);
+
+        private StatefulClaim(Path lockPath, FileChannel channel) {
+            this.lockPath = lockPath;
+            this.channel = channel;
+        }
+    }
+
+    private static void closeQuietly(FileChannel channel) {
+        try {
+            channel.close();
+        } catch (IOException e) {
+            LOG.debug("Could not close the lock file channel", e);
+        }
+    }
+
+    /**
+     * Resolves a key file inside the configured key directory, confining it to that directory. keyId values arrive from
+     * message headers (CamelPQCKeyId / CamelPQCNewKeyId), so a value containing path separators, parent references or
+     * an absolute path could otherwise resolve to a location outside the key directory. keyId is therefore constrained
+     * to a single flat file-name segment, and the resolved path is checked to lie textually under the key directory
+     * (which is stored absolute and normalized in the constructor).
+     * <p/>
+     * The {@code startsWith} check is textual and does not follow symbolic links, so a symlink placed inside the key
+     * directory could still point elsewhere. Creating such a link requires write access to the operator-controlled key
+     * directory, which is outside the header-supplied keyId threat this guards against.
+     */
+    Path resolveKeyFile(String keyId, String suffix) {
+        if (keyId == null || keyId.isBlank()) {
+            throw new IllegalArgumentException("keyId must not be null or empty");
+        }
+        if (keyId.indexOf('/') >= 0 || keyId.indexOf('\\') >= 0 || keyId.indexOf('\0') >= 0) {
+            throw new IllegalArgumentException("keyId must not contain path separators (length: " + keyId.length() + ")");
+        }
+        Path resolved = keyDirectory.resolve(keyId + suffix).normalize();
+        if (!resolved.startsWith(keyDirectory)) {
+            throw new IllegalArgumentException(
+                    "keyId must resolve inside the key directory (length: " + keyId.length() + ")");
+        }
+        return resolved;
+    }
+
+    /**
+     * Detects whether the given file content is a JSON document (the current format) by inspecting the first
+     * non-whitespace byte, without decoding the bytes as text (a legacy Java-serialized file is binary).
+     */
+    private static boolean isJsonContent(byte[] content) {
+        for (byte b : content) {
+            if (b == ' ' || b == '\t' || b == '\n' || b == '\r') {
+                continue;
+            }
+            return b == '{';
+        }
+        return false;
+    }
+
+    /**
+     * JSON structure for storing key data (private or public) in files.
+     */
+    record KeyFileData(
+            @JsonProperty("key") String key,
+            @JsonProperty("format") String format,
+            @JsonProperty("algorithm") String algorithm) {
+
+        @JsonCreator
+        KeyFileData {
+        }
+    }
+
+    /**
+     * JSON structure for storing key metadata in files.
+     */
+    static final class MetadataFileData {
+        @JsonProperty("keyId")
+        String keyId;
+        @JsonProperty("algorithm")
+        String algorithm;
+        @JsonProperty("createdAt")
+        String createdAt;
+        @JsonProperty("lastUsedAt")
+        String lastUsedAt;
+        @JsonProperty("expiresAt")
+        String expiresAt;
+        @JsonProperty("nextRotationAt")
+        String nextRotationAt;
+        @JsonProperty("usageCount")
+        long usageCount;
+        @JsonProperty("status")
+        String status;
+        @JsonProperty("description")
+        String description;
+
+        MetadataFileData() {
+        }
+
+        static MetadataFileData fromKeyMetadata(KeyMetadata metadata) {
+            MetadataFileData data = new MetadataFileData();
+            data.keyId = metadata.getKeyId();
+            data.algorithm = metadata.getAlgorithm();
+            data.createdAt = metadata.getCreatedAt().toString();
+            data.lastUsedAt = metadata.getLastUsedAt() != null ? metadata.getLastUsedAt().toString() : null;
+            data.expiresAt = metadata.getExpiresAt() != null ? metadata.getExpiresAt().toString() : null;
+            data.nextRotationAt = metadata.getNextRotationAt() != null ? metadata.getNextRotationAt().toString() : null;
+            data.usageCount = metadata.getUsageCount();
+            data.status = metadata.getStatus().name();
+            data.description = metadata.getDescription();
+            return data;
+        }
+
+        KeyMetadata toKeyMetadata() {
+            KeyMetadata metadata = new KeyMetadata(keyId, algorithm, Instant.parse(createdAt));
+            if (lastUsedAt != null) {
+                metadata.setLastUsedAt(Instant.parse(lastUsedAt));
+            }
+            if (expiresAt != null) {
+                metadata.setExpiresAt(Instant.parse(expiresAt));
+            }
+            if (nextRotationAt != null) {
+                metadata.setNextRotationAt(Instant.parse(nextRotationAt));
+            }
+            metadata.setUsageCount(usageCount);
+            metadata.setStatus(KeyMetadata.KeyStatus.valueOf(status));
+            metadata.setDescription(description);
+            return metadata;
+        }
+    }
+}

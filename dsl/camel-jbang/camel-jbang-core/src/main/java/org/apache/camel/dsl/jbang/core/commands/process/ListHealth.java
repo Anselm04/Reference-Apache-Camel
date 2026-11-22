@@ -1,0 +1,344 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.camel.dsl.jbang.core.commands.process;
+
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Comparator;
+import java.util.List;
+import java.util.Map;
+import java.util.TreeMap;
+import java.util.stream.Collectors;
+
+import com.github.freva.asciitable.AsciiTable;
+import com.github.freva.asciitable.Column;
+import com.github.freva.asciitable.HorizontalAlign;
+import com.github.freva.asciitable.OverflowBehaviour;
+import org.aesh.command.CommandDefinition;
+import org.aesh.command.option.Argument;
+import org.aesh.command.option.Option;
+import org.apache.camel.dsl.jbang.core.common.CliException;
+import org.apache.camel.dsl.jbang.core.common.PidNameAgeCompletionCandidates;
+import org.apache.camel.dsl.jbang.core.common.ProcessHelper;
+import org.apache.camel.dsl.jbang.core.common.RowSort;
+import org.apache.camel.dsl.jbang.core.common.TerminalWidthHelper;
+import org.apache.camel.dsl.jbang.run.common.CliTimes;
+import org.apache.camel.health.HealthCheckHelper;
+import org.apache.camel.util.StringHelper;
+import org.apache.camel.util.TimeUtils;
+import org.apache.camel.util.json.JsonArray;
+import org.apache.camel.util.json.JsonObject;
+import org.apache.camel.util.json.Jsoner;
+
+@CommandDefinition(name = "health", description = "Get health check status of running Camel integrations", generateHelp = true,
+                   footer = {
+                           "Examples:",
+                           "  camel get health",
+                           "  camel get health myApp --down",
+                           "  camel get health --watch" })
+public class ListHealth extends ProcessWatchCommand {
+
+    private static final RowSort<Row> ORDER = RowSort.<Row> integration(r -> r.pid, r -> r.name, r -> r.uptime);
+
+    @Argument(description = "Name or pid of running Camel integration")
+    String name = "*";
+
+    @Option(name = "sort", description = "Sort by pid, name or age", defaultValue = "pid",
+            completer = PidNameAgeCompletionCandidates.class)
+    String sort;
+
+    @Option(name = "level", description = "Level of details: full, or default", defaultValue = "default")
+    String level;
+
+    @Option(name = "down", hasValue = false, description = "Show only checks which are DOWN")
+    boolean down;
+
+    @Option(name = "ready", hasValue = false, description = "Show only readiness checks")
+    boolean ready;
+
+    @Option(name = "live", hasValue = false, description = "Show only liveness checks")
+    boolean live;
+
+    @Option(name = "trace", hasValue = false, description = "Include stack-traces in error messages", defaultValue = "false")
+    boolean trace;
+
+    @Option(name = "depth", description = "Max depth of stack-trace", defaultValue = "1")
+    int depth;
+
+    @Override
+    public Integer doProcessWatchCall() throws Exception {
+        final List<Row> rows = new ArrayList<>();
+
+        // the options are wrong for every integration, so before reading them
+        Comparator<Row> order = ORDER.comparator(sort);
+        if (level != null && !"default".equals(level) && !"full".equals(level)) {
+            throw CliException.usage("--level must be full or default, was: " + level);
+        }
+
+        // include stack-traces
+        if (trace && depth <= 1) {
+            depth = Integer.MAX_VALUE;
+        }
+
+        forEachIntegration(name, (ph, root) -> {
+            JsonObject context = (JsonObject) root.get("context");
+            if (context == null) {
+                return;
+            }
+            JsonObject hc = (JsonObject) root.get("healthChecks");
+            if (hc == null) {
+                return;
+            }
+            JsonArray array = (JsonArray) hc.get("checks");
+            for (int i = 0; i < array.size(); i++) {
+                JsonObject o = (JsonObject) array.get(i);
+                Row row = new Row();
+                row.pid = Long.toString(ph.pid());
+                row.uptime = extractSince(ph);
+                row.ago = TimeUtils.printSince(row.uptime);
+                row.name = context.getString("name");
+                if ("CamelJBang".equals(row.name)) {
+                    row.name = ProcessHelper.extractName(root, ph);
+                }
+                row.id = o.getString("id");
+                row.group = o.getString("group");
+                row.state = o.getString("state");
+                row.readiness = o.getBoolean("readiness");
+                row.liveness = o.getBoolean("liveness");
+                row.message = o.getString("message");
+                row.stackTrace = o.getCollection("stackTrace");
+
+                JsonObject d = (JsonObject) o.get("details");
+                if (d != null) {
+                    row.total = d.getString("invocation.count");
+                    row.success = d.getString("success.count");
+                    row.failure = d.getString("failure.count");
+                    String kind = d.getString("check.kind");
+                    if ("READINESS".equals(kind)) {
+                        row.liveness = false;
+                    } else if ("LIVENESS".equals(kind)) {
+                        row.readiness = false;
+                    }
+                    // calc how long time since the check was invoked
+                    String time = d.getString("invocation.time");
+                    if (time != null) {
+                        row.sinceLast = sinceNow(time);
+                    }
+                    time = d.getString("success.start.time");
+                    if (time != null) {
+                        row.sinceStartSuccess = sinceNow(time);
+                    }
+                    time = d.getString("failure.start.time");
+                    if (time != null) {
+                        row.sinceStartFailure = sinceNow(time);
+                    }
+                    for (Map.Entry<String, Object> entry : d.entrySet()) {
+                        String k = entry.getKey();
+                        // gather custom details
+                        if (!HealthCheckHelper.isReservedKey(k)) {
+                            if (row.customMeta == null) {
+                                row.customMeta = new TreeMap<>();
+                            }
+                            row.customMeta.put(k, entry.getValue());
+                        }
+                    }
+                }
+
+                boolean add = true;
+                if (live && !row.liveness) {
+                    add = false;
+                }
+                if (ready && !row.readiness) {
+                    add = false;
+                }
+                if (down && !row.state.equals("DOWN")) {
+                    add = false;
+                }
+                if (level == null || "default".equals(level)) {
+                    if (row.state.equals("UP") && "camel".equals(row.group)
+                            && (row.id.startsWith("route:") || row.id.startsWith("consumer:"))) {
+                        // skip camel/route: camel/consumer: checks when they are UP
+                        // as they are less relevant and is verbose
+                        add = false;
+                    }
+                }
+                if (add) {
+                    rows.add(row);
+                }
+            }
+        });
+
+        // sort rows
+        rows.sort(order);
+
+        if (!rows.isEmpty() || jsonOutput) {
+            if (jsonOutput) {
+                printer().println(Jsoner.serialize(rows.stream().map(r -> {
+                    JsonObject jo = new JsonObject();
+                    jo.put("pid", JsonValues.pid(r.pid));
+                    jo.put("name", r.name);
+                    jo.put("age", r.ago);
+                    jo.put("uptime", r.uptime);
+                    jo.put("id", getId(r));
+                    jo.put("readiness", r.readiness);
+                    jo.put("liveness", r.liveness);
+                    jo.put("status", r.state);
+                    jo.put("total", JsonValues.number(r.total));
+                    jo.put("success", JsonValues.number(r.success));
+                    jo.put("failure", JsonValues.number(r.failure));
+                    jo.put("sinceLast", JsonValues.text(r.sinceLast));
+                    jo.put("sinceStartSuccess", JsonValues.text(r.sinceStartSuccess));
+                    jo.put("sinceStartFailure", JsonValues.text(r.sinceStartFailure));
+                    jo.put("message", r.message);
+                    if (trace) {
+                        // in the document, not as text after it
+                        if (r.customMeta != null) {
+                            jo.put("metadata", r.customMeta);
+                        }
+                        if (r.stackTrace != null && !r.stackTrace.isEmpty()) {
+                            jo.put("stackTrace", r.stackTrace.subList(0, Math.min(depth, r.stackTrace.size())));
+                        }
+                    }
+                    return jo;
+                }).collect(Collectors.toList())));
+            } else {
+                // Flexible columns: NAME (40), ID (40), MESSAGE (80)
+                // Fixed columns: PID(8)+AGE(8)+RL(4)+STATUS(6)+RATE(10)+SINCE(10) ~= 46
+                int tw = terminalWidth();
+                int nameW = TerminalWidthHelper.flexWidth(tw, 46 + 40 + 80, TerminalWidthHelper.noBorderOverhead(9), 15, 40);
+                int idW = TerminalWidthHelper.flexWidth(tw, 46 + 40 + 80, TerminalWidthHelper.noBorderOverhead(9), 15, 40);
+                int msgW = TerminalWidthHelper.flexWidth(tw, 46 + nameW + idW, TerminalWidthHelper.noBorderOverhead(9), 20, 80);
+                printer().println(AsciiTable.getTable(AsciiTable.NO_BORDERS, rows, Arrays.asList(
+                        new Column().header("PID").headerAlign(HorizontalAlign.CENTER).with(r -> r.pid),
+                        new Column().header("NAME").dataAlign(HorizontalAlign.LEFT)
+                                .maxWidth(nameW, OverflowBehaviour.ELLIPSIS_RIGHT)
+                                .with(r -> r.name),
+                        new Column().header("AGE").headerAlign(HorizontalAlign.CENTER).with(r -> r.ago),
+                        new Column().header("ID").dataAlign(HorizontalAlign.LEFT)
+                                .maxWidth(idW, OverflowBehaviour.ELLIPSIS_RIGHT)
+                                .with(this::getId),
+                        new Column().header("RL").minWidth(4).maxWidth(4).with(this::getLR),
+                        new Column().header("STATUS").headerAlign(HorizontalAlign.CENTER)
+                                .dataAlign(HorizontalAlign.CENTER)
+                                .with(r -> r.state),
+                        new Column().header("RATE").headerAlign(HorizontalAlign.CENTER)
+                                .dataAlign(HorizontalAlign.RIGHT)
+                                .with(this::getRate),
+                        new Column().header("SINCE").headerAlign(HorizontalAlign.CENTER)
+                                .dataAlign(HorizontalAlign.RIGHT)
+                                .with(this::getSince),
+                        new Column().header("MESSAGE").dataAlign(HorizontalAlign.LEFT)
+                                .maxWidth(msgW, OverflowBehaviour.NEWLINE)
+                                .with(r -> r.message))));
+            }
+        }
+        if (trace && !jsonOutput) {
+            var traces
+                    = rows.stream().filter(r -> r.stackTrace != null && !r.stackTrace.isEmpty()).collect(Collectors.toList());
+            if (!traces.isEmpty()) {
+                for (Row row : traces) {
+                    printer().println("\n");
+                    printer().println(StringHelper.fillChars('-', 120));
+                    printer().println(StringHelper.padString(1, 55) + "STACK-TRACE");
+                    printer().println(StringHelper.fillChars('-', 120));
+                    StringBuilder sb = new StringBuilder();
+                    sb.append(String.format("\tPID: %s%n", row.pid));
+                    sb.append(String.format("\tNAME: %s%n", row.name));
+                    sb.append(String.format("\tAGE: %s%n", row.ago));
+                    sb.append(String.format("\tCHECK-ID: %s%n", getId(row)));
+                    sb.append(String.format("\tSTATE: %s%n", row.state));
+                    sb.append(String.format("\tRATE: %s%n", row.failure));
+                    sb.append(String.format("\tSINCE: %s%n", row.sinceStartFailure));
+                    if (row.customMeta != null) {
+                        sb.append(String.format("\tMETADATA:%n"));
+                        row.customMeta.forEach((k, v) -> sb.append(String.format("\t\t%s = %s%n", k, v)));
+                    }
+                    sb.append(String.format("\tMESSAGE: %s%n", row.message));
+                    for (int i = 0; i < depth && i < row.stackTrace.size(); i++) {
+                        sb.append(String.format("\t%s%n", row.stackTrace.get(i)));
+                    }
+                    printer().println(sb.toString());
+                }
+            }
+        }
+
+        return 0;
+    }
+
+    protected String getId(Row r) {
+        if (r.group != null) {
+            return r.group + "/" + r.id;
+        } else {
+            return r.id;
+        }
+    }
+
+    protected String getLR(Row r) {
+        if (r.readiness && r.liveness) {
+            return "RL";
+        } else if (r.readiness) {
+            return "R";
+        } else if (r.liveness) {
+            return "L";
+        }
+        return "";
+    }
+
+    protected String getRate(Row r) {
+        String s1 = r.total != null && !"0".equals(r.total) ? r.total : "-";
+        String s2 = r.success != null && !"0".equals(r.success) ? r.success : "-";
+        String s3 = r.failure != null && !"0".equals(r.failure) ? r.failure : "-";
+        return s1 + "/" + s2 + "/" + s3;
+    }
+
+    protected String getSince(Row r) {
+        String s1 = r.sinceLast != null ? r.sinceLast : "-";
+        String s2 = r.sinceStartSuccess != null ? r.sinceStartSuccess : "-";
+        String s3 = r.sinceStartFailure != null ? r.sinceStartFailure : "-";
+        return s1 + "/" + s2 + "/" + s3;
+    }
+
+    /**
+     * How long ago (or ahead) a time of a health check is, such as {@code 2026-11-16T15:38:49.123+01:00[Europe/Paris]}:
+     * from its offset, as parsing the region would load the time zone rules (see {@link CliTimes}).
+     */
+    static String sinceNow(String time) {
+        return TimeUtils.printAge(Math.abs(System.currentTimeMillis() - CliTimes.parseEpochMillis(time)));
+    }
+
+    private static class Row {
+        String pid;
+        String name;
+        String ago;
+        long uptime;
+        String id;
+        String group;
+        String state;
+        boolean readiness;
+        boolean liveness;
+        String total;
+        String success;
+        String failure;
+        String sinceLast;
+        String sinceStartSuccess;
+        String sinceStartFailure;
+        String message;
+        List<String> stackTrace;
+        Map<String, Object> customMeta;
+    }
+
+}

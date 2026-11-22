@@ -1,0 +1,79 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.camel.component.grpc.server;
+
+import java.util.Map;
+
+import io.grpc.stub.StreamObserver;
+import org.apache.camel.Exchange;
+import org.apache.camel.component.grpc.GrpcConsumer;
+import org.apache.camel.component.grpc.GrpcEndpoint;
+
+/**
+ * gRPC request abstract stream observer is the base class for other stream observer implementations
+ */
+public abstract class GrpcRequestAbstractStreamObserver implements StreamObserver<Object> {
+    protected final GrpcEndpoint endpoint;
+    protected final GrpcConsumer consumer;
+    protected Exchange exchange;
+    protected StreamObserver<Object> responseObserver;
+    protected Map<String, Object> headers;
+    protected Class<?> responseType;
+
+    protected GrpcRequestAbstractStreamObserver(GrpcEndpoint endpoint, GrpcConsumer consumer,
+                                                StreamObserver<Object> responseObserver, Map<String, Object> headers) {
+        this.endpoint = endpoint;
+        this.consumer = consumer;
+        this.responseObserver = responseObserver;
+        this.headers = headers;
+    }
+
+    /**
+     * The response message type of the method: a reply of another type is converted to it, or ends the call with an
+     * error.
+     */
+    public Class<?> getResponseType() {
+        return responseType;
+    }
+
+    public void setResponseType(Class<?> responseType) {
+        this.responseType = responseType;
+    }
+
+    /**
+     * Sends the reply of the exchange to the client, converted to the response type of the method.
+     *
+     * @return true if the reply was sent, false if it is not of the response type and the call ended with an error
+     */
+    protected boolean sendResponses(Exchange exchange) {
+        return GrpcMethodHandler.sendResponses(endpoint, exchange, exchange.getMessage().getBody(), responseType,
+                responseObserver);
+    }
+
+    /**
+     * Sends the failure of the exchange to the client as an error, like for unary calls.
+     *
+     * @return true if the exchange failed and the error was sent
+     */
+    protected boolean sendFailure(Exchange exchange) {
+        if (exchange.isFailed()) {
+            responseObserver.onError(GrpcMethodHandler.toStatusException(endpoint, exchange.getException()));
+            return true;
+        }
+        return false;
+    }
+}

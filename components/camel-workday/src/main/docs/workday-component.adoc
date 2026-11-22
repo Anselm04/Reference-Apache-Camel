@@ -1,0 +1,83 @@
+= Workday Component
+:doctitle: Workday
+:shortname: workday
+:artifactid: camel-workday
+:description: Detect and parse documents using Workday.
+:since: 3.1
+:supportlevel: Stable
+:tabs-sync-option:
+:component-header: Only producer is supported
+
+*Since Camel {since}*
+
+*{component-header}*
+
+The *Workday*: components provides the ability to detect and parse documents with 
+Workday. 
+
+In order to use the Workday component, Maven users will need to add the
+following dependency to their `pom.xml`:
+
+*pom.xml*
+
+[source,xml]
+----
+<dependency>
+    <groupId>org.apache.camel</groupId>
+    <artifactId>camel-workday</artifactId>
+    <version>x.x.x</version>
+    <!-- use the same version as your Camel core version -->
+</dependency>
+----
+
+
+== Usage
+
+The entity is `report` (a Workday report as a service) or `commonAPI` (the Workday REST API), and the path is the path of
+the report or of the API resource. The credentials come from the API client that Workday generates for the integration.
+
+The following route reads a report every hour. The body is the JSON of the report:
+
+[source,yaml]
+----
+- route:
+    from:
+      uri: timer:employees
+      parameters:
+        period: 3600000
+      steps:
+        - to:
+            uri: workday:report:/ISU_Camel/Custom_Report_Employees
+            parameters:
+              host: impl.workday.com
+              tenant: "{{workday.tenant}}"
+              clientId: "{{workday.client-id}}"
+              clientSecret: "{{workday.client-secret}}"
+              tokenRefresh: "{{workday.token-refresh}}"
+        - log:
+            message: "${body}"
+----
+
+The following route reads the workers through the Common API:
+
+[source,yaml]
+----
+- route:
+    from:
+      uri: direct:workers
+      steps:
+        - to:
+            uri: workday:commonAPI:/workers
+            parameters:
+              host: impl.workday.com
+              tenant: "{{workday.tenant}}"
+              clientId: "{{workday.client-id}}"
+              clientSecret: "{{workday.client-secret}}"
+              tokenRefresh: "{{workday.token-refresh}}"
+----
+
+// component options: START
+include::partial$component-configure-options.adoc[]
+include::partial$component-endpoint-options.adoc[]
+include::partial$component-endpoint-headers.adoc[]
+// component options: END

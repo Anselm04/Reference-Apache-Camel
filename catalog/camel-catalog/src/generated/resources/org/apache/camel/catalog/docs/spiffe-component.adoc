@@ -1,0 +1,670 @@
+= SPIFFE Component
+:doctitle: SPIFFE
+:shortname: spiffe
+:artifactid: camel-spiffe
+:description: Fetch and validate SPIFFE workload identity (X.509-SVID and JWT-SVID) from the SPIFFE Workload API.
+:since: 4.23
+:supportlevel: Preview
+:tabs-sync-option:
+:component-header: Only producer is supported
+
+*Since Camel {since}*
+
+*{component-header}*
+
+The SPIFFE component integrates with the https://spiffe.io/[SPIFFE] (Secure Production Identity Framework
+For Everyone) Workload API to provide cryptographic workload identity to Camel routes. It talks to a local
+SPIFFE Workload API endpoint — for example the one exposed by a https://spiffe.io/docs/latest/spire-about/[SPIRE]
+agent — to fetch and validate SVIDs (SPIFFE Verifiable Identity Documents):
+
+* *X.509-SVID*: an X.509 certificate whose SPIFFE ID is encoded as a URI SAN, used for mutual TLS.
+* *JWT-SVID*: a JWT whose subject is the SPIFFE ID, used as a bearer token for workload-to-workload authentication.
+
+Maven users will need to add the following dependency to their `pom.xml`.
+
+[source,xml]
+------------------------------------------------------------
+<dependency>
+    <groupId>org.apache.camel</groupId>
+    <artifactId>camel-spiffe</artifactId>
+    <version>x.x.x</version>
+    <!-- use the same version as your Camel core version -->
+</dependency>
+------------------------------------------------------------
+
+== URI Format
+
+------------------------------------------------------------
+spiffe:label[?options]
+------------------------------------------------------------
+
+Where `label` is a logical name for the endpoint.
+
+// component options: START
+include::partial$component-configure-options.adoc[]
+include::partial$component-endpoint-options.adoc[]
+include::partial$component-endpoint-headers.adoc[]
+// component options: END
+
+== Workload API endpoint
+
+The address of the SPIFFE Workload API is taken from the `spiffeSocketPath` option, or, when that is not set, from
+the standard `SPIFFE_ENDPOINT_SOCKET` environment variable — for example `unix:///tmp/spire-agent/public/api.sock`.
+For advanced scenarios an already-configured `io.spiffe.workloadapi.WorkloadApiClient` can be supplied through the
+`workloadApiClient` option; in that case the component neither creates nor closes the client.
+
+== Operations
+
+The component supports the following producer operations:
+
+* `fetchX509Svid` — fetches the default X.509-SVID from the Workload API. By default (`x509Response=chain`) the message
+body is set to the certificate chain only (a `List<java.security.cert.X509Certificate>`, without the private key), so a
+route never handles key material unless it asks for it. Set `x509Response=svid` to get the whole
+`io.spiffe.svid.x509svid.X509Svid` including the private key (needed for programmatic mTLS), or `x509Response=id` to
+leave the body untouched. In every case the `CamelSpiffeSpiffeId` and `CamelSpiffeExpiry` (the leaf certificate's
+expiry) headers carry the identity.
+* `fetchJwtSvid` — fetches a JWT-SVID for the configured `audience` (or the `CamelSpiffeAudience` header). The
+message body is set to the JWT token string, with the `CamelSpiffeSpiffeId` and `CamelSpiffeExpiry` headers.
+* `validateJwtSvid` — validates a JWT-SVID against the `audience`. The token is taken from the first of:
+the `CamelSpiffeToken` header, an `Authorization: Bearer <token>` header (the scheme matched case-insensitively), or
+the message body. The `Authorization` header is tried *before* the body so a request payload on a `POST`/`PUT` is not
+mistaken for the token; this lets a `platform-http` route validate an incoming bearer token without a bean to strip
+the scheme. On success the message body is set to the validated `io.spiffe.svid.jwtsvid.JwtSvid`, so a route that
+needs the original request payload afterwards must keep a copy before validating (or validate a bodiless request).
+When several audiences are configured the token is accepted if it matches *any* of them — the Workload API validates
+one audience at a time, so each is tried in turn.
+
+[NOTE]
+====
+The `fetchX509Svid` and `fetchJwtSvid` operations place sensitive key material on the message: the `X509Svid`
+carries the workload's private key, and the JWT-SVID is a bearer token. Route authors are trusted with Exchange
+contents, but you should avoid logging or tracing the message body for these operations — for example via the
+`log`/`trace` components or the message-history / breadcrumb EIPs — to prevent accidental disclosure of the key
+or token. `fetchX509Svid` only puts the private key on the body when `x509Response=svid` is set explicitly; the
+default (`chain`) and `id` keep the key off the message entirely.
+====
+
+== Example
+
+Fetch a JWT-SVID for an outbound call:
+
+[source,java]
+------------------------------------------------------------
+from("direct:start")
+    .to("spiffe:identity?operation=fetchJwtSvid&audience=spiffe://example.org/backend")
+    .setHeader("Authorization", simple("Bearer ${body}"))
+    .to("http://backend.example.org/api");
+------------------------------------------------------------
+
+Validate an incoming bearer token on a `platform-http` route, without a bean to strip the scheme:
+
+[source,yaml]
+------------------------------------------------------------
+- route:
+    from:
+      uri: "platform-http:/api"
+      steps:
+        # the Authorization: Bearer <token> header is picked up automatically; validation replaces the body with the
+        # JwtSvid, so this fits a request whose payload is not needed afterwards
+        - to:
+            uri: "spiffe:auth?operation=validateJwtSvid&audience=spiffe://example.org/api"
+        # the token is a credential; drop it before the exchange goes further
+        - removeHeaders:
+            pattern: "Authorization"
+        - to:
+            uri: "direct:handleRequest"
+------------------------------------------------------------
+
+A missing token fails with `IllegalArgumentException`; a rejected one (invalid, expired, or a wrong audience) fails
+with `io.spiffe.exception.JwtSvidException`. Catch both — `onException(io.spiffe.exception.JwtSvidException.class,
+IllegalArgumentException.class)` — to answer `401`.
+
+== Preserve an application body during JWT validation
+
+Set `preserveBody=true` on `validateJwtSvid` to validate a request without replacing or reading its body. In this mode
+supply the token through `CamelSpiffeToken` or `Authorization: Bearer`; there is no body-token fallback, including
+when the header is missing. The default remains `preserveBody=false`, which returns the SDK `JwtSvid` in the body.
+
+After validation the `CamelSpiffeJwtIdentity` exchange property contains a `SpiffeJwtIdentity` with getters for
+`spiffeId`, `expiry` (`Instant`), `audience` and `claims`. It contains no bearer token. Claims are copied into
+unmodifiable maps/lists and omitted from `toString`, but can still contain sensitive application data: select only
+the fields a downstream authorization policy needs. The identity property and identity/expiry output headers are
+cleared before each validation, including one that fails.
+
+[tabs]
+====
+Java::
++
+[source,java]
+----
+from("platform-http:/orders")
+    .to("spiffe:auth?operation=validateJwtSvid&audience=spiffe://example.org/orders&preserveBody=true")
+    .removeHeaders("Authorization")
+    .setProperty("subject", simple("${exchangeProperty.CamelSpiffeJwtIdentity.spiffeId}"))
+    .to("direct:handleOrder");
+----
+XML::
++
+[source,xml]
+----
+<route>
+  <from uri="platform-http:/orders"/>
+  <to uri="spiffe:auth?operation=validateJwtSvid&amp;audience=spiffe://example.org/orders&amp;preserveBody=true"/>
+  <removeHeaders pattern="Authorization"/>
+  <setProperty name="subject"><simple>${exchangeProperty.CamelSpiffeJwtIdentity.spiffeId}</simple></setProperty>
+  <to uri="direct:handleOrder"/>
+</route>
+----
+YAML::
++
+[source,yaml]
+----
+- route:
+    from:
+      uri: platform-http:/orders
+      steps:
+        - to:
+            uri: "spiffe:auth?operation=validateJwtSvid&audience=spiffe://example.org/orders&preserveBody=true"
+        - removeHeaders:
+            pattern: Authorization
+        - setProperty:
+            name: subject
+            simple: "${exchangeProperty.CamelSpiffeJwtIdentity.spiffeId}"
+        - to:
+            uri: direct:handleOrder
+----
+====
+
+== Protect a route segment with a JWT-SVID policy
+
+`SpiffeJwtSecurityPolicy` combines audience validation with an explicit identity rule, preserves the application body,
+and throws `CamelAuthorizationException` before the guarded processor runs for missing, rejected or unauthorized
+tokens. Set `audience` and exactly one of `acceptedSpiffeIds` or `acceptAnySpiffeId=true`. Audience and identity rules
+come from policy configuration; message headers cannot override them. The policy reads tokens from the same two
+headers as body-preserving producer validation and never from the body.
+
+Each guarded processor owns an endpoint-managed Workload API client, released when its route stops and recreated
+on restart. The policy starts from the configuration of the `spiffe` component, so the `camel.component.spiffe.*`
+settings and a client autowired on the component apply to it; its own `workloadApiClient` and `spiffeSocketPath`
+options take precedence, and `SPIFFE_ENDPOINT_SOCKET` is used when neither names a client or a socket. An injected
+`workloadApiClient` remains owned by its supplier and is never closed by the policy.
+
+[tabs]
+====
+Java::
++
+[source,java]
+----
+SpiffeJwtSecurityPolicy jwtPolicy = new SpiffeJwtSecurityPolicy();
+jwtPolicy.setAudience("spiffe://example.org/orders");
+jwtPolicy.setAcceptedSpiffeIds("spiffe://example.org/frontend");
+getContext().getRegistry().bind("jwtPolicy", jwtPolicy);
+
+from("platform-http:/orders")
+    .policy(jwtPolicy)
+    .removeHeaders("Authorization")
+    .to("direct:handleOrder");
+----
+XML::
++
+[source,xml]
+----
+<bean id="jwtPolicy" class="org.apache.camel.component.spiffe.SpiffeJwtSecurityPolicy">
+  <property name="audience" value="spiffe://example.org/orders"/>
+  <property name="acceptedSpiffeIds" value="spiffe://example.org/frontend"/>
+</bean>
+<route>
+  <from uri="platform-http:/orders"/>
+  <policy ref="jwtPolicy">
+    <removeHeaders pattern="Authorization"/>
+    <to uri="direct:handleOrder"/>
+  </policy>
+</route>
+----
+YAML::
++
+[source,yaml]
+----
+- beans:
+    - name: jwtPolicy
+      type: org.apache.camel.component.spiffe.SpiffeJwtSecurityPolicy
+      properties:
+        audience: spiffe://example.org/orders
+        acceptedSpiffeIds: spiffe://example.org/frontend
+- route:
+    from:
+      uri: platform-http:/orders
+      steps:
+        - policy:
+            ref: jwtPolicy
+            steps:
+              - removeHeaders:
+                  pattern: Authorization
+              - to:
+                  uri: direct:handleOrder
+----
+====
+
+The successful policy publishes the same token-free `CamelSpiffeJwtIdentity` property, and nothing else: unlike the
+producer, it sets no `CamelSpiffeSpiffeId` or `CamelSpiffeExpiry` header, so the identity is a value the route
+established, which a sender cannot put on the message, and it does not travel to
+outbound producers. Check the property, not a header, further down the route. Extract verified fields into
+exchange properties to compose with OPA or OpenFGA; for example, copy its `spiffeId` into `subject`, use
+`includeProperties=subject` with OPA, or a configured OpenFGA `user` expression based on that property. Choosing
+`acceptAnySpiffeId` asserts that audience validation is sufficient at this step and leaves finer authorization to
+the downstream policy. Always remove credential headers before forwarding requests to an unrelated destination.
+
+== Mutual TLS with SPIFFE (SSLContextParameters)
+
+For X.509-based zero-trust mTLS, the component provides
+`org.apache.camel.component.spiffe.SpiffeSSLContextParameters`, an `SSLContextParameters` whose `SSLContext` is
+backed by the SPIFFE Workload API. The X.509-SVID and trust bundles are fetched live and rotated automatically,
+so any Camel component that accepts an `sslContextParameters` reference (camel-http, camel-netty-http,
+camel-jetty, camel-vertx-http, ...) can obtain SPIFFE mTLS.
+
+Peer authentication must be constrained explicitly: set `acceptedSpiffeIds` to an allow-list of peer SPIFFE IDs,
+or `acceptAnySpiffeId=true` to accept any SVID that validates against the trust bundle. The two are mutually
+exclusive, and setting neither fails closed.
+
+Because it extends `SSLContextParameters`, the inherited configuration is still honoured: set
+`serverParameters.clientAuthentication` (for a server that must require client certificates), `cipherSuites` and
+`secureSocketProtocols` as usual, and the base handshake protocol comes from `secureSocketProtocol` (default
+`TLSv1.3`). The underlying `X509Source` is created lazily (bounded by `initTimeout`, default 30s), closed on
+`CamelContext` shutdown, and the cached context is invalidated at the same time so a restarted context rebuilds a
+fresh source.
+
+`SpiffeSSLContextParameters` also implements `AutoCloseable` for standalone use. When neither the
+`createSSLContext` argument nor the parameters instance supplies a `CamelContext`, use try-with-resources or call
+`close()` explicitly to release the Workload API watcher. Closing invalidates the cached context and is idempotent;
+a subsequent `createSSLContext` call creates a new source. Stop using existing SSL contexts and TLS connections
+before closing their parameters.
+
+[tabs]
+====
+Java::
++
+[source,java]
+------------------------------------------------------------
+SpiffeSSLContextParameters ssl = new SpiffeSSLContextParameters();
+// ssl.setSpiffeSocketPath("unix:///tmp/spire-agent/public/api.sock"); // or SPIFFE_ENDPOINT_SOCKET
+ssl.setAcceptedSpiffeIds("spiffe://example.org/backend");
+getCamelContext().getRegistry().bind("spiffeSsl", ssl);
+
+from("direct:start")
+    .to("https://backend.example.org/api?sslContextParameters=#spiffeSsl");
+------------------------------------------------------------
+
+YAML::
++
+[source,yaml]
+----
+- beans:
+    - name: spiffeSsl
+      type: org.apache.camel.component.spiffe.SpiffeSSLContextParameters
+      properties:
+        # spiffeSocketPath: unix:///tmp/spire-agent/public/api.sock  # or SPIFFE_ENDPOINT_SOCKET
+        acceptedSpiffeIds: spiffe://example.org/backend
+- route:
+    from:
+      uri: direct:start
+      steps:
+        - to:
+            uri: https://backend.example.org/api
+            parameters:
+              sslContextParameters: "#spiffeSsl"
+----
+====
+
+== Select a local X.509 identity
+
+A workload can receive several X.509-SVIDs from the Workload API. Set `localSpiffeId` to choose an exact local
+identity instead of the default SVID. The producer's `fetchX509Svid` and `fetchJwtSvid` operations and
+`SpiffeSSLContextParameters` all support this option. It is distinct from `acceptedSpiffeIds`, which restricts *remote peers*: selecting a local
+identity does not broaden the TLS peer allow-list.
+
+The selector is route/bean configuration, never a message header or a per-message expression. An invalid SPIFFE ID
+fails before opening the source. An identity that is missing does not fall back to the default or another identity.
+`fetchJwtSvid` mints the JWT-SVID with `localSpiffeId` as its subject, and the Workload API refuses a subject the
+workload is not entitled to, so the option fails closed there too. `validateJwtSvid` has no local identity to choose
+and ignores it.
+
+[tabs]
+====
+Java::
++
+[source,java]
+----
+from("direct:identity")
+    .to("spiffe:identity?operation=fetchX509Svid&localSpiffeId=spiffe://example.org/billing&x509Response=id");
+----
+XML::
++
+[source,xml]
+----
+<route>
+  <from uri="direct:identity"/>
+  <to uri="spiffe:identity?operation=fetchX509Svid&amp;localSpiffeId=spiffe://example.org/billing&amp;x509Response=id"/>
+</route>
+----
+YAML::
++
+[source,yaml]
+----
+- route:
+    from:
+      uri: direct:identity
+      steps:
+        - to:
+            uri: "spiffe:identity?operation=fetchX509Svid&localSpiffeId=spiffe://example.org/billing&x509Response=id"
+----
+====
+
+The selected identity's normal `x509Response` behavior and identity/expiry headers still apply. A fetch selects from
+the current Workload API context, so a rotated certificate for that same identity is picked up on the next fetch.
+If the identity disappears, the fetch fails and clears its identity/expiry outputs.
+
+For TLS, configure the same option on the SSL parameters bean:
+
+[tabs]
+====
+Java::
++
+[source,java]
+----
+SpiffeSSLContextParameters ssl = new SpiffeSSLContextParameters();
+ssl.setLocalSpiffeId("spiffe://example.org/billing");
+ssl.setAcceptedSpiffeIds("spiffe://example.org/backend");
+getContext().getRegistry().bind("billingSsl", ssl);
+
+from("direct:callBackend")
+    .to("https://backend.example.org/api?sslContextParameters=#billingSsl");
+----
+XML::
++
+[source,xml]
+----
+<bean id="billingSsl" class="org.apache.camel.component.spiffe.SpiffeSSLContextParameters">
+  <property name="localSpiffeId" value="spiffe://example.org/billing"/>
+  <property name="acceptedSpiffeIds" value="spiffe://example.org/backend"/>
+</bean>
+<route>
+  <from uri="direct:callBackend"/>
+  <to uri="https://backend.example.org/api?sslContextParameters=#billingSsl"/>
+</route>
+----
+YAML::
++
+[source,yaml]
+----
+- beans:
+    - name: billingSsl
+      type: org.apache.camel.component.spiffe.SpiffeSSLContextParameters
+      properties:
+        localSpiffeId: spiffe://example.org/billing
+        acceptedSpiffeIds: spiffe://example.org/backend
+- route:
+    from:
+      uri: direct:callBackend
+      steps:
+        - to:
+            uri: "https://backend.example.org/api?sslContextParameters=#billingSsl"
+----
+====
+
+The TLS source reselects on every Workload API update and retains only the configured identity. It refuses to start
+if that identity is initially absent. If a later update removes it, reads of the local TLS identity fail clearly;
+the source does not retain the old selected credential or silently choose another. A subsequent update restoring
+the configured identity makes its new credential available again. Existing established TLS sessions are not
+terminated by changing the source; this selection applies when JSSE asks for the local identity. Configure
+`localSpiffeId` before creating the SSL context; changing the bean afterwards does not replace its cached context.
+Leaving the option unset preserves the SDK's default selection.
+
+== Authorizing a route on the peer SPIFFE ID (SpiffeSecurityPolicy)
+
+`SpiffeSSLContextParameters` decides *which peers may connect*; `org.apache.camel.component.spiffe.SpiffeSecurityPolicy`
+decides *what a given peer may reach*. It is an `AuthorizationPolicy` - the SPIFFE sibling of `ShiroSecurityPolicy`,
+`KeycloakSecurityPolicy` and `OpaSecurityPolicy` - that wraps a route segment and authorizes it on the caller's
+verified SPIFFE ID:
+
+[tabs]
+====
+Java::
++
+[source,java]
+------------------------------------------------------------
+// the server must REQUIRE a client certificate, or the policy has no verified peer to authorize
+SpiffeSSLContextParameters serverSsl = new SpiffeSSLContextParameters();
+serverSsl.setAcceptedSpiffeIds("spiffe://example.org/frontend");
+SSLContextServerParameters serverParameters = new SSLContextServerParameters();
+serverParameters.setClientAuthentication(ClientAuthentication.REQUIRE.name());
+serverSsl.setServerParameters(serverParameters);
+getCamelContext().getRegistry().bind("spiffeSsl", serverSsl);
+
+SpiffeSecurityPolicy spiffePolicy = new SpiffeSecurityPolicy("spiffe://example.org/frontend");
+getCamelContext().getRegistry().bind("spiffePolicy", spiffePolicy);
+
+from("netty-http:https://0.0.0.0:8443?sslContextParameters=#spiffeSsl")
+    .policy(spiffePolicy)
+    .to("direct:handleOrder");
+------------------------------------------------------------
+
+YAML::
++
+[source,yaml]
+----
+- beans:
+    - name: spiffeSsl
+      type: org.apache.camel.component.spiffe.SpiffeSSLContextParameters
+      properties:
+        acceptedSpiffeIds: spiffe://example.org/frontend
+        # the server must REQUIRE a client certificate, or the policy has no verified peer to authorize
+        serverParameters:
+          clientAuthentication: REQUIRE
+    - name: spiffePolicy
+      type: org.apache.camel.component.spiffe.SpiffeSecurityPolicy
+      properties:
+        acceptedSpiffeIds: spiffe://example.org/frontend
+- route:
+    from:
+      uri: netty-http:https://0.0.0.0:8443
+      parameters:
+        sslContextParameters: "#spiffeSsl"
+      steps:
+        - policy:
+            ref: spiffePolicy
+            steps:
+              - to:
+                  uri: direct:handleOrder
+----
+====
+
+[IMPORTANT]
+====
+A few things about the server side decide whether, and for which peers, this policy can work.
+
+* *The server must request a client certificate.* `serverParameters.clientAuthentication` defaults to unset, which
+  leaves the JSSE default: the server never asks. `SSLSession.getPeerCertificates()` then throws and the policy
+  fails closed, so *every* request is denied. Set it to `REQUIRE`, as above.
+* *The server must use `SpiffeSSLContextParameters`*, not a plain truststore that happens to trust the SPIFFE CA.
+  Such a truststore accepts any SVID that CA issued, which is a weaker check than the allow-list this policy
+  appears to give you.
+* *The handshake allow-list gates every policy.* `SpiffeSSLContextParameters.acceptedSpiffeIds` decides who may
+  connect at all, so a peer it rejects never reaches any route's policy. When several routes with different
+  `SpiffeSecurityPolicy` allow-lists share one server, this TLS-level list must contain every ID those policies
+  accept (or use `acceptAnySpiffeId` and let each policy narrow it), otherwise the handshake turns a peer away
+  before its route could have authorized it.
+
+The consumer must expose the peer authenticated by its own TLS connection. Supported sources are:
+
+[cols="1,3"]
+|===
+| Consumer | Authenticated peer source
+
+| `netty-http`
+| The channel's `SslHandler` session.
+
+| `servlet`, `jetty`
+| The secure servlet request's container-authenticated `jakarta.servlet.request.X509Certificate` attribute.
+
+| `undertow`
+| The real TLS session supplied by the connection's `SSLSessionInfo`. Forwarded SSL information without a TLS session is rejected.
+
+| `platform-http` with the Vert.x engine
+| The server request's actual `sslSession()`.
+
+| `netty`
+| The existing `CamelNettySSLSession` message header remains supported.
+
+| Other engines and TLS-terminating reverse proxies
+| No automatic peer authentication support. The proxy's connection identity does not prove the original client's identity.
+|===
+
+These adapters publish a `org.apache.camel.spi.TlsPeerCertificateProvider` in the `CamelTlsPeerCertificates`
+exchange property. This typed contract is for trusted consumers integrating actual authenticated server TLS state. It
+is never populated from HTTP identity or certificate headers. A TLS connection without a client certificate is
+recorded as an unverified peer, which fails closed; a plain connection leaves the property absent, and the policy then
+falls back to the session header. Custom consumers must uphold the same provenance contract.
+====
+
+The peer SPIFFE ID is taken from the *verified* TLS peer certificate the consumer put on the exchange through the
+typed TLS peer property (or the legacy Netty session header). Sender-supplied identity and certificate headers are
+never used (see the Security notes below). A peer that is not on the `acceptedSpiffeIds` allow-list, or that presents no verified SVID at
+all, is denied with a `CamelAuthorizationException`, so the route stops and the regular `onException` machinery applies.
+
+Set exactly one of:
+
+* `acceptedSpiffeIds` - a comma-separated allow-list of the peer SPIFFE IDs this segment authorizes;
+* `acceptAnySpiffeId=true` - authorize any peer that presents a verified SVID, leaving the which-peer decision to a
+  downstream policy. It still fails closed when no verified peer certificate is present.
+
+Setting both is rejected and setting neither fails closed, mirroring `SpiffeSSLContextParameters`.
+
+The policy answers "is the peer who they claim to be"; it is designed to *compose* with `camel-opa` ("may they do
+this") rather than duplicate it. On a successful authorization the verified SPIFFE ID is stored as the
+`CamelSpiffePeerId` exchange property, so an OPA policy downstream can forward it to a Rego rule through its
+`includeProperties` option:
+
+[tabs]
+====
+Java::
++
+[source,java]
+------------------------------------------------------------
+from("netty-http:https://0.0.0.0:8443?sslContextParameters=#spiffeSsl")
+    .policy(spiffePolicy)   // authenticates the peer, sets CamelSpiffePeerId
+    .policy(opaPolicy)      // opaPolicy.setIncludeProperties("CamelSpiffePeerId")
+    .to("direct:handleOrder");
+------------------------------------------------------------
+
+YAML::
++
+[source,yaml]
+----
+- beans:
+    - name: opaPolicy
+      type: org.apache.camel.component.opa.security.OpaSecurityPolicy
+      properties:
+        policyPath: authz/orders/allow
+        includeProperties: CamelSpiffePeerId
+- route:
+    from:
+      uri: netty-http:https://0.0.0.0:8443
+      parameters:
+        sslContextParameters: "#spiffeSsl"
+      steps:
+        # authenticates the peer, and sets the CamelSpiffePeerId exchange property
+        - policy:
+            ref: spiffePolicy
+            steps:
+              - policy:
+                  ref: opaPolicy
+                  steps:
+                    - to:
+                        uri: direct:handleOrder
+----
+====
+
+For a TLS consumer that exposes the `SSLSession` under a different header name, set `sslSessionHeader` accordingly. The
+legacy session header is used only when the typed TLS peer property is absent. A present but unverified or invalid
+typed property fails closed; a different session header cannot override it. Certificate objects and identity strings
+in message headers are never a substitute for authenticated TLS state.
+
+For OpenFGA composition, bind the user expression to the same verified exchange property. The OpenFGA model must
+define the corresponding `workload` type and tuples for those SPIFFE IDs:
+
+[source,java]
+----
+openFgaPolicy.setUser("workload:${exchangeProperty.CamelSpiffePeerId}");
+from("platform-http:/documents") // Vert.x engine with mutual TLS configured on its server
+    .policy(spiffePolicy)
+    .policy(openFgaPolicy)
+    .to("direct:documents");
+----
+
+`X-Forwarded-Client-Cert`, `X-SPIFFE-ID`, and similar proxy headers are not accepted. Terminate mutually
+authenticated TLS at the Camel consumer to authorize its direct peer. Authenticate an original client through an
+independent validated credential when TLS terminates at a reverse proxy; the proxy's own SVID identifies the proxy.
+
+include::spring-boot:partial$starter.adoc[]
+
+== Security notes
+
+* *The operation comes from the endpoint.* `CamelSpiffeOperation` is ignored unless the endpoint sets
+  `allowOperationHeader=true`. The operation decides whether this endpoint *validates* a token or *mints* one, so a
+  message able to set it could turn a validator into an endpoint that hands out this workload's own JWT-SVID.
+* *A validation always uses the configured audience.* `CamelSpiffeAudience` is honoured by `fetchJwtSvid`, where the
+  audience is a genuine per-message parameter ("mint me a token for X"), and ignored by `validateJwtSvid`, where the
+  audience is the check that binds the token to this workload. Letting a message choose it would allow a JWT-SVID
+  minted for a different service to validate successfully.
+* *Strip the component's headers on untrusted ingress.* As with any Camel component, a consumer that does not apply
+  a `HeaderFilterStrategy` blocking `Camel*` lets a sender populate the header map. Call
+  `removeHeaders("CamelSpiffe*")` before the `spiffe:` endpoint when the message comes from an untrusted producer.
+* *Key material reaches the message.* `fetchX509Svid` places an `X509Svid` - which carries the private key - on the
+  body, and `fetchJwtSvid` places the bearer token. Do not log or trace the body for those operations.
+* *Constrain the peer.* `SpiffeSSLContextParameters` requires either an `acceptedSpiffeIds` allow-list or
+  `acceptAnySpiffeId=true`; it fails closed when neither is given. Prefer the allow-list -
+  `acceptAnySpiffeId` accepts any SVID that chains to the trust bundle, which authenticates the trust domain but not
+  the peer.
+* *The authorization decision is made on the certificate, not a header.* `SpiffeSecurityPolicy` reads the peer SPIFFE
+  ID from the verified TLS peer certificate in trusted consumer state (with the legacy Netty session fallback), so a sender
+  cannot assert an identity by setting a header - and it requires mutual TLS, failing closed when the peer presented
+  no verified certificate. The verified id it publishes is the `CamelSpiffePeerId` exchange *property*, never a header,
+  so it likewise cannot be injected by an inbound message.
+
+== Producer readiness and identity observations
+
+Enable producer health checks with `camel.health.producersEnabled=true` before starting the route. The component
+also supports `healthCheckProducerEnabled` to disable its checks. The producer registers a check on start and removes
+it on stop. For each enabled check, a dedicated SDK-managed Workload API client maintains one streaming observer;
+stopping the producer closes that client and cancels its observer, even when the endpoint remains cached. Health
+calls read an immutable metadata snapshot and never fetch credentials, contact the API, or start another observer.
+Producer checks remain disabled globally by default, and no observer client is opened while they are disabled.
+If producer checks are enabled dynamically after route startup, restart the route to start its observer.
+
+The observation depends on the endpoint's configured operation:
+
+* `fetchX509Svid` observes the X.509 identity the producer serves: the one named by `localSpiffeId` when that option is
+  set, otherwise the default SVID. Readiness requires an available, unexpired SVID outside
+  `healthCheckExpiryThreshold` (default 60000 milliseconds, a duration such as `5m` is accepted). Set the threshold to
+  zero to require only that it has not expired. Health details include the observed expiry, remaining validity, and whether the identity is approaching expiry.
+* `fetchJwtSvid` and `validateJwtSvid` observe JWT trust bundles. Readiness requires a non-empty bundle update. Bundles
+  have no expiry timestamp, so the check makes no expiry claim and does not mint or validate a token. In particular,
+  it does not prove that a particular audience can be issued or that an incoming token will validate.
+
+Both report the most recent update timestamp and the state of the watch (`not-started`, `starting`, `watching`, `failed`
+or `stopped`). These are SDK callback observations, not an independently measured connection heartbeat; `lastUpdate` is
+the local observation time, not the SPIRE credential's issuance time. The check measures whether the identity the
+Workload API last delivered is valid and not about to expire, not whether the agent is reachable right now. The SDK
+reconnects to an unreachable agent on its own, with unlimited retries and without telling the watch, so an agent outage
+shows up only as an SVID that is no longer refreshed and comes within `healthCheckExpiryThreshold` of its expiry.
+`watch=failed` appears only after an error the SDK does not retry; the SDK then delivers no more updates, readiness
+stays DOWN with the last observation's validity details (`materialValid` keeps saying whether that material is still
+valid), and the route has to be restarted to watch again. Producer operations still contact the Workload API; the watch
+is not a credential cache for those operations. The rotating SSL context has its own source lifecycle and is not measured
+by these producer checks.
+
+No token, private key, certificate contents or exception text is retained or published by the check. A configured
+`workloadApiClient` is not actively probed: it can address a different API from `spiffeSocketPath`, and the SDK offers
+no independent unsubscribe handle for a borrowed client. Supply your own health check for that injected client. If
+`allowOperationHeader=true` is explicitly enabled, changing an individual message's operation does not retarget the
+readiness observer, which always reflects the endpoint's configured operation.

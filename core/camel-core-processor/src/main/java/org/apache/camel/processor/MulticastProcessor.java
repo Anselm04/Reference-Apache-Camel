@@ -1,0 +1,1683 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.camel.processor;
+
+import java.io.Closeable;
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.Iterator;
+import java.util.List;
+import java.util.Map;
+import java.util.Objects;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.Executor;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.RejectedExecutionException;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ScheduledFuture;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
+import java.util.concurrent.locks.Lock;
+import java.util.concurrent.locks.ReentrantLock;
+
+import org.apache.camel.AggregationStrategy;
+import org.apache.camel.AsyncCallback;
+import org.apache.camel.AsyncProcessor;
+import org.apache.camel.AsyncProducer;
+import org.apache.camel.CamelContext;
+import org.apache.camel.CamelContextAware;
+import org.apache.camel.CamelExchangeException;
+import org.apache.camel.Exchange;
+import org.apache.camel.ExchangePropertyKey;
+import org.apache.camel.Navigate;
+import org.apache.camel.Processor;
+import org.apache.camel.Producer;
+import org.apache.camel.Route;
+import org.apache.camel.RouteStoppingException;
+import org.apache.camel.RuntimeCamelException;
+import org.apache.camel.StreamCache;
+import org.apache.camel.Traceable;
+import org.apache.camel.impl.engine.CamelInternalProcessor;
+import org.apache.camel.processor.aggregate.ShareUnitOfWorkAggregationStrategy;
+import org.apache.camel.processor.aggregate.UseOriginalAggregationStrategy;
+import org.apache.camel.processor.errorhandler.ErrorHandlerSupport;
+import org.apache.camel.processor.errorhandler.RedeliveryErrorHandler;
+import org.apache.camel.spi.AsyncProcessorAwaitManager;
+import org.apache.camel.spi.ErrorHandlerAware;
+import org.apache.camel.spi.IdAware;
+import org.apache.camel.spi.InternalProcessorFactory;
+import org.apache.camel.spi.ProcessorExchangeFactory;
+import org.apache.camel.spi.ReactiveExecutor;
+import org.apache.camel.spi.RouteIdAware;
+import org.apache.camel.spi.StepIdAware;
+import org.apache.camel.spi.UnitOfWork;
+import org.apache.camel.support.AsyncProcessorConverterHelper;
+import org.apache.camel.support.AsyncProcessorSupport;
+import org.apache.camel.support.CamelContextHelper;
+import org.apache.camel.support.DefaultExchange;
+import org.apache.camel.support.ExchangeHelper;
+import org.apache.camel.support.LRUCacheFactory;
+import org.apache.camel.support.PluginHelper;
+import org.apache.camel.support.SendHelper;
+import org.apache.camel.support.service.ServiceHelper;
+import org.apache.camel.util.CastUtils;
+import org.apache.camel.util.IOHelper;
+import org.apache.camel.util.StopWatch;
+import org.apache.camel.util.TimeSource;
+import org.apache.camel.util.concurrent.AsyncCompletionService;
+import org.apache.camel.util.concurrent.Rejectable;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.slf4j.MDC;
+
+import static org.apache.camel.processor.ProcessorHelper.prepareMDCParallelTask;
+import static org.apache.camel.util.ObjectHelper.notNull;
+
+/**
+ * Implements the Multicast pattern to send a message exchange to a number of endpoints, each endpoint receiving a copy
+ * of the message exchange.
+ */
+public class MulticastProcessor extends BaseProcessorSupport
+        implements Navigate<Processor>, Traceable, IdAware, RouteIdAware, StepIdAware, ErrorHandlerAware {
+
+    private static final Logger LOG = LoggerFactory.getLogger(MulticastProcessor.class);
+
+    /**
+     * Class that represent each step in the multicast route to do
+     */
+    static final class DefaultProcessorExchangePair implements ProcessorExchangePair {
+        private final int index;
+        private final Processor processor;
+        private final Processor prepared;
+        private final Exchange exchange;
+
+        private DefaultProcessorExchangePair(int index, Processor processor, Processor prepared, Exchange exchange) {
+            this.index = index;
+            this.processor = processor;
+            this.prepared = prepared;
+            this.exchange = exchange;
+        }
+
+        @Override
+        public int getIndex() {
+            return index;
+        }
+
+        @Override
+        public Exchange getExchange() {
+            return exchange;
+        }
+
+        @Override
+        public Producer getProducer() {
+            if (processor instanceof Producer producer) {
+                return producer;
+            }
+            return null;
+        }
+
+        @Override
+        public Processor getProcessor() { // NOSONAR
+            // NOTE: we return prepared object on purpose.
+            return prepared;
+        }
+
+        @Override
+        public void begin() {
+            // noop
+        }
+
+        @Override
+        public void done() {
+            // noop
+        }
+
+    }
+
+    private final class Scheduler implements Executor {
+
+        @Override
+        public void execute(Runnable command) {
+            schedule(command, false);
+        }
+    }
+
+    private final class TransactedScheduler implements Executor {
+
+        @Override
+        public void execute(Runnable command) {
+            schedule(command, true);
+        }
+    }
+
+    protected final Processor onPrepare;
+    protected final ProcessorExchangeFactory processorExchangeFactory;
+    private final Lock lock = new ReentrantLock();
+    // the parallel tasks that are not done yet, so doShutdown can fail those whose parts the shut down thread pool
+    // never runs
+    private final Set<MulticastTask> parallelTasks = ConcurrentHashMap.newKeySet();
+    private final AsyncProcessorAwaitManager awaitManager;
+    private final CamelContext camelContext;
+    private final InternalProcessorFactory internalProcessorFactory;
+    private final Route route;
+    private final ReactiveExecutor reactiveExecutor;
+    private Processor errorHandler;
+    private String id;
+    private String routeId;
+    private String stepId;
+    private final Collection<Processor> processors;
+    private final AggregationStrategy aggregationStrategy;
+    private final boolean parallelProcessing;
+    private boolean synchronous;
+    private final boolean streaming;
+    private final boolean parallelAggregate;
+    private final boolean stopOnException;
+    private final ExecutorService executorService;
+    private final boolean shutdownExecutorService;
+    private final Scheduler scheduler = new Scheduler();
+    private final TransactedScheduler txScheduler = new TransactedScheduler();
+    private ExecutorService aggregateExecutorService;
+    private boolean shutdownAggregateExecutorService;
+    private final long timeout;
+    private final int cacheSize;
+    private final Map<Object, Processor> errorHandlers;
+    private final boolean shareUnitOfWork;
+
+    public MulticastProcessor(CamelContext camelContext, Route route, Collection<Processor> processors) {
+        this(camelContext, route, processors, null);
+    }
+
+    public MulticastProcessor(CamelContext camelContext, Route route, Collection<Processor> processors,
+                              AggregationStrategy aggregationStrategy) {
+        this(camelContext, route, processors, aggregationStrategy, false, null,
+             false, false, false, 0, null,
+             false, false, 0);
+    }
+
+    public MulticastProcessor(CamelContext camelContext, Route route, Collection<Processor> processors,
+                              AggregationStrategy aggregationStrategy,
+                              boolean parallelProcessing, ExecutorService executorService, boolean shutdownExecutorService,
+                              boolean streaming,
+                              boolean stopOnException, long timeout, Processor onPrepare, boolean shareUnitOfWork,
+                              boolean parallelAggregate, int cacheSize) {
+        notNull(camelContext, "camelContext");
+        this.camelContext = camelContext;
+        this.internalProcessorFactory = PluginHelper.getInternalProcessorFactory(camelContext);
+        this.awaitManager = PluginHelper.getAsyncProcessorAwaitManager(camelContext);
+        this.route = route;
+        this.reactiveExecutor = camelContext.getCamelContextExtension().getReactiveExecutor();
+        this.processors = processors;
+        this.aggregationStrategy = aggregationStrategy;
+        this.executorService = executorService;
+        this.shutdownExecutorService = shutdownExecutorService;
+        this.streaming = streaming;
+        this.stopOnException = stopOnException;
+        // must enable parallel if executor service is provided
+        this.parallelProcessing = parallelProcessing || executorService != null;
+        this.timeout = timeout;
+        this.onPrepare = onPrepare;
+        this.shareUnitOfWork = shareUnitOfWork;
+        this.parallelAggregate = parallelAggregate;
+        this.processorExchangeFactory = camelContext.getCamelContextExtension()
+                .getProcessorExchangeFactory().newProcessorExchangeFactory(this);
+        this.cacheSize = cacheSize == 0 ? CamelContextHelper.getMaximumCachePoolSize(camelContext) : cacheSize;
+        if (this.cacheSize > 0) {
+            this.errorHandlers = LRUCacheFactory.newLRUCache(this.cacheSize);
+        } else {
+            // no cache
+            this.errorHandlers = null;
+        }
+    }
+
+    @Override
+    public String toString() {
+        return id;
+    }
+
+    @Override
+    public String getId() {
+        return id;
+    }
+
+    @Override
+    public void setId(String id) {
+        this.id = id;
+    }
+
+    @Override
+    public String getRouteId() {
+        return routeId;
+    }
+
+    @Override
+    public void setRouteId(String routeId) {
+        this.routeId = routeId;
+    }
+
+    @Override
+    public String getStepId() {
+        return stepId;
+    }
+
+    @Override
+    public void setStepId(String stepId) {
+        this.stepId = stepId;
+    }
+
+    @Override
+    public void setErrorHandler(Processor errorHandler) {
+        this.errorHandler = errorHandler;
+    }
+
+    @Override
+    public Processor getErrorHandler() {
+        return errorHandler;
+    }
+
+    @Override
+    public String getTraceLabel() {
+        return "multicast";
+    }
+
+    public CamelContext getCamelContext() {
+        return camelContext;
+    }
+
+    public boolean isSynchronous() {
+        return synchronous;
+    }
+
+    public void setSynchronous(boolean synchronous) {
+        this.synchronous = synchronous;
+    }
+
+    @Override
+    protected void doBuild() throws Exception {
+        if (processorExchangeFactory != null) {
+            processorExchangeFactory.setId(id);
+            processorExchangeFactory.setRouteId(routeId);
+        }
+        ServiceHelper.buildService(processorExchangeFactory);
+    }
+
+    @Override
+    protected void doInit() throws Exception {
+        if (route != null) {
+            Exchange exchange = new DefaultExchange(getCamelContext());
+            for (Processor processor : getProcessors()) {
+                wrapInErrorHandler(route, exchange, processor);
+            }
+        }
+        ServiceHelper.initService(processorExchangeFactory);
+    }
+
+    @Override
+    public boolean process(Exchange exchange, AsyncCallback callback) {
+        AggregationStrategy strategy = getAggregationStrategy();
+
+        // set original exchange if not already pre-configured
+        if (strategy instanceof UseOriginalAggregationStrategy original) {
+            // need to create a new private instance, as we can also have concurrency issue so we cannot store state
+            AggregationStrategy clone = original.newInstance(exchange);
+            if (isShareUnitOfWork()) {
+                clone = new ShareUnitOfWorkAggregationStrategy(clone);
+            }
+            setAggregationStrategyOnExchange(exchange, clone);
+        } else if (isShareUnitOfWork() && strategy != null
+        // wrap here (not in the reifier) so the UseOriginal instanceof check above sees the unwrapped strategy
+                && !(strategy instanceof ShareUnitOfWorkAggregationStrategy)) {
+            setAggregationStrategyOnExchange(exchange, new ShareUnitOfWorkAggregationStrategy(strategy));
+        }
+
+        if (synchronous) {
+            try {
+                // force synchronous processing using await manager
+                awaitManager.process(new AsyncProcessorSupport() {
+                    @Override
+                    public boolean process(Exchange exchange, AsyncCallback callback) {
+                        // must invoke doProcess directly here to avoid calling recursive
+                        return doProcess(exchange, callback);
+                    }
+                }, exchange);
+            } catch (VirtualMachineError e) {
+                // left as before (thrown on after the callback), as in DelegateSyncProcessor
+                throw e;
+            } catch (Throwable e) {
+                // also an Error (such as one of an expression): the callback is called in finally, so an Error thrown
+                // on after it would not fail the exchange
+                exchange.setException(e);
+            } finally {
+                callback.done(true);
+            }
+            return true;
+        } else {
+            return doProcess(exchange, callback);
+        }
+    }
+
+    protected boolean doProcess(Exchange exchange, AsyncCallback callback) {
+        Iterable<ProcessorExchangePair> pairs;
+        int size = 0;
+        try {
+            pairs = createProcessorExchangePairs(exchange);
+            if (pairs instanceof Collection) {
+                pairs = ((Collection<ProcessorExchangePair>) pairs)
+                        .stream().filter(Objects::nonNull).toList();
+                size = ((Collection<ProcessorExchangePair>) pairs).size();
+            }
+        } catch (VirtualMachineError e) {
+            // left as before (thrown on), as in DelegateSyncProcessor
+            throw e;
+        } catch (Throwable e) {
+            // also an Error, such as one of the split expression
+            exchange.setException(e);
+            // unexpected exception was thrown, maybe from iterator etc. so do not regard as exhausted
+            // and do the done work
+            doDone(exchange, null, null, callback, true, false);
+            return true;
+        }
+
+        // we need to run in either transacted or reactive mode because the threading model is different
+        // when we run in transacted mode, then we synchronous processing on the current thread
+        // this can lead to a long execution which can lead to deep stackframes, and therefore we
+        // must handle this specially in a while loop structure to ensure the strackframe does not grow deeper
+        // the reactive mode will execute each sub task in its own runnable task which is scheduled on the reactive executor
+        // which is how the routing engine normally operates
+        // if we have parallel processing enabled then we cannot run in transacted mode (requires synchronous processing via same thread)
+        MulticastTask state = !isParallelProcessing() && exchange.isTransacted()
+                ? new MulticastTransactedTask(exchange, pairs, callback, size)
+                : new MulticastReactiveTask(exchange, pairs, callback, size);
+        if (isParallelProcessing()) {
+            try {
+                executorService.submit(() -> reactiveExecutor.scheduleSync(state));
+            } catch (RejectedExecutionException e) {
+                state.reject();
+            }
+            if (shutdownExecutorService && executorService.isShutdown()) {
+                // doShutdown shut the thread pool down meanwhile, maybe before it saw this task: with the CallerRuns
+                // policy the pool drops the task without an exception, so fail the exchange here (a no-op when
+                // doShutdown or reject() completed it already)
+                state.doFailed(new RouteStoppingException("The exchange cannot complete: the thread pool is shut down"));
+            }
+        } else {
+            if (exchange.isTransacted()) {
+                reactiveExecutor.scheduleQueue(state);
+            } else {
+                reactiveExecutor.scheduleMain(state);
+            }
+        }
+
+        // the remainder of the multicast will be completed async
+        // so we break out now, then the callback will be invoked which then
+        // continue routing from where we left here
+        return false;
+    }
+
+    protected void schedule(final Runnable runnable) {
+        schedule(runnable, false);
+    }
+
+    protected void schedule(final Runnable runnable, boolean transacted) {
+        if (isParallelProcessing()) {
+            @SuppressWarnings("deprecation")
+            Runnable task = prepareMDCParallelTask(camelContext, runnable);
+            try {
+                executorService.submit(() -> reactiveExecutor.scheduleSync(task));
+            } catch (RejectedExecutionException e) {
+                if (runnable instanceof Rejectable rej) {
+                    rej.reject();
+                } else {
+                    // a sub-exchange task (submitted via the completion service) is not rejectable,
+                    // so rethrow to let the multicast task fail the exchange instead of silently
+                    // dropping the sub-exchange (which would otherwise never complete)
+                    throw e;
+                }
+            }
+        } else if (transacted) {
+            reactiveExecutor.scheduleQueue(runnable);
+        } else {
+            reactiveExecutor.schedule(runnable);
+        }
+    }
+
+    protected abstract class MulticastTask implements Runnable, Rejectable {
+
+        final Exchange original;
+        final Iterable<ProcessorExchangePair> pairs;
+        final AsyncCallback callback;
+        final Iterator<ProcessorExchangePair> iterator;
+        final ReentrantLock lock = new ReentrantLock();
+        final AsyncCompletionService<Exchange> completion;
+        final AtomicReference<Exchange> result = new AtomicReference<>();
+        final AtomicInteger nbExchangeSent = new AtomicInteger();
+        final AtomicInteger nbAggregated = new AtomicInteger();
+        final AtomicBoolean allSent = new AtomicBoolean();
+        final AtomicBoolean done = new AtomicBoolean();
+        @Deprecated(since = "4.19.0")
+        final Map<String, String> mdc;
+        final ScheduledFuture<?> timeoutTask;
+
+        @SuppressWarnings("deprecation")
+        MulticastTask(Exchange original, Iterable<ProcessorExchangePair> pairs, AsyncCallback callback, int capacity,
+                      boolean transacted) {
+            this.original = original;
+            this.pairs = pairs;
+            this.callback = callback;
+            this.iterator = pairs.iterator();
+            if (timeout > 0) {
+                timeoutTask = schedule(aggregateExecutorService, this::timeout, timeout, TimeUnit.MILLISECONDS);
+            } else {
+                timeoutTask = null;
+            }
+            // if MDC is enabled we must make a copy in this constructor when the task
+            // is created by the caller thread, and then propagate back when run is called
+            // which can happen from another thread
+            // Deprecated since 4.19.0
+            if (isParallelProcessing() && original.getContext().isUseMDCLogging()) {
+                this.mdc = MDC.getCopyOfContextMap();
+            } else {
+                this.mdc = null;
+            }
+            if (capacity > 0) {
+                this.completion
+                        = new AsyncCompletionService<>(transacted ? txScheduler : scheduler, !isStreaming(), lock, capacity);
+            } else {
+                this.completion = new AsyncCompletionService<>(transacted ? txScheduler : scheduler, !isStreaming(), lock);
+            }
+            if (isParallelProcessing()) {
+                parallelTasks.add(this);
+            }
+        }
+
+        /**
+         * Marks this task as done, which only one caller can do.
+         */
+        private boolean markDone() {
+            if (done.compareAndSet(false, true)) {
+                parallelTasks.remove(this);
+                return true;
+            }
+            return false;
+        }
+
+        @Override
+        public String toString() {
+            return "MulticastTask";
+        }
+
+        @Override
+        public void run() {
+            if (this.mdc != null) {
+                this.mdc.forEach(MDC::put);
+            }
+        }
+
+        protected void aggregate() {
+            Lock lock = this.lock;
+            if (lock.tryLock()) {
+                try {
+                    aggregateCompleted();
+                } finally {
+                    lock.unlock();
+                }
+            }
+        }
+
+        /**
+         * Aggregates the completed exchanges, and is done when all the exchanges are sent and aggregated. Must be
+         * called while holding the lock.
+         */
+        private void aggregateCompleted() {
+            try {
+                Exchange exchange;
+                while (!done.get() && (exchange = completion.poll()) != null) {
+                    doAggregate(result, exchange, original);
+                    if (nbAggregated.incrementAndGet() >= nbExchangeSent.get() && allSent.get()) {
+                        doDone(result.get(), true);
+                    }
+                }
+            } catch (Exception e) {
+                doFailed(e);
+            } catch (VirtualMachineError e) {
+                // left as before, as in DelegateSyncProcessor
+                throw e;
+            } catch (Throwable e) {
+                // also an Error of the aggregation strategy: thrown on, it would leave the exchange without its done
+                doFailed(e);
+            }
+        }
+
+        /**
+         * There are no more pairs to send, even though the last pair sent was not known to be the last one (some
+         * iterators return true from hasNext() and then null from next()). In parallel mode the exchanges sent may
+         * still be in progress, so mark all as sent, and only be done when they are all aggregated (the transacted task
+         * handles the same case since CAMEL-21114).
+         */
+        private void doDoneNoMorePairs() {
+            Lock lock = this.lock;
+            lock.lock();
+            try {
+                allSent.set(true);
+                // aggregate() gives up when another thread holds the lock, so aggregate what is completed
+                aggregateCompleted();
+                if (nbAggregated.get() >= nbExchangeSent.get()) {
+                    doDone(result.get(), true);
+                }
+            } finally {
+                lock.unlock();
+            }
+        }
+
+        protected void timeout() {
+            // use lock() instead of tryLock() because timeout is a one-shot scheduled task
+            // if tryLock fails (lock held by aggregate), the timeout would be silently lost
+            // and the exchange would hang forever (CAMEL-24142)
+            Lock lock = this.lock;
+            lock.lock();
+            try {
+                if (done.get()) {
+                    return;
+                }
+                while (nbAggregated.get() < nbExchangeSent.get()) {
+                    Exchange exchange = completion.pollUnordered();
+                    int index = exchange != null ? getExchangeIndex(exchange) : nbExchangeSent.get();
+                    while (nbAggregated.get() < index) {
+                        int idx = nbAggregated.getAndIncrement();
+                        AggregationStrategy strategy = getAggregationStrategy(null);
+                        if (strategy != null) {
+                            strategy.timeout(result.get() != null ? result.get() : original,
+                                    idx, nbExchangeSent.get(), timeout);
+                        }
+                    }
+                    if (exchange != null) {
+                        doAggregate(result, exchange, original);
+                        nbAggregated.incrementAndGet();
+                    }
+                }
+                doTimeoutDone(result.get(), true);
+            } catch (Exception e) {
+                doTimeoutFailed(e);
+            } catch (VirtualMachineError e) {
+                throw e;
+            } catch (Throwable e) {
+                // also an Error of the aggregation strategy
+                doTimeoutFailed(e);
+            } finally {
+                lock.unlock();
+            }
+        }
+
+        protected void doTimeoutDone(Exchange exchange, boolean forceExhaust) {
+            if (markDone()) {
+                MulticastProcessor.this.doDone(original, exchange, pairs, callback, false, forceExhaust);
+            }
+        }
+
+        protected void doDone(Exchange exchange, boolean forceExhaust) {
+            if (markDone()) {
+                cancelTimeoutTask();
+                MulticastProcessor.this.doDone(original, exchange, pairs, callback, false, forceExhaust);
+            }
+        }
+
+        /**
+         * Fails the original exchange with the given exception and does the done work, unless this task is already
+         * done. The exception is only set by the thread that completes the task, so an exchange that has already been
+         * completed (for example by the timeout), and handed back to the caller, is not changed afterwards.
+         */
+        protected void doFailed(Exception e) {
+            doFailed((Throwable) e);
+        }
+
+        /**
+         * Same as {@link #doFailed(Exception)} for any {@link Throwable}, such as an Error that is not a
+         * {@link VirtualMachineError} (set on the exchange wrapped in a CamelExecutionException).
+         */
+        protected void doFailed(Throwable e) {
+            if (markDone()) {
+                cancelTimeoutTask();
+                original.setException(e);
+                MulticastProcessor.this.doDone(original, null, pairs, callback, false, false);
+            } else {
+                logFailedAfterDone(e);
+            }
+        }
+
+        /**
+         * Same as {@link #doFailed(Exception)} but called from the timeout task, which must not cancel itself.
+         */
+        protected void doTimeoutFailed(Exception e) {
+            doTimeoutFailed((Throwable) e);
+        }
+
+        /**
+         * Same as {@link #doTimeoutFailed(Exception)} for any {@link Throwable}.
+         */
+        protected void doTimeoutFailed(Throwable e) {
+            if (markDone()) {
+                original.setException(e);
+                MulticastProcessor.this.doDone(original, null, pairs, callback, false, false);
+            } else {
+                logFailedAfterDone(e);
+            }
+        }
+
+        private void logFailedAfterDone(Throwable e) {
+            if (e instanceof Exception) {
+                LOG.debug("Exception occurred after the exchange was already completed, so it is not set on exchange: {}",
+                        original.getExchangeId(), e);
+            } else {
+                // an Error reached the thread before, so it is not only logged at DEBUG now
+                LOG.warn("Error occurred after the exchange was already completed, so it is not set on exchange: {}",
+                        original.getExchangeId(), e);
+            }
+        }
+
+        private void cancelTimeoutTask() {
+            // cancel timeout if we are done normally (we cannot cancel if called via onTimeout)
+            if (timeoutTask != null) {
+                try {
+                    timeoutTask.cancel(true);
+                } catch (Exception e) {
+                    // ignore
+                    LOG.debug("Cancel timeout task caused an exception. This exception is ignored.", e);
+                }
+            }
+        }
+
+        @Override
+        public void reject() {
+            doFailed(new RejectedExecutionException("Task rejected executing from ExecutorService"));
+        }
+    }
+
+    /**
+     * Sub task processed reactive via the {@link ReactiveExecutor}.
+     */
+    protected class MulticastReactiveTask extends MulticastTask {
+
+        public MulticastReactiveTask(Exchange original, Iterable<ProcessorExchangePair> pairs, AsyncCallback callback,
+                                     int size) {
+            super(original, pairs, callback, size, false);
+        }
+
+        @Override
+        public void run() {
+            super.run();
+
+            try {
+                if (done.get()) {
+                    return;
+                }
+
+                // Get next processor exchange pair to sent, skipping null ones
+                ProcessorExchangePair pair = getNextProcessorExchangePair();
+                if (pair == null) {
+                    super.doDoneNoMorePairs();
+                    return;
+                }
+
+                boolean hasNext = iterator.hasNext();
+
+                Exchange exchange = pair.getExchange();
+                int index = nbExchangeSent.getAndIncrement();
+                updateNewExchange(exchange, index, pairs, hasNext);
+                if (!hasNext) {
+                    allSent.set(true);
+                }
+
+                completion.submit(exchangeResult -> {
+                    // compute time taken if sending to another endpoint
+                    StopWatch watch = beforeSend(pair);
+
+                    AsyncCallback taskCallback = (doneSync) -> {
+                        afterSend(pair, watch, original);
+
+                        // Decide whether to continue with the multicast or not; similar logic to the Pipeline
+                        // remember to test for stop on exception and aggregate before copying back results
+                        String msg = null;
+                        if (LOG.isDebugEnabled()) {
+                            msg = "Multicast processing failed for number " + index;
+                        }
+                        boolean continueProcessing = PipelineHelper.continueProcessing(exchange, msg, LOG);
+                        if (!continueProcessing && !shouldContinueOnFailure(exchange, original, index)) {
+                            if (exchange.getException() != null) {
+                                // wrap in exception to explain where it failed
+                                exchange.setException(new CamelExchangeException(
+                                        "Multicast processing failed for number " + index, exchange, exchange.getException()));
+                            } else {
+                                // we want to stop on exception, and the exception was handled by the error handler
+                                // this is similar to what the pipeline does, so we should do the same to not surprise end users
+                                // so we should set the failed exchange as the result and be done
+                                result.set(exchange);
+                            }
+                            // and do the done work
+                            doDone(exchange, true);
+                            return;
+                        }
+
+                        // Propagate the interrupted flag and the cut-off-WARN-logged marker from the
+                        // sub-exchange to the original exchange immediately, before the outer error handler's
+                        // callback fires. Only propagate when a stopped error handler in a nested EIP
+                        // (e.g. split inside multicast) already logged the cut-off WARN -- identified by
+                        // the CUTOFF_WARN_LOGGED property set by RedeliveryErrorHandler.runNotAllowed().
+                        // If interrupted was set by DirectProducer without logging a WARN, we must NOT
+                        // propagate: the outer error handler must still log its WARN for this cut-off.
+                        if (exchange.getProperty(RedeliveryErrorHandler.CUTOFF_WARN_LOGGED, false, Boolean.class)) {
+                            original.getExchangeExtension().setInterrupted(true);
+                            original.setProperty(RedeliveryErrorHandler.CUTOFF_WARN_LOGGED, Boolean.TRUE);
+                        }
+
+                        exchangeResult.accept(exchange);
+
+                        // aggregate exchanges if any
+                        aggregate();
+
+                        // next step
+                        if (hasNext && !isParallelProcessing()) {
+                            schedule(this);
+                        }
+                    };
+
+                    AsyncProcessor async = AsyncProcessorConverterHelper.convert(pair.getProcessor());
+                    if (synchronous) {
+                        // force synchronous processing using await manager
+                        // to restrict total number of threads to be bound by the thread-pool of this EIP,
+                        // as otherwise in case of async processing then other thread pools can cause
+                        // unbounded thread use that cannot be controlled by Camel
+                        awaitManager.process(async, exchange);
+                        taskCallback.done(true);
+                    } else {
+                        // async processing in reactive-mode which can use as many threads as possible
+                        // if the downstream processors are async and use different threads
+                        async.process(exchange, taskCallback);
+                    }
+                });
+                // after submitting this pair then move on to the next pair (if in parallel mode)
+                if (hasNext && isParallelProcessing()) {
+                    schedule(this);
+                }
+            } catch (Exception e) {
+                doFailed(e);
+            } catch (VirtualMachineError e) {
+                throw e;
+            } catch (Throwable e) {
+                // also an Error of the iterator of a streaming split
+                doFailed(e);
+            }
+        }
+
+        private ProcessorExchangePair getNextProcessorExchangePair() {
+            ProcessorExchangePair tpair = null;
+            while (tpair == null && iterator.hasNext()) {
+                tpair = iterator.next();
+            }
+            return tpair;
+        }
+    }
+
+    /**
+     * Transacted sub task processed synchronously using {@link Processor#process(Exchange)} with the same thread in a
+     * while loop control flow.
+     */
+    protected class MulticastTransactedTask extends MulticastTask {
+
+        public MulticastTransactedTask(Exchange original, Iterable<ProcessorExchangePair> pairs, AsyncCallback callback,
+                                       int size) {
+            super(original, pairs, callback, size, true);
+        }
+
+        @Override
+        public void run() {
+            super.run();
+
+            boolean next = true;
+            while (next) {
+                try {
+                    next = doRun();
+                } catch (Exception e) {
+                    doFailed(e);
+                    return;
+                } catch (VirtualMachineError e) {
+                    throw e;
+                } catch (Throwable e) {
+                    // also an Error of the iterator
+                    doFailed(e);
+                    return;
+                }
+            }
+        }
+
+        boolean doRun() throws Exception {
+            if (done.get()) {
+                return false;
+            }
+
+            // Check if the iterator is empty
+            // This can happen the very first time we check the existence
+            // of an item before queuing the run.
+            // or some iterators may return true for hasNext() but then null in next()
+            if (!iterator.hasNext()) {
+                doDone(result.get(), true);
+                return false;
+            }
+
+            ProcessorExchangePair pair = iterator.next();
+            if (pair == null) {
+                return true; // go again to check hasNext
+            }
+
+            boolean hasNext = iterator.hasNext();
+            Exchange exchange = pair.getExchange();
+            int index = nbExchangeSent.getAndIncrement();
+            updateNewExchange(exchange, index, pairs, hasNext);
+            if (!hasNext) {
+                allSent.set(true);
+            }
+
+            // process next
+
+            // compute time taken if sending to another endpoint
+            StopWatch watch = beforeSend(pair);
+
+            // use synchronous processing in transacted mode
+            Processor sync = pair.getProcessor();
+            try {
+                sync.process(exchange);
+            } catch (Exception e) {
+                exchange.setException(e);
+            } catch (VirtualMachineError e) {
+                // left as before (thrown on)
+                throw e;
+            } catch (Throwable e) {
+                // also an Error, as for an exception: only this part fails (thrown on, it would fail the whole exchange)
+                exchange.setException(e);
+            } finally {
+                afterSend(pair, watch, original);
+            }
+
+            // Decide whether to continue with the multicast or not; similar logic to the Pipeline
+            // remember to test for stop on exception and aggregate before copying back results
+            String msg = null;
+            if (LOG.isDebugEnabled()) {
+                msg = "Multicast processing failed for number " + index;
+            }
+            boolean continueProcessing = PipelineHelper.continueProcessing(exchange, msg, LOG);
+            if (!continueProcessing && !shouldContinueOnFailure(exchange, original, index)) {
+                if (exchange.getException() != null) {
+                    // wrap in exception to explain where it failed
+                    exchange.setException(new CamelExchangeException(
+                            "Multicast processing failed for number " + index, exchange, exchange.getException()));
+                } else {
+                    // we want to stop on exception, and the exception was handled by the error handler
+                    // this is similar to what the pipeline does, so we should do the same to not surprise end users
+                    // so we should set the failed exchange as the result and be done
+                    result.set(exchange);
+                }
+                // Propagate the interrupted flag and the cut-off-WARN-logged marker from the
+                // sub-exchange to the original before doDone() fires.
+                if (exchange.getProperty(RedeliveryErrorHandler.CUTOFF_WARN_LOGGED, false, Boolean.class)) {
+                    original.getExchangeExtension().setInterrupted(true);
+                    original.setProperty(RedeliveryErrorHandler.CUTOFF_WARN_LOGGED, Boolean.TRUE);
+                }
+                // and do the done work
+                doDone(exchange, true);
+                return false;
+            }
+
+            completion.submit(exchangeResult -> {
+                // accept the exchange as a result
+                exchangeResult.accept(exchange);
+
+                // aggregate exchanges if any
+                aggregate();
+            });
+
+            // after submitting this pair then move on to the next pair (if in parallel mode)
+            if (hasNext && isParallelProcessing()) {
+                schedule(this);
+            }
+
+            // next step
+            boolean next = hasNext && !isParallelProcessing();
+            LOG.trace("Run next: {}", next);
+            return next;
+        }
+    }
+
+    /**
+     * Determines whether processing should continue after a sub-exchange has failed.
+     * <p>
+     * The default implementation returns {@code false} when {@code stopOnException} is enabled (meaning processing
+     * should stop). Subclasses (e.g., Splitter) can override this to implement more sophisticated failure policies such
+     * as error threshold checking.
+     *
+     * @param  subExchange the failed sub-exchange
+     * @param  original    the original exchange
+     * @param  index       the index of the failed sub-exchange
+     * @return             {@code true} to continue processing despite the failure, {@code false} to stop
+     */
+    protected boolean shouldContinueOnFailure(Exchange subExchange, Exchange original, int index) {
+        return !stopOnException;
+    }
+
+    /**
+     * Whether processing was stopped because {@link #shouldContinueOnFailure(Exchange, Exchange, int)} returned
+     * {@code false} for a failed sub-exchange although {@code stopOnException} is not enabled (e.g., the Splitter
+     * reached its error threshold). The original exchange is then kept and only gets the exception, the same as with
+     * {@code stopOnException}.
+     *
+     * @param  original the original exchange
+     * @return          {@code true} if processing was stopped on a failure
+     */
+    protected boolean isStoppedOnFailure(Exchange original) {
+        return false;
+    }
+
+    protected ScheduledFuture<?> schedule(Executor executor, Runnable runnable, long delay, TimeUnit unit) {
+        if (executor instanceof ScheduledExecutorService scheduledExecutorService) {
+            return scheduledExecutorService.schedule(runnable, delay, unit);
+        } else {
+            executor.execute(() -> {
+                try {
+                    TimeSource.sleep(delay);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
+                runnable.run();
+            });
+        }
+        return null;
+    }
+
+    protected StopWatch beforeSend(ProcessorExchangePair pair) {
+        StopWatch watch;
+        final Exchange e = pair.getExchange();
+        final Producer p = pair.getProducer();
+        if (p != null) {
+            watch = SendHelper.notifySending(e, p.getEndpoint());
+        } else {
+            watch = null;
+        }
+
+        // let the prepared process it, remember to begin the exchange pair
+        pair.begin();
+
+        // return the watch
+        return watch;
+    }
+
+    /**
+     * Called when an item was sent.
+     *
+     * @param pair     the pair of the item
+     * @param watch    the watch from {@link #beforeSend(ProcessorExchangePair)}
+     * @param original the exchange that was split or multicasted. Properties should be read from this exchange, as an
+     *                 item can have inherited them from an outer split, or a nested split can have changed them.
+     */
+    protected void afterSend(ProcessorExchangePair pair, StopWatch watch, Exchange original) {
+        afterSend(pair, watch);
+    }
+
+    protected void afterSend(ProcessorExchangePair pair, StopWatch watch) {
+        // we are done with the exchange pair
+        pair.done();
+
+        // okay we are done, so notify the exchange was sent
+        final Producer producer = pair.getProducer();
+        if (producer != null) {
+            // emit event that the exchange was sent to the endpoint
+            SendHelper.notifySent(pair.getExchange(), producer.getEndpoint(), watch);
+        }
+    }
+
+    /**
+     * Common work which must be done when we are done multicasting.
+     * <p>
+     * This logic applies for both running synchronous and asynchronous as there are multiple exit points when using the
+     * asynchronous routing engine. And therefore we want the logic in one method instead of being scattered.
+     *
+     * @param original     the original exchange
+     * @param subExchange  the current sub exchange, can be <code>null</code> for the synchronous part
+     * @param pairs        the pairs with the exchanges to process
+     * @param callback     the callback
+     * @param doneSync     the <code>doneSync</code> parameter to call on callback
+     * @param forceExhaust whether error handling is exhausted
+     */
+    protected void doDone(
+            Exchange original, Exchange subExchange, final Iterable<ProcessorExchangePair> pairs,
+            AsyncCallback callback, boolean doneSync, boolean forceExhaust) {
+
+        AggregationStrategy strategy = getAggregationStrategy(subExchange);
+        // invoke the on completion callback
+        Throwable completionFailure = null;
+        if (strategy != null) {
+            try {
+                strategy.onCompletion(subExchange, original);
+            } catch (Throwable e) {
+                // the task is already done: fail the exchange below, and still call the callback, or the exchange hangs
+                completionFailure = e;
+            }
+        }
+
+        // cleanup any per exchange aggregation strategy
+        removeAggregationStrategyFromExchange(original);
+
+        // we need to know if there was an exception, and if we stopped on it (the stopOnException option, or a failure
+        // policy such as the error threshold of the Splitter)
+        // also we would need to know if any error handler has attempted redelivery and exhausted
+        boolean stoppedOnException = false;
+        boolean exception = false;
+        boolean exhaust = forceExhaust || subExchange != null
+                && (subExchange.getException() != null || subExchange.getExchangeExtension().isRedeliveryExhausted());
+        if (original.getException() != null || subExchange != null && subExchange.getException() != null) {
+            // there was an exception and we stopped
+            stoppedOnException = isStopOnException() || isStoppedOnFailure(original);
+            exception = true;
+        }
+
+        // must copy results at this point
+        if (subExchange != null) {
+            if (stoppedOnException) {
+                // if we stopped due an exception then only propagate the exception
+                original.setException(subExchange.getException());
+            } else {
+                // copy the current result to original (preserve original correlation id),
+                // so it will contain this result of this eip
+                Object correlationId = original.removeProperty(ExchangePropertyKey.CORRELATION_ID);
+                ExchangeHelper.copyResults(original, subExchange);
+                if (correlationId != null) {
+                    original.setProperty(ExchangePropertyKey.CORRELATION_ID, correlationId);
+                }
+            }
+            // Propagate the interrupted flag and the cut-off-WARN-logged marker from the sub-exchange to
+            // the original. Only propagate when a stopped error handler in a nested EIP already logged the
+            // cut-off WARN (identified by CUTOFF_WARN_LOGGED set by RedeliveryErrorHandler.runNotAllowed()).
+            // DirectProducer sets interrupted without logging, so its interruption must NOT be forwarded here
+            // -- the outer handler must log the WARN for this cut-off.
+            if (subExchange.getProperty(RedeliveryErrorHandler.CUTOFF_WARN_LOGGED, false, Boolean.class)) {
+                original.getExchangeExtension().setInterrupted(true);
+                original.setProperty(RedeliveryErrorHandler.CUTOFF_WARN_LOGGED, Boolean.TRUE);
+            }
+        }
+        if (completionFailure != null) {
+            // after copyResults, which would overwrite it; an exchange that has failed already keeps its exception
+            // (an Error, such as a NoClassDefFoundError, is wrapped by setException)
+            Exception cause = original.getException();
+            if (cause == null) {
+                original.setException(completionFailure);
+                // no error handler has seen it yet, so it is not exhausted (as when aggregate throws)
+                exhaust = false;
+            } else if (cause != completionFailure) {
+                // (or logged, when the cause is the exception instance of a throwException step)
+                ThrowExceptionProcessor.addSuppressed(original, cause, completionFailure);
+            }
+            exception = true;
+        }
+
+        if (processorExchangeFactory != null && pairs instanceof Collection) {
+            // the exchanges on the pairs was created with a factory, so they should be released
+            // (only when the pairs are a collection, as iterating a streaming iterable would read, prepare and create
+            // exchanges for all the remaining parts, such as after stopOnException or a timeout)
+            try {
+                boolean pooled = processorExchangeFactory.isPooled();
+                UnitOfWork parentUnitOfWork = original.getUnitOfWork();
+                for (ProcessorExchangePair pair : pairs) {
+                    Exchange part = pair.getExchange();
+                    if (pooled && parentUnitOfWork != null && part.getUnitOfWork() == parentUnitOfWork) {
+                        // the part shares the unit of work of the parent (shareUnitOfWork), which releasing the part
+                        // would reset (removing the on completions of the parent, such as its consumer's commit)
+                        part.getExchangeExtension().setUnitOfWork(null);
+                    }
+                    processorExchangeFactory.release(part);
+                }
+            } catch (Exception e) {
+                LOG.warn("Error releasing exchange due to {}. This exception is ignored.", e.getMessage(), e);
+            }
+        }
+        // we are done so close the pairs iterator
+        if (pairs instanceof Closeable closeable) {
+            IOHelper.close(closeable, "pairs", LOG);
+        }
+
+        // .. and then if there was an exception we need to configure the redelivery exhaust
+        // for example the noErrorHandler will not cause redelivery exhaust so if this error
+        // handled has been in use, then the exhaust would be false (if not forced)
+        if (exception) {
+            // multicast uses error handling on its output processors and they have tried to redeliver
+            // so we shall signal back to the other error handlers that we are exhausted and they should not
+            // also try to redeliver as we would then do that twice
+            original.getExchangeExtension().setRedeliveryExhausted(exhaust);
+        }
+
+        reactiveExecutor.schedule(callback);
+    }
+
+    /**
+     * Aggregate the {@link Exchange} with the current result. This method is synchronized and is called directly when
+     * parallelAggregate is disabled (by default).
+     *
+     * @param result        the current result
+     * @param exchange      the exchange to be added to the result
+     * @param inputExchange the input exchange that was sent as input to this EIP
+     */
+    protected void doAggregate(AtomicReference<Exchange> result, Exchange exchange, Exchange inputExchange) {
+        if (parallelAggregate) {
+            doAggregateInternal(getAggregationStrategy(exchange), result, exchange, inputExchange);
+        } else {
+            doAggregateSync(getAggregationStrategy(exchange), result, exchange, inputExchange);
+        }
+    }
+
+    /**
+     * Aggregate the {@link Exchange} with the current result. This method is synchronized and is called directly when
+     * parallelAggregate is disabled (by default).
+     *
+     * @param strategy      the aggregation strategy to use
+     * @param result        the current result
+     * @param exchange      the exchange to be added to the result
+     * @param inputExchange the input exchange that was sent as input to this EIP
+     */
+    private void doAggregateSync(
+            AggregationStrategy strategy, AtomicReference<Exchange> result, Exchange exchange, Exchange inputExchange) {
+        lock.lock();
+        try {
+            doAggregateInternal(strategy, result, exchange, inputExchange);
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    /**
+     * Aggregate the {@link Exchange} with the current result. This method is unsynchronized and is called directly when
+     * parallelAggregate is enabled. In all other cases, this method is called from the doAggregate which is a
+     * synchronized method
+     *
+     * @param strategy      the aggregation strategy to use
+     * @param result        the current result
+     * @param exchange      the exchange to be added to the result
+     * @param inputExchange the input exchange that was sent as input to this EIP
+     */
+    private void doAggregateInternal(
+            AggregationStrategy strategy, AtomicReference<Exchange> result, Exchange exchange, Exchange inputExchange) {
+        if (strategy != null) {
+            // prepare the exchanges for aggregation
+            Exchange oldExchange = result.get();
+            ExchangeHelper.prepareAggregation(oldExchange, exchange);
+            result.set(strategy.aggregate(oldExchange, exchange, inputExchange));
+        }
+    }
+
+    protected void updateNewExchange(Exchange exchange, int index, Iterable<ProcessorExchangePair> allPairs, boolean hasNext) {
+        exchange.setProperty(ExchangePropertyKey.MULTICAST_INDEX, index);
+        if (hasNext) {
+            exchange.setProperty(ExchangePropertyKey.MULTICAST_COMPLETE, Boolean.FALSE);
+        } else {
+            exchange.setProperty(ExchangePropertyKey.MULTICAST_COMPLETE, Boolean.TRUE);
+        }
+    }
+
+    protected Integer getExchangeIndex(Exchange exchange) {
+        return exchange.getProperty(ExchangePropertyKey.MULTICAST_INDEX, Integer.class);
+    }
+
+    protected Iterable<ProcessorExchangePair> createProcessorExchangePairs(Exchange exchange)
+            throws Exception {
+        List<ProcessorExchangePair> result = new ArrayList<>(processors.size());
+        Map<String, Object> txData = null;
+
+        StreamCache streamCache = null;
+        if (isParallelProcessing() && exchange.getIn().getBody() instanceof StreamCache streamCacheBody) {
+            // in parallel processing case, the stream must be copied, therefore, get the stream
+            streamCache = streamCacheBody;
+        }
+
+        int index = 0;
+        for (Processor processor : processors) {
+            // copy exchange, and do not share the unit of work
+            Exchange copy = processorExchangeFactory.createCorrelatedCopy(exchange, false);
+            copy.getExchangeExtension().setTransacted(exchange.isTransacted());
+            if (isParallelProcessing()) {
+                // do not share JPA EntityManager in parallel mode as it is not thread-safe (CAMEL-22534)
+                copy.removeProperty(Exchange.JPA_ENTITY_MANAGER);
+            }
+            // If we are in a transaction, set TRANSACTION_CONTEXT_DATA property for new exchanges to share txData
+            // during the transaction.
+            if (exchange.isTransacted() && copy.getProperty(Exchange.TRANSACTION_CONTEXT_DATA) == null) {
+                if (txData == null) {
+                    txData = new ConcurrentHashMap<>();
+                }
+                copy.setProperty(Exchange.TRANSACTION_CONTEXT_DATA, txData);
+            }
+            if (streamCache != null) {
+                if (index > 0) {
+                    // copy it otherwise parallel processing is not possible,
+                    // because streams can only be read once
+                    StreamCache copiedStreamCache = streamCache.copy(copy);
+                    if (copiedStreamCache != null) {
+                        copy.getIn().setBody(copiedStreamCache);
+                    }
+                }
+            }
+
+            // If the multi-cast processor has an aggregation strategy
+            // then the StreamCache created by the child routes must not be
+            // closed by the unit of work of the child route, but by the unit of
+            // work of the parent route or grand parent route or grand grand parent route ...(in case of nesting).
+            // Set therefore the unit of work of the  parent route as stream cache unit of work,
+            // if it is not already set.
+            if (copy.getProperty(ExchangePropertyKey.STREAM_CACHE_UNIT_OF_WORK) == null) {
+                copy.setProperty(ExchangePropertyKey.STREAM_CACHE_UNIT_OF_WORK, exchange.getUnitOfWork());
+            }
+            // if we share unit of work, we need to prepare the child exchange
+            if (isShareUnitOfWork()) {
+                prepareSharedUnitOfWork(copy, exchange);
+            }
+
+            // and add the pair
+            Route route = ExchangeHelper.getRoute(exchange);
+            result.add(createProcessorExchangePair(index++, processor, copy, route));
+        }
+
+        if (exchange.getException() != null) {
+            // force any exceptions occurred during creation of exchange paris to be thrown
+            // before returning the answer;
+            throw exchange.getException();
+        }
+
+        return result;
+    }
+
+    /**
+     * Creates the {@link ProcessorExchangePair} which holds the processor and exchange to be sent out.
+     * <p>
+     * You <b>must</b> use this method to create the instances of {@link ProcessorExchangePair} as they need to be
+     * specially prepared before use.
+     *
+     * @param  index     the index
+     * @param  processor the processor
+     * @param  exchange  the exchange
+     * @param  route     the route context
+     * @return           prepared for use
+     */
+    protected ProcessorExchangePair createProcessorExchangePair(
+            int index, Processor processor, Exchange exchange,
+            Route route) {
+        Processor prepared = processor;
+
+        // set property which endpoint we send to
+        setToEndpoint(exchange, prepared);
+
+        // rework error handling to support fine grained error handling
+        prepared = wrapInErrorHandler(route, exchange, prepared);
+
+        // invoke on prepare on the exchange if specified
+        if (onPrepare != null) {
+            try {
+                onPrepare.process(exchange);
+            } catch (VirtualMachineError e) {
+                // left as before (thrown on)
+                throw e;
+            } catch (Throwable e) {
+                // also an Error, as for an exception: only this part fails (thrown on, it would fail the whole exchange)
+                exchange.setException(e);
+            }
+        }
+        return new DefaultProcessorExchangePair(index, processor, prepared, exchange);
+    }
+
+    protected Processor wrapInErrorHandler(Route route, Exchange exchange, Processor processor) {
+        Processor answer;
+        Processor key = processor;
+
+        if (route != this.route && this.route != null) {
+            throw new UnsupportedOperationException("Is this really correct ?");
+        }
+        Boolean tryBlock = (Boolean) exchange.getProperty(ExchangePropertyKey.TRY_ROUTE_BLOCK);
+
+        // do not wrap in error handler if we are inside a try block
+        if (route != null && (tryBlock == null || !tryBlock)) {
+            // wrap the producer in error handler so we have fine grained error handling on
+            // the output side instead of the input side
+            // this is needed to support redelivery on that output alone and not doing redelivery
+            // for the entire multicast block again which will start from scratch again
+
+            // with a send hook installed, the output of the error handler of a producer (a recipient of the recipient
+            // list) is the producer with the hook around it, and that error handler is cached apart, so without a hook
+            // the error handler and its output are the same as when there is no send hook at all
+            final boolean hookInstalled = key instanceof AsyncProducer
+                    && camelContext.getCamelContextExtension().getSendHook() != null;
+            final Object cacheKey = hookInstalled ? new SendHookKey(key) : key;
+
+            // lookup cached first to reuse and preserve memory
+            answer = errorHandlers != null ? errorHandlers.get(cacheKey) : null;
+            if (answer != null) {
+                LOG.trace("Using existing error handler for: {}", key);
+                return answer;
+            }
+
+            LOG.trace("Creating error handler for: {}", key);
+            try {
+                // the producer with the hook around it looks up the hook on every send, so it can be cached
+                Processor output = hookInstalled ? SendHelper.newSendHookProducer((AsyncProducer) key) : key;
+                processor = wrapInErrorHandler(route, output);
+
+                // and wrap in unit of work processor so the copy exchange also can run under UoW
+                answer = createUnitOfWorkProcessor(route, processor, exchange);
+
+                // Start before publishing to the cache: a second exchange to the same new recipient
+                // can take the cache-hit path and use the wrapper before it is started.
+                // isRunAllowed() covers STARTING/STARTED/SUSPENDING/SUSPENDED phases; during doInit()
+                // (INITIALIZING) it is false, so wrappers built there are deferred to doStart().
+                if (isRunAllowed()) {
+                    ServiceHelper.startService(answer);
+                }
+
+                if (errorHandlers != null) {
+                    errorHandlers.putIfAbsent(cacheKey, answer);
+                }
+
+            } catch (Exception e) {
+                throw RuntimeCamelException.wrapRuntimeCamelException(e);
+            }
+        } else {
+            // and wrap in unit of work processor so the copy exchange also can run under UoW
+            answer = createUnitOfWorkProcessor(route, withSendHook(processor), exchange);
+            if (answer instanceof CamelInternalProcessor internal) {
+                // no error handler around the output (such as in a doTry): a recipient producer that throws from
+                // process(exchange, callback) fails the copy instead of hanging the recipient list, as in a channel
+                internal.setCatchProcessorThrows(true);
+            }
+        }
+
+        return answer;
+    }
+
+    /**
+     * Puts the send hook, if one is installed, around an output that is a producer (a recipient of the recipient list),
+     * when the output is used for this exchange only.
+     */
+    private Processor withSendHook(Processor output) {
+        if (output instanceof AsyncProducer producer) {
+            return SendHelper.withSendHook(camelContext, producer);
+        }
+        return output;
+    }
+
+    /**
+     * The key of the cached error handler of a producer whose output has the send hook around it.
+     */
+    private record SendHookKey(Processor producer) {
+    }
+
+    private Processor wrapInErrorHandler(Route route, Processor processor) throws Exception {
+        // use the error handler from multicast and clone it to use the new processor as its output
+        if (errorHandler instanceof ErrorHandlerSupport errorHandlerSupport) {
+            return errorHandlerSupport.clone(processor);
+        }
+        // fallback and use reifier to create the error handler
+        return camelContext.getCamelContextExtension().createErrorHandler(route, processor);
+    }
+
+    /**
+     * Strategy to create the unit of work to be used for the sub route
+     *
+     * @param  processor the processor
+     * @param  exchange  the exchange
+     * @return           the unit of work processor
+     */
+    protected Processor createUnitOfWorkProcessor(Route route, Processor processor, Exchange exchange) {
+        // and wrap it in a unit of work so the UoW is on the top, so the entire route will be in the same UoW
+        return internalProcessorFactory.addUnitOfWorkProcessorAdvice(camelContext, processor, route);
+    }
+
+    /**
+     * Prepares the exchange for participating in a shared unit of work
+     * <p>
+     * This ensures a child exchange can access its parent {@link UnitOfWork} when it participates in a shared unit of
+     * work.
+     *
+     * @param childExchange  the child exchange
+     * @param parentExchange the parent exchange
+     */
+    protected void prepareSharedUnitOfWork(Exchange childExchange, Exchange parentExchange) {
+        // share the unit of work on the child (the child does not hand over the on completions of the parent)
+        childExchange.getExchangeExtension().setSharedUnitOfWork(parentExchange.getUnitOfWork());
+    }
+
+    @Override
+    protected void doStart() throws Exception {
+        if (isParallelProcessing() && executorService == null) {
+            throw new IllegalArgumentException("ParallelProcessing is enabled but ExecutorService has not been set");
+        }
+        if (timeout > 0 && aggregateExecutorService == null) {
+            // use unbounded thread pool so we ensure the aggregate on-the-fly task always will have assigned a thread
+            // and run the tasks when the task is submitted. If not then the aggregate task may not be able to run
+            // and signal completion during processing, which would lead to what would appear as a dead-lock or a slow processing
+            String name = getClass().getSimpleName() + "-AggregateTask";
+            aggregateExecutorService = createAggregateExecutorService(name);
+            shutdownAggregateExecutorService = true;
+        }
+        CamelContextAware.trySetCamelContext(aggregationStrategy, camelContext);
+        ServiceHelper.startService(aggregationStrategy, processors, processorExchangeFactory);
+        // start any error handlers that were pre-built during doInit() but not yet started
+        // (they were deferred to avoid starting producers before CamelContext is fully started)
+        if (errorHandlers != null) {
+            ServiceHelper.startService(errorHandlers.values());
+        }
+    }
+
+    /**
+     * Strategy to create the thread pool for the aggregator background task which waits for and aggregates completed
+     * tasks when running in parallel mode.
+     *
+     * @param  name the suggested name for the background thread
+     * @return      the thread pool
+     */
+    protected ExecutorService createAggregateExecutorService(String name) {
+        lock.lock();
+        try {
+            // use a cached thread pool so we each on-the-fly task has a dedicated thread to process completions as they come in
+            return camelContext.getExecutorServiceManager().newScheduledThreadPool(this, name, 0);
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    @Override
+    protected void doStop() throws Exception {
+        ServiceHelper.stopService(
+                processors, errorHandlers != null ? errorHandlers.values() : null,
+                aggregationStrategy, processorExchangeFactory);
+    }
+
+    @Override
+    protected void doShutdown() throws Exception {
+        if (shutdownExecutorService && executorService != null) {
+            getCamelContext().getExecutorServiceManager().shutdownNow(executorService);
+            // an exchange that still waits for a part (its route was stopped by force) never completes once the thread
+            // pool is shut down, as the queued parts are dropped: fail it, so its caller does not wait for ever
+            for (MulticastTask task : parallelTasks) {
+                task.doFailed(new RouteStoppingException("The exchange cannot complete: the thread pool is shut down"));
+            }
+        }
+        ServiceHelper.stopAndShutdownServices(
+                processors, errorHandlers != null ? errorHandlers.values() : null,
+                aggregationStrategy, processorExchangeFactory);
+        // only clear error handlers when shutting down
+        if (errorHandlers != null) {
+            errorHandlers.clear();
+        }
+
+        if (shutdownAggregateExecutorService && aggregateExecutorService != null) {
+            getCamelContext().getExecutorServiceManager().shutdownNow(aggregateExecutorService);
+        }
+    }
+
+    protected static void setToEndpoint(Exchange exchange, Processor processor) {
+        if (processor instanceof Producer producer) {
+            exchange.setProperty(ExchangePropertyKey.TO_ENDPOINT, producer.getEndpoint().getEndpointUri());
+        }
+    }
+
+    protected AggregationStrategy getAggregationStrategy(Exchange exchange) {
+        AggregationStrategy answer = null;
+
+        // prefer to use per Exchange aggregation strategy over a global strategy
+        if (exchange != null) {
+            Map<?, ?> property = exchange.getProperty(ExchangePropertyKey.AGGREGATION_STRATEGY, Map.class);
+            Map<Object, AggregationStrategy> map = CastUtils.cast(property);
+            if (map != null) {
+                answer = map.get(this);
+            }
+        }
+        if (answer == null) {
+            // fallback to global strategy
+            answer = getAggregationStrategy();
+        }
+        return answer;
+    }
+
+    /**
+     * Sets the given {@link AggregationStrategy} on the {@link Exchange}.
+     *
+     * @param exchange            the exchange
+     * @param aggregationStrategy the strategy
+     */
+    protected void setAggregationStrategyOnExchange(Exchange exchange, AggregationStrategy aggregationStrategy) {
+        Map<?, ?> property = exchange.getProperty(ExchangePropertyKey.AGGREGATION_STRATEGY, Map.class);
+        Map<Object, AggregationStrategy> map = CastUtils.cast(property);
+        if (map == null) {
+            map = new ConcurrentHashMap<>();
+        } else {
+            // it is not safe to use the map directly as the exchange doesn't have the deep copy of it's properties
+            // we just create a new copy if we need to change the map
+            map = new ConcurrentHashMap<>(map);
+        }
+        // store the strategy using this processor as the key
+        // (so we can store multiple strategies on the same exchange)
+        map.put(this, aggregationStrategy);
+        exchange.setProperty(ExchangePropertyKey.AGGREGATION_STRATEGY, map);
+    }
+
+    /**
+     * Removes the associated {@link AggregationStrategy} from the {@link Exchange} which must be done after use.
+     *
+     * @param exchange the current exchange
+     */
+    protected void removeAggregationStrategyFromExchange(Exchange exchange) {
+        Map<?, ?> property = exchange.getProperty(ExchangePropertyKey.AGGREGATION_STRATEGY, Map.class);
+        Map<Object, AggregationStrategy> map = CastUtils.cast(property);
+        if (map == null) {
+            return;
+        }
+        // remove the strategy using this processor as the key
+        map.remove(this);
+        // and remove map if its empty
+        if (map.isEmpty()) {
+            exchange.removeProperty(ExchangePropertyKey.AGGREGATION_STRATEGY);
+        }
+    }
+
+    /**
+     * Is the multicast processor working in streaming mode?
+     * <p>
+     * In streaming mode:
+     * <ul>
+     * <li>we use {@link Iterable} to ensure we can send messages as soon as the data becomes available</li>
+     * <li>for parallel processing, we start aggregating responses as they get sent back to the processor; this means
+     * the {@link AggregationStrategy} has to take care of handling out-of-order arrival of exchanges</li>
+     * </ul>
+     */
+    public boolean isStreaming() {
+        return streaming;
+    }
+
+    /**
+     * Should the multicast processor stop processing further exchanges in case of an exception occurred?
+     */
+    public boolean isStopOnException() {
+        return stopOnException;
+    }
+
+    /**
+     * Returns the producers to multicast to
+     */
+    public Collection<Processor> getProcessors() {
+        return processors;
+    }
+
+    /**
+     * An optional timeout in millis when using parallel processing
+     */
+    public long getTimeout() {
+        return timeout;
+    }
+
+    /**
+     * Maximum cache size used for reusing processors
+     */
+    public int getCacheSize() {
+        return cacheSize;
+    }
+
+    /**
+     * Use {@link #getAggregationStrategy(org.apache.camel.Exchange)} instead.
+     */
+    public AggregationStrategy getAggregationStrategy() {
+        return aggregationStrategy;
+    }
+
+    public boolean isParallelProcessing() {
+        return parallelProcessing;
+    }
+
+    @Deprecated(since = "4.7.0")
+    public boolean isParallelAggregate() {
+        return parallelAggregate;
+    }
+
+    public boolean isShareUnitOfWork() {
+        return shareUnitOfWork;
+    }
+
+    public ExecutorService getAggregateExecutorService() {
+        return aggregateExecutorService;
+    }
+
+    public void setAggregateExecutorService(ExecutorService aggregateExecutorService) {
+        this.aggregateExecutorService = aggregateExecutorService;
+        // we use a custom executor so do not shutdown
+        this.shutdownAggregateExecutorService = false;
+    }
+
+    @Override
+    public List<Processor> next() {
+        if (!hasNext()) {
+            return null;
+        }
+        return new ArrayList<>(processors);
+    }
+
+    @Override
+    public boolean hasNext() {
+        return processors != null && !processors.isEmpty();
+    }
+}

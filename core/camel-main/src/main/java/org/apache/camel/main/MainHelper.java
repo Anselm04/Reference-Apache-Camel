@@ -1,0 +1,782 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.camel.main;
+
+import java.io.BufferedReader;
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.InputStreamReader;
+import java.io.LineNumberReader;
+import java.util.ArrayList;
+import java.util.Comparator;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Locale;
+import java.util.Map;
+import java.util.Optional;
+import java.util.Properties;
+import java.util.Set;
+import java.util.function.Function;
+import java.util.function.Predicate;
+
+import org.apache.camel.CamelContext;
+import org.apache.camel.Component;
+import org.apache.camel.PropertyBindingException;
+import org.apache.camel.spi.ExtendedPropertyConfigurerGetter;
+import org.apache.camel.spi.PropertyConfigurer;
+import org.apache.camel.support.CamelContextHelper;
+import org.apache.camel.support.PluginHelper;
+import org.apache.camel.support.PropertyBindingSupport;
+import org.apache.camel.support.PropertyConfigurerHelper;
+import org.apache.camel.support.service.ServiceHelper;
+import org.apache.camel.util.IOHelper;
+import org.apache.camel.util.ObjectHelper;
+import org.apache.camel.util.OrderedLocationProperties;
+import org.apache.camel.util.OrderedProperties;
+import org.apache.camel.util.StopWatch;
+import org.apache.camel.util.StringHelper;
+import org.apache.camel.util.TimeUtils;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import static org.apache.camel.util.LocationHelper.locationSummary;
+
+public final class MainHelper {
+    private static final Logger LOG = LoggerFactory.getLogger(MainHelper.class);
+
+    private final String version;
+    private final StopWatch stopWatch;
+    private final Map<String, String> componentEnvNames = new HashMap<>();
+    private final Map<String, String> dataformatEnvNames = new HashMap<>();
+    private final Map<String, String> languageEnvNames = new HashMap<>();
+
+    public MainHelper() {
+        stopWatch = new StopWatch();
+
+        try {
+            InputStream is = MainHelper.class.getResourceAsStream("/org/apache/camel/main/components.properties");
+            loadLines(is, componentEnvNames, s -> "CAMEL_COMPONENT_" + s.toUpperCase(Locale.US).replace('-', '_'));
+            IOHelper.close(is);
+
+            is = MainHelper.class.getResourceAsStream("/org/apache/camel/main/dataformats.properties");
+            loadLines(is, dataformatEnvNames, s -> "CAMEL_DATAFORMAT_" + s.toUpperCase(Locale.US).replace('-', '_'));
+            IOHelper.close(is);
+
+            is = MainHelper.class.getResourceAsStream("/org/apache/camel/main/languages.properties");
+            loadLines(is, languageEnvNames, s -> "CAMEL_LANGUAGE_" + s.toUpperCase(Locale.US).replace('-', '_'));
+            IOHelper.close(is);
+        } catch (Exception e) {
+            throw new RuntimeException("Error loading catalog information from classpath", e);
+        }
+
+        version = doGetVersion();
+    }
+
+    public String getVersion() {
+        return version;
+    }
+
+    public String getUptime() {
+        long delta = stopWatch.taken();
+        if (delta == 0) {
+            return "";
+        }
+        return TimeUtils.printDuration(delta);
+    }
+
+    public void bootstrapDone() {
+        // after bootstrap then these maps are no longer needed
+        componentEnvNames.clear();
+        dataformatEnvNames.clear();
+        languageEnvNames.clear();
+    }
+
+    public static String toEnvVar(String name) {
+        return name.toUpperCase(Locale.US).replaceAll("[^\\w]", "-").replace('-', '_');
+    }
+
+    public static Optional<String> lookupPropertyFromSysOrEnv(String name) {
+        String answer = System.getProperty(name);
+        if (answer == null) {
+            answer = IOHelper.lookupEnvironmentVariable(name);
+        }
+
+        return Optional.ofNullable(answer);
+    }
+
+    public static Properties loadEnvironmentVariablesAsProperties(String[] prefixes) {
+        Properties answer = new OrderedProperties();
+        if (prefixes == null || prefixes.length == 0) {
+            return answer;
+        }
+
+        for (String prefix : prefixes) {
+            final String pk = prefix.toUpperCase(Locale.US).replaceAll("[^\\w]", "-");
+            final String pk2 = pk.replace('-', '_');
+            System.getenv().forEach((k, v) -> {
+                k = k.toUpperCase(Locale.US);
+                // kubernetes ENV injected services should be skipped
+                // (https://learn.microsoft.com/en-us/visualstudio/bridge/kubernetes-environment-variables#environment-variables-table)
+                boolean k8s = k.endsWith("_SERVICE_HOST") || k.endsWith("_SERVICE_PORT") || k.endsWith("_PORT")
+                        || k.contains("_PORT_");
+                if (k8s) {
+                    LOG.trace("Skipping Kubernetes Service OS environment variable: {}", k);
+                } else {
+                    if (k.startsWith(pk) || k.startsWith(pk2)) {
+                        answer.put(envVariableToKey(k), v);
+                    }
+                }
+            });
+        }
+
+        return answer;
+    }
+
+    /**
+     * The configuration key for an OS environment variable. A variable that matches the key of a camel-main option when
+     * underscores are ignored is mapped to that key, so the underscores between the words of an option are optional
+     * ({@code CAMEL_VAULT_GCP_SERVICE_ACCOUNT_KEY} and {@code CAMEL_VAULT_GCP_SERVICEACCOUNTKEY} are both
+     * {@code camel.vault.gcp.serviceaccountkey}). Any other variable has each underscore turned into a dot.
+     *
+     * @param  name the name of the environment variable
+     * @return      the configuration key, in lower case
+     */
+    static String envVariableToKey(String name) {
+        String key = MainOptionKeys.KEYS.get(normalizeEnvName(name));
+        if (key != null) {
+            return key;
+        }
+        return name.toLowerCase(Locale.US).replace('_', '.');
+    }
+
+    private static String normalizeEnvName(String name) {
+        StringBuilder sb = new StringBuilder(name.length());
+        for (int i = 0; i < name.length(); i++) {
+            char ch = name.charAt(i);
+            if (ch != '_' && ch != '.' && ch != '-') {
+                sb.append(Character.toUpperCase(ch));
+            }
+        }
+        return sb.toString();
+    }
+
+    /**
+     * The keys of the camel-main options (in lower case), by their name without dots, dashes and underscores in upper
+     * case. Loaded only when an OS environment variable is mapped to a configuration key.
+     */
+    private static final class MainOptionKeys {
+        private static final Map<String, String> KEYS = load();
+
+        private static Map<String, String> load() {
+            Map<String, String> answer = new HashMap<>();
+            Set<String> ambiguous = new HashSet<>();
+            try (InputStream is = MainHelper.class.getResourceAsStream("/org/apache/camel/main/main-options.properties")) {
+                if (is == null) {
+                    return answer;
+                }
+                for (String line : IOHelper.loadText(is).split("\n")) {
+                    String key = line.trim();
+                    if (key.isEmpty() || key.startsWith("#")) {
+                        continue;
+                    }
+                    String name = normalizeEnvName(key);
+                    String existing = answer.put(name, key.toLowerCase(Locale.US));
+                    if (existing != null && !existing.equals(key.toLowerCase(Locale.US))) {
+                        ambiguous.add(name);
+                    }
+                }
+            } catch (IOException e) {
+                LOG.debug("Cannot load the camel-main option keys due to: {}. This exception is ignored.", e.getMessage(), e);
+            }
+            // two options that differ only by dots, dashes or underscores keep the default mapping
+            ambiguous.forEach(answer::remove);
+            return answer;
+        }
+    }
+
+    public static Map<String, String> filterEnvVariables(String[] prefixes) {
+        Map<String, String> answer = new HashMap<>();
+        System.getenv().forEach((k, v) -> {
+            final String uk = k.toUpperCase(Locale.US);
+            for (String prefix : prefixes) {
+                if (uk.startsWith(prefix)) {
+                    answer.put(uk, v);
+                }
+            }
+        });
+        return answer;
+    }
+
+    public void addComponentEnvVariables(Map<String, String> env, Properties properties, boolean custom) {
+        Set<String> toRemove = new HashSet<>();
+        env.forEach((k, v) -> {
+            if (custom) {
+                if (!k.startsWith("CAMEL_COMPONENT_")) {
+                    return;
+                }
+                toRemove.add(k);
+                String ck = "camel.component." + k.substring(16).toLowerCase(Locale.US).replace('_', '-');
+                ck = ck.replaceFirst("-", ".");
+                properties.put(ck, v);
+            } else {
+                Optional<Map.Entry<String, String>> e = longestMatch(componentEnvNames, k);
+                if (e.isPresent()) {
+                    toRemove.add(k);
+                    String catalogName = e.get().getValue();
+                    String cname = "camel.component." + catalogName;
+                    String option = k.substring(e.get().getKey().length() + 1).toLowerCase(Locale.US).replace('_', '-');
+                    properties.put(cname + "." + option, v);
+                }
+            }
+        });
+        toRemove.forEach(env::remove);
+    }
+
+    public void addDataFormatEnvVariables(Map<String, String> env, Properties properties, boolean custom) {
+        Set<String> toRemove = new HashSet<>();
+        env.forEach((k, v) -> {
+            if (custom) {
+                if (!k.startsWith("CAMEL_DATAFORMAT_")) {
+                    return;
+                }
+                toRemove.add(k);
+                String ck = "camel.dataformat." + k.substring(17).toLowerCase(Locale.US).replace('_', '-');
+                ck = ck.replaceFirst("-", ".");
+                properties.put(ck, v);
+            } else {
+                Optional<Map.Entry<String, String>> e = longestMatch(dataformatEnvNames, k);
+                if (e.isPresent()) {
+                    toRemove.add(k);
+                    String catalogName = e.get().getValue();
+                    String cname = "camel.dataformat." + catalogName;
+                    String option = k.substring(e.get().getKey().length() + 1).toLowerCase(Locale.US).replace('_', '-');
+                    properties.put(cname + "." + option, v);
+                }
+            }
+        });
+        toRemove.forEach(env::remove);
+    }
+
+    public void addLanguageEnvVariables(Map<String, String> env, Properties properties, boolean custom) {
+        Set<String> toRemove = new HashSet<>();
+        env.forEach((k, v) -> {
+            if (custom) {
+                if (!k.startsWith("CAMEL_LANGUAGE_")) {
+                    return;
+                }
+                toRemove.add(k);
+                String ck = "camel.language." + k.substring(15).toLowerCase(Locale.US).replace('_', '-');
+                ck = ck.replaceFirst("-", ".");
+                properties.put(ck, v);
+            } else {
+                Optional<Map.Entry<String, String>> e = longestMatch(languageEnvNames, k);
+                if (e.isPresent()) {
+                    toRemove.add(k);
+                    String catalogName = e.get().getValue();
+                    String cname = "camel.language." + catalogName;
+                    String option = k.substring(e.get().getKey().length() + 1).toLowerCase(Locale.US).replace('_', '-');
+                    properties.put(cname + "." + option, v);
+                }
+            }
+        });
+        toRemove.forEach(env::remove);
+    }
+
+    public static Properties loadJvmSystemPropertiesAsProperties(String[] prefixes) {
+        Properties answer = new OrderedProperties();
+        if (prefixes == null || prefixes.length == 0) {
+            return answer;
+        }
+
+        for (String prefix : prefixes) {
+            final String pk = prefix.toUpperCase(Locale.US).replaceAll("[^\\w]", "-");
+            final String pk2 = pk.replace('-', '.');
+            System.getProperties().forEach((k, v) -> {
+                String key = k.toString().toUpperCase(Locale.US);
+                if (key.startsWith(pk) || key.startsWith(pk2)) {
+                    answer.put(k.toString(), v);
+                }
+            });
+        }
+
+        return answer;
+    }
+
+    public static String optionKey(String key) {
+        // as we ignore case for property names we should use keys in same case and without dashes
+        // we need to preserve inside [] and quotes
+        key = StringHelper.dashToCamelCase(key, true);
+        return key;
+    }
+
+    public static boolean setPropertiesOnTarget(CamelContext context, Object target, Object source) throws Exception {
+        ObjectHelper.notNull(context, "context");
+        ObjectHelper.notNull(target, "target");
+
+        boolean rc = false;
+
+        PropertyConfigurer targetConfigurer = null;
+        if (target instanceof Component component) {
+            // the component needs to be initialized to have the configurer ready
+            ServiceHelper.initService(target);
+            targetConfigurer = component.getComponentPropertyConfigurer();
+        }
+        if (targetConfigurer == null) {
+            String name = target.getClass().getName();
+            // see if there is a configurer for it
+            targetConfigurer = PluginHelper.getConfigurerResolver(context).resolvePropertyConfigurer(name, context);
+        }
+
+        PropertyConfigurer sourceConfigurer = null;
+        if (source instanceof Component component) {
+            // the component needs to be initialized to have the configurer ready
+            ServiceHelper.initService(source);
+            sourceConfigurer = component.getComponentPropertyConfigurer();
+        }
+        if (sourceConfigurer == null) {
+            String name = source.getClass().getName();
+            // see if there is a configurer for it
+            sourceConfigurer = PluginHelper.getConfigurerResolver(context).resolvePropertyConfigurer(name, context);
+        }
+
+        if (targetConfigurer != null && sourceConfigurer instanceof ExtendedPropertyConfigurerGetter getter) {
+            for (String key : getter.getAllOptions(source).keySet()) {
+                Object value = getter.getOptionValue(source, key, true);
+                if (value != null) {
+                    rc |= targetConfigurer.configure(context, target, key, value, true);
+                }
+            }
+        }
+        return rc;
+    }
+
+    public static boolean setPropertiesOnTarget(
+            CamelContext context, Object target, OrderedLocationProperties properties,
+            String optionPrefix, boolean failIfNotSet, boolean ignoreCase,
+            OrderedLocationProperties autoConfiguredProperties) {
+        return setPropertiesOnTarget(context, target, properties, optionPrefix, failIfNotSet, ignoreCase,
+                autoConfiguredProperties, null);
+    }
+
+    /**
+     * Sets the properties on the target, with the given configurer, or when null, the configurer of the target found by
+     * its type.
+     */
+    public static boolean setPropertiesOnTarget(
+            CamelContext context, Object target, OrderedLocationProperties properties,
+            String optionPrefix, boolean failIfNotSet, boolean ignoreCase,
+            OrderedLocationProperties autoConfiguredProperties, PropertyConfigurer configurer) {
+
+        ObjectHelper.notNull(context, "context");
+        ObjectHelper.notNull(target, "target");
+        ObjectHelper.notNull(properties, "properties");
+
+        boolean rc = false;
+        if (configurer == null && target instanceof Component component) {
+            // the component needs to be initialized to have the configurer ready
+            ServiceHelper.initService(target);
+            configurer = component.getComponentPropertyConfigurer();
+        }
+
+        if (configurer == null) {
+            String name = target.getClass().getName();
+            // see if there is a configurer for it (use bootstrap)
+            configurer = PluginHelper.getBootstrapConfigurerResolver(context).resolvePropertyConfigurer(name, context);
+        }
+
+        // we should be flexible in terms of property names as the user may type in names using different cases and
+        // with or without dots (especially from ENV variables)
+        if (configurer instanceof ExtendedPropertyConfigurerGetter ec) {
+            Map<String, Object> options = ec.getAllOptions(target);
+            for (String key : options.keySet()) {
+                // first char is upper case
+                key = Character.toLowerCase(key.charAt(0)) + key.substring(1);
+                String actualKey = key;
+                // convert camelCase to dot notation (via toDash)
+                key = StringHelper.camelCaseToDot(key);
+                if (properties.get(key) != null) {
+                    Object value = properties.get(key);
+                    String loc = properties.getLocation(key);
+                    properties.remove(key);
+                    properties.put(loc, actualKey, value);
+                    LOG.debug("Adjusting property key: {} -> {}", key, actualKey);
+                }
+            }
+        }
+
+        try {
+            // keep a reference of the original keys
+            OrderedLocationProperties backup = new OrderedLocationProperties();
+            backup.putAll(properties);
+
+            rc = PropertyBindingSupport.build()
+                    .withMandatory(failIfNotSet)
+                    .withRemoveParameters(true)
+                    .withConfigurer(configurer)
+                    .withIgnoreCase(ignoreCase)
+                    .bind(context, target, properties.asMap());
+
+            for (Map.Entry<Object, Object> entry : backup.entrySet()) {
+                if (entry.getValue() != null && !properties.containsKey(entry.getKey())) {
+                    String prefix = optionPrefix;
+                    if (prefix != null && !prefix.endsWith(".")) {
+                        prefix = "." + prefix;
+                    }
+
+                    LOG.debug("Configured property: {}{}={} on bean: {}", prefix, entry.getKey(), entry.getValue(), target);
+                    String loc = backup.getLocation(entry.getKey());
+                    String key = prefix + entry.getKey();
+                    autoConfiguredProperties.put(loc, key, entry.getValue());
+                }
+            }
+        } catch (PropertyBindingException e) {
+            String key = e.getOptionKey();
+            if (key == null) {
+                String prefix = e.getOptionPrefix();
+                if (prefix != null && !prefix.endsWith(".")) {
+                    prefix = "." + prefix;
+                }
+
+                key = prefix != null
+                        ? prefix + "." + e.getPropertyName()
+                        : e.getPropertyName();
+            }
+
+            if (failIfNotSet) {
+                // enrich the error with more precise details with option prefix and key
+                Throwable cause = e.getCause() != null ? e.getCause() : e;
+                throw new PropertyBindingException(
+                        e.getTarget(), e.getPropertyName(), e.getValue(), optionPrefix, key, cause);
+            } else {
+                LOG.debug(
+                        "Error configuring property ({}) with name: {}) on bean: {} with value: {}. This exception is ignored as failIfNotSet=false.",
+                        key, e.getPropertyName(), target, e.getValue(), e);
+            }
+        } catch (Exception e) {
+            if (failIfNotSet) {
+                throw e;
+            } else {
+                LOG.debug("Error configuring properties on bean: {}. This exception is ignored as failIfNotSet=false.", target,
+                        e);
+            }
+        }
+
+        return rc;
+    }
+
+    /**
+     * The configurer of the data format or language that the option prefix, such as camel.dataformat.jacksonXml. or
+     * camel.language.jsonpath., is about. They are found by their name (jacksonXml-dataformat, jsonpath-language), as
+     * their name cannot always be told from their type.
+     *
+     * @param  target the data format or language
+     * @return        the configurer, or {@code null} for any other prefix, when there is none, or when it is not the
+     *                configurer of the type of the target (such as a custom bean with the name of a data format)
+     */
+    public static PropertyConfigurer configurerByName(CamelContext context, String optionPrefix, Object target) {
+        String kind;
+        if (optionPrefix.startsWith("camel.dataformat.")) {
+            kind = "dataformat";
+        } else if (optionPrefix.startsWith("camel.language.")) {
+            kind = "language";
+        } else {
+            return null;
+        }
+        String name = StringHelper.between(optionPrefix, "camel." + kind + ".", ".");
+        if (name == null || name.isEmpty()) {
+            return null;
+        }
+        PropertyConfigurer configurer
+                = PropertyConfigurerHelper.resolvePropertyConfigurerByName(context, name + "-" + kind, target);
+        // the configurer that PackageDataFormatMojo or PackageLanguageMojo generates for a type is named after it
+        if (configurer != null && configurer.getClass().getName().equals(target.getClass().getName() + "Configurer")) {
+            return configurer;
+        }
+        return null;
+    }
+
+    public static void computeProperties(
+            String keyPrefix, String key, OrderedLocationProperties prop,
+            Map<PropertyOptionKey, OrderedLocationProperties> properties,
+            Function<String, Iterable<Object>> supplier) {
+        if (key.startsWith(keyPrefix)) {
+            // grab name
+            final int dot = key.indexOf('.', keyPrefix.length());
+            final String name = dot == -1 ? key.substring(keyPrefix.length()) : key.substring(keyPrefix.length(), dot);
+
+            // enabled is a virtual property
+            if ("enabled".equals(name)) {
+                return;
+            }
+            // skip properties as its already keyPrefix earlier
+            if ("properties".equals(name)) {
+                return;
+            }
+
+            // determine if the service is enabled or not by taking into account two options:
+            //
+            //   1. ${keyPrefix}.enabled = true|false
+            //   2. ${keyPrefix}.${name}.enabled = true|false
+            //
+            // The option [2] has the higher priority so as example:
+            //
+            //   camel.component.enabled = false
+            //   camel.component.seda.enabled = true
+            //
+            // enables auto configuration of the seda component only
+            if (!isServiceEnabled(keyPrefix, name, prop)) {
+                return;
+            }
+
+            String prefix = dot == -1 ? "" : key.substring(0, dot + 1);
+            String option = dot == -1 ? "" : key.substring(dot + 1);
+            String value = prop.getProperty(key, "");
+
+            // enabled is a virtual property
+            if ("enabled".equalsIgnoreCase(option)) {
+                return;
+            }
+
+            validateOptionAndValue(key, option, value);
+
+            Iterable<Object> targets = supplier.apply(name);
+            for (Object target : targets) {
+                PropertyOptionKey pok = new PropertyOptionKey(target, prefix);
+                OrderedLocationProperties values = properties.computeIfAbsent(pok, k -> new OrderedLocationProperties());
+                String loc = prop.getLocation(key);
+
+                // we ignore case for property keys (so we should store them in canonical style
+                values.put(loc, optionKey(option), value);
+            }
+        }
+    }
+
+    public static boolean isServiceEnabled(String prefix, String name, Properties properties) {
+        ObjectHelper.notNull(prefix, "prefix");
+        ObjectHelper.notNull(name, "name");
+        ObjectHelper.notNull(properties, "properties");
+
+        if (!prefix.endsWith(".")) {
+            prefix = prefix + ".";
+        }
+
+        final String group = properties.getProperty(prefix + "enabled", "true");
+        final String item = properties.getProperty(prefix + name + ".enabled", group);
+
+        return Boolean.parseBoolean(item);
+    }
+
+    public static void validateOptionAndValue(String key, String option, String value) {
+        if (ObjectHelper.isEmpty(option)) {
+            throw new IllegalArgumentException("Error configuring property: " + key + " because option is empty");
+        }
+        if (ObjectHelper.isEmpty(value)) {
+            throw new IllegalArgumentException("Error configuring property: " + key + " because value is empty");
+        }
+    }
+
+    /**
+     * Returns the longest name from {@code names} such that {@code envVarKey} starts with that name followed by
+     * {@code _}, or {@link Optional#empty()} if no such name exists.
+     * <p>
+     * Using the longest match is critical when the catalog contains prefix pairs such as {@code CAMEL_COMPONENT_NETTY}
+     * / {@code CAMEL_COMPONENT_NETTY_HTTP} or {@code CAMEL_LANGUAGE_JS} / {@code CAMEL_LANGUAGE_JSONPATH}: a simple
+     * {@code findFirst()} on a {@link java.util.HashSet} gives a non-deterministic result, whereas the longest match
+     * always selects the most specific name.
+     */
+    private static Optional<Map.Entry<String, String>> longestMatch(Map<String, String> names, String envVarKey) {
+        return names.entrySet().stream()
+                .filter(e -> envVarKey.startsWith(e.getKey() + "_"))
+                .max(Comparator.comparingInt(e -> e.getKey().length()));
+    }
+
+    /**
+     * Loads the entire stream into memory and puts each line into the given map, with the key computed by the given
+     * function.
+     * <p>
+     * Warning, don't use for crazy big streams :)
+     */
+    private static void loadLines(
+            InputStream in, Map<String, String> map,
+            Function<String, String> keyFunc)
+            throws IOException {
+        if (in != null) {
+            try (final InputStreamReader isr = new InputStreamReader(in);
+                 final BufferedReader reader = new LineNumberReader(isr)) {
+                String line;
+                while ((line = reader.readLine()) != null) {
+                    map.put(keyFunc.apply(line), line);
+                }
+            }
+        }
+    }
+
+    private String doGetVersion() {
+        String version = null;
+
+        InputStream is = null;
+        // try to load from maven properties first
+        try {
+            Properties p = new Properties();
+            is = MainHelper.class
+                    .getResourceAsStream("/META-INF/maven/org.apache.camel/camel-main/pom.properties");
+            if (is != null) {
+                p.load(is);
+                version = p.getProperty("version", "");
+            }
+        } catch (Exception e) {
+            // ignore
+        } finally {
+            if (is != null) {
+                IOHelper.close(is);
+            }
+        }
+
+        // fallback to using Java API
+        if (version == null) {
+            Package aPackage = getClass().getPackage();
+            if (aPackage != null) {
+                version = aPackage.getImplementationVersion();
+                if (version == null) {
+                    version = aPackage.getSpecificationVersion();
+                }
+            }
+        }
+
+        if (version == null) {
+            // we could not compute the version so use a blank
+            version = "";
+        }
+
+        return version;
+    }
+
+    public static OrderedLocationProperties extractProperties(OrderedLocationProperties properties, String optionPrefix) {
+        return extractProperties(properties, optionPrefix, null, true);
+    }
+
+    public static OrderedLocationProperties extractProperties(
+            OrderedLocationProperties properties, String optionPrefix, String optionSuffix) {
+        return extractProperties(properties, optionPrefix, optionSuffix, true);
+    }
+
+    public static OrderedLocationProperties extractProperties(
+            OrderedLocationProperties properties, String optionPrefix, String optionSuffix, boolean remove) {
+        return extractProperties(properties, optionPrefix, optionSuffix, remove, null);
+    }
+
+    public static OrderedLocationProperties extractProperties(
+            OrderedLocationProperties properties, String optionPrefix, String optionSuffix,
+            boolean remove, Function<String, String> keyTransformer) {
+        if (properties == null) {
+            return new OrderedLocationProperties();
+        }
+        OrderedLocationProperties rc = new OrderedLocationProperties();
+
+        Set<Object> toRemove = new HashSet<>();
+        for (var entry : properties.entrySet()) {
+            String key = entry.getKey().toString();
+            String loc = properties.getLocation(key);
+            if (key.startsWith(optionPrefix)) {
+                Object value = properties.get(key);
+                if (keyTransformer != null) {
+                    key = keyTransformer.apply(key);
+                } else {
+                    key = key.substring(optionPrefix.length());
+                }
+                if (optionSuffix != null && key.endsWith(optionSuffix)) {
+                    if (keyTransformer != null) {
+                        key = keyTransformer.apply(key);
+                    } else {
+                        key = key.substring(0, key.length() - optionSuffix.length());
+                    }
+                }
+                rc.put(loc, key, value);
+                if (remove) {
+                    toRemove.add(entry.getKey());
+                }
+            }
+        }
+        toRemove.forEach(properties::remove);
+
+        return rc;
+    }
+
+    public static void logConfigurationSummary(
+            CamelContext camelContext,
+            Logger log, OrderedLocationProperties autoConfiguredProperties,
+            String title, Predicate<String> filter) {
+        if (log == null) {
+            log = LOG;
+        }
+        boolean header = false;
+        List<String> toRemove = new ArrayList<>();
+        for (var entry : autoConfiguredProperties.entrySet()) {
+            String k = entry.getKey().toString();
+            if (filter == null || filter.test(k)) {
+                Object v = entry.getValue();
+                String loc = locationSummary(autoConfiguredProperties, k);
+
+                // tone down logging noise for our own internal configurations
+                boolean debug = loc.contains("[camel-main]");
+                if (debug && !LOG.isDebugEnabled()) {
+                    continue;
+                }
+
+                if (!header) {
+                    log.info(title);
+                    header = true;
+                }
+
+                sensitiveAwareLogging(camelContext, log, k, v, loc, debug);
+                toRemove.add(k);
+            }
+        }
+        toRemove.forEach(autoConfiguredProperties::remove);
+    }
+
+    public static boolean containsSensitive(CamelContext camelContext, String key, Object value) {
+        boolean answer = CamelContextHelper.containsSensitive(camelContext, key);
+        if (!answer && value != null) {
+            String v = value.toString();
+            answer = v.startsWith("RAW(");
+        }
+        return answer;
+    }
+
+    public static void sensitiveAwareLogging(
+            CamelContext camelContext, Logger log, String k, Object v, String loc, boolean debug) {
+        if (log == null) {
+            log = LOG;
+        }
+        if (containsSensitive(camelContext, k, v)) {
+            if (debug) {
+                log.debug("    {} {} = xxxxxx", loc, k);
+            } else {
+                log.info("    {} {} = xxxxxx", loc, k);
+            }
+        } else {
+            if (debug) {
+                log.debug("    {} {} = {}", loc, k, v);
+            } else {
+                log.info("    {} {} = {}", loc, k, v);
+            }
+        }
+    }
+
+}

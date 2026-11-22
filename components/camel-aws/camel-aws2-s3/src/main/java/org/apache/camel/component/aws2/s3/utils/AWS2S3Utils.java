@@ -1,0 +1,232 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.camel.component.aws2.s3.utils;
+
+import java.io.ByteArrayOutputStream;
+import java.io.IOException;
+import java.io.InputStream;
+
+import org.apache.camel.Exchange;
+import org.apache.camel.component.aws2.s3.AWS2S3Configuration;
+import org.apache.camel.component.aws2.s3.AWS2S3Constants;
+import org.apache.camel.spi.Language;
+import org.apache.camel.support.PayloadHelper;
+import org.apache.camel.util.ObjectHelper;
+import software.amazon.awssdk.services.s3.model.CreateMultipartUploadRequest;
+import software.amazon.awssdk.services.s3.model.GetObjectRequest;
+import software.amazon.awssdk.services.s3.model.HeadObjectRequest;
+import software.amazon.awssdk.services.s3.model.ServerSideEncryption;
+
+import static org.apache.camel.support.LanguageSupport.hasSimpleFunction;
+
+public final class AWS2S3Utils {
+
+    private AWS2S3Utils() {
+    }
+
+    /**
+     * Reads the bucket name from the header of the given exchange. If not provided, it's read from the endpoint
+     * configuration.
+     * <p>
+     * Only the configured {@code bucketName} may be a dynamic Simple expression; a bucket name supplied through the
+     * {@code CamelAwsS3OverrideBucketName} header is used literally and is never evaluated. A configured
+     * {@code bucketName} whose Simple expression resolves to {@code null} fails fast here.
+     *
+     * @param  exchange                 The exchange to read the bucket name from
+     * @param  configuration            The AWS2 S3 configuration
+     * @return                          The bucket name.
+     * @throws IllegalArgumentException if the bucket name is not set or resolves to {@code null}.
+     */
+    public static String determineBucketName(final Exchange exchange, AWS2S3Configuration configuration) {
+        String bucketName = exchange.getIn().getHeader(AWS2S3Constants.OVERRIDE_BUCKET_NAME, String.class);
+        if (ObjectHelper.isEmpty(bucketName)) {
+            // only the configured bucket name (supplied by the route) may be a dynamic simple expression;
+            // a bucket name provided through the header is used literally and never evaluated
+            bucketName = configuration.getBucketName();
+            if (bucketName != null && hasSimpleFunction(bucketName)) {
+                Language simple = exchange.getContext().resolveLanguage("simple");
+                bucketName = simple.createExpression(bucketName).evaluate(exchange, String.class);
+            }
+        }
+        if (bucketName == null) {
+            throw new IllegalArgumentException("AWS S3 Bucket name is not set, or resolved to null.");
+        }
+        return bucketName;
+    }
+
+    public static String determineStorageClass(final Exchange exchange, AWS2S3Configuration configuration) {
+        String storageClass = exchange.getIn().getHeader(AWS2S3Constants.STORAGE_CLASS, String.class);
+        if (storageClass == null) {
+            storageClass = configuration.getStorageClass();
+        }
+
+        return storageClass;
+    }
+
+    public static String determineFileExtension(String keyName) {
+        int extPosition = keyName.lastIndexOf(".");
+        if (extPosition == -1) {
+            return "";
+        } else {
+            return keyName.substring(extPosition);
+        }
+    }
+
+    public static String determineFileName(String keyName) {
+        int extPosition = keyName.lastIndexOf(".");
+        if (extPosition == -1) {
+            return keyName;
+        } else {
+            return keyName.substring(0, extPosition);
+        }
+    }
+
+    /**
+     * Determines the length of the input stream, without reading it.
+     *
+     * @return     the length, or <tt>-1</tt> if the length cannot be determined without reading the stream
+     * @deprecated use {@link PayloadHelper#getLength(Object)}
+     */
+    @Deprecated(since = "4.23.0")
+    public static long determineLengthInputStream(InputStream is) throws IOException {
+        return PayloadHelper.getLength(is);
+    }
+
+    public static byte[] toByteArray(InputStream is, final int size) throws IOException {
+        try (ByteArrayOutputStream output = new ByteArrayOutputStream()) {
+            byte[] data = new byte[4096];
+            int total = 0;
+            int n = 0;
+            while (total < size && (n = is.read(data)) != -1) {
+                output.write(data, 0, n);
+                total += n;
+            }
+            return output.toByteArray();
+        }
+    }
+
+    /**
+     * Reads the object key from the header of the given exchange. If not provided, it's read from the endpoint
+     * configuration.
+     * <p>
+     * Only the configured {@code keyName} may be a dynamic Simple expression; a key supplied through the
+     * {@code CamelAwsS3Key} header is used literally and is never evaluated. A configured {@code keyName} whose Simple
+     * expression resolves to {@code null} fails fast here instead of passing a null key to the AWS SDK.
+     *
+     * @param  exchange                 The exchange to read the key from
+     * @param  configuration            The AWS2 S3 configuration
+     * @return                          The object key.
+     * @throws IllegalArgumentException if the key is not set or resolves to {@code null}.
+     */
+    public static String determineKey(final Exchange exchange, AWS2S3Configuration configuration) {
+        String key = exchange.getIn().getHeader(AWS2S3Constants.KEY, String.class);
+        if (ObjectHelper.isEmpty(key)) {
+            // only the configured key (supplied by the route) may be a dynamic simple expression;
+            // a key provided through the header is used literally and never evaluated
+            key = configuration.getKeyName();
+            if (key != null && hasSimpleFunction(key)) {
+                Language simple = exchange.getContext().resolveLanguage("simple");
+                key = simple.createExpression(key).evaluate(exchange, String.class);
+            }
+        }
+        if (key == null) {
+            throw new IllegalArgumentException("AWS S3 Key is not set, or resolved to null.");
+        }
+        return key;
+    }
+
+    public static String evaluateDestinationBucketPrefix(final Exchange exchange, AWS2S3Configuration configuration) {
+        String prefix = configuration.getDestinationBucketPrefix();
+        if (ObjectHelper.isEmpty(prefix)) {
+            return "";
+        }
+        if (hasSimpleFunction(prefix)) {
+            Language simple = exchange.getContext().resolveLanguage("simple");
+            prefix = simple.createExpression(prefix).evaluate(exchange, String.class);
+        }
+        return prefix;
+    }
+
+    public static String evaluateDestinationBucketSuffix(final Exchange exchange, AWS2S3Configuration configuration) {
+        String suffix = configuration.getDestinationBucketSuffix();
+        if (ObjectHelper.isEmpty(suffix)) {
+            return "";
+        }
+        if (hasSimpleFunction(suffix)) {
+            Language simple = exchange.getContext().resolveLanguage("simple");
+            suffix = simple.createExpression(suffix).evaluate(exchange, String.class);
+        }
+        return suffix;
+    }
+
+    public static void setEncryption(
+            CreateMultipartUploadRequest.Builder createMultipartUploadRequest, AWS2S3Configuration configuration) {
+        if (configuration.isUseAwsKMS()) {
+            createMultipartUploadRequest.ssekmsKeyId(configuration.getAwsKMSKeyId());
+            createMultipartUploadRequest.serverSideEncryption(ServerSideEncryption.AWS_KMS);
+        }
+
+        if (configuration.isUseSSES3()) {
+            createMultipartUploadRequest.serverSideEncryption(ServerSideEncryption.AES256);
+        }
+
+        if (configuration.isUseCustomerKey()) {
+            if (ObjectHelper.isNotEmpty(configuration.getCustomerKeyId())) {
+                createMultipartUploadRequest.sseCustomerKey(configuration.getCustomerKeyId());
+            }
+            if (ObjectHelper.isNotEmpty(configuration.getCustomerKeyMD5())) {
+                createMultipartUploadRequest.sseCustomerKeyMD5(configuration.getCustomerKeyMD5());
+            }
+            if (ObjectHelper.isNotEmpty(configuration.getCustomerAlgorithm())) {
+                createMultipartUploadRequest.sseCustomerAlgorithm(configuration.getCustomerAlgorithm());
+            }
+        }
+    }
+
+    /**
+     * The HEAD request of the given GET request: it returns the same metadata, without the content of the object.
+     *
+     * @param  getObjectRequest the request to get the object
+     * @return                  the request to get the metadata of the object only
+     */
+    public static HeadObjectRequest toHeadObjectRequest(GetObjectRequest getObjectRequest) {
+        HeadObjectRequest.Builder head = HeadObjectRequest.builder()
+                .bucket(getObjectRequest.bucket())
+                .key(getObjectRequest.key())
+                .versionId(getObjectRequest.versionId())
+                .partNumber(getObjectRequest.partNumber())
+                .range(getObjectRequest.range())
+                .ifMatch(getObjectRequest.ifMatch())
+                .ifModifiedSince(getObjectRequest.ifModifiedSince())
+                .ifNoneMatch(getObjectRequest.ifNoneMatch())
+                .ifUnmodifiedSince(getObjectRequest.ifUnmodifiedSince())
+                .responseCacheControl(getObjectRequest.responseCacheControl())
+                .responseContentDisposition(getObjectRequest.responseContentDisposition())
+                .responseContentEncoding(getObjectRequest.responseContentEncoding())
+                .responseContentLanguage(getObjectRequest.responseContentLanguage())
+                .responseContentType(getObjectRequest.responseContentType())
+                .responseExpires(getObjectRequest.responseExpires())
+                .sseCustomerAlgorithm(getObjectRequest.sseCustomerAlgorithm())
+                .sseCustomerKey(getObjectRequest.sseCustomerKey())
+                .sseCustomerKeyMD5(getObjectRequest.sseCustomerKeyMD5())
+                .requestPayer(getObjectRequest.requestPayerAsString())
+                .expectedBucketOwner(getObjectRequest.expectedBucketOwner())
+                .checksumMode(getObjectRequest.checksumModeAsString());
+        getObjectRequest.overrideConfiguration().ifPresent(head::overrideConfiguration);
+        return head.build();
+    }
+}

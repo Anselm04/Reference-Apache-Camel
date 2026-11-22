@@ -1,0 +1,292 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.camel.support.component;
+
+import java.util.Collection;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.RejectedExecutionException;
+import java.util.concurrent.atomic.AtomicBoolean;
+
+import org.apache.camel.AsyncCallback;
+import org.apache.camel.Exchange;
+import org.apache.camel.RuntimeCamelException;
+import org.apache.camel.spi.PropertyConfigurer;
+import org.apache.camel.spi.PropertyConfigurerGetter;
+import org.apache.camel.support.DefaultAsyncProducer;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+/**
+ * Base class for API based Producers
+ */
+public abstract class AbstractApiProducer<E extends Enum<E> & ApiName, T>
+        extends DefaultAsyncProducer
+        implements PropertiesInterceptor, ResultInterceptor {
+
+    // API Endpoint
+    protected final AbstractApiEndpoint<E, T> endpoint;
+
+    // properties helper
+    protected final ApiMethodPropertiesHelper<T> propertiesHelper;
+
+    // method helper
+    protected final ApiMethodHelper<?> methodHelper;
+
+    // logger
+    private final transient Logger log = LoggerFactory.getLogger(getClass());
+
+    protected AbstractApiProducer(AbstractApiEndpoint<E, T> endpoint, ApiMethodPropertiesHelper<T> propertiesHelper) {
+        super(endpoint);
+        this.propertiesHelper = propertiesHelper;
+        this.endpoint = endpoint;
+        this.methodHelper = endpoint.getMethodHelper();
+    }
+
+    @Override
+    public boolean process(final Exchange exchange, final AsyncCallback callback) {
+        // properties for method arguments should let exchange override
+        final Map<String, Object> properties = new HashMap<>();
+        properties.putAll(endpoint.getConfigurationProperties());
+        properties.putAll(endpoint.getEndpointProperties());
+        propertiesHelper.getExchangeProperties(exchange, properties);
+
+        // let the endpoint and the Producer intercept properties
+        endpoint.interceptProperties(properties);
+        interceptProperties(properties);
+
+        // decide which method to invoke
+        final ApiMethod method = findMethod(exchange, properties);
+        if (method == null) {
+            // synchronous failure
+            callback.done(true);
+            return true;
+        }
+
+        // the call runs once: set when the task starts, or when the call is rejected after the task was submitted
+        final AtomicBoolean claimed = new AtomicBoolean();
+
+        // create a runnable invocation task to be submitted on a background thread pool
+        // this way we avoid blocking the current thread for long-running methods
+        Runnable invocation = new Runnable() {
+            @Override
+            public void run() {
+                if (!claimed.compareAndSet(false, true)) {
+                    // the call was rejected because the pool was shut down while the task was submitted
+                    return;
+                }
+                try {
+                    if (log.isDebugEnabled()) {
+                        log.debug("Invoking operation {} with {}", method.getName(), properties.keySet());
+                    }
+
+                    Object result = doInvokeMethod(method, properties);
+
+                    // producer returns a single response, even for methods with List return types
+                    exchange.getMessage().setBody(result);
+
+                    interceptResult(result, exchange);
+
+                } catch (Exception t) {
+                    exchange.setException(RuntimeCamelException.wrapRuntimeCamelException(t));
+                } catch (VirtualMachineError e) {
+                    // left as before (thrown on after the callback), as in DelegateSyncProcessor. On this thread of the
+                    // executor it is kept in the Future that nobody reads, so log it to make it visible at least
+                    log.error("Error invoking operation {} on exchange {}: the exchange completes as if the call succeeded,"
+                              + " and the error is thrown on to the executor thread, which drops it",
+                            method.getName(), exchange.getExchangeId(), e);
+                    throw e;
+                } catch (Throwable e) {
+                    // also an Error outside the reflective call of the API method (which wraps an Error of the method),
+                    // such as when the client is created: the callback is called in finally, and an Error thrown on
+                    // after it would not fail the exchange, and would be lost in the Future of the executor
+                    exchange.setException(e);
+                } finally {
+                    callback.done(false);
+                }
+            }
+        };
+
+        final ExecutorService executorService;
+        try {
+            executorService = endpoint.getExecutorService();
+        } catch (RejectedExecutionException e) {
+            // the CamelContext has stopped, and has no pool for this endpoint
+            return rejected(exchange, callback, e);
+        }
+        if (executorService.isShutdown()) {
+            // the CallerRuns policy of a shut down pool would drop the task without running it, and the exchange would
+            // never complete
+            return rejected(exchange, callback, newRejectedException(method));
+        }
+        try {
+            executorService.submit(invocation);
+        } catch (RejectedExecutionException e) {
+            if (claimed.compareAndSet(false, true)) {
+                return rejected(exchange, callback, e);
+            }
+            // a custom rejection policy ran the task synchronously before it threw: the task completes the exchange
+            // (the JDK CallerRuns policy drops the task of a shut down pool, and Abort throws without running it)
+            return false;
+        }
+        if (executorService.isShutdown() && claimed.compareAndSet(false, true)) {
+            // the pool was shut down while the task was submitted, so the task may have been dropped: the call is
+            // rejected (when the task was kept after all, it does not run the call)
+            return rejected(exchange, callback, newRejectedException(method));
+        }
+        return false;
+    }
+
+    private RejectedExecutionException newRejectedException(ApiMethod method) {
+        return new RejectedExecutionException(
+                "The thread pool of " + endpoint + " is shut down, the call of operation " + method.getName()
+                                              + " is rejected");
+    }
+
+    private static boolean rejected(Exchange exchange, AsyncCallback callback, RejectedExecutionException cause) {
+        exchange.setException(cause);
+        callback.done(true);
+        return true;
+    }
+
+    @Override
+    public void interceptProperties(Map<String, Object> properties) {
+        // do nothing by default
+    }
+
+    /**
+     * Invoke the API method. Derived classes can override, but MUST call super.doInvokeMethod().
+     *
+     * @param  method                API method to invoke.
+     * @param  properties            method arguments from endpoint properties and exchange In headers.
+     * @return                       API method invocation result.
+     * @throws RuntimeCamelException on error. Exceptions thrown by API method are wrapped.
+     */
+    protected Object doInvokeMethod(ApiMethod method, Map<String, Object> properties)
+            throws RuntimeCamelException {
+        return ApiMethodHelper.invokeMethod(endpoint.getApiProxy(method, properties), method, properties);
+    }
+
+    @Override
+    public final Object splitResult(Object result) {
+        // producer never splits results
+        return result;
+    }
+
+    @Override
+    public void interceptResult(Object methodResult, Exchange resultExchange) {
+        // do nothing by default
+    }
+
+    protected ApiMethod findMethod(Exchange exchange, Map<String, Object> properties) {
+
+        ApiMethod method = null;
+        final List<ApiMethod> candidates = endpoint.getCandidates();
+        if (processInBody(exchange, properties)) {
+
+            // filter candidates based on endpoint and exchange properties
+            final Set<String> argNames = properties.keySet();
+            final List<ApiMethod> filteredMethods = methodHelper.filterMethods(
+                    candidates,
+                    ApiMethodHelper.MatchType.SUPER_SET,
+                    argNames);
+
+            // get the method to call
+            if (filteredMethods.isEmpty()) {
+                Set<String> missing = methodHelper.getMissingProperties(endpoint.getMethodName(), argNames);
+                throw new RuntimeCamelException(
+                        String.format("Missing properties for %s, need one or more from (%s args) %s",
+                                endpoint.getMethodName(),
+                                missing.size(),
+                                missing));
+            } else if (filteredMethods.size() == 1) {
+                // found an exact match
+                method = filteredMethods.get(0);
+            } else {
+                method = ApiMethodHelper.getHighestPriorityMethod(filteredMethods);
+                log.warn("Calling highest priority operation {} from operations {}", method, filteredMethods);
+            }
+        }
+
+        return method;
+    }
+
+    // returns false on exception, which is set in exchange
+    private boolean processInBody(Exchange exchange, Map<String, Object> properties) {
+        final String inBodyProperty = endpoint.getInBody();
+        if (inBodyProperty != null) {
+            Object value = exchange.getIn().getBody();
+            if (value != null) {
+                try {
+                    Class<?> type = null;
+                    // attempt to find out type via configurer so we avoid using reflection
+                    PropertyConfigurer configurer = endpoint.getComponent().getEndpointPropertyConfigurer();
+                    if (configurer instanceof PropertyConfigurerGetter getter) {
+                        type = getter.getOptionType(inBodyProperty, true);
+                    }
+                    if (type == null) {
+                        // the configurer knows the options of the endpoint, not the parameters of the API methods
+                        type = methodHelper.allArguments().get(inBodyProperty);
+                    }
+                    if (type == null && !(configurer instanceof PropertyConfigurerGetter)) {
+                        // fallback to be reflection based
+                        type = endpoint.getConfiguration().getClass().getDeclaredField(inBodyProperty).getType();
+                    }
+                    if (type != null && !isArrayValueForArrayType(type, value)) {
+                        Object converted
+                                = endpoint.getCamelContext().getTypeConverter().mandatoryConvertTo(type, exchange, value);
+                        if (converted != value) {
+                            // a converter may set the header of another argument, such as the media content of a
+                            // Google Drive file, after the headers were read: add the arguments the headers have now
+                            Map<String, Object> fromHeaders = new HashMap<>();
+                            propertiesHelper.getExchangeProperties(exchange, fromHeaders);
+                            fromHeaders.forEach(properties::putIfAbsent);
+                        }
+                        value = converted;
+                    }
+                } catch (Exception e) {
+                    exchange.setException(new RuntimeCamelException(
+                            String.format(
+                                    "Error converting value %s to property %s: %s", value, inBodyProperty, e.getMessage()),
+                            e));
+
+                    return false;
+                }
+            } else {
+                // allow null values for inBody only if its a nullable option
+                if (!methodHelper.getNullableArguments().contains(inBodyProperty)) {
+                    exchange.setException(new NullPointerException(inBodyProperty));
+
+                    return false;
+                }
+            }
+
+            log.debug("Property [{}] has message body value {}", inBodyProperty, value);
+            properties.put(inBodyProperty, value);
+        }
+
+        return true;
+    }
+
+    // a collection or an array for an array parameter is converted when the method is invoked
+    private static boolean isArrayValueForArrayType(Class<?> type, Object value) {
+        return type.isArray() && (value instanceof Collection<?> || value.getClass().isArray());
+    }
+}

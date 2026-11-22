@@ -1,0 +1,488 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.camel.language.groovy;
+
+import java.lang.invoke.MethodHandle;
+import java.lang.invoke.MethodHandles;
+import java.lang.invoke.MethodType;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Objects;
+import java.util.Set;
+
+import groovy.lang.Binding;
+import groovy.lang.GroovyShell;
+import groovy.lang.Script;
+import org.apache.camel.CamelContext;
+import org.apache.camel.Exchange;
+import org.apache.camel.Message;
+import org.apache.camel.RuntimeCamelException;
+import org.apache.camel.attachment.AttachmentMessage;
+import org.apache.camel.attachment.DefaultAttachmentMessage;
+import org.apache.camel.spi.BodyTypeRegistry;
+import org.apache.camel.support.BodyFacts;
+import org.apache.camel.support.ExchangeHelper;
+import org.apache.camel.support.ExpressionSupport;
+import org.apache.camel.support.LanguageHelper;
+import org.codehaus.groovy.control.CompilationFailedException;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+public class GroovyExpression extends ExpressionSupport {
+
+    private static final Logger LOG = LoggerFactory.getLogger(GroovyExpression.class);
+
+    /**
+     * The script variables named in the missing property hint: the ones a script reaches for, without the aliases
+     * (header, variable, in, exchangeProperty) and the out message that only exists on an InOut exchange. Every name
+     * must be in {@link ExchangeBinding#EXCHANGE_VARIABLES}.
+     */
+    static final String SCRIPT_VARIABLES_HINT
+            = "exchange, message, body, headers, variables, exchangeProperties, exception, camelContext, attachments"
+              + " and log";
+
+    private final String text;
+
+    // the language and shell factory of the CamelContext, resolved once instead of on every evaluation
+    private volatile Resolved resolved;
+    // the compiled script of this expression, so a cache eviction in the language does not force a recompilation
+    private volatile CompiledScript compiled;
+
+    public GroovyExpression(String text) {
+        this.text = text;
+    }
+
+    @Override
+    public String toString() {
+        return "groovy: " + text;
+    }
+
+    @Override
+    protected String assertionFailureMessage(Exchange exchange) {
+        return "groovy: " + text;
+    }
+
+    @Override
+    public void init(CamelContext context) {
+        super.init(context);
+        resolve(context);
+    }
+
+    @Override
+    public <T> T evaluate(Exchange exchange, Class<T> type) {
+        Map<String, Object> globalVariables = new HashMap<>();
+        Script script = instantiateScript(exchange, globalVariables);
+        script.setBinding(createBinding(exchange, globalVariables));
+
+        Object value;
+        try {
+            value = script.run();
+        } catch (groovy.lang.MissingPropertyException e) {
+            // a bean name used as a variable (formatter.format(body)): say where beans are, and what the variables are.
+            // The same exception type with the hint in its message; no cause, as the message would then be built from
+            // the cause and lose the hint
+            String name = e.getProperty();
+            boolean bean = name != null && exchange.getContext().getRegistry().lookupByName(name) != null;
+            Object body = exchange.getMessage().getBody();
+            // body.find { it.sku == ... } on the payload text iterates its bytes or characters: the body was not
+            // unmarshalled (CAMEL-25330). The same with JSON text in a header: headers.items.find { ... }
+            boolean onText = e.getType() == Byte.class || e.getType() == Character.class || e.getType() == String.class;
+            boolean bodyText = onText && (body instanceof byte[] || body instanceof String);
+            String textHeader = onText && !bodyText ? jsonTextHeader(exchange) : null;
+            // body.email on the body itself: the file as read or a stream, which is not data yet, or an iterator
+            // (CAMEL-25749); null for an object, where the name read is wrong
+            String payload = !onText && body != null && e.getType() == body.getClass() && !(body instanceof Map)
+                    ? BodyFacts.hint(exchange, BodyFacts.Need.DATA) : null;
+            // customer.customerNo on parsed data, where customer holds the text C-482: the text is a value of the
+            // data, and the body needs no unmarshal
+            BodyTypeRegistry.Kind kind = BodyFacts.kindOf(body);
+            boolean bodyData = kind == BodyTypeRegistry.Kind.DATA || kind == BodyTypeRegistry.Kind.COLLECTION;
+            String hint;
+            if (bodyText) {
+                // what the body is, the step that set it, and the unmarshal that parses it (CAMEL-25749)
+                hint = BodyFacts.describe(exchange) + ", not parsed data: "
+                       + BodyFacts.hint(exchange, BodyFacts.Need.DATA);
+            } else if (payload != null) {
+                hint = BodyFacts.describe(exchange) + ": " + payload;
+            } else if (textHeader != null) {
+                String ref = isIdentifier(textHeader) ? "headers." + textHeader : "headers['" + textHeader + "']";
+                String variable
+                        = isIdentifier(textHeader) ? "variables." + textHeader : "variables['" + textHeader + "']";
+                // the parsed data is kept in a variable, not a header: a header is sent on with the message
+                hint = "header '" + textHeader + "' is still JSON text, not parsed data: parse it in the script with"
+                       + " new groovy.json.JsonSlurper().parseText(" + ref + "), or keep the parsed data in a variable"
+                       + " (setVariable with simple ${body} after unmarshal: json) and read " + variable;
+            } else if (onText && bodyData && !bean) {
+                String keys = BodyFacts.hint(exchange, BodyFacts.Need.DATA);
+                hint = "the value read here is text (a " + e.getType().getSimpleName() + ") in the body, not an object"
+                       + " with fields: " + BodyFacts.describe(exchange) + ", which is data already, so no unmarshal is"
+                       + " needed; check the name read, and the value it is read on" + (keys != null ? " (" + keys + ")" : "");
+            } else if (onText && !bean) {
+                hint = "the value read here is still text (a " + e.getType().getSimpleName()
+                       + " comes from iterating text), not parsed data: unmarshal it first (unmarshal: json for JSON),"
+                       + " or parse it in the script with new groovy.json.JsonSlurper().parseText(...)";
+            } else if (bean) {
+                hint = "'" + name + "' is a bean in the registry, not a script variable; use"
+                       + " exchange.getContext().getRegistry().lookupByName('" + name
+                       + "'), or call it from the route with"
+                       + " - bean: {ref: " + name + "}";
+            } else {
+                // JsonOutput.toJson(body) with no import: a class Groovy reads as a variable (r27 of the local-model
+                // benchmark wrote such classes without their import)
+                List<String> classes = GroovyLanguage.notImported(name, script.getClass().getClassLoader());
+                hint = !classes.isEmpty()
+                        ? name + " is the class " + classes.get(0) + ", which the script does not import: add import "
+                          + classes.get(0) + " at the top of the script, or write " + classes.get(0)
+                        : "the script variables are " + SCRIPT_VARIABLES_HINT;
+            }
+            throw new groovy.lang.MissingPropertyException(
+                    e.getMessageWithoutLocationText() + " (" + hint + ")", name, e.getType());
+        } catch (groovy.lang.MissingMethodException e) {
+            // new JsonSlurper().parseText(body) on a body of bytes: parseText takes text (r26 of the local-model
+            // benchmark, a JMS message read as JSON in connect-service-jms-request-reply step 3). camel-groovy adds
+            // parseText for bytes as a Groovy extension module (CAMEL-27150): this is for a runtime that does not load it
+            String hint = bytesToParseTextHint(exchange, e);
+            if (hint == null) {
+                throw e;
+            }
+            throw new HintedMissingMethodException(e, hint);
+        }
+
+        return exchange.getContext().getTypeConverter().convertTo(type, GroovyLanguage.scriptResult(value));
+    }
+
+    @SuppressWarnings("unchecked")
+    protected Script instantiateScript(Exchange exchange, Map<String, Object> globalVariables) {
+        Resolved r = resolve(exchange.getContext());
+        GroovyShellFactory shellFactory = r.shellFactory;
+        String fileName = null;
+        if (shellFactory != null) {
+            fileName = shellFactory.getFileName(exchange);
+            globalVariables.putAll(shellFactory.getVariables(exchange));
+        }
+
+        int generation = r.language.getGeneration();
+        CompiledScript c = compiled;
+        if (c == null || c.generation != generation || c.context != r.context || c.language != r.language
+                || !Objects.equals(c.fileName, fileName)) {
+            // Get the script from the cache, or create a new instance
+            final String key = fileName != null ? fileName + text : text;
+            final String name = fileName;
+            Class<Script> scriptClass = r.language.getOrCompile(key, () -> {
+                // prefer to use classloader from groovy script compiler, and if not fallback to app context
+                ClassLoader cl
+                        = exchange.getContext().getCamelContextExtension().getContextPlugin(GroovyScriptClassLoader.class);
+                GroovyShell shell = shellFactory != null ? shellFactory.createGroovyShell(exchange)
+                        : cl != null ? new GroovyShell(cl) : new GroovyShell();
+                GroovyLanguage.preCompile(exchange.getContext(), name, text);
+                try {
+                    return name != null
+                            ? shell.getClassLoader().parseClass(text, name) : shell.getClassLoader().parseClass(text);
+                } catch (CompilationFailedException e) {
+                    throw GroovyLanguage.compileFailure(e, shell.getClassLoader());
+                }
+            });
+            c = new CompiledScript(r.context, r.language, generation, fileName, scriptClass, constructor(scriptClass));
+            compiled = c;
+        }
+        // New instance of the script
+        return c.newInstance();
+    }
+
+    private static MethodHandle constructor(Class<Script> scriptClass) {
+        try {
+            return MethodHandles.publicLookup().findConstructor(scriptClass, MethodType.methodType(void.class));
+        } catch (NoSuchMethodException | IllegalAccessException e) {
+            throw new RuntimeCamelException(e);
+        }
+    }
+
+    protected Binding createBinding(Exchange exchange, Map<String, Object> globalVariables) {
+        return new ExchangeBinding(exchange, globalVariables);
+    }
+
+    private Resolved resolve(CamelContext context) {
+        Resolved r = resolved;
+        if (r == null || r.context != context) {
+            GroovyLanguage language = (GroovyLanguage) context.resolveLanguage("groovy");
+            Set<GroovyShellFactory> shellFactories = context.getRegistry().findByType(GroovyShellFactory.class);
+            GroovyShellFactory shellFactory = shellFactories.size() == 1 ? shellFactories.iterator().next() : null;
+            r = new Resolved(context, language, shellFactory);
+            resolved = r;
+        }
+        return r;
+    }
+
+    private record Resolved(CamelContext context, GroovyLanguage language, GroovyShellFactory shellFactory) {
+    }
+
+    /**
+     * The compiled class of the script with its no-arg constructor: a method handle bound once is cheaper to invoke
+     * than {@code Class.getDeclaredConstructor().newInstance()}, which copies the constructor on every call.
+     */
+    private record CompiledScript(
+            CamelContext context, GroovyLanguage language, int generation, String fileName, Class<Script> scriptClass,
+            MethodHandle constructor) {
+
+        Script newInstance() {
+            try {
+                return (Script) constructor.invoke();
+            } catch (Error e) {
+                throw e;
+            } catch (Throwable e) {
+                throw new RuntimeCamelException(e);
+            }
+        }
+    }
+
+    /**
+     * Binding with the same variables as {@link ExchangeHelper#populateVariableMap(Exchange, Map, boolean)} plus
+     * message (the current message, the Camel 4 name of request), attachments and log.
+     * <p>
+     * The body, the headers, the exception and the out message are read when the binding is created. The values that
+     * are costly to create (the copy of the exchange properties, the variable repository and the attachment message)
+     * are created the first time the script uses them (through the variable or {@code binding.variables}), so they
+     * reflect the exchange at that moment: a property set by the script before it reads {@code exchangeProperties} is
+     * visible. Once created a value is kept for the rest of the evaluation.
+     * <p>
+     * A global variable of the {@link GroovyShellFactory} is hidden by the exchange variable with the same name, except
+     * {@code out} and {@code response} when the exchange has no out message, as they are then not exposed.
+     */
+    static final class ExchangeBinding extends Binding {
+
+        static final Set<String> EXCHANGE_VARIABLES = Set.of(
+                "body", "header", "headers", "variable", "variables", "exception", "in", "request", "message",
+                "exchange", "exchangeProperty", "exchangeProperties", "out", "response", "camelContext", "attachments",
+                "log");
+
+        private final Exchange exchange;
+        private final Message in;
+        private final Object body;
+        private final Map<String, Object> headers;
+        private final Exception exception;
+        private final Message out;
+        private Map<String, Object> exchangeProperties;
+        private Map<String, Object> exchangeVariables;
+        private Map<?, ?> attachments;
+        private boolean materialized;
+
+        ExchangeBinding(Exchange exchange, Map<String, Object> globalVariables) {
+            super(new HashMap<>());
+            this.exchange = exchange;
+            this.in = exchange.getIn();
+            this.body = in.getBody();
+            this.headers = in.getHeaders();
+            this.exception = LanguageHelper.exception(exchange);
+            this.out = ExchangeHelper.isOutCapable(exchange) ? exchange.getMessage() : null;
+            if (!globalVariables.isEmpty()) {
+                Map<String, Object> variables = super.getVariables();
+                // the exchange variables take precedence over global variables with the same name
+                globalVariables.forEach((k, v) -> {
+                    if (!isExposed(k)) {
+                        variables.put(k, v);
+                    }
+                });
+            }
+        }
+
+        @Override
+        public Object getVariable(String name) {
+            if (materialized || super.getVariables().containsKey(name) || !isExposed(name)) {
+                // throws MissingPropertyException when the variable does not exist
+                return super.getVariable(name);
+            }
+            return exchangeVariable(name);
+        }
+
+        @Override
+        public boolean hasVariable(String name) {
+            if (!materialized && isExposed(name)) {
+                return true;
+            }
+            return super.hasVariable(name);
+        }
+
+        @Override
+        @SuppressWarnings("rawtypes")
+        public Map getVariables() {
+            if (!materialized) {
+                Map<String, Object> variables = super.getVariables();
+                for (String name : EXCHANGE_VARIABLES) {
+                    // variables set by the script win
+                    if (isExposed(name) && !variables.containsKey(name)) {
+                        variables.put(name, exchangeVariable(name));
+                    }
+                }
+                materialized = true;
+            }
+            return super.getVariables();
+        }
+
+        @Override
+        public void removeVariable(String name) {
+            getVariables();
+            super.removeVariable(name);
+        }
+
+        /**
+         * Whether the name is an exchange variable of this binding: out and response only exist when the exchange has
+         * an out message.
+         */
+        private boolean isExposed(String name) {
+            if (!EXCHANGE_VARIABLES.contains(name)) {
+                return false;
+            }
+            return out != null || !("out".equals(name) || "response".equals(name));
+        }
+
+        /**
+         * The value of an exchange variable.
+         */
+        private Object exchangeVariable(String name) {
+            switch (name) {
+                case "body":
+                    return body;
+                case "header":
+                case "headers":
+                    return headers;
+                case "variable":
+                case "variables":
+                    if (exchangeVariables == null) {
+                        exchangeVariables = exchange.getVariables();
+                    }
+                    return exchangeVariables;
+                case "exception":
+                    return exception;
+                case "in":
+                case "request":
+                case "message":
+                    return in;
+                case "exchange":
+                    return exchange;
+                case "exchangeProperty":
+                case "exchangeProperties":
+                    if (exchangeProperties == null) {
+                        exchangeProperties = exchange.getAllProperties();
+                    }
+                    return exchangeProperties;
+                case "out":
+                case "response":
+                    return out;
+                case "camelContext":
+                    return exchange.getContext();
+                case "attachments":
+                    if (attachments == null) {
+                        AttachmentMessage am = new DefaultAttachmentMessage(exchange.getMessage());
+                        attachments = am.hasAttachments() ? am.getAttachments() : Collections.emptyMap();
+                    }
+                    return attachments;
+                case "log":
+                    return LOG;
+                default:
+                    return null;
+            }
+        }
+    }
+
+    /**
+     * The hint for parseText of a JsonSlurper called with bytes: parseText takes text, and JsonSlurper.parse reads the
+     * bytes. For the body, also what it is and the unmarshal that parses it. Null for any other missing method.
+     */
+    private static String bytesToParseTextHint(Exchange exchange, groovy.lang.MissingMethodException e) {
+        Object[] args = e.getArguments();
+        if (!"parseText".equals(e.getMethod()) || e.getType() == null
+                || !e.getType().getName().startsWith("groovy.json.") || args == null || args.length != 1
+                || !(args[0] instanceof byte[])) {
+            return null;
+        }
+        if (args[0] == exchange.getMessage().getBody()) {
+            String unmarshal = BodyFacts.hint(exchange, BodyFacts.Need.DATA);
+            return BodyFacts.describe(exchange) + ": parseText takes text, so parse the bytes with"
+                   + " new groovy.json.JsonSlurper().parse(body)" + (unmarshal != null ? ", or " + unmarshal : "");
+        }
+        return "the value is bytes (a byte[]), and parseText takes text: parse the bytes with"
+               + " new groovy.json.JsonSlurper().parse(...)";
+    }
+
+    /**
+     * A MissingMethodException with a hint at the end of the first line of its message, the line a log shows. It keeps
+     * the type, so an onException for it still applies.
+     */
+    static final class HintedMissingMethodException extends groovy.lang.MissingMethodException {
+
+        private static final long serialVersionUID = 1L;
+
+        private final String hint;
+
+        HintedMissingMethodException(groovy.lang.MissingMethodException cause, String hint) {
+            super(cause.getMethod(), cause.getType(), cause.getArguments(), cause.isStatic());
+            this.hint = hint;
+            setStackTrace(cause.getStackTrace());
+        }
+
+        @Override
+        public String getMessage() {
+            String message = super.getMessage();
+            int eol = message.indexOf('\n');
+            return eol < 0
+                    ? message + " (" + hint + ")"
+                    : message.substring(0, eol) + " (" + hint + ")" + message.substring(eol);
+        }
+    }
+
+    /** The first header that holds JSON text (a String or byte[] starting with { or [), or null. */
+    private static String jsonTextHeader(Exchange exchange) {
+        for (Map.Entry<String, Object> header : exchange.getMessage().getHeaders().entrySet()) {
+            int first = firstNonBlank(header.getValue());
+            if (first == '{' || first == '[') {
+                return header.getKey();
+            }
+        }
+        return null;
+    }
+
+    private static boolean isIdentifier(String name) {
+        if (name.isEmpty() || !Character.isJavaIdentifierStart(name.charAt(0))) {
+            return false;
+        }
+        for (int i = 1; i < name.length(); i++) {
+            if (!Character.isJavaIdentifierPart(name.charAt(i))) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private static int firstNonBlank(Object body) {
+        if (body instanceof byte[] bytes) {
+            for (int i = 0; i < bytes.length && i < 256; i++) {
+                if (!Character.isWhitespace(bytes[i])) {
+                    return bytes[i];
+                }
+            }
+        } else if (body instanceof String text) {
+            for (int i = 0; i < text.length() && i < 256; i++) {
+                if (!Character.isWhitespace(text.charAt(i))) {
+                    return text.charAt(i);
+                }
+            }
+        }
+        return -1;
+    }
+}

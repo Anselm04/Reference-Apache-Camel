@@ -1,0 +1,35 @@
+{
+  "dataformat": {
+    "kind": "dataformat",
+    "name": "flatpack",
+    "title": "Flatpack",
+    "description": "Marshal and unmarshal Java lists and maps to\/from flat files (such as CSV, delimited, or fixed length formats) using Flatpack library",
+    "deprecated": false,
+    "firstVersion": "2.1.0",
+    "label": "dataformat,transformation,csv",
+    "javaType": "org.apache.camel.dataformat.flatpack.FlatpackDataFormat",
+    "supportLevel": "Stable",
+    "groupId": "org.apache.camel",
+    "artifactId": "camel-flatpack",
+    "version": "4.24.0-SNAPSHOT",
+    "modelName": "flatpack",
+    "modelJavaType": "org.apache.camel.model.dataformat.FlatpackDataFormat"
+  },
+  "bodyTypes": {
+    "marshalIn": { "carriers": [ "list", "map" ], "description": "The rows as a List of Maps, such as the DataSetList unmarshal gives, or a single Map as one row. Other bodies fail. Without a definition, the keys of the first Map name the columns" },
+    "marshalOut": { "carriers": [ "stream" ], "format": "text", "description": "The records in the stream cache, or a byte array when stream caching is off. An empty List writes nothing" },
+    "unmarshalIn": { "carriers": [ "text", "bytes", "stream", "file" ], "format": "text" },
+    "unmarshalOut": { "carriers": [ "list" ], "javaType": "org.apache.camel.component.flatpack.DataSetList", "description": "A DataSetList: a List of the rows, each a HashMap of the column names and the values, which does not keep the column order" }
+  },
+  "properties": {
+    "id": { "index": 0, "kind": "attribute", "displayName": "Id", "group": "common", "required": false, "type": "string", "javaType": "java.lang.String", "deprecated": false, "autowired": false, "secret": false, "description": "The id of this node" },
+    "definition": { "index": 1, "kind": "attribute", "displayName": "Definition", "group": "common", "required": false, "type": "string", "javaType": "java.lang.String", "deprecated": false, "autowired": false, "secret": false, "description": "The flatpack pzmap configuration file. Can be omitted in simpler situations, but its preferred to use the pzmap." },
+    "fixed": { "index": 2, "kind": "attribute", "displayName": "Fixed", "group": "common", "required": false, "type": "boolean", "javaType": "java.lang.Boolean", "deprecated": false, "autowired": false, "secret": false, "defaultValue": false, "description": "Delimited or fixed. Is by default false = delimited." },
+    "delimiter": { "index": 3, "kind": "attribute", "displayName": "Delimiter", "group": "common", "required": false, "type": "string", "javaType": "java.lang.String", "deprecated": false, "autowired": false, "secret": false, "defaultValue": ",", "description": "The delimiter char (could be ; , or similar)." },
+    "ignoreFirstRecord": { "index": 4, "kind": "attribute", "displayName": "Ignore First Record", "group": "common", "required": false, "type": "boolean", "javaType": "java.lang.Boolean", "deprecated": false, "autowired": false, "secret": false, "defaultValue": true, "description": "Whether the first line is ignored for delimited files (for the column headers). Is by default true." },
+    "allowShortLines": { "index": 5, "kind": "attribute", "displayName": "Allow Short Lines", "group": "common", "required": false, "type": "boolean", "javaType": "java.lang.Boolean", "deprecated": false, "autowired": false, "secret": false, "defaultValue": false, "description": "Allows for lines to be shorter than expected and ignores the extra characters." },
+    "ignoreExtraColumns": { "index": 6, "kind": "attribute", "displayName": "Ignore Extra Columns", "group": "common", "required": false, "type": "boolean", "javaType": "java.lang.Boolean", "deprecated": false, "autowired": false, "secret": false, "defaultValue": false, "description": "Allows for lines to be longer than expected and ignores the extra characters." },
+    "textQualifier": { "index": 7, "kind": "attribute", "displayName": "Text Qualifier", "group": "advanced", "label": "advanced", "required": false, "type": "string", "javaType": "java.lang.String", "deprecated": false, "autowired": false, "secret": false, "description": "If the text is qualified with a character. Uses quote character by default." },
+    "parserFactory": { "index": 8, "kind": "attribute", "displayName": "Parser Factory", "group": "advanced", "label": "advanced", "required": false, "type": "object", "javaType": "net.sf.flatpack.ParserFactory", "deprecated": false, "autowired": false, "secret": false, "description": "References to a custom parser factory to lookup in the registry." }
+  }
+}

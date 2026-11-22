@@ -1,0 +1,351 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.camel.dsl.jbang.core.commands;
+
+import java.nio.file.Path;
+import java.util.List;
+import java.util.Optional;
+import java.util.Set;
+
+import org.apache.camel.catalog.DefaultCamelCatalog;
+import org.apache.camel.dsl.jbang.core.common.CliExitCode;
+import org.apache.camel.dsl.jbang.core.common.InstallDetector;
+import org.apache.camel.dsl.jbang.core.common.OllamaDoctorSupport;
+import org.apache.camel.dsl.jbang.run.common.CamelJBangConstants;
+import org.apache.camel.tooling.maven.MavenDownloaderImpl;
+import org.apache.camel.tooling.maven.MavenResolutionException;
+import org.apache.camel.util.json.JsonArray;
+import org.apache.camel.util.json.JsonObject;
+import org.apache.camel.util.json.Jsoner;
+import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.Assertions;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+import org.junitpioneer.jupiter.SetSystemProperty;
+import org.mockito.MockedConstruction;
+
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.mockito.ArgumentMatchers.anyBoolean;
+import static org.mockito.ArgumentMatchers.anyList;
+import static org.mockito.ArgumentMatchers.anySet;
+import static org.mockito.Mockito.doThrow;
+import static org.mockito.Mockito.mockConstruction;
+import static org.mockito.Mockito.verify;
+
+class DoctorTest extends CamelCommandBaseTestSupport {
+
+    private MockedConstruction<MavenDownloaderImpl> downloaders;
+    private MavenResolutionException resolutionFailure;
+    private boolean initializationFailure;
+
+    @BeforeEach
+    void mockDownloader() {
+        downloaders = mockConstruction(MavenDownloaderImpl.class, (downloader, context) -> {
+            if (initializationFailure) {
+                doThrow(new IllegalStateException("Invalid Maven settings")).when(downloader).build();
+            }
+            if (resolutionFailure != null) {
+                doThrow(resolutionFailure).when(downloader).resolveArtifacts(anyList(), anySet(), anyBoolean(), anyBoolean());
+            }
+        });
+    }
+
+    @AfterEach
+    void closeDownloaderMocks() {
+        downloaders.close();
+    }
+
+    @Test
+    void mavenResolutionFailureFailsCommand() throws Exception {
+        resolutionFailure = new MavenResolutionException("Product artifact unavailable");
+        Doctor command = new CamelJBangMain().withPrinter(printer).command(new Doctor());
+
+        assertThat(command.doCall()).isEqualTo(1);
+        assertThat(printer.getOutput()).contains("Artifact resolution failed", "Product artifact unavailable", "Disk Space:");
+    }
+
+    @Test
+    void mavenInitializationFailureFailsCommand() throws Exception {
+        initializationFailure = true;
+        Doctor command = new CamelJBangMain().withPrinter(printer).command(new Doctor());
+
+        assertThat(command.doCall()).isEqualTo(1);
+        assertThat(printer.getOutput()).contains("Invalid Maven settings", "Disk Space:");
+    }
+
+    @Test
+    @SetSystemProperty(key = CamelJBangConstants.REPOS, value = "product=file:/product-repository")
+    @SetSystemProperty(key = CamelJBangConstants.MAVEN_SETTINGS, value = "custom-settings.xml")
+    @SetSystemProperty(key = CamelJBangConstants.MAVEN_SETTINGS_SECURITY, value = "custom-settings-security.xml")
+    @SetSystemProperty(key = CamelJBangConstants.MAVEN_CENTRAL_ENABLED, value = "false")
+    @SetSystemProperty(key = CamelJBangConstants.MAVEN_APACHE_SNAPSHOTS, value = "false")
+    @SetSystemProperty(key = CamelJBangConstants.DOWNLOAD, value = "false")
+    @SetSystemProperty(key = CamelJBangConstants.FRESH, value = "true")
+    void usesConfiguredMavenEnvironment() throws Exception {
+        Doctor command = new CamelJBangMain().withPrinter(printer).command(new Doctor());
+
+        assertThat(command.doCall()).isZero();
+        assertThat(downloaders.constructed()).hasSize(1);
+        MavenDownloaderImpl downloader = downloaders.constructed().get(0);
+        verify(downloader).setRepos("product=file:/product-repository");
+        verify(downloader).setMavenSettingsLocation("custom-settings.xml");
+        verify(downloader).setMavenSettingsSecurityLocation("custom-settings-security.xml");
+        verify(downloader).setMavenCentralEnabled(false);
+        verify(downloader).setMavenApacheSnapshotEnabled(false);
+        verify(downloader).setOffline(true);
+        verify(downloader).setFresh(true);
+        // a SNAPSHOT CLI asks for the Apache snapshots; with them disabled (as here) the downloader has none to add
+        String version = new DefaultCamelCatalog().getCatalogVersion();
+        verify(downloader).resolveArtifacts(
+                List.of("org.apache.camel:camel-api:" + version),
+                Set.of(), false, version.endsWith("-SNAPSHOT"));
+    }
+
+    @Test
+    public void exitCodeFollowsTheChecks() throws Exception {
+        Doctor command = new CamelJBangMain().withPrinter(printer).command(new Doctor());
+        int exit = command.doCall();
+
+        // a check that fails (such as Maven on a machine without network) fails the command, a warning does not
+        boolean failed = command.getChecks().stream().anyMatch(c -> Doctor.FAIL.equals(c.status()));
+        Assertions.assertEquals(failed ? CliExitCode.FAILURE : CliExitCode.OK, exit);
+    }
+
+    @Test
+    void shouldPrintChecksAsJson() throws Exception {
+        Doctor command = new CamelJBangMain().withPrinter(printer).command(new Doctor());
+        command.jsonOutput = true;
+        command.doCall();
+
+        JsonObject root = Jsoner.deserialize(printer.getStdout(), (JsonObject) null);
+        assertThat(root).as(printer.getStdout()).isNotNull();
+        assertThat(root.getString("status")).isIn(Doctor.OK, Doctor.WARN, Doctor.FAIL);
+        JsonArray checks = root.getCollection("checks");
+        assertThat(checks.stream().map(c -> ((JsonObject) c).getString("name")))
+                .contains("camel", "java", "jbang", "maven", "container", "ollama", "ports", "disk");
+        assertThat(checks.stream().map(c -> ((JsonObject) c).getString("status")))
+                .allMatch(st -> List.of(Doctor.OK, Doctor.WARN, Doctor.FAIL).contains(st));
+        // only the JSON document: no banner
+        assertThat(printer.getStdout()).doesNotContain("Camel CLI Doctor");
+    }
+
+    @Test
+    void optionalToolsAreWarnings() throws Exception {
+        Doctor command = new CamelJBangMain().withPrinter(printer).command(new Doctor());
+        command.printOllamaStatus(OllamaDoctorSupport.Status.notRunning());
+
+        assertThat(command.getChecks()).singleElement()
+                .satisfies(c -> assertThat(c.name()).isEqualTo("ollama"))
+                .satisfies(c -> assertThat(c.status()).isEqualTo(Doctor.WARN));
+    }
+
+    @Test
+    void moreThanOneInstallFails() {
+        Path locationA = Path.of("/home/user/.local/share/camel-cli/versions/4.22.0");
+        Path locationB = Path.of("/opt/homebrew/Cellar/apache-camel/4.21.0/libexec");
+        Doctor command = new CamelJBangMain().withPrinter(printer).command(new Doctor());
+
+        command.checkInstallLocations(List.of(
+                new InstallDetector.InstallInfo(locationA, InstallDetector.InstallMethod.WEB_INSTALLER),
+                new InstallDetector.InstallInfo(locationB, InstallDetector.InstallMethod.HOMEBREW)), Optional.empty());
+
+        assertThat(command.getChecks()).singleElement()
+                .satisfies(c -> assertThat(c.status()).isEqualTo(Doctor.FAIL))
+                .satisfies(c -> assertThat(c.message()).isEqualTo("Found 2 Camel CLI installations"));
+    }
+
+    @Test
+    public void shouldPrintBanner() throws Exception {
+        Doctor command = new CamelJBangMain().withPrinter(printer).command(new Doctor());
+        command.doCall();
+
+        String output = printer.getOutput();
+        Assertions.assertTrue(output.contains("Camel CLI Doctor"));
+        Assertions.assertTrue(output.contains("=================="));
+    }
+
+    @Test
+    public void shouldCheckJava() throws Exception {
+        Doctor command = new CamelJBangMain().withPrinter(printer).command(new Doctor());
+        command.doCall();
+
+        String output = printer.getOutput();
+        Assertions.assertTrue(output.contains("Java:"));
+        String javaVersion = System.getProperty("java.version");
+        Assertions.assertTrue(output.contains(javaVersion));
+    }
+
+    @Test
+    public void shouldCheckCamelVersion() throws Exception {
+        Doctor command = new CamelJBangMain().withPrinter(printer).command(new Doctor());
+        command.doCall();
+
+        String output = printer.getOutput();
+        Assertions.assertTrue(output.contains("Camel:"));
+    }
+
+    @Test
+    public void shouldCheckPorts() throws Exception {
+        Doctor command = new CamelJBangMain().withPrinter(printer).command(new Doctor());
+        command.doCall();
+
+        String output = printer.getOutput();
+        Assertions.assertTrue(output.contains("Ports:"));
+    }
+
+    @Test
+    public void shouldCheckDiskSpace() throws Exception {
+        Doctor command = new CamelJBangMain().withPrinter(printer).command(new Doctor());
+        command.doCall();
+
+        String output = printer.getOutput();
+        Assertions.assertTrue(output.contains("Disk Space:"));
+    }
+
+    @Test
+    public void shouldIncludeAllSections() throws Exception {
+        Doctor command = new CamelJBangMain().withPrinter(printer).command(new Doctor());
+        command.doCall();
+
+        List<String> lines = printer.getLines();
+        Assertions.assertTrue(lines.size() >= 7, "Doctor should output at least 7 lines (banner + checks)");
+    }
+
+    @Test
+    void shouldReportOllamaSection() throws Exception {
+        Doctor command = new CamelJBangMain().withPrinter(printer).command(new Doctor());
+        command.doCall();
+
+        assertThat(printer.getOutput()).contains("Ollama:");
+    }
+
+    @Test
+    void shouldReportOllamaNotDetectedWhenUnavailable() throws Exception {
+        Doctor command = new CamelJBangMain().withPrinter(printer).command(new Doctor());
+        command.printOllamaStatus(OllamaDoctorSupport.Status.notRunning());
+
+        assertThat(printer.getOutput())
+                .contains("Ollama:")
+                .contains("Not detected");
+    }
+
+    @Test
+    void shouldPrintRunningOllamaWithModels() throws Exception {
+        Doctor command = new CamelJBangMain().withPrinter(printer).command(new Doctor());
+        OllamaDoctorSupport.Status status = new OllamaDoctorSupport.Status(
+                true, "http://localhost:11434", List.of("qwen2.5:32b", "llama3.2:latest"));
+
+        command.printOllamaStatus(status);
+
+        assertThat(printer.getOutput())
+                .contains("Ollama:")
+                .contains("Running at localhost:11434")
+                .contains("qwen2.5:32b, llama3.2:latest");
+    }
+
+    @Test
+    void skipsInstallCheckOutsideLauncher() throws Exception {
+        System.clearProperty("camel.launcher");
+        Doctor command = new CamelJBangMain().withPrinter(printer).command(new Doctor());
+
+        command.doCall();
+
+        assertThat(command.getChecks()).extracting(Doctor.Check::name).doesNotContain("installs");
+        assertThat(printer.getOutput()).doesNotContain("Camel CLI installations");
+    }
+
+    @Test
+    void reportsSingleInstallAsOkUnderLauncher() throws Exception {
+        System.setProperty("camel.launcher", "true");
+        try {
+            Doctor command = new CamelJBangMain().withPrinter(printer).command(new Doctor());
+
+            command.doCall();
+
+            assertThat(printer.getOutput()).contains("Installs:");
+        } finally {
+            System.clearProperty("camel.launcher");
+        }
+    }
+
+    @Test
+    void exitsNonZeroWhenMultipleInstallsFound() {
+        Path locationA = Path.of("/home/user/.local/share/camel-cli/versions/4.22.0");
+        Path locationB = Path.of("/opt/homebrew/Cellar/apache-camel/4.21.0/libexec");
+        List<InstallDetector.InstallInfo> installs = List.of(
+                new InstallDetector.InstallInfo(locationA, InstallDetector.InstallMethod.WEB_INSTALLER),
+                new InstallDetector.InstallInfo(locationB, InstallDetector.InstallMethod.HOMEBREW));
+        Doctor command = new CamelJBangMain().withPrinter(printer).command(new Doctor());
+
+        boolean conflict = command.checkInstallLocations(installs, Optional.of(locationA.resolve("bin/camel.sh")));
+
+        assertThat(conflict).isTrue();
+        assertThat(printer.getOutput()).contains("Found 2 Camel CLI installations")
+                .contains("Warning: more than one Camel CLI installation was found");
+    }
+
+    @Test
+    void versionsOfTheWebInstallerAreOneInstall() {
+        Path versions = Path.of("/home/user/.local/share/camel-cli/versions");
+        List<InstallDetector.InstallInfo> installs = List.of(
+                new InstallDetector.InstallInfo(versions.resolve("4.23.0"), InstallDetector.InstallMethod.WEB_INSTALLER),
+                new InstallDetector.InstallInfo(versions.resolve("4.22.2"), InstallDetector.InstallMethod.WEB_INSTALLER));
+        Doctor command = new CamelJBangMain().withPrinter(printer).command(new Doctor());
+
+        boolean conflict = command.checkInstallLocations(installs, Optional.of(versions.resolve("4.23.0/bin/camel.sh")));
+
+        assertThat(conflict).isFalse();
+        assertThat(command.getChecks()).singleElement()
+                .satisfies(c -> assertThat(c.status()).isNotEqualTo(Doctor.FAIL));
+        assertThat(printer.getOutput())
+                .contains("Found 1 Camel CLI installation (2 versions of the web installer)")
+                .contains("4.23.0 (WEB_INSTALLER) <- active")
+                .doesNotContain("4.22.2 (WEB_INSTALLER) <- active")
+                .doesNotContain("Warning: more than one");
+    }
+
+    @Test
+    void versionsOfTheWebInstallerNextToAnotherInstallFail() {
+        Path versions = Path.of("/home/user/.local/share/camel-cli/versions");
+        List<InstallDetector.InstallInfo> installs = List.of(
+                new InstallDetector.InstallInfo(versions.resolve("4.23.0"), InstallDetector.InstallMethod.WEB_INSTALLER),
+                new InstallDetector.InstallInfo(versions.resolve("4.22.2"), InstallDetector.InstallMethod.WEB_INSTALLER),
+                new InstallDetector.InstallInfo(
+                        Path.of("/opt/homebrew/Cellar/apache-camel/4.21.0/libexec"),
+                        InstallDetector.InstallMethod.HOMEBREW));
+        Doctor command = new CamelJBangMain().withPrinter(printer).command(new Doctor());
+
+        boolean conflict = command.checkInstallLocations(installs, Optional.empty());
+
+        assertThat(conflict).isTrue();
+        assertThat(printer.getOutput()).contains("Found 2 Camel CLI installations (2 versions of the web installer)");
+    }
+
+    @Test
+    void reportsNoConflictWhenSingleInstallFound() {
+        Path location = Path.of("/home/user/.local/share/camel-cli/versions/4.22.0");
+        List<InstallDetector.InstallInfo> installs = List.of(
+                new InstallDetector.InstallInfo(location, InstallDetector.InstallMethod.WEB_INSTALLER));
+        Doctor command = new CamelJBangMain().withPrinter(printer).command(new Doctor());
+
+        boolean conflict = command.checkInstallLocations(installs, Optional.of(location.resolve("bin/camel.sh")));
+
+        assertThat(conflict).isFalse();
+        assertThat(printer.getOutput()).contains("Found 1 Camel CLI installation")
+                .doesNotContain("Warning: more than one");
+    }
+}

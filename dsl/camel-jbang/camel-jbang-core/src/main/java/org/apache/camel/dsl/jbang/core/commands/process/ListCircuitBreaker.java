@@ -1,0 +1,270 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.camel.dsl.jbang.core.commands.process;
+
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.List;
+import java.util.stream.Collectors;
+
+import com.github.freva.asciitable.AsciiTable;
+import com.github.freva.asciitable.Column;
+import com.github.freva.asciitable.ColumnData;
+import com.github.freva.asciitable.HorizontalAlign;
+import com.github.freva.asciitable.OverflowBehaviour;
+import org.aesh.command.CommandDefinition;
+import org.aesh.command.option.Argument;
+import org.aesh.command.option.Option;
+import org.apache.camel.dsl.jbang.core.common.CopyableRow;
+import org.apache.camel.dsl.jbang.core.common.PidNameAgeCompletionCandidates;
+import org.apache.camel.dsl.jbang.core.common.ProcessHelper;
+import org.apache.camel.dsl.jbang.core.common.RowSort;
+import org.apache.camel.util.TimeUtils;
+import org.apache.camel.util.json.JsonArray;
+import org.apache.camel.util.json.JsonObject;
+import org.apache.camel.util.json.Jsoner;
+
+@CommandDefinition(name = "circuit-breaker", description = "Get status of Circuit Breaker EIPs", generateHelp = true,
+                   footer = {
+                           "Examples:",
+                           "  camel get circuit-breaker",
+                           "  camel get circuit-breaker --watch" })
+public class ListCircuitBreaker extends ProcessWatchCommand {
+
+    private static final RowSort<Row> ORDER = RowSort.<Row> integration(r -> r.pid, r -> r.name, r -> r.uptime);
+
+    @Argument(description = "Name or pid of running Camel integration")
+    String name = "*";
+
+    @Option(name = "sort", description = "Sort by pid, name or age", defaultValue = "pid",
+            completer = PidNameAgeCompletionCandidates.class)
+    String sort;
+
+    @Override
+    public Integer doProcessWatchCall() throws Exception {
+        List<Row> rows = new ArrayList<>();
+
+        forEachIntegration(name, (ph, root) -> {
+            // there must be a status file for the running Camel integration
+            Row row = new Row();
+            JsonObject context = (JsonObject) root.get("context");
+            if (context == null) {
+                return;
+            }
+            row.name = context.getString("name");
+            if ("CamelJBang".equals(row.name)) {
+                row.name = ProcessHelper.extractName(root, ph);
+            }
+            row.pid = Long.toString(ph.pid());
+            row.uptime = extractSince(ph);
+            row.age = TimeUtils.printSince(row.uptime);
+            Row baseRow = row.copy();
+
+            JsonObject mo = (JsonObject) root.get("resilience4j");
+            if (mo != null) {
+                JsonArray arr = (JsonArray) mo.get("circuitBreakers");
+                if (arr != null) {
+                    for (int i = 0; i < arr.size(); i++) {
+                        row = baseRow.copy();
+                        JsonObject jo = (JsonObject) arr.get(i);
+                        row.component = "resilience4j";
+                        row.id = jo.getString("id");
+                        row.routeId = jo.getString("routeId");
+                        row.state = jo.getString("state");
+                        row.bufferedCalls = jo.getInteger("bufferedCalls");
+                        row.successfulCalls = jo.getInteger("successfulCalls");
+                        row.failedCalls = jo.getInteger("failedCalls");
+                        row.notPermittedCalls = jo.getLong("notPermittedCalls");
+                        row.fallbackCalls = jo.getLongOrDefault("fallbackCalls", 0);
+                        row.timedOutCalls = jo.getLongOrDefault("timedOutCalls", 0);
+                        row.bulkheadRejectedCalls = jo.getLongOrDefault("bulkheadRejectedCalls", 0);
+                        row.bulkheadEnabled = isBulkheadEnabled(jo);
+                        row.failureRate = jo.getDouble("failureRate");
+                        rows.add(row);
+                    }
+                }
+            }
+            mo = (JsonObject) root.get("fault-tolerance");
+            if (mo != null) {
+                JsonArray arr = (JsonArray) mo.get("circuitBreakers");
+                if (arr != null) {
+                    for (int i = 0; i < arr.size(); i++) {
+                        row = baseRow.copy();
+                        JsonObject jo = (JsonObject) arr.get(i);
+                        row.component = "fault-tolerance";
+                        row.id = jo.getString("id");
+                        row.routeId = jo.getString("routeId");
+                        row.state = jo.getString("state");
+                        row.successfulCalls = jo.getLongOrDefault("successfulCalls", 0).intValue();
+                        row.failedCalls = jo.getLongOrDefault("failedCalls", 0).intValue();
+                        row.notPermittedCalls = jo.getLongOrDefault("notPermittedCalls", 0);
+                        row.fallbackCalls = jo.getLongOrDefault("fallbackCalls", 0);
+                        row.timedOutCalls = jo.getLongOrDefault("timedOutCalls", 0);
+                        row.bulkheadRejectedCalls = jo.getLongOrDefault("bulkheadRejectedCalls", 0);
+                        row.bulkheadEnabled = isBulkheadEnabled(jo);
+                        row.failureRate = -1;
+                        rows.add(row);
+                    }
+                }
+            }
+            mo = (JsonObject) root.get("circuit-breaker");
+            if (mo != null) {
+                JsonArray arr = (JsonArray) mo.get("circuitBreakers");
+                if (arr != null) {
+                    for (int i = 0; i < arr.size(); i++) {
+                        row = baseRow.copy();
+                        JsonObject jo = (JsonObject) arr.get(i);
+                        row.component = "core";
+                        row.id = jo.getString("routeId");
+                        row.routeId = jo.getString("routeId");
+                        row.state = jo.getString("state");
+                        row.successfulCalls = jo.getInteger("successfulCalls");
+                        row.failedCalls = jo.getInteger("failedCalls");
+                        rows.add(row);
+                    }
+                }
+            }
+        });
+
+        // sort rows
+        rows.sort(ORDER.comparator(sort));
+
+        if (!rows.isEmpty() || jsonOutput) {
+            if (jsonOutput) {
+                printer().println(Jsoner.serialize(rows.stream().map(r -> {
+                    JsonObject jo = new JsonObject();
+                    jo.put("pid", JsonValues.pid(r.pid));
+                    jo.put("name", r.name);
+                    jo.put("component", r.component);
+                    jo.put("routeId", r.routeId);
+                    jo.put("id", r.id);
+                    jo.put("status", r.state);
+                    jo.put("bufferedCalls", r.bufferedCalls);
+                    jo.put("successfulCalls", r.successfulCalls);
+                    jo.put("failedCalls", r.failedCalls);
+                    jo.put("notPermittedCalls", r.notPermittedCalls);
+                    jo.put("fallbackCalls", r.fallbackCalls);
+                    jo.put("timedOutCalls", r.timedOutCalls);
+                    jo.put("bulkheadRejectedCalls", r.bulkheadRejectedCalls);
+                    jo.put("failureRate", r.failureRate);
+                    return jo;
+                }).collect(Collectors.toList())));
+            } else {
+                List<ColumnData<Row>> columns = new ArrayList<>(
+                        Arrays.asList(
+                                new Column().header("PID").headerAlign(HorizontalAlign.CENTER).with(r -> r.pid),
+                                new Column().header("NAME").dataAlign(HorizontalAlign.LEFT)
+                                        .maxWidth(30, OverflowBehaviour.ELLIPSIS_RIGHT)
+                                        .with(r -> r.name),
+                                new Column().header("COMPONENT").dataAlign(HorizontalAlign.LEFT).with(r -> r.component),
+                                new Column().header("ROUTE").dataAlign(HorizontalAlign.LEFT).with(r -> r.routeId),
+                                new Column().header("ID").dataAlign(HorizontalAlign.LEFT).with(r -> r.id),
+                                new Column().header("STATE").dataAlign(HorizontalAlign.LEFT).with(r -> r.state),
+                                new Column().header("PENDING").headerAlign(HorizontalAlign.RIGHT)
+                                        .dataAlign(HorizontalAlign.RIGHT)
+                                        .with(this::getPending),
+                                new Column().header("SUCCESS").headerAlign(HorizontalAlign.RIGHT)
+                                        .dataAlign(HorizontalAlign.RIGHT)
+                                        .with(this::getSuccess),
+                                new Column().header("FAIL").headerAlign(HorizontalAlign.CENTER).dataAlign(HorizontalAlign.RIGHT)
+                                        .with(this::getFailure),
+                                new Column().header("REJECT").headerAlign(HorizontalAlign.RIGHT)
+                                        .dataAlign(HorizontalAlign.RIGHT)
+                                        .with(this::getReject),
+                                new Column().header("FALLBACK").headerAlign(HorizontalAlign.RIGHT)
+                                        .dataAlign(HorizontalAlign.RIGHT)
+                                        .with(r -> countOrBlank(r, r.fallbackCalls)),
+                                new Column().header("TIMEOUT").headerAlign(HorizontalAlign.RIGHT)
+                                        .dataAlign(HorizontalAlign.RIGHT)
+                                        .with(r -> countOrBlank(r, r.timedOutCalls))));
+                // the bulkhead column only makes sense when a bulkhead is configured
+                if (rows.stream().anyMatch(r -> r.bulkheadEnabled)) {
+                    columns.add(new Column().header("BULKHEAD").headerAlign(HorizontalAlign.RIGHT)
+                            .dataAlign(HorizontalAlign.RIGHT)
+                            .with(r -> countOrBlank(r, r.bulkheadRejectedCalls)));
+                }
+                printer().println(AsciiTable.getTable(AsciiTable.NO_BORDERS, rows, columns));
+            }
+        }
+
+        return 0;
+    }
+
+    private String getFailure(Row r) {
+        if (r.failedCalls <= 0) {
+            return "";
+        } else if (r.failureRate > 0) {
+            return r.failedCalls + " (" + String.format("%.0f", r.failureRate) + "%)";
+        } else {
+            return Integer.toString(r.failedCalls);
+        }
+    }
+
+    private String getPending(Row r) {
+        if ("resilience4j".equals(r.component)) {
+            return Integer.toString(r.bufferedCalls);
+        }
+        return "";
+    }
+
+    private String getSuccess(Row r) {
+        if ("resilience4j".equals(r.component) || "fault-tolerance".equals(r.component) || "core".equals(r.component)) {
+            return Integer.toString(r.successfulCalls);
+        }
+        return "";
+    }
+
+    private String getReject(Row r) {
+        if ("resilience4j".equals(r.component) || "fault-tolerance".equals(r.component)) {
+            return Long.toString(r.notPermittedCalls);
+        }
+        return "";
+    }
+
+    private String countOrBlank(Row r, long count) {
+        if ("resilience4j".equals(r.component) || "fault-tolerance".equals(r.component)) {
+            return Long.toString(count);
+        }
+        return "";
+    }
+
+    private static boolean isBulkheadEnabled(JsonObject jo) {
+        JsonObject cfg = (JsonObject) jo.get("configuration");
+        return cfg != null && Boolean.TRUE.equals(cfg.get("bulkheadEnabled"));
+    }
+
+    private static class Row extends CopyableRow<Row> {
+        String pid;
+        String name;
+        String age;
+        long uptime;
+        String component;
+        String id;
+        String routeId;
+        String state;
+        int bufferedCalls;
+        int successfulCalls;
+        int failedCalls;
+        long notPermittedCalls;
+        long fallbackCalls;
+        long timedOutCalls;
+        long bulkheadRejectedCalls;
+        boolean bulkheadEnabled;
+        double failureRate;
+    }
+
+}

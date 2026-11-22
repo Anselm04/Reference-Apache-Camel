@@ -1,0 +1,165 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.camel.dsl.jbang.core.commands.process;
+
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.List;
+import java.util.stream.Collectors;
+
+import com.github.freva.asciitable.AsciiTable;
+import com.github.freva.asciitable.Column;
+import com.github.freva.asciitable.HorizontalAlign;
+import com.github.freva.asciitable.OverflowBehaviour;
+import org.aesh.command.CommandDefinition;
+import org.aesh.command.option.Argument;
+import org.aesh.command.option.Option;
+import org.apache.camel.dsl.jbang.core.common.CopyableRow;
+import org.apache.camel.dsl.jbang.core.common.ProcessHelper;
+import org.apache.camel.dsl.jbang.core.common.RowSort;
+import org.apache.camel.dsl.jbang.core.common.TerminalWidthHelper;
+import org.apache.camel.util.TimeUtils;
+import org.apache.camel.util.json.JsonArray;
+import org.apache.camel.util.json.JsonObject;
+import org.apache.camel.util.json.Jsoner;
+
+@CommandDefinition(name = "groovy", description = "Groovy Sources used of Camel integrations", generateHelp = true,
+                   footer = {
+                           "Examples:",
+                           "  camel get groovy",
+                           "  camel get groovy --watch" })
+public class ListGroovy extends ProcessWatchCommand {
+
+    private static final RowSort<Row> ORDER = new RowSort<Row>()
+            .number("pid", r -> r.pid)
+            .text("name", r -> r.name);
+
+    @Argument(description = "Name or pid of running Camel integration")
+    String name = "*";
+
+    @Option(name = "sort", description = "Sort by pid or name", defaultValue = "pid",
+            completer = CamelProcessorStatus.PidNameCompletionCandidates.class)
+    String sort;
+
+    @Override
+    public Integer doProcessWatchCall() throws Exception {
+        List<Row> rows = new ArrayList<>();
+
+        forEachIntegration(name, (ph, root) -> {
+            // there must be a status file for the running Camel integration
+            Row row = new Row();
+            JsonObject context = (JsonObject) root.get("context");
+            if (context == null) {
+                return;
+            }
+            row.name = context.getString("name");
+            if ("CamelJBang".equals(row.name)) {
+                row.name = ProcessHelper.extractName(root, ph);
+            }
+            row.pid = Long.toString(ph.pid());
+
+            JsonObject jo = (JsonObject) root.get("groovy");
+            if (jo != null) {
+                jo = (JsonObject) jo.get("compiler");
+            }
+            if (jo != null) {
+                row = row.copy();
+                row.compiledCounter = jo.getInteger("compiledCounter");
+                row.preloaddCounter = jo.getInteger("preloadedCounter");
+                row.classesSize = jo.getInteger("classesSize");
+                row.time = jo.getLong("compiledTime");
+                row.last = jo.getLong("lastCompilationTimestamp");
+                row.compiledClasses.clear();
+                JsonArray arr = jo.getCollection("classes");
+                for (int i = 0; arr != null && i < arr.size(); i++) {
+                    row.compiledClasses.add(arr.getString(i));
+                }
+                rows.add(row);
+            }
+        });
+
+        // sort rows
+        rows.sort(ORDER.comparator(sort));
+
+        if (!rows.isEmpty() || jsonOutput) {
+            if (jsonOutput) {
+                printer().println(Jsoner.serialize(rows.stream().map(r -> {
+                    JsonObject jo = new JsonObject();
+                    jo.put("pid", JsonValues.pid(r.pid));
+                    jo.put("name", r.name);
+                    jo.put("preload", r.preloaddCounter);
+                    jo.put("compile", r.compiledCounter);
+                    jo.put("time", r.time);
+                    jo.put("since", getLast(r));
+                    jo.put("lastTimestamp", r.last > 0 ? r.last : null);
+                    jo.put("classes", r.compiledClasses);
+                    return jo;
+                }).collect(Collectors.toList())));
+            } else {
+                // Flexible column: CLASSES (60)
+                // Fixed columns: PID(8)+NAME(30)+PRELOAD(7)+COMPILE(7)+TIME(8)+SINCE(8) ~= 68
+                int tw = terminalWidth();
+                int classesW = TerminalWidthHelper.flexWidth(tw, 68, TerminalWidthHelper.noBorderOverhead(7), 15, 60);
+                printer().println(AsciiTable.getTable(AsciiTable.NO_BORDERS, rows, Arrays.asList(
+                        new Column().header("PID").headerAlign(HorizontalAlign.CENTER).with(r -> r.pid),
+                        new Column().header("NAME").dataAlign(HorizontalAlign.LEFT)
+                                .maxWidth(30, OverflowBehaviour.ELLIPSIS_RIGHT)
+                                .with(r -> r.name),
+                        new Column().header("PRELOAD").headerAlign(HorizontalAlign.CENTER)
+                                .with(r -> "" + r.preloaddCounter),
+                        new Column().header("COMPILE").headerAlign(HorizontalAlign.CENTER)
+                                .with(r -> "" + r.compiledCounter),
+                        new Column().header("TIME").headerAlign(HorizontalAlign.CENTER).with(this::getTime),
+                        new Column().header("SINCE").headerAlign(HorizontalAlign.CENTER).with(this::getLast),
+                        new Column().header("CLASSES").headerAlign(HorizontalAlign.LEFT).dataAlign(HorizontalAlign.LEFT)
+                                .maxWidth(classesW, OverflowBehaviour.ELLIPSIS_LEFT).with(this::getClasses))));
+            }
+        }
+
+        return 0;
+    }
+
+    private String getTime(Row r) {
+        return TimeUtils.printDuration(r.time, true);
+    }
+
+    private String getLast(Row r) {
+        if (r.last > 0) {
+            return TimeUtils.printSince(r.last);
+        }
+        return null;
+    }
+
+    private String getClasses(Row r) {
+        if (r.compiledClasses.isEmpty()) {
+            return null;
+        }
+        return String.join("\n", r.compiledClasses);
+    }
+
+    private static class Row extends CopyableRow<Row> {
+        String pid;
+        String name;
+        int compiledCounter;
+        int preloaddCounter;
+        int classesSize;
+        long time;
+        long last;
+        List<String> compiledClasses = new ArrayList<>();
+    }
+
+}

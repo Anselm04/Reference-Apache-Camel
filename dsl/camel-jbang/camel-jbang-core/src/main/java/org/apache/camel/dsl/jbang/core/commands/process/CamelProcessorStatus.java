@@ -1,0 +1,528 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.camel.dsl.jbang.core.commands.process;
+
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Comparator;
+import java.util.Iterator;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.stream.Collectors;
+
+import com.github.freva.asciitable.AsciiTable;
+import com.github.freva.asciitable.Column;
+import com.github.freva.asciitable.HorizontalAlign;
+import com.github.freva.asciitable.OverflowBehaviour;
+import org.aesh.command.CommandDefinition;
+import org.aesh.command.option.Argument;
+import org.aesh.command.option.Option;
+import org.aesh.command.option.OptionList;
+import org.apache.camel.dsl.jbang.core.common.CompletionCandidates;
+import org.apache.camel.dsl.jbang.core.common.ListingFormat;
+import org.apache.camel.dsl.jbang.core.common.ProcessHelper;
+import org.apache.camel.dsl.jbang.core.common.RowSort;
+import org.apache.camel.dsl.jbang.core.common.TerminalWidthHelper;
+import org.apache.camel.support.PatternHelper;
+import org.apache.camel.tooling.model.Strings;
+import org.apache.camel.util.StringHelper;
+import org.apache.camel.util.TimeUtils;
+import org.apache.camel.util.json.JsonArray;
+import org.apache.camel.util.json.JsonObject;
+import org.apache.camel.util.json.Jsoner;
+
+@CommandDefinition(name = "processor", description = "Get status of Camel processors", generateHelp = true,
+                   footer = {
+                           "Examples:",
+                           "  camel get processor",
+                           "  camel get processor --source",
+                           "  camel get processor --watch" })
+public class CamelProcessorStatus extends ProcessWatchCommand {
+
+    private static final RowSort<Row> ORDER = RowSort.<Row> integration(r -> r.pid, r -> r.name, r -> r.uptime);
+
+    public static class PidNameCompletionCandidates extends CompletionCandidates {
+
+        public PidNameCompletionCandidates() {
+        }
+
+        @Override
+        public Iterator<String> iterator() {
+            return List.of("pid", "name").iterator();
+        }
+
+    }
+
+    @Argument(description = "Name or pid of running Camel integration")
+    String name = "*";
+
+    @Option(name = "sort", description = "Sort by pid or name", defaultValue = "pid",
+            completer = PidNameCompletionCandidates.class)
+    String sort;
+
+    @Option(name = "remote", hasValue = false, description = "Break down counters into remote/total pairs")
+    boolean remote;
+
+    @Option(name = "source", hasValue = false, description = "Prefer to display source filename/code instead of IDs")
+    boolean source;
+
+    @Option(name = "mask", hasValue = false, defaultValue = "true",
+            description = "Whether to mask endpoint URIs to avoid printing sensitive information such as password or access keys")
+    boolean mask = true;
+
+    @Option(name = "limit", description = "Filter routes by limiting to the given number of rows")
+    int limit;
+
+    @Option(name = "filter-mean", description = "Filter processors that must be slower than the given time (ms)")
+    long mean;
+
+    @Option(name = "running", hasValue = false, description = "Only include running processors")
+    boolean running;
+
+    @OptionList(name = "filter", valueSeparator = OptionList.NO_SEPARATOR, description = "Filter processors by id")
+    String[] filter;
+
+    @OptionList(name = "group", valueSeparator = OptionList.NO_SEPARATOR, description = "Filter processors by group")
+    String[] group;
+
+    @Option(name = "description", hasValue = false, description = "Include description in the ID column (if available)")
+    boolean description;
+
+    @Option(name = "note", hasValue = false, description = "Include note in the ID column (if available)")
+    boolean note;
+
+    @Option(name = "show-group", hasValue = false, description = "Include group column")
+    boolean showGroup;
+
+    @Override
+    public Integer doProcessWatchCall() throws Exception {
+        List<Row> rows = new ArrayList<>();
+
+        forEachIntegration(name, (ph, root) -> {
+            JsonObject context = (JsonObject) root.get("context");
+            if (context == null) {
+                return;
+            }
+            JsonArray array = (JsonArray) root.get("routes");
+            for (int i = 0; i < array.size(); i++) {
+                JsonObject o = (JsonObject) array.get(i);
+                Row row = new Row();
+                row.name = context.getString("name");
+                if ("CamelJBang".equals(row.name)) {
+                    row.name = ProcessHelper.extractName(root, ph);
+                }
+                row.pid = Long.toString(ph.pid());
+                row.routeId = o.getString("routeId");
+                row.group = o.getString("group");
+                row.description = o.getString("description");
+                row.note = o.getString("note");
+                row.nodePrefixId = o.getString("nodePrefixId");
+                row.processor = ListingFormat.masked(o.getString("from"), mask);
+                row.source = o.getString("source");
+                row.state = o.getString("state");
+                Map<String, ?> stats = o.getMap("statistics");
+                if (stats != null) {
+                    row.total = stats.get("exchangesTotal").toString();
+                    Object num = stats.get("remoteExchangesTotal");
+                    if (num != null) {
+                        row.totalRemote = num.toString();
+                    }
+                    row.inflight = stats.get("exchangesInflight").toString();
+                    num = stats.get("remoteExchangesInflight");
+                    if (num != null) {
+                        row.inflightRemote = num.toString();
+                    }
+                    row.failed = stats.get("exchangesFailed").toString();
+                    num = stats.get("remoteExchangesFailed");
+                    if (num != null) {
+                        row.failedRemote = num.toString();
+                    }
+                    row.mean = stats.get("meanProcessingTime").toString();
+                    if ("-1".equals(row.mean)) {
+                        row.mean = null;
+                    }
+                    row.max = stats.get("maxProcessingTime").toString();
+                    row.min = stats.get("minProcessingTime").toString();
+                    Object last = stats.get("lastProcessingTime");
+                    if (last != null) {
+                        row.last = last.toString();
+                    }
+                    last = stats.get("deltaProcessingTime");
+                    if (last != null) {
+                        row.delta = last.toString();
+                    }
+                    last = stats.get("lastCreatedExchangeTimestamp");
+                    if (last != null) {
+                        long time = Long.parseLong(last.toString());
+                        row.sinceLastStarted = TimeUtils.printSince(time);
+                    }
+                    last = stats.get("lastCompletedExchangeTimestamp");
+                    if (last != null) {
+                        long time = Long.parseLong(last.toString());
+                        row.sinceLastCompleted = TimeUtils.printSince(time);
+                    }
+                    last = stats.get("lastFailedExchangeTimestamp");
+                    if (last != null) {
+                        long time = Long.parseLong(last.toString());
+                        row.sinceLastFailed = TimeUtils.printSince(time);
+                    }
+                }
+
+                boolean add = true;
+                if (mean > 0 && (row.mean == null || Long.parseLong(row.mean) < mean)) {
+                    add = false;
+                }
+                // the limit is a number of routes, and the rows have the processors of the routes too
+                if (limit > 0 && rows.stream().filter(r -> r.processorId == null).count() >= limit) {
+                    add = false;
+                }
+                if (add) {
+                    rows.add(row);
+                    List<JsonObject> list = o.getCollection("processors");
+                    if (list != null) {
+                        addProcessors(row, rows, list);
+                    }
+                }
+            }
+        });
+
+        // filter rows
+        if (running || filter != null || group != null) {
+            // a route stays with its processors that are kept, so they are shown with their integration and route
+            Set<String> routesOfProcessors = rows.stream()
+                    .filter(r -> r.processorId != null && accept(r))
+                    .map(r -> r.pid + "/" + r.routeId)
+                    .collect(Collectors.toSet());
+            rows.removeIf(r -> !accept(r)
+                    && (r.processorId != null || !routesOfProcessors.contains(r.pid + "/" + r.routeId)));
+        }
+
+        // sort rows
+        rows.sort(order());
+
+        if (!rows.isEmpty() || jsonOutput) {
+            printTable(rows);
+        }
+
+        return 0;
+    }
+
+    private boolean accept(Row r) {
+        boolean keep = true;
+        if (filter != null) {
+            keep = PatternHelper.matchPatterns(r.processorId, filter);
+        }
+        if (!keep && filter != null) {
+            for (String f : filter) {
+                if (!keep) {
+                    String w = f.endsWith("*") ? f : f + "*"; // use wildcard in matching processor
+                    keep = PatternHelper.matchPattern(r.processor, w);
+                }
+            }
+        }
+        // group take precedence
+        if (keep && group != null) {
+            keep = PatternHelper.matchPatterns(r.group, group);
+        }
+        if (keep && running) {
+            keep = "Started".equals(r.state);
+        }
+        return keep;
+    }
+
+    private void addProcessors(Row route, List<Row> rows, List<JsonObject> processors) {
+        for (JsonObject o : processors) {
+            Row row = new Row();
+            row.pid = route.pid;
+            row.name = route.name;
+            row.routeId = route.routeId;
+            row.group = route.group;
+            row.processorId = o.getString("id");
+            row.nodePrefixId = o.getString("nodePrefixId");
+            row.processor = o.getString("processor");
+            row.description = o.getString("description");
+            row.level = o.getIntegerOrDefault("level", 0);
+            row.source = o.getString("source");
+            row.state = o.getString("state");
+            row.disabled = o.getBooleanOrDefault("disabled", false);
+            Map<String, ?> stats = o.getMap("statistics");
+            if (stats != null) {
+                row.total = stats.get("exchangesTotal").toString();
+                row.inflight = stats.get("exchangesInflight").toString();
+                row.failed = stats.get("exchangesFailed").toString();
+                row.mean = stats.get("meanProcessingTime").toString();
+                if ("-1".equals(row.mean)) {
+                    row.mean = null;
+                }
+                row.max = stats.get("maxProcessingTime").toString();
+                row.min = stats.get("minProcessingTime").toString();
+                Object last = stats.get("lastProcessingTime");
+                if (last != null) {
+                    row.last = last.toString();
+                }
+                last = stats.get("deltaProcessingTime");
+                if (last != null) {
+                    row.delta = last.toString();
+                }
+                last = stats.get("lastCompletedExchangeTimestamp");
+                if (last != null) {
+                    long time = Long.parseLong(last.toString());
+                    row.sinceLastCompleted = TimeUtils.printSince(time);
+                }
+                last = stats.get("lastFailedExchangeTimestamp");
+                if (last != null) {
+                    long time = Long.parseLong(last.toString());
+                    row.sinceLastFailed = TimeUtils.printSince(time);
+                }
+            }
+            if (source) {
+                List<JsonObject> lines = o.getCollection("code");
+                if (lines != null) {
+                    for (JsonObject line : lines) {
+                        Code code = new Code();
+                        code.line = line.getInteger("line");
+                        code.code = line.getString("code");
+                        if (line.getBooleanOrDefault("match", false)) {
+                            code.match = true;
+                        }
+                        row.code.add(code);
+                    }
+                }
+            }
+            // with --filter-mean only the slower processors, as for the routes
+            if (mean <= 0 || (row.mean != null && Long.parseLong(row.mean) >= mean)) {
+                rows.add(row);
+            }
+        }
+    }
+
+    protected void printTable(List<Row> rows) {
+        if (jsonOutput) {
+            printer().println(Jsoner.serialize(rows.stream().map(r -> {
+                JsonObject jo = new JsonObject();
+                jo.put("pid", JsonValues.pid(r.pid));
+                jo.put("name", r.name);
+                jo.put("routeId", r.routeId);
+                jo.put("group", r.group);
+                jo.put("id", getId(r));
+                jo.put("processor", r.processor);
+                jo.put("status", getStatus(r));
+                jo.put("total", JsonValues.number(r.total));
+                jo.put("failed", JsonValues.number(r.failed));
+                jo.put("inflight", JsonValues.number(r.inflight));
+                // the exchanges that came from a remote endpoint (of the routes only)
+                jo.put("remoteTotal", JsonValues.number(r.totalRemote));
+                jo.put("remoteFailed", JsonValues.number(r.failedRemote));
+                jo.put("remoteInflight", JsonValues.number(r.inflightRemote));
+                // processing times in millis
+                jo.put("mean", JsonValues.number(r.mean));
+                jo.put("min", JsonValues.number(r.min));
+                jo.put("max", JsonValues.number(r.max));
+                jo.put("last", JsonValues.number(r.last));
+                jo.put("delta", JsonValues.number(r.delta));
+                jo.put("sinceLastStarted", JsonValues.text(r.sinceLastStarted));
+                jo.put("sinceLastCompleted", JsonValues.text(r.sinceLastCompleted));
+                jo.put("sinceLastFailed", JsonValues.text(r.sinceLastFailed));
+                return jo;
+            }).collect(Collectors.toList())));
+            return;
+        }
+        // Flexible columns: ID (40), ID desc (60), PROCESSOR (45)
+        // Fixed columns: PID(8)+NAME(30)+GROUP(20)+STATUS(8)+TOTAL(5)+FAIL(4)+INFLIGHT(8)+MEAN(4)+MIN(3)+MAX(3)+LAST(4)+DELTA(5)+SINCE-LAST(10) ~= 112
+        int tw = terminalWidth();
+        int idW = TerminalWidthHelper.flexWidth(tw, 112 + 45, TerminalWidthHelper.noBorderOverhead(15), 15, 40);
+        int idDescW = TerminalWidthHelper.flexWidth(tw, 112 + 45, TerminalWidthHelper.noBorderOverhead(15), 20, 60);
+        int procW = TerminalWidthHelper.flexWidth(tw, 112 + 40, TerminalWidthHelper.noBorderOverhead(15), 20, 45);
+        printer().println(AsciiTable.getTable(AsciiTable.NO_BORDERS, rows, Arrays.asList(
+                new Column().header("PID").headerAlign(HorizontalAlign.CENTER).with(this::getPid),
+                new Column().header("NAME").dataAlign(HorizontalAlign.LEFT).maxWidth(30, OverflowBehaviour.ELLIPSIS_RIGHT)
+                        .with(this::getName),
+                new Column().header("GROUP").visible(showGroup).dataAlign(HorizontalAlign.LEFT)
+                        .maxWidth(20, OverflowBehaviour.ELLIPSIS_RIGHT)
+                        .with(this::getGroup),
+                new Column().header("ID").visible(!description && !note).dataAlign(HorizontalAlign.LEFT)
+                        .maxWidth(idW, OverflowBehaviour.ELLIPSIS_RIGHT)
+                        .with(this::getId),
+                new Column().header("ID").visible(description || note).dataAlign(HorizontalAlign.LEFT)
+                        .maxWidth(idDescW, OverflowBehaviour.NEWLINE)
+                        .with(this::getIdAndNoteDescription),
+                new Column().header("PROCESSOR").dataAlign(HorizontalAlign.LEFT).minWidth(25)
+                        .maxWidth(procW, OverflowBehaviour.ELLIPSIS_RIGHT)
+                        .with(this::getProcessor),
+                new Column().header("STATUS").dataAlign(HorizontalAlign.LEFT).headerAlign(HorizontalAlign.CENTER)
+                        .with(this::getStatus),
+                new Column().header("TOTAL").with(this::getTotal),
+                new Column().header("FAIL").with(this::getFailed),
+                new Column().header("INFLIGHT").with(this::getInflight),
+                new Column().header("MEAN").with(r -> r.mean),
+                new Column().header("MIN").with(r -> r.min),
+                new Column().header("MAX").with(r -> r.max),
+                new Column().header("LAST").with(r -> r.last),
+                new Column().header("DELTA").with(this::getDelta),
+                new Column().header("SINCE-LAST").with(this::getSinceLast))));
+    }
+
+    /**
+     * The order of the rows by the --sort option.
+     */
+    protected Comparator<Row> order() {
+        return ORDER.comparator(sort);
+    }
+
+    protected String getSinceLast(Row r) {
+        String s1 = r.sinceLastCompleted != null ? r.sinceLastCompleted : "-";
+        String s2 = r.sinceLastFailed != null ? r.sinceLastFailed : "-";
+        return s1 + "/" + s2;
+    }
+
+    protected String getDelta(Row r) {
+        return ListingFormat.delta(r.delta);
+    }
+
+    protected String getTotal(Row r) {
+        if (remote && r.totalRemote != null) {
+            return r.totalRemote + "/" + r.total;
+        }
+        return r.total;
+    }
+
+    protected String getFailed(Row r) {
+        if (remote && r.failedRemote != null) {
+            return r.failedRemote + "/" + r.failed;
+        }
+        return r.failed;
+    }
+
+    protected String getInflight(Row r) {
+        if (remote && r.inflightRemote != null) {
+            return r.inflightRemote + "/" + r.inflight;
+        }
+        return r.inflight;
+    }
+
+    protected String getName(Row r) {
+        return r.processorId == null ? r.name : "";
+    }
+
+    protected String getGroup(Row r) {
+        return r.group;
+    }
+
+    protected String getId(Row r) {
+        String answer;
+        if (source && r.source != null) {
+            answer = sourceLocLine(r.source);
+        } else {
+            if (r.processorId == null) {
+                answer = r.routeId;
+            } else {
+                answer = r.processorId;
+                if (r.nodePrefixId != null && answer.startsWith(r.nodePrefixId)) {
+                    answer = answer.substring(r.nodePrefixId.length());
+                }
+            }
+        }
+        return answer;
+    }
+
+    protected String getIdAndNoteDescription(Row r) {
+        String id = getId(r);
+        if (description && r.description != null) {
+            if (id != null) {
+                id = id + "\n  " + Strings.wrapWords(r.description, " ", "\n  ", 55, true);
+            } else {
+                id = r.description;
+            }
+        }
+        if (note && r.note != null) {
+            if (id != null) {
+                id = id + "\n  " + Strings.wrapWords(r.note, " ", "\n  ", 55, true);
+            } else {
+                id = r.note;
+            }
+        }
+        return id;
+    }
+
+    protected String getPid(Row r) {
+        if (r.processorId == null) {
+            return r.pid;
+        } else {
+            return "";
+        }
+    }
+
+    protected String getStatus(Row r) {
+        if (r.disabled) {
+            return "Disabled";
+        }
+        return r.state;
+    }
+
+    protected String getProcessor(Row r) {
+        String answer = r.processor;
+        if (source) {
+            answer = r.code.stream()
+                    .filter(l -> l.match)
+                    .findFirst()
+                    .map(l -> Jsoner.unescape(l.code).trim())
+                    .orElse(r.processor);
+        }
+        String pad = StringHelper.padString(r.level, 2);
+        return pad + answer;
+    }
+
+    static class Row {
+        String pid;
+        String name;
+        long uptime;
+        String routeId;
+        String group;
+        String nodePrefixId;
+        String processorId;
+        String processor;
+        String description;
+        String note;
+        int level;
+        String source;
+        String state;
+        boolean disabled;
+        String total;
+        String totalRemote;
+        String failed;
+        String failedRemote;
+        String inflight;
+        String inflightRemote;
+        String mean;
+        String max;
+        String min;
+        String last;
+        String delta;
+        String sinceLastStarted;
+        String sinceLastCompleted;
+        String sinceLastFailed;
+        List<Code> code = new ArrayList<>();
+    }
+
+    private static class Code {
+        int line;
+        String code;
+        boolean match;
+    }
+
+}

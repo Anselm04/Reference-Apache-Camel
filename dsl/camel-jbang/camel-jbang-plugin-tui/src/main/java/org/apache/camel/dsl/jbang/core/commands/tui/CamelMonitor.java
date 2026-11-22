@@ -1,0 +1,2625 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.camel.dsl.jbang.core.commands.tui;
+
+import java.io.IOException;
+import java.lang.System.Logger;
+import java.lang.System.Logger.Level;
+import java.net.BindException;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.Comparator;
+import java.util.List;
+import java.util.Locale;
+import java.util.Map;
+import java.util.Objects;
+import java.util.Queue;
+import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.function.BiConsumer;
+import java.util.function.Function;
+import java.util.function.Predicate;
+import java.util.stream.Collectors;
+
+import dev.tamboui.layout.Constraint;
+import dev.tamboui.layout.Layout;
+import dev.tamboui.layout.Rect;
+import dev.tamboui.style.Color;
+import dev.tamboui.style.Style;
+import dev.tamboui.terminal.Backend;
+import dev.tamboui.terminal.Frame;
+import dev.tamboui.text.CharWidth;
+import dev.tamboui.text.Line;
+import dev.tamboui.text.Span;
+import dev.tamboui.text.Text;
+import dev.tamboui.tui.TuiRunner;
+import dev.tamboui.tui.event.Event;
+import dev.tamboui.tui.event.KeyCode;
+import dev.tamboui.tui.event.KeyEvent;
+import dev.tamboui.tui.event.MouseEvent;
+import dev.tamboui.tui.event.MouseEventKind;
+import dev.tamboui.tui.event.PasteEvent;
+import dev.tamboui.tui.event.TickEvent;
+import dev.tamboui.widgets.Clear;
+import dev.tamboui.widgets.paragraph.Paragraph;
+import dev.tamboui.widgets.tabs.Tabs;
+import dev.tamboui.widgets.tabs.TabsState;
+import dev.tamboui.widgets.wavetext.WaveText;
+import dev.tamboui.widgets.wavetext.WaveTextState;
+import org.aesh.command.CommandDefinition;
+import org.aesh.command.option.Argument;
+import org.aesh.command.option.Option;
+import org.apache.camel.dsl.jbang.core.commands.CamelCommand;
+import org.apache.camel.dsl.jbang.core.commands.ai.ToolConfirms;
+import org.apache.camel.dsl.jbang.core.common.CliException;
+import org.apache.camel.dsl.jbang.core.common.CliExitCode;
+import org.apache.camel.dsl.jbang.core.common.CommandLineHelper;
+import org.apache.camel.dsl.jbang.core.common.EnvironmentHelper;
+import org.apache.camel.dsl.jbang.run.common.VersionHelper;
+import org.apache.camel.util.json.JsonObject;
+import sun.misc.Signal;
+
+import static org.apache.camel.dsl.jbang.core.commands.tui.TabRegistry.*;
+import static org.apache.camel.dsl.jbang.core.commands.tui.TuiHelper.hint;
+import static org.apache.camel.dsl.jbang.core.commands.tui.TuiHelper.hintLast;
+
+@CommandDefinition(name = "monitor", description = "Live dashboard for monitoring Camel integrations", generateHelp = true)
+public class CamelMonitor extends CamelCommand {
+
+    private static final Logger LOG = System.getLogger(CamelMonitor.class.getName());
+    private static final long DEFAULT_REFRESH_MS = 500;
+
+    /**
+     * The TamboUI system properties {@code --record} configures. They are process-wide, so the session that sets them
+     * clears them again on the way out; otherwise a later TUI backend created in the same JVM would still see recording
+     * enabled via {@code RecordingConfig.isEnabled()}.
+     */
+    static final List<String> RECORD_PROPERTIES = List.of(
+            "tamboui.record",
+            "tamboui.record.width",
+            "tamboui.record.height",
+            "tamboui.record.duration",
+            "tamboui.record.fps");
+
+    // Compact tab bar (10 labels + 9 "|" dividers) needs 88 chars — that is the true minimum
+    private static final int MIN_WIDTH = 88;
+    private static final int MIN_HEIGHT = 24;
+    // Below this width the tab bar uses tight "|" dividers instead of spaced " | " so all 10 labels still fit
+    private static final int TABS_FULL_MIN_WIDTH = 157;
+
+    @Argument(description = "Name or pid of running Camel integration")
+    String name = "*";
+
+    @Option(name = "refresh", description = "Refresh interval in milliseconds (default: ${DEFAULT-VALUE})",
+            defaultValue = "100")
+    long refreshInterval = DEFAULT_REFRESH_MS;
+
+    @Option(name = "record", optionalValue = true,
+            description = "Play a .tape file in the TUI and record it to an Asciinema .cast file")
+    String record;
+
+    @Option(name = "record-size",
+            description = "Size of the recorded terminal for --record, as <cols>x<rows> (default: ${DEFAULT-VALUE})",
+            defaultValue = "200x50")
+    String recordSize = "200x50";
+
+    @Option(name = "record-fps", description = "Frames per second captured by --record (default: ${DEFAULT-VALUE})",
+            defaultValue = "10")
+    int recordFps = 10;
+
+    @Option(name = "record-duration",
+            description = "Maximum duration in milliseconds captured by --record (default: ${DEFAULT-VALUE})",
+            defaultValue = "120000")
+    int recordDuration = 120000;
+
+    @Option(name = "mcp", hasValue = false, description = "Enable embedded MCP server for AI agent access to the TUI")
+    boolean mcp;
+
+    @Option(name = "mcp-port", description = "MCP server port (default: ${DEFAULT-VALUE})", defaultValue = "8123")
+    // written by ensureMcpServer() on the AI panel's agent thread, read on the event and main threads
+    volatile int mcpPort = 8123;
+
+    @Option(name = "web", hasValue = false,
+            description = "Enable browser-accessible terminal (WebSocket) server; without an interactive"
+                          + " terminal it serves browsers only")
+    boolean web;
+
+    @Option(name = "web-port", description = "Web terminal server port (default: ${DEFAULT-VALUE})", defaultValue = "8090")
+    int webPort = 8090;
+
+    @Option(name = "theme", description = "Color theme (overrides persisted preference for this session)",
+            completer = ThemeModeCompletionCandidates.class)
+    String theme;
+
+    @Option(name = "panel-theme", description = "Color theme of the shell (F6) and AI (F8) panels, or 'same' for the main theme"
+                                                + " (overrides the Panel Theme setting for this session)",
+            completer = ThemeModeCompletionCandidates.class)
+    String panelTheme;
+
+    @Option(name = "defaults", hasValue = false,
+            description = "Start with the default settings, as a new user sees the TUI; changes last for the"
+                          + " session and are not saved")
+    boolean defaults;
+
+    // State
+    private final TabsState tabsState = new TabsState(TAB_OVERVIEW);
+    private TabRegistry tabRegistry;
+
+    // selectedPid is stored on ctx (MonitorContext) so tabs can access it
+
+    private DataRefreshService dataService;
+    private OllamaMonitor ollamaMonitor;
+    private String monitorNotification;
+    private boolean monitorNotificationError;
+    private long monitorNotificationExpiry;
+    private final WaveTextState notificationWaveState = new WaveTextState();
+    private String lastWaveNotification;
+    private Confirmations confirmations;
+    private volatile TuiMcpServer mcpServer;
+    private Path mcpJsonFile;
+    private TuiWebServer webServer;
+    private McpFacade mcpFacade;
+    private final Queue<McpFacade.PendingKey> pendingKeys = new ConcurrentLinkedQueue<>();
+    private final CaptionOverlay captionOverlay = new CaptionOverlay();
+    private final RecordingManager recordingManager = new RecordingManager(captionOverlay);
+    private final DrawOverlay drawOverlay = new DrawOverlay();
+    private final CanvasOverlay canvasOverlay = new CanvasOverlay();
+    private final HelpOverlay helpOverlay = new HelpOverlay();
+    private final ShellPanel shellPanel = new ShellPanel();
+    private final AiPanel aiPanel = new AiPanel();
+    private boolean logPinned;
+    private final PanelAnimation logPinAnim = new PanelAnimation();
+
+    private ActionsPopup actionsPopup;
+    private ProcessControl processControl;
+    private ProcessControlPopup processControlPopup;
+    private final ToolConfirmPopup toolConfirmPopup = new ToolConfirmPopup();
+    private final LiveEdit liveEdit = new LiveEdit(new LiveEdit.Host() {
+        @Override
+        public EditReplay.Editor openFileForReplay(Path file) {
+            tabRegistry.handleTabKey(TabRegistry.TAB_SOURCE);
+            return tabRegistry.sourceTab().openFileForReplay(file);
+        }
+
+        @Override
+        public boolean isEditing() {
+            return tabRegistry.sourceTab().isViewerEditing();
+        }
+
+        @Override
+        public void notification(String message, boolean error) {
+            setNotification(message, error);
+        }
+
+        @Override
+        public boolean isAiPanelOpen() {
+            return aiPanel.isOpen();
+        }
+
+        @Override
+        public void openAiPanel() {
+            aiPanel.open();
+        }
+
+        @Override
+        public void closeAiPanel() {
+            aiPanel.close();
+        }
+
+        @Override
+        public void askAboutEdit(String prefill, Predicate<String> onQuestion) {
+            if (shellPanel.isOpen()) {
+                shellPanel.close();
+            }
+            aiPanel.askAboutEdit(prefill, onQuestion);
+        }
+
+        @Override
+        public void addPendingNote(String note) {
+            aiPanel.addPendingNote(note);
+        }
+    });
+    /** The files AI tools wrote, for the source viewer to show again on the UI thread. */
+    private final Queue<Path> writtenFiles = new ConcurrentLinkedQueue<>();
+    private TuiRunner runner;
+    private String lastWindowTitle;
+    // Set by TuiWebServer for browser sessions; local terminal sessions leave this null
+    // and let TuiBackendHelper auto-detect the active terminal instead.
+    Backend webBackend;
+
+    private MonitorContext ctx;
+
+    private final FilesBrowser filesBrowser = new FilesBrowser();
+    private PopupManager popupManager;
+
+    // Mouse support: last rendered areas for hit-testing
+    private Rect lastTabsArea;
+    private Rect lastContentArea;
+    private Line[] lastTabLabels;
+    private String lastTabDivider;
+    // Panel resize drag state
+    private final DragSplit panelSplit = new DragSplit();
+    /** The views and view settings of the active tab, on the first row of its content. */
+    private final SubViewBar subViewBar = new SubViewBar();
+    /** Where the key hints of the footer are, so a click on one presses its key. */
+    private final HintClicks footerClicks = new HintClicks();
+
+    private final ClassLoader classLoader;
+
+    public CamelMonitor(ClassLoader classLoader) {
+        this.classLoader = classLoader;
+    }
+
+    /**
+     * Parses a {@code --record-size} value such as {@code 160x44} into {@code [cols, rows]}.
+     */
+    int[] parseRecordSize(String size) {
+        String[] parts = size == null ? new String[0] : size.toLowerCase(Locale.ROOT).split("x", -1);
+        if (parts.length == 2) {
+            try {
+                int cols = Integer.parseInt(parts[0].trim());
+                int rows = Integer.parseInt(parts[1].trim());
+                if (cols > 0 && rows > 0) {
+                    return new int[] { cols, rows };
+                }
+            } catch (NumberFormatException e) {
+                // fall through to the parameter error below
+            }
+        }
+        throw new CliException(
+                CliExitCode.USAGE,
+                "Invalid value for option '--record-size': expected '<cols>x<rows>' with positive numbers, was '"
+                                   + size + "'");
+    }
+
+    /**
+     * Hands the {@code --record*} options to TamboUI through the {@link #RECORD_PROPERTIES} system properties, which is
+     * the only way TamboUI accepts a recording configuration. TamboUI only records: the tape is played by
+     * {@link TapePlayer} (see {@link #startTapePlayer}), which knows the keys and commands of the TUI.
+     */
+    void configureRecording() {
+        if (record == null) {
+            return;
+        }
+        if (web) {
+            // The properties below are process-wide, so every browser session spawned by TuiWebServer would be
+            // wrapped for recording too, all writing the same cast file. The two modes are also conceptually
+            // exclusive: --record drives a headless TUI from a tape rather than from a connected terminal.
+            throw new CliException(
+                    CliExitCode.USAGE, "Option '--record' cannot be combined with '--web': recording replays a tape headlessly "
+                                       + "and would be inherited by every browser session");
+        }
+        Path tapeFile = Path.of(record);
+        Path castFile = Path.of(record.replaceAll("\\.tape$", "") + ".cast");
+        int[] size = parseRecordSize(recordSize);
+        if (!Files.isRegularFile(tapeFile)) {
+            throw new CliException(CliExitCode.USAGE, "Tape file not found: " + tapeFile.toAbsolutePath());
+        }
+        System.setProperty("tamboui.record", castFile.toAbsolutePath().toString());
+        System.setProperty("tamboui.record.width", String.valueOf(size[0]));
+        System.setProperty("tamboui.record.height", String.valueOf(size[1]));
+        System.setProperty("tamboui.record.duration", String.valueOf(recordDuration));
+        System.setProperty("tamboui.record.fps", String.valueOf(recordFps));
+    }
+
+    /**
+     * Plays the {@code --record} tape on a background thread: its keys go through the same queue as the keys of an MCP
+     * client, its TUI commands call the MCP tools, and it quits the TUI at the end of the tape, which ends the
+     * recording.
+     */
+    private void startTapePlayer(TuiRunner tui) throws IOException {
+        TapePlayer player = new TapePlayer(warning -> System.err.println("Tape: " + warning));
+        List<TapePlayer.Step> steps = player.parse(Path.of(record));
+        TuiToolRegistry tools = new TuiToolRegistry(mcpFacade);
+        TapePlayer.Driver driver = new TapePlayer.Driver() {
+            @Override
+            public void key(KeyEvent event) {
+                pendingKeys.add(new McpFacade.PendingKey(event, MonotonicClock.millis()));
+            }
+
+            @Override
+            public void mouse(MouseEvent event) {
+                pendingKeys.add(new McpFacade.PendingKey(event, MonotonicClock.millis()));
+            }
+
+            @Override
+            public String screen() {
+                return TapePlayer.screenText(recordingManager.getLastBuffer());
+            }
+
+            @Override
+            public String tool(String name, Map<String, Object> args) throws Exception {
+                return tools.execute(name, args);
+            }
+
+            @Override
+            public void quit() {
+                tui.quit();
+            }
+        };
+        Thread thread = new Thread(() -> {
+            try {
+                player.play(steps, driver);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+        }, "tui-tape-player");
+        thread.setDaemon(true);
+        thread.start();
+    }
+
+    /**
+     * Undoes {@link #configureRecording()} at the end of the session that ran it.
+     * <p>
+     * The already-loaded {@code RecordingConfig} keeps its own copy, so the shutdown hook still writes the cast file;
+     * clearing only stops a TUI backend created later in the same JVM from being wrapped for recording again.
+     */
+    void clearRecordingProperties() {
+        for (String key : RECORD_PROPERTIES) {
+            System.clearProperty(key);
+        }
+    }
+
+    @Override
+    public Integer doCall() throws Exception {
+        System.setProperty("java.awt.headless", "true");
+
+        String openDir = MonitorStartup.openDirectory(name);
+        if (openDir != null) {
+            // the directory is a project to open, not a name filter
+            name = "*";
+        }
+        if (defaults) {
+            TuiUserConfig.useDefaults();
+        }
+        applyThemeOption();
+        configureRecording();
+        if (MonitorStartup.browserOnly(web, webBackend != null, record != null, EnvironmentHelper.isInteractiveTerminal())) {
+            MonitorStartup.serveBrowserOnly(
+                    new TuiWebServer(webPort, getMain(), classLoader, name, refreshInterval, theme), webPort, mcp, printer());
+            return 0;
+        }
+        MonitorStartup.requireTerminal(webBackend != null, record != null);
+        recordingManager.init(record != null);
+
+        // to make ServiceLoader work with tamboui for downloaded JARs
+        Thread.currentThread().setContextClassLoader(classLoader);
+
+        // data service first: tabs and popups reference its state
+        createDataService();
+        ctx = new MonitorContext(dataService.data(), dataService.infraData());
+        dataService.setContext(ctx);
+        ctx.dataService = dataService;
+        ollamaMonitor = new OllamaMonitor();
+        ctx.ollamaMonitor = ollamaMonitor;
+
+        // popups, tabs and their cross-wiring
+        createActionsPopup();
+        createProcessControlPopup();
+        wireContextCallbacks();
+        createTabRegistry();
+        setupGotoTabSupport();
+        createPopupManager();
+        wireOverviewActions();
+
+        loadInitialData(openDir);
+
+        // optional integrations: AI/MCP facade, MCP server, web server
+        createMcpFacade();
+        startMcpServer();
+        startWebServer();
+
+        runTui();
+        return 0;
+    }
+
+    /** Validates and applies the --theme and --panel-theme options. */
+    void applyThemeOption() {
+        MonitorStartup.applyThemeOptions(theme, panelTheme);
+    }
+
+    /**
+     * Creates the data refresh service; tabs and popups reference its state so it is created first.
+     */
+    private void createDataService() {
+        // Create data refresh service first — tabs and popups reference its state
+        dataService = new DataRefreshService(
+                name,
+                new DataRefreshService.RefreshContext() {
+                    @Override
+                    public int selectedTab() {
+                        return tabRegistry != null ? tabRegistry.selectedTabIndex() : tabsState.selected();
+                    }
+
+                    @Override
+                    public boolean isSwitchPopupVisible() {
+                        return popupManager != null && popupManager.isSwitchPopupVisible();
+                    }
+
+                    @Override
+                    public String getPendingAutoSelect() {
+                        return actionsPopup != null ? actionsPopup.getPendingAutoSelect() : null;
+                    }
+
+                    @Override
+                    public void clearPendingAutoSelect() {
+                        if (actionsPopup != null) {
+                            actionsPopup.clearPendingAutoSelect();
+                        }
+                    }
+
+                    @Override
+                    public void onInfraAutoSelected(int tableIndex, String pid) {
+                        if (tabRegistry != null) {
+                            tabRegistry.overviewTab().tableState.select(tableIndex);
+                        }
+                        ctx.selectedPid = pid;
+                    }
+
+                    @Override
+                    public boolean isInfraSelected() {
+                        return CamelMonitor.this.isInfraSelected();
+                    }
+                },
+                this::getStatusFile,
+                this::getErrorFile);
+    }
+
+    /**
+     * Creates the actions popup (F2) wired to the data service and recording manager.
+     */
+    private void createActionsPopup() {
+        actionsPopup = new ActionsPopup(
+                () -> dataService.data().get().stream()
+                        .filter(i -> !i.vanishing && i.name != null)
+                        .map(i -> i.name)
+                        .collect(Collectors.toSet()),
+                () -> dataService.data().get().stream()
+                        .filter(i -> !i.vanishing)
+                        .collect(Collectors.toList()),
+                () -> dataService.infraData().get().stream()
+                        .filter(i -> !i.vanishing)
+                        .collect(Collectors.toList()),
+                captionOverlay,
+                () -> recordingManager.requestScreenshot(),
+                () -> recordingManager.toggleRecording(),
+                () -> recordingManager.isRecording(),
+                () -> recordingManager.toggleTapeRecording(),
+                () -> recordingManager.isTapeRecording(),
+                dataService::enableBurstMode, dataService.stoppingPids());
+
+        actionsPopup.setContext(ctx);
+        actionsPopup.setMonitorContext(ctx);
+        actionsPopup.setNotificationCallback((msg, error) -> setNotification(msg, error));
+    }
+
+    /**
+     * Creates the process control popup and its bridge back to this monitor.
+     */
+    private void createProcessControlPopup() {
+        processControl = new ProcessControl(
+                ctx, dataService, () -> runner, actionsPopup.getLaunchManager(),
+                this::setNotification);
+        processControlPopup = new ProcessControlPopup(ctx);
+        processControlPopup.setActions(new ProcessControlPopup.ControlActions() {
+            @Override
+            public void sendRouteCommand(String pid, String routeId, String command) {
+                processControl.sendRouteCommand(pid, routeId, command);
+            }
+
+            @Override
+            public void stopSelectedProcess(boolean forceKill) {
+                processControl.stopSelectedProcess(forceKill);
+            }
+
+            @Override
+            public void restartSelectedProcess() {
+                processControl.restartSelectedProcess();
+            }
+
+            @Override
+            public void showKillConfirm() {
+                popupManager.showKillConfirm();
+            }
+
+            @Override
+            public void showConfirm(String title, String message, Runnable onConfirm) {
+                popupManager.showConfirm(title, message, onConfirm);
+            }
+
+            @Override
+            public void onRunPhantom(IntegrationInfo phantom) {
+                actionsPopup.openRunOptionsForPhantom(phantom);
+            }
+
+            @Override
+            public void onStopAll() {
+                actionsPopup.openStopAll();
+            }
+
+            @Override
+            public boolean hasRunningProcesses() {
+                return actionsPopup.hasRunningProcesses();
+            }
+        });
+    }
+
+    /**
+     * Opens the AI panel with a question for the Source editor's fix with AI (Shift+F8), made from the directory of the
+     * selected integration's sources.
+     */
+    private void openAiWithQuestion(Function<Path, String> question) {
+        if (shellPanel.isOpen()) {
+            shellPanel.close();
+        }
+        Path dir = mcpFacade != null ? mcpFacade.getSelectedSourceDirectory() : null;
+        aiPanel.openWithQuestion(question.apply(dir));
+    }
+
+    /**
+     * Wires the shared MonitorContext callbacks and connects the shell and AI panels.
+     */
+    private void wireContextCallbacks() {
+        ctx.notificationCallback = (msg, error) -> setNotification(msg, error);
+        ctx.openMarkdownCallback = actionsPopup::openMarkdown;
+        ctx.openMarkdownAtCallback = actionsPopup::openMarkdownAt;
+        ctx.askAiCallback = new MonitorContext.AskAi() {
+            @Override
+            public void fixProblem(Path file, int line, String problem, String lineText) {
+                openAiWithQuestion(dir -> AiFixPrompt.of(dir, file, line, problem, lineText));
+            }
+
+            @Override
+            public void fixFailure(Path file, int line, String failure, String lineText) {
+                openAiWithQuestion(dir -> AiFixPrompt.ofFailure(dir, file, line, failure, lineText));
+            }
+
+            @Override
+            public void ask(String question) {
+                openAiWithQuestion(dir -> question);
+            }
+
+            @Override
+            public void askNow(String question) {
+                if (shellPanel.isOpen()) {
+                    shellPanel.close();
+                }
+                aiPanel.askNow(question);
+            }
+        };
+        ctx.projectOverviewCallback = () -> {
+            if (shellPanel.isOpen()) {
+                shellPanel.close();
+            }
+            aiPanel.startProjectOverview();
+        };
+        ctx.openOptionsCallback = actionsPopup::openOptions;
+        ctx.openCatalogDocCallback = actionsPopup::openCatalogDoc;
+        actionsPopup.setResetStatsAction(this::resetStats);
+        shellPanel.setContext(ctx);
+        aiPanel.setContext(ctx);
+        actionsPopup.setOpenShellAction(shellPanel::open);
+        actionsPopup.setOpenAiPromptAction(aiPanel::open);
+        actionsPopup.setBrowseFilesAction(this::openFilesPopup);
+        actionsPopup.setSwitchIntegrationAction(
+                () -> popupManager.openSwitchPopup(ctx.selectedPid, getNonVanishingIntegrations()));
+        actionsPopup.setQuitAction(() -> quitTui(true));
+    }
+
+    /**
+     * Quits this session the way {@code q} does. With confirmations on (the default) a dialog asks first; Ctrl+C and a
+     * session with confirmations off quit at once. The F2 menu's Quit entry and the {@code tui_action} MCP tool go
+     * through here too, so quitting behaves the same however it is asked for.
+     */
+    void quitTui(boolean confirm) {
+        if (confirm && ctx.confirmFirst()) {
+            LaunchManager launches = actionsPopup.getLaunchManager();
+            long running = launches.runningLaunchCount();
+            if (running > 0) {
+                // what was started from here keeps running when the TUI quits: say so, and offer to stop it
+                String what = running == 1
+                        ? "1 integration started here keeps running"
+                        : running + " integrations started here keep running";
+                popupManager.showConfirm("Confirm Quit", " Quit the TUI? ", what, () -> runner.quit(),
+                        's', running == 1 ? "stop it and quit" : "stop them and quit", () -> {
+                            launches.stopLaunched();
+                            runner.quit();
+                        });
+            } else {
+                popupManager.showConfirm("Confirm Quit", " Quit the TUI? ", () -> runner.quit());
+            }
+        } else {
+            runner.quit();
+        }
+    }
+
+    /**
+     * Deletes the folders of the examples that no longer run; an example that still runs keeps its folder and the files
+     * it reads (CAMEL-25425).
+     */
+    private void deleteExampleDirs() {
+        try {
+            List<Path> runningDirs = ctx.data.get().stream()
+                    .filter(i -> !i.vanishing && i.directory != null)
+                    .map(i -> Path.of(i.directory))
+                    .toList();
+            actionsPopup.getLaunchManager().deleteExampleDirs(runningDirs);
+        } catch (Exception e) {
+            // best effort: what is left is removed by a later session
+        }
+    }
+
+    /**
+     * Creates the tab registry, initialises all tabs and wires their data refresh callbacks.
+     */
+    private void createTabRegistry() {
+        tabRegistry = new TabRegistry(tabsState);
+        tabRegistry.initTabs(ctx, dataService, this::resetIntegrationTabState);
+        tabRegistry.setCallbacks(new TabRegistry.TabCallbacks() {
+            @Override
+            public void openMorePopup() {
+                popupManager.openMorePopup();
+            }
+
+            @Override
+            public void closeMorePopup() {
+                popupManager.closeMorePopup();
+            }
+
+            @Override
+            public void selectMorePopupEntry(int index) {
+                popupManager.selectMorePopupEntry(index);
+            }
+        });
+    }
+
+    /**
+     * Registers the go-to-tab entries (including the pseudo entries for switch, shell and AI) in the actions popup.
+     */
+    private void setupGotoTabSupport() {
+        List<TabRegistry.TabEntry> gotoEntries = tabRegistry.allTabEntries();
+        gotoEntries.add(
+                new TabRegistry.TabEntry(TuiIcons.SWITCH, "Switch Integration", "Switch between integrations", "F3", -10, -1));
+        gotoEntries.add(new TabRegistry.TabEntry(TuiIcons.COMPUTER, "Shell", "Open embedded terminal", "F6", -11, -1));
+        gotoEntries.add(new TabRegistry.TabEntry(TuiIcons.MCP_BRAIN, "AI Prompt", "Open AI prompt panel", "F8", -12, -1));
+        actionsPopup.setGotoTabSupport(gotoEntries, () -> {
+            TabRegistry.TabEntry entry = actionsPopup.consumePendingGotoEntry();
+            if (entry != null) {
+                if (entry.tabIndex() == -10) {
+                    popupManager.openSwitchPopup(ctx.selectedPid, getNonVanishingIntegrations());
+                } else if (entry.tabIndex() == -11) {
+                    shellPanel.open();
+                } else if (entry.tabIndex() == -12) {
+                    aiPanel.open();
+                } else if (entry.moreIndex() >= 0) {
+                    tabRegistry.selectMoreTab(entry.moreIndex());
+                } else {
+                    tabRegistry.handleTabKey(entry.tabIndex());
+                }
+            }
+        });
+        actionsPopup.setActiveTabFilter(ctx::findSelectedIntegration, tabRegistry::moreTabs);
+    }
+
+    /**
+     * Creates the popup manager that owns the switch, more, confirm and files popups.
+     */
+    private void createPopupManager() {
+        popupManager = new PopupManager(
+                ctx, this::getNonVanishingIntegrations, tabRegistry::moreTabs, filesBrowser,
+                new PopupManager.PopupCallbacks() {
+                    @Override
+                    public void selectMoreTab(int index) {
+                        tabRegistry.selectMoreTab(index);
+                    }
+
+                    @Override
+                    public void resetIntegrationTabState() {
+                        CamelMonitor.this.resetIntegrationTabState();
+                    }
+
+                    @Override
+                    public void refreshLogData() {
+                        CamelMonitor.this.refreshLogData();
+                    }
+
+                    @Override
+                    public void stopSelectedProcess(boolean forceKill) {
+                        processControl.stopSelectedProcess(forceKill);
+                    }
+
+                    @Override
+                    public void fallbackToOverviewIfTabInactive() {
+                        if (tabRegistry.selectedTabIndex() == TabRegistry.TAB_MORE) {
+                            MonitorTab active = tabRegistry.getActiveMoreTab();
+                            if (active != null) {
+                                IntegrationInfo info = ctx.findSelectedIntegration();
+                                for (TabRegistry.MoreTab mt : tabRegistry.moreTabs()) {
+                                    if (mt.tab() == active && !TabRegistry.isMoreTabActive(mt, info)) {
+                                        tabsState.select(TabRegistry.TAB_OVERVIEW);
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                });
+    }
+
+    /**
+     * Wires the Overview tab actions back to this monitor and the popups.
+     */
+    private void wireOverviewActions() {
+        tabRegistry.overviewTab().setActions(new OverviewTab.OverviewActions() {
+            @Override
+            public void sendRouteCommand(String pid, String routeId, String command) {
+                processControl.sendRouteCommand(pid, routeId, command);
+            }
+
+            @Override
+            public void stopSelectedProcess(boolean forceKill) {
+                processControl.stopSelectedProcess(forceKill);
+            }
+
+            @Override
+            public void restartSelectedProcess() {
+                processControl.restartSelectedProcess();
+            }
+
+            @Override
+            public void showKillConfirm() {
+                popupManager.showKillConfirm();
+            }
+
+            @Override
+            public void openDoc(IntegrationInfo info) {
+                actionsPopup.openDoc(info);
+            }
+
+            @Override
+            public void openFilesPopup() {
+                CamelMonitor.this.openFilesPopup();
+            }
+
+            @Override
+            public void showConfirm(String title, String message, Runnable onConfirm) {
+                popupManager.showConfirm(title, message, onConfirm);
+            }
+        });
+    }
+
+    /**
+     * Performs the synchronous initial data load and either opens the given directory as a project or auto-selects the
+     * single running integration.
+     */
+    private void loadInitialData(String openDir) throws Exception {
+        // Initial data load (synchronous before TUI starts)
+        dataService.refreshSync(this::refreshLogData, this::refreshConditionalData);
+
+        // If the argument was a directory, open it as a project
+        if (openDir != null) {
+            openDirectoryAsPhantom(openDir);
+            // Re-scan so the phantom is merged into the data list before the Source tab reads it
+            dataService.refreshSync(this::refreshLogData, this::refreshConditionalData);
+            tabRegistry.handleTabKey(TAB_SOURCE);
+        } else {
+            // Auto-select if there's exactly one integration running
+            tabRegistry.overviewTab().selectCurrentIntegration();
+        }
+    }
+
+    /**
+     * Creates the MCP facade that exposes the TUI to AI agents, and connects it to the AI panel and overlays.
+     */
+    private void createMcpFacade() {
+        canvasOverlay.setOnOpen(() -> {
+            popupManager.dismissAll();
+            actionsPopup.close();
+            helpOverlay.close();
+            captionOverlay.close();
+            shellPanel.close();
+            aiPanel.close();
+        });
+        canvasOverlay.setOnClose(drawOverlay::clear);
+        mcpFacade = new McpFacade(
+                ctx, dataService.data(), tabsState, recordingManager,
+                captionOverlay, drawOverlay, canvasOverlay, helpOverlay,
+                actionsPopup, filesBrowser,
+                tabRegistry,
+                pendingKeys,
+                new McpFacade.MonitorBridge() {
+                    @Override
+                    public MonitorTab activeTab() {
+                        return tabRegistry.activeTab();
+                    }
+
+                    @Override
+                    public void handleTabKey(int tabIndex) {
+                        tabRegistry.handleTabKey(tabIndex);
+                    }
+
+                    @Override
+                    public void selectMoreTab(int moreIndex) {
+                        tabRegistry.selectMoreTab(moreIndex);
+                    }
+
+                    @Override
+                    public boolean isSwitchPopupVisible() {
+                        return popupManager.isSwitchPopupVisible();
+                    }
+
+                    @Override
+                    public boolean isMorePopupVisible() {
+                        return popupManager.isMorePopupVisible();
+                    }
+
+                    @Override
+                    public void renderOverviewFooter(List<Span> spans) {
+                        CamelMonitor.this.renderOverviewFooter(spans);
+                    }
+
+                    @Override
+                    public void insertFKeyHints(List<Span> spans) {
+                        CamelMonitor.this.insertFKeyHints(spans);
+                    }
+
+                    @Override
+                    public void sendRouteCommand(String pid, String routeId, String command) {
+                        processControl.sendRouteCommand(pid, routeId, command);
+                    }
+
+                    @Override
+                    public void restartProcess() {
+                        processControl.restartSelectedProcess();
+                    }
+
+                    @Override
+                    public void stopProcess(boolean forceKill) {
+                        processControl.stopSelectedProcess(forceKill);
+                    }
+
+                    @Override
+                    public McpFacade.ReplayOutcome replayFileWrite(McpFacade.FileWrite request) {
+                        return liveEdit.replayFileWrite(request);
+                    }
+
+                    @Override
+                    public String parkedReplayFile() {
+                        return liveEdit.parkedReplayFile();
+                    }
+
+                    @Override
+                    public void fileWritten(Path file) {
+                        writtenFiles.add(file);
+                    }
+
+                    @Override
+                    public boolean confirmFileWrite(McpFacade.FileWrite request) {
+                        return toolConfirmPopup.ask(request);
+                    }
+
+                    @Override
+                    public boolean confirmToolCall(ToolConfirms.Call call) {
+                        return toolConfirmPopup.ask(call);
+                    }
+
+                    @Override
+                    public void stopAll() {
+                        actionsPopup.openStopAll();
+                    }
+
+                    @Override
+                    public void resetIntegrationTabState() {
+                        CamelMonitor.this.resetIntegrationTabState();
+                    }
+                });
+        confirmations = Confirmations.of(
+                pendingKeys, popupManager, toolConfirmPopup, actionsPopup, liveEdit, aiPanel, filesBrowser, tabRegistry);
+        ctx.tapeDriven = () -> record != null || recordingManager.isTapeRecording();
+        mcpFacade.setConfirmations(confirmations);
+        mcpFacade.setSourceValidator(tabRegistry.sourceTab().editAssist()::validateSource);
+        mcpFacade.setPropertyLineValidator(tabRegistry.sourceTab().editAssist()::validateSpringBootPropertyLine);
+        mcpFacade.setLaunchManager(actionsPopup.getLaunchManager());
+        mcpFacade.setFullScan(dataService::forceFullScan, dataService::fullScansDone);
+        aiPanel.setMcpFacade(mcpFacade);
+        aiPanel.setGenAiUsage(dataService.genAiUsage());
+        mcpFacade.setAiActivityLog(aiPanel::getActivityLog);
+        actionsPopup.setAiActivityLog(aiPanel::getActivityLog);
+    }
+
+    /**
+     * Starts the embedded MCP server when --mcp is enabled.
+     */
+    private void startMcpServer() throws Exception {
+        if (mcp) {
+            mcpServer = new TuiMcpServer(mcpPort, mcpFacade);
+            try {
+                mcpServer.start();
+                wireMcpServer(mcpServer);
+                mcpJsonFile = writeMcpJson(mcpPort);
+            } catch (BindException e) {
+                System.err.println("MCP server failed to start: port " + mcpPort + " is already in use.");
+                System.err.println("Use --mcp-port to specify a different port, e.g.: camel tui --mcp --mcp-port 8124");
+                mcpServer = null;
+                mcp = false;
+            }
+        }
+        aiPanel.setMcpInfo(mcp, mcpPort);
+        aiPanel.setMcpUrlSupplierForTestingOrRuntime(this::ensureMcpServer);
+    }
+
+    /**
+     * Starts the embedded web server when --web is enabled.
+     */
+    private void startWebServer() throws Exception {
+        if (web) {
+            webServer = new TuiWebServer(webPort, getMain(), classLoader, name, refreshInterval, theme);
+            try {
+                webServer.start();
+            } catch (BindException e) {
+                System.err.println("Web server failed to start: port " + webPort + " is already in use.");
+                System.err.println("Use --web-port to specify a different port, e.g.: camel tui --web --web-port 8091");
+                webServer = null;
+                web = false;
+            }
+        }
+    }
+
+    /**
+     * Creates the TamboUI runner, completes the runtime wiring, runs the event loop and shuts everything down
+     * afterwards.
+     */
+    private void runTui() throws Exception {
+        try (var tui = webBackend != null
+                ? TuiBackendHelper.createTuiRunner(webBackend)
+                : TuiBackendHelper.createTuiRunner()) {
+            this.runner = tui;
+            aiPanel.setExitCallbackForTestingOrRuntime(tui::quit);
+            ctx.runner = tui;
+            actionsPopup.setResetScreenAction(() -> tui.terminal().clear());
+            actionsPopup.setThemeRefreshAction(() -> tui.terminal().clear());
+            actionsPopup.setClearScreenAction(() -> tui.terminal().clear());
+            actionsPopup.setCamelAnimationAction(() -> playBuiltinAnimation("camel"));
+            // Preload diagram data if an integration was auto-selected
+            tabRegistry.routesTab().preloadDiagram();
+            tabRegistry.diagramTab().preloadDiagram();
+            // Open on the configured starting tab (if any), now that all tab wiring is in place
+            applyStartingTab();
+            applyLogPin();
+            applyRatePer();
+            applyConfirmActions();
+            if (webBackend == null) {
+                // Intercept Ctrl+C: quit the TUI cleanly instead of letting
+                // the JVM tear down the classloader while we're still running.
+                // Signal.handle is process-wide and would clobber concurrent sessions
+                // (e.g. browser connections via --web), so only the local terminal
+                // session registers it.
+                Signal.handle(new Signal("INT"), sig -> tui.quit());
+            }
+            updateWindowTitle();
+            if (record != null) {
+                startTapePlayer(tui);
+            }
+            tui.run(
+                    this::handleEvent,
+                    frame -> ScreenSanitizer.render(frame, this::render));
+        } finally {
+            shellPanel.destroy();
+            aiPanel.destroy();
+            ctx.backgroundExecutor.shutdownNow();
+            if (ollamaMonitor != null) {
+                ollamaMonitor.close();
+            }
+            if (mcpServer != null) {
+                mcpServer.stop();
+            }
+            if (webServer != null) {
+                webServer.stop();
+            }
+            deleteMcpJson(mcpJsonFile);
+            deleteExampleDirs();
+            this.runner = null;
+            if (record != null) {
+                // Only the session that set the properties clears them again
+                clearRecordingProperties();
+            }
+        }
+    }
+
+    /**
+     * Selects the tab configured as the starting tab in {@link TuiSettings} (if any), resolving the stored programmatic
+     * name against {@link TabRegistry#allTabEntries()}. Unset, unknown, or the default "Overview" leaves the initial
+     * {@code TAB_OVERVIEW} selection untouched. Reuses the same selection logic as the Go-to callback.
+     */
+    private void applyStartingTab() {
+        String startTab = TuiSettings.load().getStartTab();
+        if (startTab == null || startTab.isBlank() || "Overview".equals(startTab)) {
+            return;
+        }
+        for (TabRegistry.TabEntry entry : tabRegistry.allTabEntries()) {
+            if (entry.name().equals(startTab)) {
+                if (entry.moreIndex() >= 0) {
+                    tabRegistry.selectMoreTab(entry.moreIndex());
+                } else {
+                    tabRegistry.handleTabKey(entry.tabIndex());
+                }
+                return;
+            }
+        }
+    }
+
+    private void applyLogPin() {
+        String logPin = TuiSettings.load().getLogPin();
+        if (logPin == null || logPin.isBlank()) {
+            return;
+        }
+        int cycleIndex;
+        switch (logPin) {
+            case "25":
+                cycleIndex = 0;
+                break;
+            case "50":
+                cycleIndex = 1;
+                break;
+            case "75":
+                cycleIndex = 2;
+                break;
+            default:
+                return;
+        }
+        logPinned = true;
+        logPinAnim.reset(cycleIndex);
+        ctx.logPinned = true;
+        ctx.logPinPercent = Integer.parseInt(logPin);
+    }
+
+    /**
+     * Renders the shell or AI panel according to the panel settings: at the bottom or top of the content area, and
+     * either taking space away from the tab (move) or drawn on top of it (overlay).
+     */
+    private void renderSidePanel(Frame frame, Rect contentArea, int ph, BiConsumer<Frame, Rect> panel) {
+        // A panel at the top leaves the bottom free, so a pinned log stays visible there.
+        Rect upper = contentArea;
+        Rect pinArea = null;
+        boolean showPin = ctx.panelTop && logPinned && tabRegistry.selectedTabIndex() != TAB_LOG;
+        if (showPin) {
+            logPinAnim.initHeight(contentArea.height());
+            int pinH = pinnedLogHeight(contentArea.height(), ph, logPinAnim.panelHeight());
+            if (pinH > 0) {
+                upper = new Rect(contentArea.x(), contentArea.y(), contentArea.width(), contentArea.height() - pinH);
+                pinArea = new Rect(contentArea.x(), upper.bottom(), contentArea.width(), pinH);
+            }
+        }
+        ctx.logPinVisible = pinArea != null;
+
+        Rect[] layout = panelLayout(upper, ph, ctx.panelTop, ctx.panelOverlay);
+        Rect tabArea = layout[0];
+        Rect panelArea = layout[1];
+        // tabs hide their charts when little space is left: report how much of the area they lost
+        ctx.shellPercent = (contentArea.height() - tabArea.height()) * 100 / Math.max(1, contentArea.height());
+        if (tabArea.height() > 0) {
+            renderContent(frame, tabArea);
+        }
+        if (pinArea != null) {
+            tabRegistry.logTab().render(frame, pinArea);
+        }
+        if (ctx.panelOverlay) {
+            frame.renderWidget(Clear.INSTANCE, panelArea);
+        }
+        // with a panel theme (Settings > Panel Theme) the panel and its empty cells take that theme's colors, so it
+        // stands apart from the tab; the base colors of the rest of the frame are filled at the end of render()
+        Theme.inPanel(() -> {
+            panel.accept(frame, panelArea);
+            Theme.applyBaseColors(frame.buffer(), panelArea);
+        });
+        // the draggable border is the panel edge that faces the tab
+        panelSplit.setBorderPos(ctx.panelTop ? panelArea.bottom() - 1 : panelArea.y());
+    }
+
+    /**
+     * Rows for the pinned log below a top panel: the requested pin height, reduced so the panel and at least three rows
+     * of tab remain; zero when there is no room.
+     */
+    static int pinnedLogHeight(int contentHeight, int panelHeight, int pinHeight) {
+        int room = contentHeight - panelHeight - 3;
+        return Math.max(0, Math.min(pinHeight, room));
+    }
+
+    /**
+     * Splits the content area between the tab and a side panel of {@code panelHeight} rows.
+     *
+     * @param  top     place the panel at the top of the area instead of the bottom
+     * @param  overlay keep the full area for the tab and let the panel cover part of it
+     * @return         the tab area (height 0 when the panel fills everything) and the panel area
+     */
+    static Rect[] panelLayout(Rect content, int panelHeight, boolean top, boolean overlay) {
+        int h = content.height();
+        int ph = Math.max(0, Math.min(panelHeight, h));
+        if (ph >= h) {
+            return new Rect[] { new Rect(content.x(), content.y(), content.width(), 0), content };
+        }
+        Rect panelArea = top
+                ? new Rect(content.x(), content.y(), content.width(), ph)
+                : new Rect(content.x(), content.y() + h - ph, content.width(), ph);
+        Rect tabArea;
+        if (overlay) {
+            tabArea = content;
+        } else if (top) {
+            tabArea = new Rect(content.x(), content.y() + ph, content.width(), h - ph);
+        } else {
+            tabArea = new Rect(content.x(), content.y(), content.width(), h - ph);
+        }
+        return new Rect[] { tabArea, panelArea };
+    }
+
+    private void applyRatePer() {
+        String ratePer = TuiSettings.load().getRatePer();
+        ctx.ratePerMinute = "minutes".equals(ratePer);
+    }
+
+    private void applyConfirmActions() {
+        TuiSettings settings = TuiSettings.load();
+        ctx.confirmActions = settings.isConfirmActions();
+        ctx.validateOnSave = settings.isValidateOnSave();
+        ctx.routeTree = settings.isRouteTree();
+        ctx.panelTop = settings.isPanelTop();
+        ctx.panelOverlay = settings.isPanelOverlay();
+        if (panelTheme == null) {
+            // --panel-theme wins for the session
+            Theme.setPanelTheme(settings.getPanelTheme());
+        }
+    }
+
+    // ---- Event Handling ----
+
+    private boolean handleEvent(Event event, TuiRunner runner) {
+        if (event instanceof KeyEvent ke) {
+            recordingManager.recordKey(ke, confirmations.isDelivering());
+            if (captionOverlay.isVisible()) {
+                if (captionOverlay.handleKeyEvent(ke)) {
+                    return true;
+                }
+            }
+            if (helpOverlay.isVisible()) {
+                return helpOverlay.handleKeyEvent(ke);
+            }
+            if (canvasOverlay.isVisible()) {
+                return canvasOverlay.handleKeyEvent(ke);
+            }
+            if (shellPanel.isOpen()) {
+                // Shift+F6 cycles shell height — handle before delegating to shell
+                if (ke.isKey(KeyCode.F6) && ke.hasShift()) {
+                    if (lastContentArea != null) {
+                        shellPanel.cycleHeight(lastContentArea.height());
+                    }
+                    return true;
+                }
+                return shellPanel.handleKeyEvent(ke);
+            }
+            if (actionsPopup.isVisible()) {
+                boolean result = actionsPopup.handleKeyEvent(ke);
+                if (!actionsPopup.isVisible()) {
+                    recordingManager.rollbackMenu();
+                }
+                return result;
+            }
+            if (processControlPopup.isVisible()) {
+                return processControlPopup.handleKeyEvent(ke);
+            }
+            if (toolConfirmPopup.isVisible()) {
+                return toolConfirmPopup.handleKeyEvent(ke);
+            }
+            if (liveEdit.handleKeyEvent(ke)) {
+                return true;
+            }
+            if (popupManager.handleKeyEvent(ke, tabRegistry.selectedTabIndex(), TAB_LOG)) {
+                return true;
+            }
+            if (aiPanel.isOpen() && !confirmations.isDeliveringMcpKey()) {
+                if (ke.isKey(KeyCode.F8) && ke.hasShift()) {
+                    if (lastContentArea != null) {
+                        aiPanel.cycleHeight(lastContentArea.height());
+                    }
+                    return true;
+                }
+                if (aiPanel.handleKeyEvent(ke)) {
+                    return true;
+                }
+                if (liveEdit.isAsking() && !ke.isCtrlC()) {
+                    // asking about a paused live edit: the keys the panel does not take stay away from the editor
+                    // beneath (its Esc would discard the edit); Esc and F8 go back to the edit
+                    if (ke.isCancel() || ke.isKey(KeyCode.F8)) {
+                        aiPanel.close();
+                    }
+                    return true;
+                }
+            }
+            if (handleGlobalKeys(ke, runner)) {
+                return true;
+            }
+            if (handleTabKeys(ke)) {
+                return true;
+            }
+        }
+        if (event instanceof MouseEvent me) {
+            recordingManager.recordMouse(me, confirmations.isDelivering());
+            if (shellPanel.isOpen() && shellPanel.handleMouseEvent(me)) {
+                return true;
+            }
+            if (aiPanel.isOpen() && aiPanel.handleMouseEvent(me)) {
+                return true;
+            }
+            if (handleMouseEvent(me, runner)) {
+                return true;
+            }
+        }
+        if (event instanceof PasteEvent pe) {
+            return handlePasteEvent(pe);
+        }
+        if (event instanceof TickEvent) {
+            return handleTickEvent(runner);
+        }
+        return false;
+    }
+
+    private boolean handleGlobalKeys(KeyEvent ke, TuiRunner runner) {
+        MonitorTab activeTab = tabRegistry.activeTab();
+        if (activeTab != null && activeTab.claimsKey(ke)) {
+            // a key an editor of the tab uses itself: the tab gets it in handleTabKeys
+            return false;
+        }
+        if (ke.isCancel()) {
+            // the tab closes what it has open (on the Overview tab: deselects the integration), else back to Overview
+            if ((activeTab == null || !activeTab.handleEscape())
+                    && tabRegistry.selectedTabIndex() != TAB_OVERVIEW) {
+                tabsState.select(TAB_OVERVIEW);
+            }
+            return true;
+        }
+        boolean textEditing = isTextInputActive();
+        // Each session (the local terminal, or a browser tab connected via --web) owns an
+        // independent CamelMonitor/TuiRunner, so quitting here only ends this session.
+        if (!textEditing && (ke.isCharIgnoreCase('q') || ke.isCtrlC())) {
+            quitTui(!ke.isCtrlC());
+            return true;
+        }
+        if (ke.isCtrlC()) {
+            runner.quit();
+            return true;
+        }
+        if (!textEditing && handleTabDigitKeys(ke)) {
+            return true;
+        }
+        if (opensHelp(ke, textEditing)) {
+            // Only opens the overlay: while it is visible, dispatch delegates to
+            // helpOverlay.handleKeyEvent (which handles F1/?/q/Esc to close) before reaching here.
+            if (activeTab != null) {
+                String help = activeTab.getHelpText();
+                if (help != null) {
+                    helpOverlay.open(help);
+                }
+            }
+            return true;
+        }
+        return handleFunctionKeys(ke);
+    }
+
+    /**
+     * Whether a text field has the keyboard (a filter, search, probe, SQL or editor field of the active tab, or the
+     * viewer of the files popup), in which case the single-character global shortcuts must not fire. Each tab answers
+     * for its own fields with {@link MonitorTab#isTextInputActive()}.
+     */
+    private boolean isTextInputActive() {
+        MonitorTab tab = tabRegistry.activeTab();
+        return (tab != null && tab.isTextInputActive())
+                || (filesBrowser.isVisible() && filesBrowser.isSourceViewerTextInputActive());
+    }
+
+    /**
+     * Digit keys 1-0 switch tabs directly. Source needs an integration (not infra); the data tabs additionally need a
+     * running (non-phantom) integration.
+     */
+    private boolean handleTabDigitKeys(KeyEvent ke) {
+        if (ke.isChar('1')) {
+            return tabRegistry.handleTabKey(TAB_OVERVIEW);
+        }
+        if (ke.isChar('3')) {
+            return tabRegistry.handleTabKey(TAB_LOG);
+        }
+        if (!isInfraSelected()) {
+            if (ke.isChar('2')) {
+                return tabRegistry.handleTabKey(TAB_SOURCE);
+            }
+            if (!isPhantomSelected()) {
+                if (ke.isChar('4')) {
+                    return tabRegistry.handleTabKey(TAB_TIMELINE);
+                }
+                if (ke.isChar('5')) {
+                    return tabRegistry.handleTabKey(TAB_DIAGRAM);
+                }
+                if (ke.isChar('6')) {
+                    return tabRegistry.handleTabKey(TAB_ROUTES);
+                }
+                if (ke.isChar('7')) {
+                    return tabRegistry.handleTabKey(TAB_ENDPOINTS);
+                }
+                if (ke.isChar('8')) {
+                    return tabRegistry.handleTabKey(TAB_HISTORY);
+                }
+                if (ke.isChar('9')) {
+                    return tabRegistry.handleTabKey(TAB_ERRORS);
+                }
+                if (ke.isChar('0')) {
+                    return tabRegistry.handleTabKey(TAB_MORE);
+                }
+            }
+        }
+        return false;
+    }
+
+    /**
+     * F6 shell, F8 AI panel, Ctrl+L log pin, Shift+F2 go-to tab, F2 actions, F3 switch integration, F10 process
+     * control.
+     */
+    private boolean handleFunctionKeys(KeyEvent ke) {
+        if (ke.isKey(KeyCode.F6)) {
+            if (shellPanel.isOpen()) {
+                shellPanel.close();
+            } else {
+                if (aiPanel.isOpen()) {
+                    aiPanel.close();
+                }
+                shellPanel.open();
+            }
+            return true;
+        }
+        if (ke.isKey(KeyCode.F8) && !ke.hasShift()) {
+            // Shift+F8 is the Source editor's: fix the problem of the line with AI
+            if (aiPanel.isOpen()) {
+                aiPanel.close();
+            } else {
+                if (shellPanel.isOpen()) {
+                    shellPanel.close();
+                }
+                aiPanel.open();
+            }
+            return true;
+        }
+        if (ke.hasCtrl() && ke.isCharIgnoreCase('f')) {
+            // browse the selected integration's files from any tab (the Overview tab also has plain f), and from
+            // the AI panel, which lets this key through
+            if (ctx.selectedPid != null && !ctx.isInfraSelected()) {
+                openFilesPopup();
+            }
+            return true;
+        }
+        if (ke.hasCtrl() && ke.isCharIgnoreCase('l')) {
+            if (!logPinned) {
+                logPinned = true;
+                logPinAnim.reset(0);
+            } else if (lastContentArea != null) {
+                logPinAnim.cycleHeight(lastContentArea.height());
+                if (logPinAnim.cyclePercent() >= 100) {
+                    logPinned = false;
+                    logPinAnim.reset(0);
+                }
+            }
+            ctx.logPinned = logPinned;
+            ctx.logPinPercent = logPinned ? logPinAnim.cyclePercent() : 0;
+            return true;
+        }
+        if (ke.isKey(KeyCode.F2) && ke.hasShift()) {
+            actionsPopup.openGotoTab();
+            return true;
+        }
+        if (ke.isKey(KeyCode.F2)) {
+            recordingManager.markMenuOpened();
+            if (tabRegistry.selectedTabIndex() == TAB_ROUTES && tabRegistry.routesTab() != null) {
+                actionsPopup.setPreSelectedRouteId(tabRegistry.routesTab().selectedRouteId());
+            }
+            actionsPopup.open();
+            return true;
+        }
+        if (ke.isKey(KeyCode.F3)) {
+            popupManager.openSwitchPopup(ctx.selectedPid, getNonVanishingIntegrations());
+            return true;
+        }
+        if (ke.isKey(KeyCode.F10)) {
+            processControlPopup.open();
+            return true;
+        }
+        return false;
+    }
+
+    /**
+     * Whether the key event should open the help overlay. F1 always opens it; '?' opens it too, but only when no text
+     * input is focused, so the character is not swallowed while the user is typing in a search or probe field.
+     */
+    static boolean opensHelp(KeyEvent ke, boolean textEditing) {
+        return ke.isKey(KeyCode.F1) || (!textEditing && ke.isChar('?'));
+    }
+
+    private boolean handleTabKeys(KeyEvent ke) {
+        MonitorTab activeTab = tabRegistry.activeTab();
+
+        if (ke.isUp()) {
+            if (activeTab != null && activeTab.handleKeyEvent(ke)) {
+                return true;
+            }
+            tabRegistry.navigateUp();
+            return true;
+        }
+        if (ke.isDown()) {
+            if (activeTab != null && activeTab.handleKeyEvent(ke)) {
+                return true;
+            }
+            tabRegistry.navigateDown();
+            return true;
+        }
+        if (ke.isPageUp() || ke.isKey(KeyCode.PAGE_UP)) {
+            if (activeTab != null && activeTab.handleKeyEvent(ke)) {
+                return true;
+            }
+            return true;
+        }
+        if (ke.isPageDown() || ke.isKey(KeyCode.PAGE_DOWN)) {
+            if (activeTab != null && activeTab.handleKeyEvent(ke)) {
+                return true;
+            }
+            return true;
+        }
+        if (ke.isLeft()) {
+            if (activeTab != null && activeTab.handleKeyEvent(ke)) {
+                return true;
+            }
+        }
+        if (ke.isRight()) {
+            if (activeTab != null && activeTab.handleKeyEvent(ke)) {
+                return true;
+            }
+        }
+        if (ke.isHome()) {
+            if (activeTab != null && activeTab.handleKeyEvent(ke)) {
+                return true;
+            }
+        }
+        if (ke.isEnd()) {
+            if (activeTab != null && activeTab.handleKeyEvent(ke)) {
+                return true;
+            }
+        }
+
+        int tab = tabRegistry.selectedTabIndex();
+        if (ke.isConfirm() && tab == TAB_OVERVIEW) {
+            if (tabRegistry.overviewTab().openFromAbout()) {
+                return true;
+            }
+            tabRegistry.overviewTab().selectCurrentIntegration();
+            if (ctx.selectedPid != null) {
+                if (isPhantomSelected()) {
+                    tabRegistry.handleTabKey(TAB_SOURCE);
+                } else {
+                    int selectTab = resolveSelectTab();
+                    if (selectTab != TAB_OVERVIEW) {
+                        tabRegistry.handleTabKey(selectTab);
+                    }
+                }
+            }
+            return true;
+        }
+        if (activeTab != null && activeTab.handleKeyEvent(ke)) {
+            return true;
+        }
+        return false;
+    }
+
+    private boolean handleMouseEvent(MouseEvent me, TuiRunner runner) {
+        // Panel border drag resize: detect press on the border row, then track drag
+        boolean hasBottomPanel = shellPanel.isOpen() || aiPanel.isOpen()
+                || (logPinned && tabRegistry.selectedTabIndex() != TAB_LOG);
+        if (lastContentArea != null && hasBottomPanel
+                && panelSplit.handleMouse(me, me.y())) {
+            if (panelSplit.isDragging() && me.kind() == MouseEventKind.DRAG) {
+                int contentHeight = lastContentArea.height();
+                if (contentHeight > 0) {
+                    boolean top = ctx.panelTop && (shellPanel.isOpen() || aiPanel.isOpen());
+                    int newHeight = top
+                            ? me.y() - lastContentArea.y() + 1
+                            : lastContentArea.y() + contentHeight - me.y();
+                    newHeight = Math.max(3, Math.min(contentHeight - 3, newHeight));
+                    if (shellPanel.isOpen()) {
+                        shellPanel.setPanelHeight(newHeight);
+                    } else if (aiPanel.isOpen()) {
+                        aiPanel.setPanelHeight(newHeight);
+                    } else {
+                        logPinAnim.setPanelHeight(newHeight);
+                    }
+                }
+            }
+            return true;
+        }
+
+        // Modal popups capture all mouse events (including tab bar and footer)
+        if (actionsPopup.isVisible()) {
+            boolean result = actionsPopup.handleMouseEvent(me);
+            if (!actionsPopup.isVisible()) {
+                recordingManager.rollbackMenu();
+            }
+            return result;
+        }
+        // The confirm dialogs (quit, kill) too: the footer lists their keys
+        if (popupManager.isConfirmVisible() || popupManager.isKillConfirmVisible()) {
+            return me.isClick() && handleFooterClick(me, runner)
+                    || popupManager.handleMouseEvent(me, tabRegistry.selectedTabIndex(), TAB_LOG);
+        }
+
+        // Tab bar clicks: detect which tab was clicked and switch to it
+        if (me.isClick() && lastTabsArea != null && lastTabLabels != null) {
+            int tabsY = lastTabsArea.height() >= 2 ? lastTabsArea.y() + 1 : lastTabsArea.y();
+            if (me.y() == tabsY && lastTabsArea.contains(me.x(), me.y())) {
+                int clickedTab = HintClicks.tabAt(lastTabLabels, lastTabDivider, me.x() - lastTabsArea.x());
+                if (clickedTab >= 0) {
+                    if (isInfraSelected()) {
+                        int realTab = clickedTab == 1 ? TAB_LOG : TAB_OVERVIEW;
+                        tabsState.select(realTab);
+                    } else if (isPhantomSelected()) {
+                        int realTab = clickedTab == 1 ? TAB_SOURCE : TAB_OVERVIEW;
+                        tabRegistry.handleTabKey(realTab);
+                    } else {
+                        tabRegistry.handleTabKey(clickedTab);
+                    }
+                    return true;
+                }
+            }
+        }
+
+        // Footer key-binding clicks: a click on a hint fires the matching key
+        if (me.isClick() && handleFooterClick(me, runner)) {
+            return true;
+        }
+
+        // The view bar of the tab: a click on a view goes there, a click on a view setting presses its key
+        if (subViewBar.isOnRow(me.y()) && lastContentArea != null
+                && lastContentArea.contains(me.x(), me.y())
+                && !popupManager.isMorePopupVisible() && !popupManager.isSwitchPopupVisible()) {
+            if (me.isClick()) {
+                SubViewBar.View view = subViewBar.viewAt(me.x(), me.y());
+                if (view != null) {
+                    view.select().run();
+                    return true;
+                }
+                KeyEvent key = HintClicks.keyEvent(subViewBar.keyAt(me.x(), me.y()));
+                if (key != null) {
+                    return recordingManager.pressedByClick(() -> handleEvent(key, runner));
+                }
+            }
+            return true;
+        }
+
+        // Mouse events in the content area: delegate to the active tab
+        if (lastContentArea != null && lastContentArea.contains(me.x(), me.y())) {
+            if (popupManager.isMorePopupVisible() || popupManager.isSwitchPopupVisible()) {
+                return popupManager.handleMouseEvent(me, tabRegistry.selectedTabIndex(), TAB_LOG);
+            }
+            if (filesBrowser.isVisible()) {
+                return filesBrowser.handleMouseEvent(me);
+            }
+            MonitorTab activeTab = tabRegistry.activeTab();
+            if (activeTab != null && activeTab.handleMouseEvent(me, lastContentArea)) {
+                return true;
+            }
+            if (me.kind() == MouseEventKind.SCROLL_UP) {
+                tabRegistry.navigateUp();
+                return true;
+            }
+            if (me.kind() == MouseEventKind.SCROLL_DOWN) {
+                tabRegistry.navigateDown();
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /** A click on a key hint of the footer presses its key, as if it was typed. */
+    private boolean handleFooterClick(MouseEvent me, TuiRunner runner) {
+        KeyEvent key = footerClicks.keyAt(me.x(), me.y());
+        return key != null && recordingManager.pressedByClick(() -> handleEvent(key, runner));
+    }
+
+    private boolean handlePasteEvent(PasteEvent pe) {
+        // Same precedence as key events: an open shell holds input focus, then popups, then the AI panel
+        if (shellPanel.isOpen()) {
+            shellPanel.handlePaste(pe.text());
+            return true;
+        }
+        if (actionsPopup.isVisible()) {
+            actionsPopup.handlePaste(pe.text());
+            return true;
+        }
+        if (aiPanel.isOpen()) {
+            aiPanel.handlePaste(pe.text());
+            return true;
+        }
+        if (filesBrowser.isVisible() && filesBrowser.isSourceViewerTextInputActive()) {
+            filesBrowser.handlePaste(pe.text());
+            return true;
+        }
+        // the text field of the tab on screen that has the keyboard, if any
+        MonitorTab tab = tabRegistry.activeTab();
+        return tab != null && tab.handlePaste(pe.text());
+    }
+
+    private boolean handleTickEvent(TuiRunner runner) {
+        long now = MonotonicClock.millis();
+        if (confirmations.deliverDue(now, key -> handleEvent(key, runner))) {
+            return true;
+        }
+        actionsPopup.tick(now);
+        drawOverlay.tick(now);
+        captionOverlay.tick(now);
+        liveEdit.tick(now);
+        for (Path written = writtenFiles.poll(); written != null; written = writtenFiles.poll()) {
+            tabRegistry.sourceTab().reloadIfShowing(written);
+        }
+        recordingManager.tickRecentKeys(now);
+        boolean anyDiagramShowing = tabRegistry.routesTab().isShowDiagram()
+                || tabRegistry.diagramTab().isShowDiagram();
+        long interval = anyDiagramShowing ? Math.max(refreshInterval, 1000) : refreshInterval;
+        // the selection changed without a key or click (an integration started, stopped or was auto-selected):
+        // every tab is told, as it is when the user switches
+        boolean selectionChanged = !Objects.equals(ctx.selectedPid, notifiedSelectedPid);
+        if (selectionChanged) {
+            resetIntegrationTabState();
+        }
+        // the background refresh brought new data: draw it now, not at the next refresh
+        boolean dataRefreshed = dataService.takeFreshData() || selectionChanged;
+        if (now - dataService.lastRefresh() >= interval) {
+            dataService.refresh(runner, this::refreshLogData, this::refreshConditionalData);
+            tabRegistry.routesTab().refreshDiagramIfNeeded();
+            tabRegistry.diagramTab().refreshDiagramIfNeeded();
+            updateWindowTitle();
+            dataRefreshed = true;
+        }
+        // Redraw only when the periodic data refresh fired or an animation is in flight.
+        // Everything else (footer indicators, auto-dismiss overlays, live tab data) is
+        // refreshed by the next data-refresh redraw, which is bounded by {@code interval}.
+        // Without this gate the tick loop forced a full redraw on every tick (~25/s at the
+        // default 40ms tick rate) even while idle.
+        return dataRefreshed || tabRegistry.isFlowFrameDue() || needsAnimationRedraw(
+                shellPanel.isOpen(),
+                aiPanel.isOpen(),
+                logPinAnim.isAnimating(),
+                canvasOverlay.isVisible(),
+                captionOverlay.isVisible(),
+                monitorNotification != null,
+                recordingManager.isRecording() && !recordingManager.getRecentKeys().isEmpty());
+    }
+
+    /**
+     * Decides whether a tick must trigger a redraw because something is animating faster than the periodic data
+     * refresh. Kept as a pure static method so the redraw intent can be unit-tested without wiring up the whole
+     * monitor.
+     *
+     * @param  shellOpen            the shell panel is open (live terminal output)
+     * @param  aiOpen               the AI panel is open (streaming output / thinking spinner)
+     * @param  logPinAnimating      the pinned-log panel is sliding open/closed
+     * @param  canvasVisible        a full-screen canvas animation is playing
+     * @param  captionVisible       a caption is typing or fading
+     * @param  notificationActive   a header notification wave is animating
+     * @param  recordingKeysVisible recorded keystrokes are shown (1s highlight then fade-out)
+     * @return                      true if the frame must be redrawn on this tick
+     */
+    static boolean needsAnimationRedraw(
+            boolean shellOpen, boolean aiOpen, boolean logPinAnimating, boolean canvasVisible,
+            boolean captionVisible, boolean notificationActive, boolean recordingKeysVisible) {
+        return shellOpen || aiOpen || logPinAnimating || canvasVisible
+                || captionVisible || notificationActive || recordingKeysVisible;
+    }
+
+    private void resetIntegrationTabState() {
+        notifiedSelectedPid = ctx.selectedPid;
+        tabRegistry.resetIntegrationTabState(dataService, filesBrowser);
+    }
+
+    // the selected integration the tabs were last told about
+    private String notifiedSelectedPid;
+
+    // ---- Rendering ----
+
+    private void render(Frame frame) {
+        Rect area = frame.area();
+
+        if (area.width() < MIN_WIDTH || area.height() < MIN_HEIGHT) {
+            renderTooSmall(frame, area);
+            return;
+        }
+
+        // Layout: header (1 row) + tabs (2 rows) + content (fill) + footer (1 row)
+        List<Rect> mainChunks = Layout.vertical()
+                .constraints(
+                        Constraint.length(1),
+                        Constraint.length(2),
+                        Constraint.fill(),
+                        Constraint.length(1))
+                .split(area);
+
+        String reloadMsg = dataService.consumeReloadNotification();
+        if (reloadMsg != null) {
+            setNotification(reloadMsg, false);
+        }
+        String reloadFailed = dataService.consumeReloadFailedNotification();
+        if (reloadFailed != null) {
+            setNotification(reloadFailed, true);
+        }
+
+        Rect contentArea;
+        if (canvasOverlay.isVisible()) {
+            // Canvas covers header + tabs + content
+            contentArea = new Rect(area.x(), area.y(), area.width(), area.height() - 1);
+            lastContentArea = contentArea;
+        } else {
+            if (isPhantomSelected()) {
+                int t = tabRegistry.selectedTabIndex();
+                if (t != TAB_OVERVIEW && t != TAB_SOURCE) {
+                    tabsState.select(TAB_OVERVIEW);
+                }
+            }
+            renderHeader(frame, mainChunks.get(0));
+            renderTabs(frame, mainChunks.get(1));
+            lastTabsArea = mainChunks.get(1);
+            contentArea = mainChunks.get(2);
+            lastContentArea = contentArea;
+        }
+        shellPanel.tickAnimation();
+        aiPanel.tickAnimation();
+        logPinAnim.tickAnimation();
+        ctx.bottomPanelFocused = shellPanel.isOpen() || aiPanel.isOpen();
+        if (canvasOverlay.isVisible()) {
+            canvasOverlay.render(frame, contentArea);
+        } else if (shellPanel.isOpen()) {
+            shellPanel.initHeight(contentArea.height());
+            renderSidePanel(frame, contentArea, shellPanel.panelHeight(), shellPanel::render);
+        } else if (aiPanel.isOpen()) {
+            aiPanel.initHeight(contentArea.height());
+            renderSidePanel(frame, contentArea, aiPanel.panelHeight(contentArea.height()), aiPanel::render);
+        } else if (logPinned && tabRegistry.selectedTabIndex() != TAB_LOG) {
+            logPinAnim.initHeight(contentArea.height());
+            int ph = logPinAnim.panelHeight();
+            ctx.shellPercent = ph * 100 / Math.max(1, contentArea.height());
+            ctx.logPinVisible = true;
+            List<Rect> splitChunks = Layout.vertical()
+                    .constraints(Constraint.fill(), Constraint.length(ph))
+                    .split(contentArea);
+            renderContent(frame, splitChunks.get(0));
+            tabRegistry.logTab().render(frame, splitChunks.get(1));
+            panelSplit.setBorderPos(splitChunks.get(1).y());
+        } else {
+            ctx.shellPercent = 0;
+            ctx.logPinVisible = false;
+            renderContent(frame, contentArea);
+            panelSplit.clearBorderPos();
+        }
+        if (popupManager.isMorePopupVisible()) {
+            popupManager.renderMorePopup(frame, contentArea);
+        }
+        if (popupManager.isSwitchPopupVisible()) {
+            popupManager.renderSwitchPopup(frame, contentArea);
+        }
+        if (filesBrowser.isVisible()) {
+            filesBrowser.render(frame, contentArea);
+        }
+        if (drawOverlay.isVisible()) {
+            drawOverlay.render(frame, contentArea);
+        }
+        if (popupManager.isKillConfirmVisible()) {
+            popupManager.renderKillConfirm(frame, contentArea);
+        }
+        if (popupManager.isConfirmVisible()) {
+            popupManager.renderConfirm(frame, contentArea);
+        }
+        actionsPopup.render(frame, contentArea);
+        processControlPopup.render(frame, contentArea);
+        toolConfirmPopup.render(frame, contentArea);
+        if (captionOverlay.isCaptionVisible()) {
+            captionOverlay.render(frame, contentArea);
+        }
+        if (helpOverlay.isVisible()) {
+            helpOverlay.render(frame, contentArea);
+        }
+        renderFooter(frame, mainChunks.get(3));
+        Theme.applyBaseColors(frame.buffer(), area);
+        LinkTargets.tidy(frame.buffer());
+
+        recordingManager.updateBuffer(frame.buffer());
+        recordingManager.processPendingScreenshot();
+    }
+
+    private void renderHeader(Frame frame, Rect area) {
+        List<IntegrationInfo> infos = dataService.data().get();
+        String camelVersion = VersionHelper.extractCamelVersion();
+        long activeCount = infos.stream().filter(i -> !i.vanishing).count();
+
+        List<Span> titleSpans = new ArrayList<>();
+        titleSpans.add(Span.styled(" Camel TUI", Theme.title()));
+        titleSpans.add(Span.raw("  "));
+        titleSpans.add(Span.styled(camelVersion != null ? "v" + camelVersion : "", Theme.success()));
+        titleSpans.add(Span.raw("  "));
+        titleSpans.add(Span.styled(activeCount + " integration(s)", Theme.info()));
+        long activeInfra = dataService.infraData().get().stream().filter(i -> !i.vanishing).count();
+        if (activeInfra > 0) {
+            titleSpans.add(Span.raw("  "));
+            titleSpans.add(Span.styled(activeInfra + " infra(s)", Theme.notice()));
+        }
+        if (ctx.selectedPid != null) {
+            titleSpans.add(Span.raw("  "));
+            InfraInfo selInfra = findSelectedInfra();
+            if (selInfra != null) {
+                titleSpans.add(Span.styled("selected: " + selectedName(), Theme.notice()));
+            } else {
+                titleSpans.add(Span.styled("selected: " + selectedName(), Theme.warning()));
+            }
+        }
+        if (monitorNotification != null) {
+            if (MonotonicClock.millis() > monitorNotificationExpiry) {
+                monitorNotification = null;
+            }
+        }
+        // Right-aligned header spans (the chaos badge, web server indicator)
+        List<Span> headerRight = new ArrayList<>(ChaosTab.headerBadge(ctx.findSelectedIntegration()));
+        if (web && webBackend == null) {
+            headerRight.add(Span.styled("web :" + webPort + " ",
+                    Theme.notice().underlined().hyperlink("http://127.0.0.1:" + webPort + "/")));
+        }
+
+        String activeNotification = monitorNotification;
+        boolean activeNotificationError = monitorNotificationError;
+        Line titleLine = Line.from(titleSpans);
+
+        if (activeNotification != null) {
+            if (!activeNotification.equals(lastWaveNotification)) {
+                notificationWaveState.reset();
+                lastWaveNotification = activeNotification;
+            }
+            int titleWidth = titleSpans.stream().mapToInt(s -> s.width()).sum();
+            int rightWidth = headerRight.stream().mapToInt(Span::width).sum();
+            int waveWidth = CharWidth.of(activeNotification) + 2;
+            int leftWidth = Math.min(titleWidth + 2, area.width() - waveWidth - rightWidth);
+            if (leftWidth > 0 && waveWidth > 0 && leftWidth + waveWidth + rightWidth <= area.width()) {
+                Rect leftArea = new Rect(area.x(), area.y(), leftWidth, 1);
+                Rect waveArea = new Rect(area.x() + leftWidth, area.y(), waveWidth, 1);
+                frame.renderWidget(
+                        Paragraph.builder().text(Text.from(titleLine)).build(),
+                        leftArea);
+                Color waveColor = activeNotificationError
+                        ? Theme.error().fg().orElseThrow()
+                        : Theme.success().fg().orElseThrow();
+                WaveText wave = WaveText.builder()
+                        .text(activeNotification)
+                        .color(waveColor)
+                        .inverted(false)
+                        .speed(1.2)
+                        .mode(WaveText.Mode.LOOP)
+                        .build();
+                notificationWaveState.advance();
+                frame.renderStatefulWidget(wave, waveArea, notificationWaveState);
+            } else {
+                frame.renderWidget(
+                        Paragraph.builder().text(Text.from(titleLine)).build(),
+                        area);
+            }
+        } else {
+            frame.renderWidget(
+                    Paragraph.builder().text(Text.from(titleLine)).build(),
+                    area);
+        }
+        if (!headerRight.isEmpty()) {
+            int rightWidth = headerRight.stream().mapToInt(Span::width).sum();
+            if (rightWidth < area.width()) {
+                Rect rightArea = new Rect(area.x() + area.width() - rightWidth, area.y(), rightWidth, 1);
+                frame.renderWidget(
+                        Paragraph.builder().text(Text.from(Line.from(headerRight))).build(),
+                        rightArea);
+            }
+        }
+    }
+
+    private void renderTooSmall(Frame frame, Rect area) {
+        Style orange = Style.EMPTY.fg(Theme.accent());
+        Style normal = Style.EMPTY;
+        Style bold = Style.EMPTY.bold();
+
+        String line1 = "Terminal size too small:";
+        String wLabel = " Width = ";
+        String wVal = String.valueOf(area.width());
+        String hLabel = "  Height = ";
+        String hVal = String.valueOf(area.height());
+        String line2 = wLabel + wVal + hLabel + hVal;
+
+        String line4 = "Needed for current config:";
+        String line5 = " Width = " + MIN_WIDTH + "  Height = " + MIN_HEIGHT;
+
+        // 5 content lines (2 + blank + 2 + blank), center vertically
+        int startY = area.y() + Math.max(0, (area.height() - 5) / 2);
+
+        int x1 = area.x() + Math.max(0, (area.width() - CharWidth.of(line1)) / 2);
+        frame.buffer().setString(x1, startY, line1, bold);
+
+        int x2 = area.x() + Math.max(0, (area.width() - CharWidth.of(line2)) / 2);
+        int wLabelW = CharWidth.of(wLabel);
+        int wValW = CharWidth.of(wVal);
+        int hLabelW = CharWidth.of(hLabel);
+        frame.buffer().setString(x2, startY + 1, wLabel, normal);
+        frame.buffer().setString(x2 + wLabelW, startY + 1, wVal,
+                area.width() < MIN_WIDTH ? orange : normal);
+        frame.buffer().setString(x2 + wLabelW + wValW, startY + 1, hLabel, normal);
+        frame.buffer().setString(x2 + wLabelW + wValW + hLabelW, startY + 1, hVal,
+                area.height() < MIN_HEIGHT ? orange : normal);
+
+        int x4 = area.x() + Math.max(0, (area.width() - CharWidth.of(line4)) / 2);
+        frame.buffer().setString(x4, startY + 3, line4, bold);
+
+        int x5 = area.x() + Math.max(0, (area.width() - CharWidth.of(line5)) / 2);
+        frame.buffer().setString(x5, startY + 4, line5, normal);
+        Theme.applyBaseColors(frame.buffer(), area);
+    }
+
+    private void renderTabs(Frame frame, Rect area) {
+        boolean compact = area.width() < TABS_FULL_MIN_WIDTH;
+        String dividerStr = compact ? "|" : " | ";
+        Span divider = Span.styled(dividerStr, Theme.muted());
+        boolean infraSelected = isInfraSelected();
+
+        if (infraSelected) {
+            // Infra mode: only Overview and Log tabs
+            Line[] labels = {
+                    Line.from(TuiIcons.primaryTabHeader(TuiIcons.TAB_OVERVIEW, "1", "Overview")),
+                    Line.from(TuiIcons.primaryTabHeader(TuiIcons.TAB_LOG, "3", "Log"))
+            };
+
+            int infraTabIdx = tabsState.selected() == TAB_LOG ? 1 : 0;
+            TabsState infraTabsState = new TabsState(infraTabIdx);
+
+            Tabs tabs = Tabs.builder()
+                    .titles(labels)
+                    .highlightStyle(Theme.accentBg())
+                    .divider(divider)
+                    .build();
+
+            Rect labelsArea = area.height() >= 2
+                    ? new Rect(area.x(), area.y() + 1, area.width(), 1)
+                    : area;
+            frame.renderStatefulWidget(tabs, labelsArea, infraTabsState);
+            lastTabLabels = labels;
+            lastTabDivider = dividerStr;
+            return;
+        }
+
+        if (isPhantomSelected()) {
+            Line[] labels = {
+                    Line.from(TuiIcons.primaryTabHeader(TuiIcons.TAB_OVERVIEW, "1", "Overview")),
+                    Line.from(TuiIcons.primaryTabHeader(TuiIcons.TAB_SOURCE, "2", "Source"))
+            };
+
+            int phantomTabIdx = tabsState.selected() == TAB_SOURCE ? 1 : 0;
+            TabsState phantomTabsState = new TabsState(phantomTabIdx);
+
+            Tabs tabs = Tabs.builder()
+                    .titles(labels)
+                    .highlightStyle(Theme.accentBg())
+                    .divider(divider)
+                    .build();
+
+            Rect labelsArea = area.height() >= 2
+                    ? new Rect(area.x(), area.y() + 1, area.width(), 1)
+                    : area;
+            frame.renderStatefulWidget(tabs, labelsArea, phantomTabsState);
+            lastTabLabels = labels;
+            lastTabDivider = dividerStr;
+            return;
+        }
+
+        Line[] labels = {
+                Line.from(TuiIcons.primaryTabHeader(TuiIcons.TAB_OVERVIEW, "1", "Overview")),
+                Line.from(TuiIcons.primaryTabHeader(TuiIcons.TAB_SOURCE, "2", "Source")),
+                Line.from(TuiIcons.primaryTabHeader(TuiIcons.TAB_LOG, "3", "Log")),
+                Line.from(TuiIcons.primaryTabHeader(TuiIcons.TAB_TIMELINE, "4", "Timeline")),
+                Line.from(TuiIcons.primaryTabHeader(TuiIcons.TAB_DIAGRAM, "5", "Diagram")),
+                Line.from(TuiIcons.primaryTabHeader(TuiIcons.TAB_ROUTES, "6", "Route")),
+                Line.from(TuiIcons.primaryTabHeader(TuiIcons.TAB_ENDPOINTS, "7", "Endpoint")),
+                Line.from(TuiIcons.primaryTabHeader(TuiIcons.TAB_INSPECT, "8", "Inspect")),
+                Line.from(TuiIcons.primaryTabHeader(TuiIcons.TAB_ERRORS, "9", "Errors")),
+                Line.from(TuiIcons.primaryTabHeader(TuiIcons.TAB_MORE, "0", TuiIcons.moreTabLabel())),
+        };
+        popupManager.setCurrentTabLabels(labels);
+        lastTabLabels = labels;
+        lastTabDivider = dividerStr;
+
+        Tabs tabs = Tabs.builder()
+                .titles(labels)
+                .highlightStyle(Theme.accentBg())
+                .divider(divider)
+                .build();
+
+        Rect labelsArea = area.height() >= 2
+                ? new Rect(area.x(), area.y() + 1, area.width(), 1)
+                : area;
+        frame.renderStatefulWidget(tabs, labelsArea, tabsState);
+
+        if (area.height() >= 2) {
+            String[] badgeTexts = new String[labels.length];
+            Style[] badgeStyles = new Style[labels.length];
+            computeTabBadges(badgeTexts, badgeStyles);
+
+            int badgeY = area.y();
+            int dividerW = CharWidth.of(dividerStr);
+            int tabX = 0;
+            for (int i = 0; i < labels.length; i++) {
+                if (i > 0) {
+                    tabX += dividerW;
+                }
+                int tabW = labels[i].width();
+                if (!badgeTexts[i].isEmpty()) {
+                    int badgeW = CharWidth.of(badgeTexts[i]);
+                    int startX = area.x() + tabX + Math.max(0, (tabW - badgeW) / 2);
+                    frame.buffer().setString(startX, badgeY, badgeTexts[i], badgeStyles[i]);
+                }
+                tabX += tabW;
+            }
+        }
+    }
+
+    private void renderContent(Frame frame, Rect area) {
+        MonitorTab tab = tabRegistry.activeTab();
+        if (tab != null) {
+            SubViewBar.Spec spec = tab.subViewBar();
+            if (spec != null && area.height() > 3) {
+                List<Rect> rows = Layout.vertical().constraints(Constraint.length(1), Constraint.fill()).split(area);
+                subViewBar.render(frame, rows.get(0), spec);
+                area = rows.get(1);
+            } else {
+                subViewBar.clear();
+            }
+            tab.render(frame, area);
+        }
+    }
+
+    private void computeTabBadges(String[] badgeTexts, Style[] badgeStyles) {
+        Style yellow = Theme.label();
+        Style cyan = Style.EMPTY.fg(Theme.accent()).bold();
+        Style red = Theme.error().bold();
+        for (int j = 0; j < badgeStyles.length; j++) {
+            badgeTexts[j] = "";
+            badgeStyles[j] = yellow;
+        }
+
+        List<IntegrationInfo> infos = dataService.data().get();
+        long activeCount = infos.stream().filter(i -> !i.vanishing).count();
+        IntegrationInfo sel = findSelectedIntegration();
+        boolean hasSelection = ctx.selectedPid != null && sel != null;
+
+        if (activeCount > 0) {
+            badgeTexts[TAB_OVERVIEW] = "(" + activeCount + ")";
+        }
+        int routeCount = hasSelection ? sel.routes.size() : 0;
+        if (routeCount > 0) {
+            badgeTexts[TAB_DIAGRAM] = "(1)";
+            badgeTexts[TAB_ROUTES] = "(" + routeCount + ")";
+        }
+        int endpointCount = hasSelection ? sel.endpoints.size() : 0;
+        if (endpointCount > 0) {
+            badgeTexts[TAB_ENDPOINTS] = "(" + endpointCount + ")";
+        }
+        boolean hasTraces = hasSelection && !dataService.traces().get().isEmpty();
+        if (hasTraces) {
+            badgeTexts[TAB_HISTORY] = "(*)";
+            badgeStyles[TAB_HISTORY] = cyan;
+        } else {
+            long historyCount = hasSelection
+                    ? tabRegistry.historyTab().historyEntries.stream()
+                            .map(e -> {
+                                if (e.headers != null) {
+                                    Object bid = e.headers.get("breadcrumbId");
+                                    if (bid != null) {
+                                        return bid.toString();
+                                    }
+                                }
+                                return e.exchangeId;
+                            })
+                            .distinct().count()
+                    : 0;
+            if (historyCount > 0) {
+                badgeTexts[TAB_HISTORY] = "(" + historyCount + ")";
+            }
+        }
+        long cbOpenCount = hasSelection
+                ? sel.circuitBreakers.stream()
+                        .filter(cb -> cb.state != null && (cb.state.equalsIgnoreCase("open")
+                                || cb.state.equalsIgnoreCase("forced_open")))
+                        .count()
+                : 0;
+        if (cbOpenCount > 0) {
+            badgeTexts[TAB_MORE] = "(" + cbOpenCount + " OPEN)";
+            badgeStyles[TAB_MORE] = red;
+        }
+        int errorCount = hasSelection ? sel.errorCount : 0;
+        if (errorCount > 0) {
+            badgeTexts[TAB_ERRORS] = "(" + errorCount + ")";
+            badgeStyles[TAB_ERRORS] = red;
+        }
+    }
+
+    private void openFilesPopup() {
+        IntegrationInfo info = findSelectedIntegration();
+        if (info != null) {
+            filesBrowser.open(info);
+        }
+    }
+
+    private List<IntegrationInfo> getNonVanishingIntegrations() {
+        return dataService.data().get().stream()
+                .filter(i -> !i.vanishing && i.name != null)
+                .sorted(Comparator.comparing(i -> i.name, String.CASE_INSENSITIVE_ORDER))
+                .collect(Collectors.toList());
+    }
+
+    private void setNotification(String message, boolean error) {
+        monitorNotification = message;
+        monitorNotificationError = error;
+        monitorNotificationExpiry = MonotonicClock.millis() + (error ? 20000 : 10000);
+        notificationWaveState.reset();
+    }
+
+    private void resetStats() {
+        IntegrationInfo info = ctx.findSelectedIntegration();
+        if (info == null) {
+            return;
+        }
+        String pid = info.pid;
+        JsonObject root = new JsonObject();
+        root.put("action", "reset-stats");
+        ctx.fireAction(pid, root);
+        dataService.metrics().resetStats(pid);
+
+        info.errors = new ArrayList<>();
+        dataService.traces().set(Collections.emptyList());
+        dataService.traceFilePositions().clear();
+        tabRegistry.historyTab().historyEntries = Collections.emptyList();
+    }
+
+    private void playBuiltinAnimation(String name) {
+        List<BuiltinAnimations.Frame> frames = BuiltinAnimations.get(name);
+        if (frames == null) {
+            return;
+        }
+        canvasOverlay.open();
+        Thread thread = new Thread(() -> {
+            try {
+                for (BuiltinAnimations.Frame f : frames) {
+                    if (!canvasOverlay.isVisible()) {
+                        return;
+                    }
+                    if (f.delayMs() > 0) {
+                        Thread.sleep(f.delayMs());
+                    }
+                    if (!canvasOverlay.isVisible()) {
+                        return;
+                    }
+                    drawOverlay.setDrawing(f.cells(), 0);
+                }
+                Thread.sleep(100);
+                canvasOverlay.close();
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+        }, "camel-animation");
+        thread.setDaemon(true);
+        thread.start();
+    }
+
+    private void renderFooter(Frame frame, Rect area) {
+        // Disable footer key-binding clicks until the normal path below re-captures the hint regions.
+        // Overlay/early-return states (screenshot flash, help, caption) leave the footer non-clickable.
+        footerClicks.clear();
+
+        // Show screenshot flash message briefly
+        String msg = recordingManager.screenshotFlashMessage();
+        if (msg != null) {
+            frame.renderWidget(
+                    Paragraph.from(Line.from(Span.styled(" " + msg, Theme.success()))),
+                    area);
+            return;
+        }
+
+        List<Span> spans = new ArrayList<>();
+        int fKeyTotal = 0;
+
+        if (helpOverlay.isVisible()) {
+            helpOverlay.renderFooter(spans);
+            frame.renderWidget(Paragraph.from(Line.from(spans)), area);
+            return;
+        }
+
+        if (captionOverlay.isCaptionVisible()) {
+            captionOverlay.renderFooter(spans);
+            frame.renderWidget(Paragraph.from(Line.from(spans)), area);
+            return;
+        }
+
+        if (canvasOverlay.isVisible()) {
+            canvasOverlay.renderFooter(spans);
+            frame.renderWidget(Paragraph.from(Line.from(spans)), area);
+            return;
+        }
+
+        // Modal popups own the footer no matter which tab is active, so the hints always describe
+        // the keys that the topmost dialog will actually receive.
+        if (filesBrowser.isVisible()) {
+            filesBrowser.renderFooter(spans);
+        } else if (popupManager.isKillConfirmVisible() || popupManager.isConfirmVisible()) {
+            hint(spans, "Enter", "confirm");
+            String extra = popupManager.isConfirmVisible() ? popupManager.confirmExtraHint() : null;
+            if (extra != null) {
+                hint(spans, extra.substring(0, 1), extra.substring(2));
+            }
+            hintLast(spans, "Esc", "cancel");
+        } else if (popupManager.isSwitchPopupVisible()) {
+            hint(spans, "Enter", "switch");
+            hintLast(spans, "Esc", "close");
+        } else if (popupManager.isMorePopupVisible()) {
+            hint(spans, "Enter", "open");
+            hintLast(spans, "Esc", "close");
+        } else if (actionsPopup.isVisible()) {
+            actionsPopup.renderFooter(spans);
+        } else if (processControlPopup.isVisible()) {
+            processControlPopup.renderFooter(spans);
+        } else if (toolConfirmPopup.isVisible()) {
+            toolConfirmPopup.renderFooter(spans);
+        } else if (liveEdit.capturesKeys()) {
+            liveEdit.renderFooter(spans);
+        } else if (aiPanel.isOpen()) {
+            // asking about a paused AI edit, or the panel came back after a replay
+            aiPanel.renderFooter(spans);
+        } else if (liveEdit.isShown() && !tabRegistry.sourceTab().showsViewerDialog()) {
+            liveEdit.renderFooter(spans);
+        } else if (shellPanel.isOpen()) {
+            shellPanel.renderFooter(spans);
+        } else {
+            MonitorTab tab = tabRegistry.activeTab();
+
+            if (tabRegistry.selectedTabIndex() == TAB_OVERVIEW) {
+                fKeyTotal = renderOverviewFooter(spans);
+            } else if (tab != null) {
+                tab.renderFooter(spans);
+                fKeyTotal = insertFKeyHints(spans);
+            }
+        }
+
+        List<Span> rightSpans = new ArrayList<>();
+
+        if (recordingManager.isRecording() && !recordingManager.getRecentKeys().isEmpty()) {
+            long now = MonotonicClock.millis();
+            List<RecordingManager.KeyRecord> recentKeys = recordingManager.getRecentKeys();
+            int maxKeys = Math.min(recentKeys.size(), 8);
+            List<RecordingManager.KeyRecord> visible = recentKeys.subList(recentKeys.size() - maxKeys, recentKeys.size());
+            for (RecordingManager.KeyRecord kr : visible) {
+                long age = now - kr.pressedAt();
+                Style style = age < 1000
+                        ? Theme.selectionBg()
+                        : Theme.muted();
+                rightSpans.add(Span.styled(" " + kr.label() + " ", style));
+            }
+        }
+
+        if (mcp) {
+            if (!rightSpans.isEmpty()) {
+                rightSpans.add(Span.raw("  "));
+            }
+            String client = mcpServer != null ? mcpServer.getConnectedClient() : null;
+            boolean active = mcpServer != null && mcpServer.isRecentActivity();
+            String mcpLabel = "MCP :" + mcpPort;
+            String suffix;
+            Style labelStyle;
+            Style suffixStyle;
+            if (client != null) {
+                suffix = active ? " " + TuiIcons.SELECTED : " " + TuiIcons.IDLE;
+                mcpLabel += " (" + client + ")";
+                labelStyle = Theme.success();
+                suffixStyle = active ? Theme.success() : Theme.muted();
+            } else {
+                // the server runs and waits for an agent: not an error
+                suffix = " no client";
+                labelStyle = Theme.muted();
+                suffixStyle = Theme.muted();
+            }
+            rightSpans.add(Span.styled(mcpLabel, labelStyle));
+            rightSpans.add(Span.styled(suffix, suffixStyle));
+            if (client == null) {
+                rightSpans.add(Span.styled("  F2 → Setup MCP", Theme.muted()));
+            }
+        }
+
+        int hintsWidth = spans.stream().mapToInt(Span::width).sum();
+        int rightWidth = rightSpans.stream().mapToInt(Span::width).sum();
+        int minGap = rightSpans.isEmpty() ? 0 : 1;
+
+        if (hintsWidth + rightWidth + minGap > area.width()) {
+            // Drop decorative right-side content first
+            rightSpans.clear();
+            rightWidth = 0;
+            minGap = 0;
+            // the F-keys every screen has go first, what belongs to the screen last
+            hintsWidth = fKeyTotal > 0
+                    ? FooterHints.fit(spans, fKeyStart, fKeyTotal - tabFKeySpans, tabFKeySpans, hintsWidth, area.width())
+                    : FooterHints.fit(spans, spans.size(), 0, 0, hintsWidth, area.width());
+        }
+
+        if (!rightSpans.isEmpty()) {
+            int gap = Math.max(1, area.width() - hintsWidth - rightWidth);
+            spans.add(Span.raw(" ".repeat(gap)));
+            spans.addAll(rightSpans);
+        }
+
+        footerClicks.capture(area, spans);
+        frame.renderWidget(Paragraph.from(Line.from(spans)), area);
+    }
+
+    // how many of the F-key hint spans of the footer are the screen's own (after F1/F2/F10), and where they start
+    private int tabFKeySpans;
+    private int fKeyStart;
+
+    private int insertFKeyHints(List<Span> spans) {
+        MonitorTab tab = tabRegistry.activeTab();
+        int insertPos = FooterHints.fKeyPosition(spans, tab != null && tab.isTextInputActive());
+        List<Span> fKeySpans = new ArrayList<>();
+        // F1 opens the help of every tab, but is seldom pressed: the Overview, the first screen, names it
+        if (tab == tabRegistry.overviewTab() && tab.getHelpText() != null) {
+            hint(fKeySpans, "F1", "help");
+        }
+        hint(fKeySpans, "F2", "actions");
+        hint(fKeySpans, "F10", "run");
+        int globalFKeys = fKeySpans.size();
+        if (tab != null) {
+            tab.renderFKeyHints(fKeySpans);
+        }
+        tabFKeySpans = fKeySpans.size() - globalFKeys;
+        fKeyStart = insertPos;
+        spans.addAll(insertPos, fKeySpans);
+        // the number of F-key spans, global and the screen's own: FooterHints.fit drops the global ones first
+        return fKeySpans.size();
+    }
+
+    private int renderOverviewFooter(List<Span> spans) {
+        tabRegistry.overviewTab().renderFooter(spans);
+        int fKeyTotal = insertFKeyHints(spans);
+        return fKeyTotal;
+    }
+
+    private int resolveSelectTab() {
+        TuiSettings settings = TuiSettings.load();
+        String tabName = settings.getSelectTab();
+        if (tabName == null) {
+            return TAB_LOG;
+        }
+        for (TabRegistry.TabEntry entry : tabRegistry.allTabEntries()) {
+            if (entry.name().equals(tabName) && entry.tabIndex() != TAB_MORE) {
+                return entry.tabIndex();
+            }
+        }
+        return TAB_LOG;
+    }
+
+    // ---- Data Loading ----
+
+    private void refreshLogData() {
+        if (tabRegistry.selectedTabIndex() != TAB_LOG && !logPinned) {
+            return;
+        }
+        String logPid = null;
+        String logFileName = null;
+        InfraInfo selInfra = findSelectedInfra();
+        if (selInfra != null) {
+            logPid = selInfra.pid;
+            logFileName = "infra-" + selInfra.alias + "-" + selInfra.pid + ".log";
+        } else {
+            IntegrationInfo selected = findSelectedIntegration();
+            if (selected != null) {
+                logPid = selected.pid;
+                logFileName = selected.pid + ".log";
+                // fallback to name-based log file (e.g. Quarkus apps use app name)
+                if (!Files.exists(CommandLineHelper.getCamelDir().resolve(logFileName))
+                        && selected.name != null) {
+                    Path nameLog = CommandLineHelper.getCamelDir().resolve(selected.name + ".log");
+                    if (Files.exists(nameLog)) {
+                        logFileName = selected.name + ".log";
+                    }
+                }
+            }
+        }
+        if (logPid != null) {
+            tabRegistry.logTab().refreshFromFile(logPid, logFileName);
+        }
+    }
+
+    /**
+     * The data refreshed only while it is on screen, on the background refresh thread: the AI panel's statistics, and
+     * what the active tab shows (each tab fetches its own in {@link MonitorTab#refreshWhileVisible()}).
+     */
+    private void refreshConditionalData() {
+        if (aiPanel.isOpen() && aiPanel.isStatsView() && ctx.selectedPid != null) {
+            // at once when the view opens, then every few seconds while it is open
+            boolean now = aiPanel.usageRefreshRequested;
+            aiPanel.usageRefreshRequested = false;
+            dataService.refreshGenAiData(now);
+        }
+        if (ollamaMonitor != null) {
+            // cheap and throttled: keeps the More menu's Ollama entry in step with whether a server answers
+            ollamaMonitor.probe();
+        }
+        MonitorTab tab = tabRegistry.activeTab();
+        if (tab != null) {
+            tab.refreshWhileVisible();
+        }
+    }
+
+    // ---- Helpers ----
+
+    private IntegrationInfo findSelectedIntegration() {
+        return ctx.findSelectedIntegration();
+    }
+
+    private InfraInfo findSelectedInfra() {
+        return ctx.findSelectedInfra();
+    }
+
+    private boolean isInfraSelected() {
+        return ctx.isInfraSelected();
+    }
+
+    private boolean isPhantomSelected() {
+        IntegrationInfo info = ctx.findSelectedIntegration();
+        return info != null && info.phantom;
+    }
+
+    private String selectedName() {
+        return ctx.selectedName();
+    }
+
+    // ---- MCP .mcp.json lifecycle ----
+
+    /**
+     * Returns the Streamable HTTP URL of the embedded MCP server, starting it on an ephemeral localhost port if neither
+     * --mcp nor an earlier call did. Used by the AI panel to hand the TUI tools to an ACP agent. No .mcp.json is
+     * written for an on-demand server. Called from the AI panel's agent thread.
+     */
+    synchronized String ensureMcpServer() throws IOException {
+        TuiMcpServer server = mcpServer;
+        if (server == null) {
+            server = new TuiMcpServer(mcp ? mcpPort : 0, mcpFacade);
+            server.start();
+            mcpServer = server;
+            mcpPort = server.getPort();
+            wireMcpServer(server);
+        }
+        return "http://127.0.0.1:" + server.getPort() + "/mcp";
+    }
+
+    /** Hands a started MCP server to the facade, the actions popup and the AI panel. */
+    private void wireMcpServer(TuiMcpServer server) {
+        mcpFacade.setMcpActivityLog(server::getActivityLog, server::getToolCallCount);
+        actionsPopup.setMcpEnabled(true, mcpPort, server::getConnectedClient,
+                server::getActivityLog, server::getToolCallCount);
+        aiPanel.setMcpInfo(true, mcpPort);
+    }
+
+    private static Path writeMcpJson(int port) {
+        Path path = Path.of(".mcp.json");
+        if (Files.exists(path)) {
+            // do not overwrite an existing .mcp.json (may belong to Claude Code, Cursor, etc.)
+            return null;
+        }
+        try {
+            String json = """
+                    {
+                      "mcpServers": {
+                        "camel-tui": {
+                          "type": "http",
+                          "url": "http://localhost:%d/mcp"
+                        }
+                      }
+                    }
+                    """.formatted(port);
+            Files.writeString(path, json);
+            return path;
+        } catch (IOException e) {
+            LOG.log(Level.WARNING, "Failed to write .mcp.json: {0}", e.getMessage());
+            return null;
+        }
+    }
+
+    private static void deleteMcpJson(Path path) {
+        if (path != null) {
+            try {
+                Files.deleteIfExists(path);
+            } catch (IOException e) {
+                LOG.log(Level.DEBUG, "Failed to delete .mcp.json: {0}", e.getMessage());
+            }
+        }
+    }
+
+    private void openDirectoryAsPhantom(String directory) {
+        Path dirPath = Path.of(directory).toAbsolutePath().normalize();
+        if (!Files.isDirectory(dirPath)) {
+            return;
+        }
+        // check if this directory already matches a running integration
+        for (IntegrationInfo info : dataService.data().get()) {
+            if (!info.vanishing && directory.equals(info.directory)) {
+                ctx.selectedPid = info.pid;
+                return;
+            }
+        }
+        // check if already registered as a phantom
+        IntegrationInfo existing = ctx.findPhantomByDirectory(dirPath.toString());
+        if (existing != null) {
+            ctx.selectedPid = existing.pid;
+            return;
+        }
+
+        Path pomFile = dirPath.resolve("pom.xml");
+        String runtime = Files.isRegularFile(pomFile) ? TuiHelper.detectPomRuntime(pomFile) : null;
+
+        IntegrationInfo phantom = new IntegrationInfo();
+        phantom.name = dirPath.getFileName().toString();
+        phantom.directory = dirPath.toString();
+        phantom.sourceDir = dirPath.toString();
+        phantom.projectType = runtime;
+        if ("spring-boot".equals(runtime)) {
+            phantom.platform = "Spring Boot";
+        } else if ("quarkus".equals(runtime)) {
+            phantom.platform = "Quarkus";
+        } else {
+            phantom.platform = "Camel";
+        }
+        if (runtime != null) {
+            phantom.camelVersion = DependencyLoader.detectCamelVersion(pomFile);
+        }
+        ctx.addPhantom(phantom);
+        ctx.selectedPid = phantom.pid;
+    }
+
+    private void updateWindowTitle() {
+        if (runner == null) {
+            return;
+        }
+        String name = ctx != null && ctx.selectedPid != null ? ctx.selectedName() : null;
+        String title = name != null ? "Camel TUI: " + name : "Camel TUI";
+        if (!title.equals(lastWindowTitle)) {
+            lastWindowTitle = title;
+            runner.setWindowTitle(title);
+        }
+    }
+
+    void setRunnerForTesting(Runnable onQuit) {
+        aiPanel.setExitCallbackForTestingOrRuntime(onQuit);
+    }
+
+    AiPanel aiPanelForTesting() {
+        return aiPanel;
+    }
+
+}

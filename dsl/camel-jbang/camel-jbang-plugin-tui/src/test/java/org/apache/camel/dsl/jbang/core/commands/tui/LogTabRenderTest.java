@@ -1,0 +1,347 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.camel.dsl.jbang.core.commands.tui;
+
+import java.util.ArrayList;
+import java.util.List;
+import java.util.concurrent.atomic.AtomicReference;
+
+import dev.tamboui.buffer.Buffer;
+import dev.tamboui.layout.Rect;
+import dev.tamboui.terminal.Frame;
+import dev.tamboui.text.Span;
+import dev.tamboui.tui.event.KeyCode;
+import dev.tamboui.tui.event.KeyEvent;
+import dev.tamboui.tui.event.KeyModifiers;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertTrue;
+
+/**
+ * Rendering tests for {@link LogTab}. These tests render the tab into a virtual terminal buffer and inspect the
+ * rendered cell content.
+ */
+class LogTabRenderTest {
+
+    private MonitorContext ctx;
+    private IntegrationInfo info;
+
+    @BeforeEach
+    void setUp() {
+        info = new IntegrationInfo();
+        info.pid = "1234";
+        info.name = "test-app";
+
+        AtomicReference<List<IntegrationInfo>> data = new AtomicReference<>(List.of(info));
+        AtomicReference<List<InfraInfo>> infraData = new AtomicReference<>(List.of());
+        ctx = new MonitorContext(data, infraData);
+        ctx.selectedPid = "1234";
+    }
+
+    @Test
+    void foldsAStormOfTheSameLineIntoOneEntry() {
+        List<LogEntry> entries = new ArrayList<>();
+        LogTab.addFolded(entries, LogTab.parseLogLine(
+                "2026-09-22 10:00:00.001  INFO 42 --- [           main] route1 : Started"));
+        for (int i = 0; i < 100; i++) {
+            LogTab.addFolded(entries, LogTab.parseLogLine(
+                    "2026-09-22 10:01:" + String.format("%02d", i % 60)
+                                                          + ".000 ERROR 42 --- [ timer://tick] route1 : Failed to call the API"));
+        }
+        LogTab.addFolded(entries, LogTab.parseLogLine(
+                "2026-09-22 10:02:00.001  INFO 42 --- [           main] route1 : Done"));
+
+        assertEquals(3, entries.size(), "the storm is one entry between the two others");
+        assertEquals(100, entries.get(1).repeat);
+        assertEquals("10:01:39.000", entries.get(1).time, "the entry keeps the newest timestamp");
+        assertEquals(1, entries.get(0).repeat, "a line that happened once is not a repeat");
+    }
+
+    @Test
+    void cSwitchesBetweenCompactWideAndWideCollapsed() {
+        List<LogEntry> entries = new ArrayList<>();
+        for (int i = 0; i < 17; i++) {
+            entries.add(LogTab.parseLogLine("2026-11-08 10:00:" + String.format("%02d", i)
+                                            + ".000  INFO 42 --- [ - timer://java] route1 : Hello World"));
+        }
+        LogTab tab = new LogTab(ctx);
+        tab.setEntriesForTesting(entries);
+
+        // compact: the short heading, and the same line in a row is one line with a count
+        assertEquals(LogTab.View.COMPACT, tab.view());
+        String compact = TuiTestHelper.renderToString(tab, 140, 30);
+        assertTrue(compact.contains("10:00:16.000  INFO route1") && compact.contains("Hello World  (x17)"), compact);
+        assertTrue(footer(tab).contains("view [compact]"), footer(tab));
+
+        // wide: every line as logged, one by one
+        tab.handleKeyEvent(KeyEvent.ofChar('c'));
+        String wide = TuiTestHelper.renderToString(tab, 140, 30);
+        assertTrue(wide.contains("2026-11-08 10:00:00.000  INFO 42 --- [ - timer://java] route1 : Hello World"), wide);
+        assertTrue(wide.contains("2026-11-08 10:00:16.000"), wide);
+        assertFalse(wide.contains("(x"), wide);
+        assertTrue(footer(tab).contains("view [wide]"), footer(tab));
+
+        // wide and collapsed: the line as logged, with the repeats collapsed
+        tab.handleKeyEvent(KeyEvent.ofChar('c'));
+        String collapsed = TuiTestHelper.renderToString(tab, 140, 30);
+        assertTrue(collapsed.contains("2026-11-08 10:00:16.000  INFO 42 --- [ - timer://java] route1 : Hello World  (x17)"),
+                collapsed);
+        assertFalse(collapsed.contains("2026-11-08 10:00:00.000"), collapsed);
+        assertTrue(footer(tab).contains("view [wide, collapsed]"), footer(tab));
+
+        tab.handleKeyEvent(KeyEvent.ofChar('c'));
+        assertEquals(LogTab.View.COMPACT, tab.view());
+    }
+
+    @Test
+    void spacePausesAndResumesWithTheBadgeOfTheTimeline() {
+        List<LogEntry> entries = new ArrayList<>();
+        for (int i = 0; i < 40; i++) {
+            entries.add(LogTab.parseLogLine("2026-11-11 10:00:" + String.format("%02d", i)
+                                            + ".000  INFO 42 --- [main] route1 : Line " + i));
+        }
+        LogTab tab = new LogTab(ctx);
+        tab.setEntriesForTesting(entries);
+
+        String live = TuiTestHelper.renderToString(tab, 140, 12);
+        assertTrue(live.contains("● live"), live);
+        assertTrue(footer(tab).matches(".*Space +pause.*"), footer(tab));
+
+        // CAMEL-26864: Space pauses, as on the Timeline; the badge says so, not only the footer
+        assertTrue(tab.handleKeyEvent(KeyEvent.ofChar(' ')));
+        String paused = TuiTestHelper.renderToString(tab, 140, 12);
+        assertTrue(paused.contains("‖ PAUSED") && !paused.contains("● live"), paused);
+        assertTrue(footer(tab).matches(".*Space +resume.*"), footer(tab));
+
+        tab.pageUp();
+        String above = TuiTestHelper.renderToString(tab, 140, 12);
+        assertTrue(above.contains("‖ PAUSED, more below"), above);
+
+        // End (and f) still resume
+        tab.handleKeyEvent(KeyEvent.ofKey(KeyCode.END));
+        String resumed = TuiTestHelper.renderToString(tab, 140, 12);
+        assertTrue(resumed.contains("● live") && resumed.contains("Line 39"), resumed);
+    }
+
+    private static String footer(LogTab tab) {
+        List<Span> spans = new ArrayList<>();
+        tab.renderFooter(spans);
+        return spans.stream().map(Span::content).reduce("", String::concat);
+    }
+
+    @Test
+    void switchingTheViewKeepsTheLineAtTheTop() {
+        List<LogEntry> lines = new ArrayList<>();
+        lines.add(LogTab.parseLogLine("2026-11-08 10:00:00.000  INFO 42 --- [main] route1 : Started"));
+        for (int i = 0; i < 5; i++) {
+            lines.add(LogTab.parseLogLine("2026-11-08 10:00:0" + (i + 1) + ".000  INFO 42 --- [main] route1 : Hello"));
+        }
+        lines.add(LogTab.parseLogLine("2026-11-08 10:00:07.000  INFO 42 --- [main] route1 : Done"));
+        List<LogEntry> shown = LogTab.fold(lines);
+
+        assertEquals(3, shown.size());
+        assertEquals(1, shown.get(1).line, "the folded entry starts at the first of its lines");
+        assertEquals(1, lines.get(3).repeat, "the lines read stay one by one");
+        // line 4 (a Hello) is in the folded entry 1, and line 6 (Done) is entry 2
+        assertEquals(1, LogTab.shownIndexOf(shown, 4, true));
+        assertEquals(2, LogTab.shownIndexOf(shown, 6, true));
+        assertEquals(4, LogTab.shownIndexOf(lines, 4, false));
+    }
+
+    @Test
+    void theCompactViewShowsTimeLevelLoggerAndMessage() {
+        LogEntry entry = LogTab.parseLogLine("2026-10-01 17:24:30.257  INFO 85013 --- [ntloop-thread-0]"
+                                             + " tform.http.vertx.VertxPlatformHttpServer : Vert.x HttpServer started on 0.0.0.0:8080");
+        String text = LogTab.compactLine(entry).spans().stream().map(Span::content).reduce("", String::concat);
+        assertEquals("17:24:30.257  INFO VertxPlatformHttpServer  Vert.x HttpServer started on 0.0.0.0:8080", text);
+    }
+
+    @Test
+    void renderNoSelectionShowsPrompt() {
+        ctx.selectedPid = null;
+        LogTab tab = new LogTab(ctx);
+        String rendered = TuiTestHelper.renderToString(tab, 120, 20);
+        assertTrue(rendered.contains("No integration selected") || rendered.contains("Select an integration"),
+                "Should show selection prompt when no integration selected");
+    }
+
+    @Test
+    void renderShowsBlockTitle() {
+        LogTab tab = new LogTab(ctx);
+        String rendered = TuiTestHelper.renderToString(tab, 120, 20);
+        assertTrue(rendered.contains("Log"), "Should show Log in the block title");
+    }
+
+    @Test
+    void theTitleNamesTheIntegrationAndItsLogLevel() {
+        info.rootLogLevel = "INFO";
+        LogTab tab = new LogTab(ctx);
+        String rendered = TuiTestHelper.renderToString(tab, 120, 20);
+        assertTrue(rendered.contains("[test-app] Log level: INFO"), rendered);
+    }
+
+    @Test
+    void renderShowsLoadingOrEmpty() {
+        LogTab tab = new LogTab(ctx);
+        String rendered = TuiTestHelper.renderToString(tab, 120, 20);
+        assertTrue(rendered.contains("Loading") || rendered.contains("Log"),
+                "Should show loading state or Log title");
+    }
+
+    @Test
+    void followingWithWordWrapShowsTheNewestLineAfterAStackTrace() {
+        List<LogEntry> entries = new ArrayList<>();
+        entries.add(LogTab.parseLogLine(
+                "2026-10-05 20:14:58.101 ERROR 33838 --- [mer://inventory] o.a.c.p.e.DefaultErrorHandler : Failed delivery"));
+        for (int i = 0; i < 20; i++) {
+            // a stack trace line starts with a tab, and the paragraph continues it under its "at" when it wraps
+            entries.add(LogTab.parseLogLine("\tat org.apache.camel.processor.errorhandler.RedeliveryErrorHandler"
+                                            + "$RedeliveryTask.run(RedeliveryErrorHandler.java:" + (1200 + i)
+                                            + ") ~[camel-core-processor-4.23.0.jar:4.23.0]"));
+        }
+        entries.add(LogTab.parseLogLine(
+                "2026-10-05 20:14:59.906 ERROR 33838 --- [mer://inventory] orders.camel.yaml:44 : The newest line"));
+        LogTab tab = new LogTab(ctx);
+        tab.setEntriesForTesting(entries);
+
+        String rendered = TuiTestHelper.renderToString(tab, 83, 20);
+
+        assertTrue(rendered.contains("The newest line"), rendered);
+    }
+
+    @Test
+    void followingWithWordWrapShowsTheNewestLine() {
+        List<LogEntry> entries = new ArrayList<>();
+        for (int i = 0; i < 40; i++) {
+            // long continuation lines that wrap to two rows each
+            entries.add(LogTab.parseLogLine("orders.camel.yaml:" + i + "   orders/to" + i + "   "
+                                            + "to[direct:big-orders] ".repeat(8)));
+        }
+        entries.add(LogTab.parseLogLine(
+                "2026-10-05 20:14:59.906 ERROR 33838 --- [mer://inventory] orders.camel.yaml:44 : The newest line"));
+        LogTab tab = new LogTab(ctx);
+        tab.setEntriesForTesting(entries);
+
+        String rendered = TuiTestHelper.renderToString(tab, 120, 20);
+
+        assertTrue(rendered.contains("The newest line"), rendered);
+    }
+
+    @Test
+    void scrollingSidewaysShiftsPlainLines() {
+        LogTab tab = new LogTab(ctx);
+        tab.setEntriesForTesting(List.of(LogTab.parseLogLine("0123456789abcdefghijklmnopqrstuvwxyz0123456789abcdef")));
+        tab.handleKeyEvent(KeyEvent.ofChar('w'));
+        tab.handleKeyEvent(KeyEvent.ofKey(KeyCode.RIGHT));
+
+        Buffer buffer = render(tab, 30, 6);
+
+        assertTrue(rowText(buffer, 1).startsWith("456789abcdef"), rowText(buffer, 1));
+    }
+
+    @Test
+    void scrollingSidewaysKeepsTheColorsOfCompactLines() {
+        LogTab tab = new LogTab(ctx);
+        tab.setEntriesForTesting(List.of(LogTab.parseLogLine("2026-10-01 17:24:30.257 ERROR 85013 --- [main]"
+                                                             + " org.foo.MyLogger : Something failed with a message long enough to scroll")));
+        tab.handleKeyEvent(KeyEvent.ofChar('w'));
+        tab.handleKeyEvent(KeyEvent.ofKey(KeyCode.RIGHT));
+
+        Buffer buffer = render(tab, 40, 6);
+
+        // "17:24:30.257 ERROR MyLogger ..." without its first 4 columns
+        String row = rowText(buffer, 1);
+        assertTrue(row.startsWith("4:30.257 ERROR"), row);
+        assertEquals(Theme.error().fg(), buffer.get(1 + row.indexOf("ERROR"), 1).style().fg());
+    }
+
+    private static Buffer render(LogTab tab, int width, int height) {
+        Rect area = new Rect(0, 0, width, height);
+        Buffer buffer = Buffer.empty(area);
+        tab.render(Frame.forTesting(buffer), area);
+        return buffer;
+    }
+
+    /** The text inside the border of the given row. */
+    private static String rowText(Buffer buffer, int y) {
+        StringBuilder sb = new StringBuilder();
+        for (int x = 1; x < buffer.width() - 1; x++) {
+            sb.append(buffer.get(x, y).symbol());
+        }
+        return sb.toString();
+    }
+
+    @Test
+    void shiftF8WithDifferentErrorsOnTheScreenShowsThePickList() {
+        ctx.askAiCallback = (file, line, problem, text) -> {
+        };
+        List<LogEntry> entries = new ArrayList<>();
+        for (String line : List.of(
+                "2026-10-05 20:14:57.676 ERROR 33838 --- [timer://billing] ocessor.errorhandler.DefaultErrorHandler : "
+                                   + "Failed delivery for (MessageId: 4E93-1). Exhausted after delivery attempt: 1",
+                "Message History",
+                "orders.camel.yaml:34                     billing/throwException2        throwException[]",
+                "Stacktrace",
+                "java.lang.IllegalStateException: No account for customer 42",
+                "\tat org.apache.camel.processor.ThrowExceptionProcessor.process(ThrowExceptionProcessor.java:68)",
+                "2026-10-05 20:14:59.906 ERROR 33838 --- [mer://inventory] orders.camel.yaml:44                     : "
+                                                                                                                    + "Stock is low for item 7")) {
+            entries.add(LogTab.parseLogLine(line));
+        }
+        LogTab tab = new LogTab(ctx);
+        tab.setEntriesForTesting(entries);
+        TuiTestHelper.renderToString(tab, 120, 20);
+
+        tab.handleKeyEvent(KeyEvent.ofKey(KeyCode.F8, KeyModifiers.SHIFT));
+        String rendered = TuiTestHelper.renderToString(tab, 120, 20);
+
+        assertTrue(rendered.contains("which ERROR"), rendered);
+        assertTrue(rendered.contains("Stock is low for item 7"), rendered);
+        assertTrue(rendered.contains("IllegalStateException: No account for customer 42"), rendered);
+    }
+
+    @Test
+    void theFixWithAiHintIsWithTheFKeysWhenAnErrorIsOnTheScreen() {
+        ctx.askAiCallback = (file, line, problem, text) -> {
+        };
+        LogTab tab = new LogTab(ctx);
+        tab.setEntriesForTesting(List.of(
+                LogTab.parseLogLine("2026-10-05 21:10:20.969  INFO 1 --- [ timer://orders] orders.camel.yaml:18 : Order 12"),
+                LogTab.parseLogLine(
+                        "2026-10-05 21:10:25.025 ERROR 1 --- [mer://inventory] orders.camel.yaml:43 : Stock is low")));
+        TuiTestHelper.renderToString(tab, 120, 20);
+
+        List<Span> spans = new ArrayList<>();
+        tab.renderFKeyHints(spans);
+        String hints = spans.stream().map(Span::content).reduce("", String::concat);
+        assertTrue(hints.contains("Shift+F8"), hints);
+    }
+
+    @Test
+    void renderFooterHints() {
+        LogTab tab = new LogTab(ctx);
+        List<Span> footerSpans = new ArrayList<>();
+        tab.renderFooter(footerSpans);
+        String footer = footerSpans.stream().map(Span::content).reduce("", String::concat);
+        assertTrue(footer.contains("find") || footer.contains("/"),
+                "Footer should contain find hint");
+    }
+
+}

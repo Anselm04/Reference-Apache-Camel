@@ -1,0 +1,626 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.camel.component.stream;
+
+import java.io.BufferedReader;
+import java.io.File;
+import java.io.FileInputStream;
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.InputStreamReader;
+import java.net.HttpURLConnection;
+import java.net.URI;
+import java.net.URLConnection;
+import java.nio.charset.Charset;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.List;
+import java.util.Map;
+import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.ExecutorService;
+import java.util.stream.Stream;
+
+import org.apache.camel.Exchange;
+import org.apache.camel.Processor;
+import org.apache.camel.support.DefaultConsumer;
+import org.apache.camel.support.service.ServiceHelper;
+import org.apache.camel.util.FileUtil;
+import org.apache.camel.util.IOHelper;
+import org.apache.camel.util.StringHelper;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+/**
+ * Consumer that can read from streams
+ */
+public class StreamConsumer extends DefaultConsumer implements Runnable {
+
+    private static final Logger LOG = LoggerFactory.getLogger(StreamConsumer.class);
+
+    private static final String TYPES = "in,file,http";
+    private static final String INVALID_URI = "Invalid uri, valid form: 'stream:{" + TYPES + "}'";
+    private static final List<String> TYPES_LIST = Arrays.asList(TYPES.split(","));
+    // the least time to wait before the stream is opened again after it could not be opened or read when scanning
+    private static final long SCAN_FAILURE_DELAY = 1000;
+    private ExecutorService executor;
+    private FileWatcherStrategy fileWatcher;
+    private volatile boolean watchFileChanged;
+    private volatile InputStream inputStream = System.in;
+    private volatile InputStream inputStreamToClose;
+    private volatile URLConnection urlConnectionToClose;
+    private volatile File file;
+    private StreamEndpoint endpoint;
+    private String uri;
+    private volatile boolean initialPromptDone;
+    private volatile boolean streamOpenedOnStart;
+    private final List<String> lines = new CopyOnWriteArrayList<>();
+    // the failures in a row to open or read a scanned stream (reset once data is read again), and whether the scan
+    // must wait before it opens the stream again, only used by the thread that reads
+    private int scanFailures;
+    private boolean scanFailedBeforeSleep;
+
+    public StreamConsumer(StreamEndpoint endpoint, Processor processor, String uri) throws Exception {
+        super(endpoint, processor);
+        this.endpoint = endpoint;
+        this.uri = uri;
+        validateUri(uri);
+    }
+
+    @Override
+    protected void doStart() throws Exception {
+        super.doStart();
+
+        // use file watch service if we read from file
+        if (endpoint.isFileWatcher()) {
+            String dir = new File(endpoint.getFileName()).getParent();
+            fileWatcher = new FileWatcherStrategy(dir, file -> {
+                String onlyName = file.getName();
+                String target = FileUtil.stripPath(endpoint.getFileName());
+                LOG.trace("File changed: {}", onlyName);
+                if (onlyName.equals(target)) {
+                    // file is changed
+                    watchFileChanged = true;
+                }
+            });
+            fileWatcher.setCamelContext(getEndpoint().getCamelContext());
+        }
+        ServiceHelper.startService(fileWatcher);
+
+        // if we scan the stream we are lenient and can wait for the stream to be available later
+        if (!endpoint.isScanStream()) {
+            // open the stream here so a missing file or URL fails the start, and let run use this stream
+            openStream();
+            streamOpenedOnStart = true;
+        }
+
+        scanFailures = 0;
+        scanFailedBeforeSleep = false;
+        executor = endpoint.getCamelContext().getExecutorServiceManager().newSingleThreadExecutor(this,
+                endpoint.getEndpointUri());
+        executor.execute(this);
+
+        if (endpoint.getGroupLines() < 0) {
+            throw new IllegalArgumentException(
+                    "Option groupLines must be 0 or positive number, was " + endpoint.getGroupLines());
+        }
+    }
+
+    @Override
+    public void doStop() throws Exception {
+        if (executor != null) {
+            endpoint.getCamelContext().getExecutorServiceManager().shutdownNow(executor);
+            executor = null;
+        }
+        ServiceHelper.stopAndShutdownService(fileWatcher);
+        lines.clear();
+
+        streamOpenedOnStart = false;
+        IOHelper.close(inputStreamToClose);
+        if (urlConnectionToClose != null) {
+            closeURLConnection(urlConnectionToClose);
+            urlConnectionToClose = null;
+        }
+        super.doStop();
+    }
+
+    @Override
+    public void run() {
+        try {
+            if (endpoint.isReadLine()) {
+                readFromStreamLineMode();
+            } else {
+                readFromStreamRawMode();
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        } catch (Exception e) {
+            getExceptionHandler().handleException(e);
+        }
+    }
+
+    private void openStream() throws Exception {
+        if (streamOpenedOnStart) {
+            // use the stream doStart opened, so the file or URL is opened (and requested) only once
+            streamOpenedOnStart = false;
+            return;
+        }
+
+        // close old stream, before obtaining a new stream
+        IOHelper.close(inputStreamToClose);
+        if (urlConnectionToClose != null) {
+            closeURLConnection(urlConnectionToClose);
+        }
+
+        if ("in".equals(uri)) {
+            inputStream = System.in;
+            // do not close regular inputStream as it may be System.in etc.
+            inputStreamToClose = null;
+        } else if ("file".equals(uri)) {
+            inputStream = resolveStreamFromFile();
+            inputStreamToClose = inputStream;
+        } else if ("http".equals(uri)) {
+            inputStream = resolveStreamFromUrl();
+            inputStreamToClose = inputStream;
+        }
+    }
+
+    private BufferedReader initializeStreamLineMode() throws Exception {
+        openStream();
+
+        if (inputStream != null) {
+            if ("http".equals(uri)) {
+                // read as-is
+                return IOHelper.buffered(new InputStreamReader(inputStream));
+            } else {
+                Charset charset = endpoint.getCharset();
+                return IOHelper.buffered(new InputStreamReader(inputStream, charset));
+            }
+        } else {
+            return null;
+        }
+    }
+
+    private InputStream initializeStreamRawMode() throws Exception {
+        openStream();
+        return inputStream;
+    }
+
+    private void readFromStreamRawMode() throws Exception {
+        long index = 0;
+
+        if (endpoint.isScanStream()) {
+            InputStream is = openScannedStream(this::initializeStreamRawMode);
+            // repeat scanning from stream
+            while (isRunAllowed()) {
+
+                byte[] data = null;
+                if (is != null) {
+                    try {
+                        data = is.readAllBytes();
+                    } catch (IOException e) {
+                        // such as an HTTP connection that is lost: the stream ends here, and is opened again (retry)
+                        scanFailed("Cannot read from the stream", e);
+                        is = null;
+                    }
+                }
+                boolean eos = data == null || data.length == 0;
+                if (!eos) {
+                    scanRecovered();
+                }
+
+                if (!eos && isRunAllowed()) {
+                    // a scanned stream is never complete
+                    index = processRaw(data, index, false);
+                } else if (eos && isRunAllowed() && endpoint.isRetry() && !scanFailedBeforeSleep) {
+                    // not right after a failure: then the stream is opened again after the sleep below
+                    boolean reOpen = true;
+                    if (endpoint.isFileWatcher()) {
+                        reOpen = watchFileChanged;
+                    }
+                    if (reOpen) {
+                        LOG.debug("File: {} changed/rollover, re-reading file from beginning", file);
+                        is = openScannedStream(this::initializeStreamRawMode);
+                        // we have re-initialized the stream so lower changed flag
+                        if (endpoint.isFileWatcher()) {
+                            watchFileChanged = false;
+                        }
+                    } else {
+                        LOG.trace("File: {} not changed since last read", file);
+                    }
+                }
+
+                // sleep only if there is no input
+                if (eos && !sleepBeforeNextScan()) {
+                    break;
+                }
+            }
+        } else {
+            InputStream is = initializeStreamRawMode();
+            // regular read stream once until end of stream
+            boolean eos = false;
+            while (!eos && isRunAllowed()) {
+                if (endpoint.getPromptMessage() != null) {
+                    doPromptMessage();
+                }
+
+                byte[] data = null;
+                try {
+                    data = is.readAllBytes();
+                } catch (IOException e) {
+                    // ignore
+                }
+                eos = data == null || data.length == 0;
+                if (!eos) {
+                    index = processRaw(data, index);
+                }
+            }
+        }
+    }
+
+    private void readFromStreamLineMode() throws Exception {
+        long index = 0;
+        String line;
+
+        if (endpoint.isScanStream()) {
+            BufferedReader br = openScannedStream(this::initializeStreamLineMode);
+            // repeat scanning from stream
+            while (isRunAllowed()) {
+                if (br != null) {
+                    try {
+                        line = br.readLine();
+                        LOG.trace("Read line: {}", line);
+                        if (line != null) {
+                            scanRecovered();
+                        }
+                    } catch (IOException e) {
+                        // such as an HTTP connection that is lost: the stream ends here, and is opened again (retry)
+                        scanFailed("Cannot read from the stream", e);
+                        br = null;
+                        line = null;
+                    }
+                } else {
+                    line = null;
+                }
+                boolean eos = line == null;
+                if (!eos && isRunAllowed()) {
+                    index = processLine(line, false, index);
+                } else if (eos && isRunAllowed() && endpoint.isRetry() && !scanFailedBeforeSleep) {
+                    // not right after a failure: then the stream is opened again after the sleep below
+                    boolean reOpen = true;
+                    if (endpoint.isFileWatcher()) {
+                        reOpen = watchFileChanged;
+                    }
+                    if (reOpen) {
+                        LOG.debug("File: {} changed/rollover, re-reading file from beginning", file);
+                        br = openScannedStream(this::initializeStreamLineMode);
+                        // we have re-initialized the stream so lower changed flag
+                        if (endpoint.isFileWatcher()) {
+                            watchFileChanged = false;
+                        }
+                    } else {
+                        LOG.trace("File: {} not changed since last read", file);
+                    }
+                }
+
+                // sleep only if there is no input
+                if (eos && !sleepBeforeNextScan()) {
+                    break;
+                }
+            }
+        } else {
+            BufferedReader br = initializeStreamLineMode();
+            // regular read stream once until end of stream
+            boolean eos = false;
+            String line2 = null;
+            while (!eos && isRunAllowed()) {
+                if (endpoint.getPromptMessage() != null) {
+                    doPromptMessage();
+                }
+
+                if (line2 == null) {
+                    line = br.readLine();
+                } else {
+                    line = line2;
+                }
+                LOG.trace("Read line: {}", line);
+
+                eos = line == null;
+                if (!eos && isRunAllowed()) {
+                    // read ahead if there is more data
+                    line2 = readAhead(br);
+                    boolean last = line2 == null;
+                    index = processLine(line, last, index);
+                }
+            }
+            // EOL so trigger any
+            processLine(null, true, index);
+        }
+        // important: do not close the reader as it will close the standard system.in etc.
+    }
+
+    /**
+     * Opens the scanned stream. A stream that cannot be opened (such as an HTTP server that cannot be reached) is
+     * reported and gives null, as a file that does not exist yet does: the scan opens it again later (retry) instead of
+     * ending, which would leave the consumer started without reading anything.
+     */
+    private <T> T openScannedStream(ScannedStreamOpener<T> opener) throws InterruptedException {
+        try {
+            return opener.open();
+        } catch (InterruptedException e) {
+            throw e;
+        } catch (Exception e) {
+            scanFailed("Cannot open the stream", e);
+            return null;
+        }
+    }
+
+    private void scanFailed(String message, Exception cause) {
+        if (!isRunAllowed()) {
+            // stopping: the stream was closed by the stop
+            return;
+        }
+        scanFailures++;
+        scanFailedBeforeSleep = true;
+        // the stream is opened again only with the retry option, as at the end of the stream
+        String next = endpoint.isRetry() ? ", it is opened again" : ", set the retry option to open it again";
+        if (scanFailures == 1) {
+            getExceptionHandler().handleException(message + " of " + endpoint + next, cause);
+        } else {
+            LOG.debug("{} of {} ({} times in a row){}", message, endpoint, scanFailures, next, cause);
+        }
+    }
+
+    /**
+     * Data was read from the scanned stream: a failure after this is the first one in a row again. The counter is not
+     * reset when the stream is opened, as a server that answers and then drops the connection before any data every
+     * time would otherwise report every failure to the exception handler.
+     */
+    private void scanRecovered() {
+        if (scanFailures > 0) {
+            LOG.info("Reading from the stream of {} again after {} failed attempts", endpoint, scanFailures);
+            scanFailures = 0;
+        }
+    }
+
+    /**
+     * Waits before the next scan of the stream: the scan stream delay, and at least one second after the stream could
+     * not be opened or read, so that a server that is down is not asked in a loop. Without retry a stream that failed
+     * is not opened again, and the scan keeps waiting at least one second until it is stopped.
+     *
+     * @return false if interrupted (the consumer is stopping)
+     */
+    private boolean sleepBeforeNextScan() {
+        long delay = endpoint.getScanStreamDelay();
+        if (scanFailedBeforeSleep || scanFailures > 0 && !endpoint.isRetry()) {
+            delay = Math.max(delay, SCAN_FAILURE_DELAY);
+            scanFailedBeforeSleep = false;
+        }
+        try {
+            Thread.sleep(delay);
+            return true;
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return false;
+        }
+    }
+
+    @FunctionalInterface
+    private interface ScannedStreamOpener<T> {
+        T open() throws Exception;
+    }
+
+    /**
+     * Strategy method for processing the line
+     */
+    protected long processLine(String line, boolean last, long index) throws Exception {
+        lock.lock();
+        try {
+            if (endpoint.getGroupLines() > 0) {
+                // remember line
+                if (line != null) {
+                    lines.add(line);
+                }
+
+                // should we flush lines?
+                if (!lines.isEmpty() && (lines.size() >= endpoint.getGroupLines() || last)) {
+                    // spit out lines as we hit the size, or it was the last
+                    List<String> copy = new ArrayList<>(lines);
+                    Object body = endpoint.getGroupStrategy().groupLines(copy);
+                    // remember to inc index when we create an exchange
+                    Exchange exchange = createExchange(body, index++, last);
+
+                    // clear lines
+                    lines.clear();
+
+                    getProcessor().process(exchange);
+                }
+            } else if (line != null) {
+                // single line
+                // remember to inc index when we create an exchange
+                Exchange exchange = createExchange(line, index++, last);
+                getProcessor().process(exchange);
+            }
+
+            return index;
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    /**
+     * Strategy method for processing the data
+     */
+    protected long processRaw(byte[] body, long index) throws Exception {
+        return processRaw(body, index, true);
+    }
+
+    /**
+     * Strategy method for processing the data. last tells whether this is the last exchange of the stream; it is false
+     * for each scan of a scanned stream, which is never complete.
+     */
+    protected long processRaw(byte[] body, long index, boolean last) throws Exception {
+        lock.lock();
+        try {
+            Exchange exchange = createExchange(body, index++, last);
+            getProcessor().process(exchange);
+            return index;
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    /**
+     * Strategy method for prompting the prompt message
+     */
+    protected void doPromptMessage() {
+        long delay = 0;
+
+        if (!initialPromptDone && endpoint.getInitialPromptDelay() > 0) {
+            initialPromptDone = true;
+            delay = endpoint.getInitialPromptDelay();
+        } else if (endpoint.getPromptDelay() > 0) {
+            delay = endpoint.getPromptDelay();
+        }
+
+        if (delay > 0) {
+            try {
+                Thread.sleep(delay);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+        }
+        if (inputStream == System.in) {
+            System.out.print(endpoint.getPromptMessage());
+        }
+    }
+
+    private String readAhead(BufferedReader br) throws IOException {
+        if (uri.equals("in")) {
+            // do not read ahead with reading from system in
+            return null;
+        } else {
+            return br.readLine();
+        }
+    }
+
+    private InputStream resolveStreamFromFile() throws IOException {
+        String fileName = endpoint.getFileName();
+        StringHelper.notEmpty(fileName, "fileName");
+
+        FileInputStream fileStream;
+
+        file = new File(fileName);
+
+        if (LOG.isDebugEnabled()) {
+            LOG.debug("File to be scanned: {}, path: {}", file.getName(), file.getAbsolutePath());
+        }
+
+        if (file.canRead()) {
+            fileStream = new FileInputStream(file);
+        } else if (endpoint.isScanStream()) {
+            // if we scan the stream then it may not be available and we should return null
+            fileStream = null;
+        } else {
+            throw new IllegalArgumentException(INVALID_URI);
+        }
+
+        return fileStream;
+    }
+
+    /**
+     * From a comma-separated list of headers in the format of "FIELD=VALUE" or "FIELD:VALUE", split on the commas and
+     * split on the separator to create a stream of Map.Entry values while filtering out invalid combinations
+     *
+     * @param  headerList A string containing a comma-separated list of headers
+     * @return            A Stream of Map.Entry items which can then be added as headers to a URLConnection
+     */
+    Stream<Map.Entry<String, String>> parseHeaders(String headerList) {
+        return Arrays.asList(headerList.split(","))
+                .stream()
+                .map(s -> s.split("[=:]"))
+                .filter(h -> h.length == 2)
+                .map(h -> Map.entry(h[0].trim(), h[1].trim()));
+    }
+
+    private InputStream resolveStreamFromUrl() throws IOException {
+        String url = endpoint.getHttpUrl();
+        StringHelper.notEmpty(url, "httpUrl");
+
+        urlConnectionToClose = URI.create(url).toURL().openConnection();
+        urlConnectionToClose.setUseCaches(false);
+        String headers = endpoint.getHttpHeaders();
+        if (headers != null) {
+            parseHeaders(headers)
+                    .forEach(e -> urlConnectionToClose.setRequestProperty(e.getKey(), e.getValue()));
+        }
+
+        InputStream is;
+
+        try {
+            is = urlConnectionToClose.getInputStream();
+        } catch (IOException e) {
+            // close the http connection to avoid
+            // leaking gaps in case of an exception
+            if (urlConnectionToClose instanceof HttpURLConnection httpURLConnection) {
+                httpURLConnection.disconnect();
+            }
+            throw e;
+        }
+
+        return is;
+    }
+
+    private void validateUri(String uri) throws IllegalArgumentException {
+        String[] s = uri.split(":");
+        if (s.length < 2) {
+            throw new IllegalArgumentException(INVALID_URI);
+        }
+        String[] t = s[1].split("\\?");
+
+        if (t.length < 1) {
+            throw new IllegalArgumentException(INVALID_URI);
+        }
+
+        this.uri = t[0].trim();
+        if (this.uri.startsWith("//")) {
+            this.uri = this.uri.substring(2);
+        }
+
+        if (!TYPES_LIST.contains(this.uri)) {
+            throw new IllegalArgumentException(INVALID_URI);
+        }
+    }
+
+    protected Exchange createExchange(Object body, long index, boolean last) {
+        Exchange exchange = createExchange(true);
+        exchange.getIn().setBody(body);
+        exchange.getIn().setHeader(StreamConstants.STREAM_INDEX, index);
+        exchange.getIn().setHeader(StreamConstants.STREAM_COMPLETE, last);
+        return exchange;
+    }
+
+    private static void closeURLConnection(URLConnection con) {
+        if (con instanceof HttpURLConnection httpURLConnection) {
+            try {
+                httpURLConnection.disconnect();
+            } catch (Exception e) {
+                // ignore
+            }
+        }
+    }
+
+}

@@ -1,0 +1,177 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.camel.dsl.jbang.core.commands.process;
+
+import java.awt.*;
+import java.lang.reflect.Method;
+import java.net.URI;
+import java.util.concurrent.CountDownLatch;
+
+import org.aesh.command.CommandDefinition;
+import org.aesh.command.option.Argument;
+import org.aesh.command.option.Option;
+import org.apache.camel.dsl.jbang.core.commands.CamelCommand;
+import org.apache.camel.dsl.jbang.core.common.EnvironmentHelper;
+import org.apache.camel.dsl.jbang.run.common.HawtioVersion;
+import org.apache.camel.main.download.DependencyDownloaderClassLoader;
+import org.apache.camel.main.download.MavenDependencyDownloader;
+import org.apache.camel.support.ObjectHelper;
+import org.apache.camel.tooling.maven.MavenArtifact;
+
+@CommandDefinition(name = "hawtio", description = "Launch Hawtio web console", generateHelp = true,
+                   footer = {
+                           "Examples:",
+                           "  camel hawtio",
+                           "  camel hawtio --port=8090" })
+public class Hawtio extends CamelCommand {
+
+    @Argument(description = "Name or pid of running Camel integration")
+    String name;
+
+    @Option(name = "version", description = "Version of the Hawtio web console", defaultValue = HawtioVersion.HAWTIO_VERSION)
+    String version = HawtioVersion.HAWTIO_VERSION;
+
+    @Option(name = "host", description = "Hostname to bind the Hawtio web console to", defaultValue = "127.0.0.1")
+    String host = "127.0.0.1";
+
+    // use port 8888 as 8080 is too commonly used
+    @Option(name = "port", description = "Port number to use for Hawtio web console (port 8888 by default)",
+            defaultValue = "8888")
+    int port = 8888;
+
+    @Option(name = "open-url", aliases = { "openUrl" }, hasValue = false,
+            description = "To automatic open Hawtio web console in the web browser (without an interactive"
+                          + " terminal the default is false)",
+            defaultValue = "true")
+    boolean openUrl = true;
+
+    private final CountDownLatch shutdownLatch = new CountDownLatch(1);
+    private volatile long pid;
+
+    @Override
+    public Integer doCall() throws Exception {
+        if (openUrl && !isOptionGiven("--open-url") && !EnvironmentHelper.isInteractiveTerminal()) {
+            // a script or an AI agent has no use for a browser window
+            openUrl = false;
+        }
+        int exit;
+        if (name == null) {
+            exit = callHawtio();
+        } else {
+            // attach jolokia before calling hawtio and disconnect afterward
+            try {
+                exit = connectJolokia();
+                if (exit == 0) {
+                    exit = callHawtio();
+                }
+            } finally {
+                if (pid != 0) {
+                    disconnectJolokia();
+                }
+            }
+        }
+        return exit;
+    }
+
+    protected Integer connectJolokia() throws Exception {
+        Jolokia jolokia = getMain().command(new Jolokia());
+        jolokia.name = name;
+        int exit = jolokia.call();
+        this.pid = jolokia.getPid();
+        return exit;
+    }
+
+    protected void disconnectJolokia() throws Exception {
+        Jolokia jolokia = getMain().command(new Jolokia());
+        jolokia.name = Long.toString(pid);
+        jolokia.stop = true;
+        jolokia.call();
+    }
+
+    protected Integer callHawtio() throws Exception {
+        try (MavenDependencyDownloader downloader = new MavenDependencyDownloader()) {
+            ClassLoader cl = createClassLoader();
+            downloader.setClassLoader(cl);
+            downloader.start();
+            // download hawtio embedded mode
+            downloader.downloadDependency("io.hawt", "hawtio-embedded", version);
+            // download war that has the web-console
+            MavenArtifact ma = downloader.downloadArtifact("io.hawt", "hawtio-war:war", version);
+            if (ma == null) {
+                printer().printErr("Cannot download io.hawt:hawtio-war:war:" + version);
+                return 1;
+            }
+            String war = ma.getFile().getAbsolutePath();
+            // invoke hawtio main app that launches hawtio
+            try {
+                // turn off hawito auth
+                System.setProperty("hawtio.authenticationEnabled", "false");
+
+                // use CL from that has the downloaded JAR
+                Thread.currentThread().setContextClassLoader(cl);
+                Class<?> clazz = cl.loadClass("io.hawt.embedded.Main");
+                Object hawt = clazz.getDeclaredConstructor().newInstance();
+                Method m = clazz.getMethod("setWar", String.class);
+                ObjectHelper.invokeMethod(m, hawt, war);
+                m = clazz.getMethod("setHost", String.class);
+                ObjectHelper.invokeMethod(m, hawt, host);
+                m = clazz.getMethod("setPort", Integer.class);
+                ObjectHelper.invokeMethod(m, hawt, port);
+                m = clazz.getMethod("run");
+                ObjectHelper.invokeMethod(m, hawt);
+
+                String url = "http://" + host + ":" + port + "/hawtio";
+                if (openUrl) {
+                    // open web browser
+                    System.setProperty("hawtio.url", url);
+                    if (Desktop.isDesktopSupported()) {
+                        try {
+                            Desktop.getDesktop().browse(new URI(url));
+                        } catch (Exception e) {
+                            printer().printErr("Failed to open browser session, to access Hawtio open url: " + url);
+                        }
+                    }
+                } else {
+                    printer().println("Hawtio web console is running at: " + url);
+                }
+
+                // keep JVM running
+                installHangupInterceptor();
+                shutdownLatch.await();
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                printer().printErr("Interrupted while launching Hawtio");
+                return 1;
+            } catch (Exception e) {
+                printer().printErr("Cannot launch Hawtio due to: " + e.getMessage());
+                return 1;
+            }
+        }
+
+        return 0;
+    }
+
+    private ClassLoader createClassLoader() {
+        return new DependencyDownloaderClassLoader(null);
+    }
+
+    private void installHangupInterceptor() {
+        Thread task = new Thread(shutdownLatch::countDown);
+        Runtime.getRuntime().addShutdownHook(task);
+    }
+
+}

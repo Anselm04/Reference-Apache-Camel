@@ -1,0 +1,155 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.camel.component.pulsar.utils.consumers;
+
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.List;
+import java.util.concurrent.TimeUnit;
+
+import org.apache.camel.component.pulsar.PulsarConfiguration;
+import org.apache.camel.component.pulsar.PulsarConsumer;
+import org.apache.camel.component.pulsar.PulsarEndpoint;
+import org.apache.camel.component.pulsar.PulsarMessageListener;
+import org.apache.camel.util.ObjectHelper;
+import org.apache.pulsar.client.api.Consumer;
+import org.apache.pulsar.client.api.ConsumerBuilder;
+import org.apache.pulsar.client.api.DeadLetterPolicy;
+import org.apache.pulsar.client.api.DeadLetterPolicy.DeadLetterPolicyBuilder;
+import org.apache.pulsar.client.api.KeySharedPolicy;
+import org.apache.pulsar.client.api.PulsarClientException;
+import org.apache.pulsar.client.api.SubscriptionType;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+public final class CommonCreationStrategyImpl {
+
+    private static final Logger LOGGER = LoggerFactory.getLogger(CommonCreationStrategyImpl.class);
+
+    private CommonCreationStrategyImpl() {
+    }
+
+    /**
+     * Subscribes the configured number of consumers.
+     *
+     * When one of them cannot subscribe, the consumers subscribed so far are closed and the failure is thrown. The
+     * route then fails to start, so it can be started again (for example by the supervising route controller), instead
+     * of running with fewer consumers than configured, or with none, and never subscribing the missing ones.
+     */
+    static Collection<Consumer<byte[]>> createMultipleConsumers(
+            final PulsarEndpoint pulsarEndpoint, final PulsarConsumer pulsarConsumer, final SubscriptionType subscriptionType)
+            throws PulsarClientException {
+        final PulsarConfiguration configuration = pulsarEndpoint.getPulsarConfiguration();
+        final List<Consumer<byte[]>> consumers = new ArrayList<>();
+
+        try {
+            for (int i = 0; i < configuration.getNumberOfConsumers(); i++) {
+                final String consumerName = configuration.getConsumerNamePrefix() + i;
+                consumers.add(getBuilder(consumerName, pulsarEndpoint, pulsarConsumer).subscriptionType(subscriptionType)
+                        .subscribe());
+            }
+        } catch (PulsarClientException | RuntimeException e) {
+            for (Consumer<byte[]> consumer : consumers) {
+                try {
+                    consumer.close();
+                } catch (Exception closeFailure) {
+                    LOGGER.debug("Error closing consumer {} after a failed subscribe. This exception is ignored.",
+                            consumer, closeFailure);
+                }
+            }
+            throw e;
+        }
+        return consumers;
+    }
+
+    protected static ConsumerBuilder<byte[]> getBuilder(
+            final String name, final PulsarEndpoint pulsarEndpoint, final PulsarConsumer pulsarConsumer) {
+        final PulsarConfiguration endpointConfiguration = pulsarEndpoint.getPulsarConfiguration();
+
+        ConsumerBuilder<byte[]> builder = pulsarEndpoint.getPulsarClient().newConsumer();
+        if (endpointConfiguration.getKeySharedPolicy() != null) {
+            if ("AUTO_SPLIT".equalsIgnoreCase(endpointConfiguration.getKeySharedPolicy())) {
+                builder.keySharedPolicy(KeySharedPolicy.autoSplitHashRange());
+            } else if ("STICKY".equalsIgnoreCase(endpointConfiguration.getKeySharedPolicy())) {
+                builder.keySharedPolicy(KeySharedPolicy.stickyHashRange());
+            } else {
+                throw new IllegalArgumentException(
+                        "Unsupported KeySharedPolicy: " + endpointConfiguration.getKeySharedPolicy());
+            }
+        }
+        if (endpointConfiguration.isTopicsPattern()) {
+            builder.topicsPattern(pulsarEndpoint.getUri());
+            if (endpointConfiguration.getSubscriptionTopicsMode() != null) {
+                builder.subscriptionTopicsMode(endpointConfiguration.getSubscriptionTopicsMode());
+            }
+        } else {
+            builder.topic(pulsarEndpoint.getUri());
+        }
+        builder.subscriptionName(endpointConfiguration.getSubscriptionName())
+                .receiverQueueSize(endpointConfiguration.getConsumerQueueSize()).consumerName(name)
+                .ackTimeout(endpointConfiguration.getAckTimeoutMillis(), TimeUnit.MILLISECONDS)
+                .subscriptionInitialPosition(
+                        endpointConfiguration.getSubscriptionInitialPosition().toPulsarSubscriptionInitialPosition())
+                .subscriptionMode(endpointConfiguration.getSubscriptionMode().toPulsarSubscriptionMode())
+                .acknowledgmentGroupTime(endpointConfiguration.getAckGroupTimeMillis(), TimeUnit.MILLISECONDS)
+                .negativeAckRedeliveryDelay(endpointConfiguration.getNegativeAckRedeliveryDelayMicros(), TimeUnit.MICROSECONDS)
+                .readCompacted(endpointConfiguration.isReadCompacted())
+                .enableBatchIndexAcknowledgment(endpointConfiguration.isEnableBatchIndexAcknowledgment());
+
+        if (endpointConfiguration.isMessageListener()) {
+            builder.messageListener(new PulsarMessageListener(pulsarEndpoint, pulsarConsumer));
+        }
+
+        if (endpointConfiguration.isEnableRetry()) {
+            // retry mode
+            builder.enableRetry(true);
+            // without a dead letter policy the Pulsar client uses its own (16 redeliveries and the default retry
+            // letter and dead letter topics)
+            if (endpointConfiguration.getMaxRedeliverCount() != null) {
+                DeadLetterPolicyBuilder policy = DeadLetterPolicy.builder()
+                        .maxRedeliverCount(endpointConfiguration.getMaxRedeliverCount());
+                if (endpointConfiguration.getRetryLetterTopic() != null) {
+                    policy.retryLetterTopic(endpointConfiguration.getRetryLetterTopic());
+                }
+                // without it the Pulsar client sends the messages to its default dead letter topic
+                if (endpointConfiguration.getDeadLetterTopic() != null) {
+                    policy.deadLetterTopic(endpointConfiguration.getDeadLetterTopic());
+                }
+                builder.deadLetterPolicy(policy.build());
+            }
+        } else if (endpointConfiguration.getMaxRedeliverCount() != null) {
+            // or potentially dead-letter-topic mode
+            DeadLetterPolicyBuilder policy = DeadLetterPolicy.builder()
+                    .maxRedeliverCount(endpointConfiguration.getMaxRedeliverCount());
+            if (endpointConfiguration.getDeadLetterTopic() != null) {
+                policy.deadLetterTopic(endpointConfiguration.getDeadLetterTopic());
+            }
+
+            builder.deadLetterPolicy(policy.build());
+        }
+
+        if (ObjectHelper.isNotEmpty(endpointConfiguration.getAckTimeoutRedeliveryBackoff())) {
+            builder.ackTimeoutRedeliveryBackoff(endpointConfiguration.getAckTimeoutRedeliveryBackoff());
+        }
+
+        if (ObjectHelper.isNotEmpty(endpointConfiguration.getNegativeAckRedeliveryBackoff())) {
+            builder.negativeAckRedeliveryBackoff(endpointConfiguration.getNegativeAckRedeliveryBackoff());
+        }
+
+        return builder;
+    }
+}

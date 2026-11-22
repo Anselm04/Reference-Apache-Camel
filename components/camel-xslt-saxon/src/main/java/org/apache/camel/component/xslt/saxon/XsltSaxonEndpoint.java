@@ -1,0 +1,372 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.camel.component.xslt.saxon;
+
+import java.io.IOException;
+import java.io.InputStream;
+import java.net.URI;
+import java.net.URISyntaxException;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+
+import javax.xml.XMLConstants;
+import javax.xml.parsers.ParserConfigurationException;
+import javax.xml.parsers.SAXParser;
+import javax.xml.parsers.SAXParserFactory;
+import javax.xml.transform.Source;
+import javax.xml.transform.TransformerException;
+import javax.xml.transform.TransformerFactory;
+import javax.xml.transform.sax.SAXSource;
+import javax.xml.transform.stream.StreamSource;
+
+import org.xml.sax.InputSource;
+import org.xml.sax.SAXException;
+import org.xml.sax.XMLReader;
+
+import net.sf.saxon.Configuration;
+import net.sf.saxon.TransformerFactoryImpl;
+import org.apache.camel.CamelContext;
+import org.apache.camel.Category;
+import org.apache.camel.Component;
+import org.apache.camel.Exchange;
+import org.apache.camel.api.management.ManagedAttribute;
+import org.apache.camel.api.management.ManagedResource;
+import org.apache.camel.component.xslt.TransformerFactoryConfigurationStrategy;
+import org.apache.camel.component.xslt.XsltBuilder;
+import org.apache.camel.component.xslt.XsltEndpoint;
+import org.apache.camel.spi.BodyType;
+import org.apache.camel.spi.BodyType.Carrier;
+import org.apache.camel.spi.BodyTypes;
+import org.apache.camel.spi.ClassResolver;
+import org.apache.camel.spi.Injector;
+import org.apache.camel.spi.Metadata;
+import org.apache.camel.spi.UriEndpoint;
+import org.apache.camel.spi.UriParam;
+import org.apache.camel.support.EndpointHelper;
+import org.apache.camel.support.builder.ExpressionBuilder;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+/**
+ * Transform XML payloads using an XSLT template using Saxon.
+ */
+@ManagedResource(description = "Managed XsltSaxonEndpoint")
+@UriEndpoint(firstVersion = "3.0.0", scheme = "xslt-saxon", title = "XSLT Saxon", syntax = "xslt-saxon:resourceUri",
+             remote = false, producerOnly = true, category = { Category.CORE, Category.TRANSFORMATION })
+@BodyTypes(producerIn = @BodyType(value = { Carrier.TEXT, Carrier.BYTES, Carrier.STREAM, Carrier.FILE, Carrier.POJO },
+                                  format = "xml", dependsOn = { "source", "useJsonBody" },
+                                  byOption = @BodyType.When(option = "failOnNullBody", value = "false",
+                                                            carriers = {
+                                                                    Carrier.NULL, Carrier.TEXT, Carrier.BYTES,
+                                                                    Carrier.STREAM, Carrier.FILE, Carrier.POJO }),
+                                  description = "The XML to transform: text, bytes, a stream, a file, a DOM or another"
+                                                + " javax.xml.transform.Source; JSON text with useJsonBody. A Map, a List or no"
+                                                + " body fails"),
+           producerOut = @BodyType(value = Carrier.TEXT, javaType = "java.lang.String", dependsOn = "resultHandlerFactory",
+                                   byOption = {
+                                           @BodyType.When(option = "output", value = "bytes", carriers = Carrier.BYTES,
+                                                          javaType = "byte[]"),
+                                           @BodyType.When(option = "output", value = "DOM", carriers = Carrier.POJO,
+                                                          javaType = "org.w3c.dom.Document"),
+                                           @BodyType.When(option = "output", value = "file", carriers = Carrier.FILE,
+                                                          javaType = "java.io.File") },
+                                   description = "The result of the transformation"))
+public class XsltSaxonEndpoint extends XsltEndpoint {
+
+    private static final Logger LOG = LoggerFactory.getLogger(XsltSaxonEndpoint.class);
+
+    @UriParam(label = "advanced")
+    private Configuration saxonConfiguration;
+    @Metadata(label = "advanced")
+    private Map<String, Object> saxonConfigurationProperties = new HashMap<>();
+    @Metadata(label = "advanced")
+    private Map<String, Object> saxonReaderProperties = new HashMap<>();
+    @UriParam(label = "advanced", javaType = "java.lang.String")
+    private List<Object> saxonExtensionFunctions;
+    @UriParam(displayName = "Allow StAX", defaultValue = "true")
+    private boolean allowStAX = true;
+    @UriParam(label = "advanced,security", defaultValue = "true", security = "insecure:dev", insecureValue = "false")
+    private boolean secureProcessing = true;
+    @UriParam
+    @Metadata(firstVersion = "4.15.0", displayName = "Use JSON Body", defaultValue = "false", required = false)
+    private boolean useJsonBody = false;
+
+    public XsltSaxonEndpoint(String endpointUri, Component component) {
+        super(endpointUri, component);
+    }
+
+    @Override
+    public boolean isRemote() {
+        return false;
+    }
+
+    public List<Object> getSaxonExtensionFunctions() {
+        return saxonExtensionFunctions;
+    }
+
+    /**
+     * Allows you to use a custom net.sf.saxon.lib.ExtensionFunctionDefinition. You would need to add camel-saxon to the
+     * classpath. The function is looked up in the registry, where you can comma to separate multiple values to lookup.
+     */
+    public void setSaxonExtensionFunctions(List<Object> extensionFunctions) {
+        this.saxonExtensionFunctions = extensionFunctions;
+    }
+
+    /**
+     * Allows you to use a custom net.sf.saxon.lib.ExtensionFunctionDefinition. You would need to add camel-saxon to the
+     * classpath. The function is looked up in the registry, where you can comma to separate multiple values to lookup.
+     */
+    public void setSaxonExtensionFunctions(String extensionFunctions) {
+        this.saxonExtensionFunctions = EndpointHelper.resolveReferenceListParameter(
+                getCamelContext(),
+                extensionFunctions,
+                Object.class);
+    }
+
+    public Configuration getSaxonConfiguration() {
+        return saxonConfiguration;
+    }
+
+    /**
+     * To use a custom Saxon configuration. The secureProcessing option is applied to this configuration, which Saxon
+     * uses by reference, so endpoints that share the same configuration must use the same secureProcessing value.
+     */
+    public void setSaxonConfiguration(Configuration saxonConfiguration) {
+        this.saxonConfiguration = saxonConfiguration;
+    }
+
+    public Map<String, Object> getSaxonConfigurationProperties() {
+        return saxonConfigurationProperties;
+    }
+
+    /**
+     * To set custom Saxon configuration properties
+     */
+    public void setSaxonConfigurationProperties(Map<String, Object> configurationProperties) {
+        this.saxonConfigurationProperties = configurationProperties;
+    }
+
+    public Map<String, Object> getSaxonReaderProperties() {
+        return saxonReaderProperties;
+    }
+
+    /**
+     * To set custom Saxon Reader properties
+     */
+    public void setSaxonReaderProperties(Map<String, Object> saxonReaderProperties) {
+        this.saxonReaderProperties = saxonReaderProperties;
+    }
+
+    @ManagedAttribute(description = "Whether to allow using StAX as the javax.xml.transform.Source")
+    public boolean isAllowStAX() {
+        return allowStAX;
+    }
+
+    /**
+     * Whether to allow using StAX as the javax.xml.transform.Source. You can enable this if the XSLT library supports
+     * StAX such as the Saxon library (camel-saxon). The Xalan library (default in JVM) does not support StAXSource.
+     */
+    public void setAllowStAX(boolean allowStAX) {
+        this.allowStAX = allowStAX;
+    }
+
+    public boolean isSecureProcessing() {
+        return secureProcessing;
+    }
+
+    /**
+     * Feature for XML secure processing (see javax.xml.XMLConstants). This is enabled by default. However, when using
+     * Saxon Professional you may need to turn this off to allow Saxon to be able to use Java extension functions. Note
+     * that turning it off also restores the previous, unrestricted parsing of a {@code Source} message body that is
+     * still to be parsed, so only do so for trusted input. With a saxonConfiguration, the feature is set on that
+     * configuration, so endpoints that share the same configuration must use the same secureProcessing value.
+     */
+    public void setSecureProcessing(boolean secureProcessing) {
+        this.secureProcessing = secureProcessing;
+    }
+
+    public boolean isUseJsonBody() {
+        return useJsonBody;
+    }
+
+    /**
+     * Whether to use JSON body as input. When enabled, the message body is expected to be JSON and will be converted to
+     * XML representation of JSON using XSLT3 `json-to-xml()` function before XSLT processing. This allows XSLT
+     * stylesheets to process JSON input directly using standard XPath expressions.
+     */
+    public void setUseJsonBody(boolean useJsonBody) {
+        this.useJsonBody = useJsonBody;
+    }
+
+    @Override
+    protected XsltSaxonBuilder createXsltBuilder() throws Exception {
+        final CamelContext ctx = getCamelContext();
+        final ClassResolver resolver = ctx.getClassResolver();
+        final Injector injector = ctx.getInjector();
+
+        LOG.debug("{} using schema resource: {}", this, getResourceUri());
+
+        final XsltSaxonBuilder xslt = injector.newInstance(XsltSaxonBuilder.class);
+
+        TransformerFactory factory = getTransformerFactory();
+        if (factory == null) {
+            final String factoryClassName = getTransformerFactoryClass() != null
+                    ? getTransformerFactoryClass()
+                    : ((XsltSaxonComponent) getComponent()).getTransformerFactoryClass();
+            if (factoryClassName == null) {
+                factory = new TransformerFactoryImpl();
+            } else {
+                Class<TransformerFactory> factoryClass = resolver.resolveMandatoryClass(factoryClassName,
+                        TransformerFactory.class, XsltSaxonComponent.class.getClassLoader());
+                LOG.debug("Using TransformerFactoryClass {}", factoryClass);
+                factory = injector.newInstance(factoryClass);
+            }
+
+            if (factory instanceof TransformerFactoryImpl tf) {
+                // a custom Saxon configuration replaces the configuration of the factory, so secure processing is
+                // applied after it, and the explicit Saxon configuration properties last
+                XsltSaxonHelper.registerSaxonConfiguration(tf, saxonConfiguration);
+                XsltSaxonHelper.configureSecureProcessing(tf, secureProcessing);
+                XsltSaxonHelper.registerSaxonConfigurationProperties(tf, saxonConfigurationProperties);
+                XsltSaxonHelper.registerSaxonExtensionFunctions(tf, saxonExtensionFunctions);
+            }
+
+            XsltSaxonHelper.configureExternalAccess(factory);
+
+            final TransformerFactoryConfigurationStrategy strategy = getTransformerFactoryConfigurationStrategy() != null
+                    ? getTransformerFactoryConfigurationStrategy()
+                    : ((XsltSaxonComponent) getComponent()).getTransformerFactoryConfigurationStrategy();
+            if (strategy != null) {
+                strategy.configure(factory, this);
+            }
+
+            int effectiveXpathTotalOpLimit = getXpathTotalOpLimit() > 0
+                    ? getXpathTotalOpLimit()
+                    : ((XsltSaxonComponent) getComponent()).getXpathTotalOpLimit();
+            if (effectiveXpathTotalOpLimit > 0) {
+                try {
+                    factory.setAttribute("jdk.xml.xpathTotalOpLimit", effectiveXpathTotalOpLimit);
+                } catch (IllegalArgumentException e) {
+                    LOG.debug("TransformerFactory does not support jdk.xml.xpathTotalOpLimit");
+                }
+            }
+        }
+
+        LOG.debug("Using TransformerFactory {}", factory);
+        xslt.setTransformerFactory(factory);
+        if (getResultHandlerFactory() != null) {
+            xslt.setResultHandlerFactory(getResultHandlerFactory());
+        }
+        if (getErrorListener() != null) {
+            xslt.errorListener(getErrorListener());
+        }
+        xslt.setFailOnNullBody(isFailOnNullBody());
+        xslt.transformerCacheSize(getTransformerCacheSize());
+        xslt.setUriResolver(getUriResolver());
+        xslt.setEntityResolver(getEntityResolver());
+        xslt.setAllowStAX(allowStAX);
+        xslt.setUseJsonBody(useJsonBody);
+        xslt.setSecureProcessing(secureProcessing);
+        xslt.setDeleteOutputFile(isDeleteOutputFile());
+        xslt.setSource(ExpressionBuilder.singleInputExpression(getSource()));
+
+        if (getXsltMessageLogger() != null) {
+            xslt.setXsltMessageLogger(getXsltMessageLogger());
+        }
+
+        configureOutput(xslt, getOutput().name());
+
+        // any additional transformer parameters then make a copy to avoid side effects
+        if (getParameters() != null) {
+            Map<String, Object> copy = new HashMap<>(getParameters());
+            xslt.setParameters(copy);
+        }
+
+        return xslt;
+    }
+
+    @Override
+    protected XsltBuilder createBuilderForCustomStylesheet(String template, Exchange exchange) throws Exception {
+        InputStream is = getCamelContext().getTypeConverter().mandatoryConvertTo(InputStream.class, exchange, template);
+        XsltBuilder builder = createXsltBuilder();
+        Source source = new StreamSource(is);
+        if (!this.saxonReaderProperties.isEmpty()) {
+            source = createReaderForSource(source);
+        }
+        builder.setTransformerSource(source);
+        return builder;
+    }
+
+    /**
+     * Loads the resource.
+     *
+     * @param  resourceUri          the resource to load
+     * @throws TransformerException is thrown if error loading resource
+     * @throws IOException          is thrown if error loading resource
+     */
+    @Override
+    protected void loadResource(String resourceUri, XsltBuilder xslt) throws TransformerException, IOException {
+        LOG.trace("{} loading schema resource: {}", this, resourceUri);
+        Source source = xslt.getUriResolver().resolve(resourceUri, null);
+        if (source == null) {
+            throw new IOException("Cannot load schema resource " + resourceUri);
+        }
+        if (!this.saxonReaderProperties.isEmpty()) {
+            source = createReaderForSource(source);
+        }
+        xslt.setTransformerSource(source);
+        setCacheCleared(false);
+    }
+
+    private Source createReaderForSource(Source source) {
+        InputSource inputSource = SAXSource.sourceToInputSource(source);
+        if (inputSource == null) {
+            return source;
+        }
+        try {
+            SAXParserFactory factory = SAXParserFactory.newInstance();
+            factory.setFeature(XMLConstants.FEATURE_SECURE_PROCESSING, true);
+            factory.setFeature("http://apache.org/xml/features/disallow-doctype-decl", true);
+            factory.setFeature("http://xml.org/sax/features/external-general-entities", false);
+            factory.setFeature("http://xml.org/sax/features/external-parameter-entities", false);
+            SAXParser saxParser = factory.newSAXParser();
+            XMLReader xmlReader = saxParser.getXMLReader();
+
+            for (Map.Entry<String, Object> entry : this.saxonReaderProperties.entrySet()) {
+                String key = entry.getKey();
+                Object value = entry.getValue();
+                try {
+                    URI uri = new URI(key);
+                    if (value != null
+                            && (value.toString().equals("true") || (value.toString().equals("false")))) {
+                        xmlReader.setFeature(uri.toString(), Boolean.parseBoolean(value.toString()));
+                    } else if (value != null) {
+                        xmlReader.setProperty(uri.toString(), value);
+                    }
+                } catch (URISyntaxException e) {
+                    LOG.debug("{} isn't a valid URI, so ignore it", key);
+                }
+            }
+            return new SAXSource(xmlReader, inputSource);
+        } catch (SAXException | ParserConfigurationException e) {
+            LOG.info("Can't create XMLReader for source ", e);
+            return source;
+        }
+    }
+
+}

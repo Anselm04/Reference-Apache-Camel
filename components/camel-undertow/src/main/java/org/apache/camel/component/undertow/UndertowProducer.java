@@ -1,0 +1,307 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.camel.component.undertow;
+
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.Reader;
+import java.net.URI;
+import java.net.URISyntaxException;
+import java.nio.ByteBuffer;
+import java.util.Collections;
+import java.util.List;
+import java.util.Map;
+import java.util.Optional;
+
+import javax.net.ssl.SSLContext;
+
+import io.undertow.client.ClientRequest;
+import io.undertow.client.UndertowClient;
+import io.undertow.protocols.ssl.UndertowXnioSsl;
+import io.undertow.server.DefaultByteBufferPool;
+import io.undertow.util.HeaderMap;
+import io.undertow.util.Headers;
+import io.undertow.util.HttpString;
+import io.undertow.util.Methods;
+import org.apache.camel.AsyncCallback;
+import org.apache.camel.Exchange;
+import org.apache.camel.InvalidPayloadException;
+import org.apache.camel.Message;
+import org.apache.camel.TypeConverter;
+import org.apache.camel.component.undertow.handlers.CamelWebSocketHandler;
+import org.apache.camel.http.base.cookie.CookieHandler;
+import org.apache.camel.support.DefaultAsyncProducer;
+import org.apache.camel.util.URISupport;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.xnio.OptionMap;
+import org.xnio.Xnio;
+import org.xnio.XnioWorker;
+import org.xnio.ssl.XnioSsl;
+
+/**
+ * The Undertow producer.
+ *
+ * The implementation of Producer is considered as experimental. The Undertow client classes are not thread safe, their
+ * purpose is for the reverse proxy usage inside Undertow itself. This may change in the future versions and general
+ * purpose HTTP client wrapper will be added. Therefore, this producer may be changed too.
+ */
+public class UndertowProducer extends DefaultAsyncProducer {
+
+    private static final Logger LOG = LoggerFactory.getLogger(UndertowProducer.class);
+
+    private UndertowClient client;
+    private final UndertowEndpoint endpoint;
+    private final OptionMap options;
+    private DefaultByteBufferPool pool;
+    private XnioSsl ssl;
+    private XnioWorker worker;
+    private CamelWebSocketHandler webSocketHandler;
+    // whether this producer registered its WebSocket handler, so only then it unregisters it
+    private boolean registered;
+
+    public UndertowProducer(final UndertowEndpoint endpoint, final OptionMap options) {
+        super(endpoint);
+        this.endpoint = endpoint;
+        this.options = options;
+    }
+
+    @Override
+    public UndertowEndpoint getEndpoint() {
+        return endpoint;
+    }
+
+    boolean isSendToAll(Message in) {
+        // header may be null; have to be careful here (and fallback to use sendToAll option configured from endpoint)
+        Boolean value = in.getHeader(UndertowConstants.SEND_TO_ALL, endpoint.getSendToAll(), Boolean.class);
+        return value != null && value;
+    }
+
+    @Override
+    public boolean process(final Exchange camelExchange, final AsyncCallback callback) {
+        if (endpoint.isWebSocket()) {
+            return processWebSocket(camelExchange, callback);
+        }
+
+        /* not a WebSocket */
+        final URI uri;
+        final HttpString method;
+        final String pathAndQuery;
+        try {
+            final String exchangeUri = UndertowHelper.createURL(camelExchange, getEndpoint());
+            uri = UndertowHelper.createURI(camelExchange, exchangeUri, getEndpoint());
+            method = UndertowHelper.createMethod(camelExchange, endpoint, camelExchange.getIn().getBody() != null);
+            pathAndQuery = URISupport.pathAndQueryOf(uri);
+            // the client writes the request target byte by byte with no validation, so a CR or LF (for example from a
+            // percent-encoded control character in a header) would break the request line; refuse it instead
+            UndertowHelper.checkWriteable("HTTP request target", pathAndQuery);
+        } catch (final URISyntaxException | IllegalArgumentException e) {
+            camelExchange.setException(e);
+            callback.done(true);
+            return true;
+        }
+
+        final UndertowHttpBinding undertowHttpBinding = endpoint.getUndertowHttpBinding();
+
+        final CookieHandler cookieHandler = endpoint.getCookieHandler();
+        final Map<String, List<String>> cookieHeaders;
+        if (cookieHandler != null) {
+            try {
+                cookieHeaders = cookieHandler.loadCookies(camelExchange, uri);
+            } catch (final IOException e) {
+                camelExchange.setException(e);
+                callback.done(true);
+                return true;
+            }
+        } else {
+            cookieHeaders = Collections.emptyMap();
+        }
+
+        final ClientRequest request = new ClientRequest();
+        request.setMethod(method);
+        request.setPath(pathAndQuery);
+
+        final HeaderMap requestHeaders = request.getRequestHeaders();
+
+        final Object body;
+        try {
+            // Set the Host header. When preserveHostHeader is set this is the caller's Host header, which the client
+            // writes verbatim, so it is validated like any other header value.
+            final Message message = camelExchange.getIn();
+            final String host = message.getHeader(UndertowConstants.HOST_STRING, String.class);
+            if (endpoint.isPreserveHostHeader()) {
+                final String hostHeader = Optional.ofNullable(host).orElseGet(uri::getAuthority);
+                UndertowHelper.checkWriteable("Host header", hostHeader);
+                requestHeaders.put(Headers.HOST, hostHeader);
+            } else {
+                requestHeaders.put(Headers.HOST, uri.getAuthority());
+            }
+            cookieHeaders.forEach((key, values) -> {
+                requestHeaders.putAll(HttpString.tryFromString(key), values);
+            });
+
+            body = undertowHttpBinding.toHttpRequest(request, camelExchange.getIn());
+        } catch (final IllegalArgumentException e) {
+            // a Host or other header value that cannot be written to a header line (see UndertowHelper.checkWriteable)
+            camelExchange.setException(e);
+            callback.done(true);
+            return true;
+        }
+        final UndertowClientCallback clientCallback;
+        final boolean streaming = getEndpoint().isUseStreaming();
+        if (streaming && body instanceof InputStream) {
+            // For streaming, make it chunked encoding instead of specifying content length
+            requestHeaders.put(Headers.TRANSFER_ENCODING, "chunked");
+            clientCallback = new UndertowStreamingClientCallback(
+                    camelExchange, callback, getEndpoint(),
+                    request, (InputStream) body);
+        } else {
+            ByteBuffer bodyAsByte = null;
+            if (body != null) {
+                // write text in the charset that the request Content-Type declares, if any, and a number as its text
+                final String contentType = requestHeaders.getFirst(Headers.CONTENT_TYPE);
+                final TypeConverter tc = endpoint.getCamelContext().getTypeConverter();
+                bodyAsByte = UndertowHelper.toByteBuffer(tc, body, contentType);
+                if (bodyAsByte != null) {
+                    requestHeaders.put(Headers.CONTENT_LENGTH, bodyAsByte.remaining());
+                } else if (Methods.POST.equals(method) || Methods.PUT.equals(method) || Methods.PATCH.equals(method)) {
+                    // a Map, a List or an object must be marshalled first, rather than be sent as an empty request
+                    // (a GET or a DELETE sends no body it cannot convert, as before)
+                    final Message in = camelExchange.getIn();
+                    camelExchange.setException(new InvalidPayloadException(
+                            camelExchange, ByteBuffer.class, in,
+                            UndertowHelper.notAnHttpBody(camelExchange, "request", contentType)));
+                    callback.done(true);
+                    return true;
+                }
+            }
+
+            if (streaming) {
+                // response may receive streaming
+                clientCallback = new UndertowStreamingClientCallback(
+                        camelExchange, callback, getEndpoint(),
+                        request, bodyAsByte);
+            } else {
+                clientCallback = new UndertowClientCallback(
+                        camelExchange, callback, getEndpoint(),
+                        request, bodyAsByte);
+            }
+        }
+
+        if (LOG.isDebugEnabled()) {
+            LOG.debug("Executing http {} method: {}", method, pathAndQuery);
+        }
+
+        // when connect succeeds or fails UndertowClientCallback will
+        // get notified on a I/O thread run by Xnio worker. The writing
+        // of request and reading of response is performed also in the
+        // callback
+        client.connect(clientCallback, uri, worker, ssl, pool, options);
+
+        // the call above will proceed on Xnio I/O thread we will
+        // notify the exchange asynchronously when the HTTP exchange
+        // ends with success or failure from UndertowClientCallback
+        return false;
+    }
+
+    private boolean processWebSocket(final Exchange camelExchange, final AsyncCallback camelCallback) {
+        final Message in = camelExchange.getIn();
+        try {
+            Object message = in.getBody();
+            if (!(message instanceof String || message instanceof byte[] || message instanceof Reader
+                    || message instanceof InputStream)) {
+                message = in.getBody(String.class);
+            }
+
+            if (message != null) {
+                final int timeout = endpoint.getSendTimeout();
+                if (isSendToAll(in)) {
+                    return webSocketHandler.send(peer -> true, message, timeout, camelExchange, camelCallback);
+                }
+                final List<String> connectionKeys = in.getHeader(UndertowConstants.CONNECTION_KEY_LIST, List.class);
+                if (connectionKeys != null) {
+                    return webSocketHandler.send(
+                            peer -> connectionKeys.contains(peer.getAttribute(UndertowConstants.CONNECTION_KEY)), message,
+                            timeout, camelExchange, camelCallback);
+                }
+                final String connectionKey = in.getHeader(UndertowConstants.CONNECTION_KEY, String.class);
+                if (connectionKey != null) {
+                    return webSocketHandler.send(
+                            peer -> connectionKey.equals(peer.getAttribute(UndertowConstants.CONNECTION_KEY)), message,
+                            timeout, camelExchange, camelCallback);
+                }
+                throw new IllegalStateException(
+                        String.format("Cannot process message which has none of the headers %s, %s or %s set: %s",
+                                UndertowConstants.SEND_TO_ALL, UndertowConstants.CONNECTION_KEY_LIST,
+                                UndertowConstants.CONNECTION_KEY, in));
+            } else {
+                /* nothing to do for a null body */
+                camelCallback.done(true);
+                return true;
+            }
+        } catch (Exception e) {
+            camelExchange.setException(e);
+            camelCallback.done(true);
+            return true;
+        }
+    }
+
+    @Override
+    protected void doStart() throws Exception {
+        super.doStart();
+
+        // as in Undertow tests
+        pool = new DefaultByteBufferPool(true, 17 * 1024);
+
+        final Xnio xnio = Xnio.getInstance();
+        worker = xnio.createWorker(options);
+
+        final SSLContext sslContext = getEndpoint().getSslContext();
+        if (sslContext != null) {
+            ssl = new UndertowXnioSsl(xnio, options, sslContext);
+        }
+
+        client = UndertowClient.getInstance();
+
+        if (endpoint.isWebSocket()) {
+            this.webSocketHandler = (CamelWebSocketHandler) endpoint.getComponent().registerEndpoint(endpoint, null,
+                    endpoint.getHttpHandlerRegistrationInfo(), endpoint.getSslContext(), new CamelWebSocketHandler());
+            this.registered = true;
+            this.webSocketHandler.addProducer(endpoint);
+        }
+
+        LOG.debug("Created worker: {} with options: {}", worker, options);
+    }
+
+    @Override
+    protected void doStop() throws Exception {
+        super.doStop();
+
+        if (registered) {
+            registered = false;
+            webSocketHandler.removeProducer(endpoint);
+            endpoint.getComponent().unregisterEndpoint(null, endpoint.getHttpHandlerRegistrationInfo(),
+                    endpoint.getSslContext());
+        }
+
+        if (worker != null && !worker.isShutdown()) {
+            LOG.debug("Shutting down worker: {}", worker);
+            worker.shutdown();
+        }
+    }
+
+}

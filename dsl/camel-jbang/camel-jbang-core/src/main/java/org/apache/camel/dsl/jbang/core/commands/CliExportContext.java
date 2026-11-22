@@ -1,0 +1,99 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.camel.dsl.jbang.core.commands;
+
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Map;
+import java.util.Optional;
+
+import org.apache.camel.dsl.jbang.core.commands.ai.YamlLoadFailureReport;
+import org.apache.camel.dsl.jbang.core.common.Plugin;
+import org.apache.camel.dsl.jbang.core.common.PluginHelper;
+import org.apache.camel.dsl.jbang.run.RunContext;
+import org.apache.camel.dsl.jbang.run.common.PluginExporter;
+import org.apache.camel.dsl.jbang.run.common.PluginRunCustomizer;
+import org.apache.camel.dsl.jbang.run.common.Printer;
+import org.apache.camel.dsl.jbang.run.export.ExportContext;
+
+/**
+ * The {@link ExportContext} of the CLI: the exporters and run customizers are those of the active plugins, a YAML route
+ * file that did not load is reported as camel run does, and a confirmation is asked on the terminal. The dependencies
+ * are resolved by the default resolver of the export.
+ */
+public final class CliExportContext {
+
+    private CliExportContext() {
+    }
+
+    /**
+     * @param main    the CLI
+     * @param printer where the export prints
+     * @param yes     whether to answer yes to the confirmations
+     */
+    public static ExportContext create(CamelJBangMain main, Printer printer, boolean yes) {
+        return configure(new ExportContext(), main, printer, yes, "export");
+    }
+
+    /**
+     * Configures the given context as the one of the CLI, such as the {@link RunContext} of camel run.
+     *
+     * @param  context the context to configure
+     * @param  main    the CLI
+     * @param  printer where the export prints
+     * @param  yes     whether to answer yes to the confirmations
+     * @param  target  the command name used to filter plugins (e.g. "run" or "export")
+     * @return         the context
+     */
+    public static <T extends ExportContext> T configure(
+            T context, CamelJBangMain main, Printer printer, boolean yes, String target) {
+        context.withPrinter(printer)
+                .withPlugins(repos -> {
+                    List<PluginRunCustomizer> runCustomizers = new ArrayList<>();
+                    List<PluginExporter> exporters = new ArrayList<>();
+                    Map<String, Plugin> active = PluginHelper.getActivePlugins(main, repos, target, true);
+                    active.forEach((command, plugin) -> {
+                        Optional<PluginRunCustomizer> runCustomizer;
+                        Optional<PluginExporter> exporter;
+                        try {
+                            runCustomizer = plugin.getRunCustomizer();
+                            exporter = plugin.getExporter();
+                        } catch (LinkageError e) {
+                            // the JVM links the classes of a plugin when they are first used: one built for another
+                            // Camel version may be created, and fail here as its run customizer or exporter refers to
+                            // a class that has moved. It is left out as one that cannot be loaded (CAMEL-26964)
+                            PluginHelper.warnNotLinked(main.getOut(), command, target, e);
+                            return;
+                        }
+                        runCustomizer.ifPresent(runCustomizers::add);
+                        exporter.ifPresent(exporters::add);
+                    });
+                    // and the plugins built into the CLI (they link with it), unless the plugin configuration has the
+                    // same plugin
+                    for (Plugin embedded : main.getEmbeddedPlugins(target)) {
+                        if (active.values().stream().noneMatch(p -> p.getClass().equals(embedded.getClass()))) {
+                            embedded.getRunCustomizer().ifPresent(runCustomizers::add);
+                            embedded.getExporter().ifPresent(exporters::add);
+                        }
+                    }
+                    return new ExportContext.ActivePlugins(List.copyOf(runCustomizers), List.copyOf(exporters));
+                })
+                .withStartFailureListener(YamlLoadFailureReport::logIfYamlLoadFailure)
+                .withConfirm(message -> CommandHelper.confirmOperation(message, yes));
+        return context;
+    }
+}

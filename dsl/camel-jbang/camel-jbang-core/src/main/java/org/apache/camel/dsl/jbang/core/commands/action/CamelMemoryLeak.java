@@ -1,0 +1,564 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.camel.dsl.jbang.core.commands.action;
+
+import java.io.IOException;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.List;
+import java.util.Locale;
+
+import com.github.freva.asciitable.AsciiTable;
+import com.github.freva.asciitable.Column;
+import com.github.freva.asciitable.HorizontalAlign;
+import com.github.freva.asciitable.OverflowBehaviour;
+import org.aesh.command.CommandDefinition;
+import org.aesh.command.option.Argument;
+import org.aesh.command.option.Option;
+import org.apache.camel.dsl.jbang.core.common.ActionClient;
+import org.apache.camel.dsl.jbang.core.common.ActionClient.ActionResult;
+import org.apache.camel.dsl.jbang.core.common.CliException;
+import org.apache.camel.dsl.jbang.core.common.CliExitCode;
+import org.apache.camel.dsl.jbang.core.common.TerminalWidthHelper;
+import org.apache.camel.util.json.JsonArray;
+import org.apache.camel.util.json.JsonObject;
+
+@CommandDefinition(name = "memory-leak", description = "Diagnose memory leaks in a running Camel integration",
+                   generateHelp = true,
+                   footer = {
+                           "Note: Sizes are sampled during the recording window, not total heap usage.",
+                           "A longer recording captures more samples and shows larger totals for the same",
+                           "leak.",
+                           "Use values to compare classes relative to each other, not as absolute heap",
+                           "numbers.",
+                           "",
+                           "Examples:",
+                           "  camel cmd memory-leak --start",
+                           "  camel cmd memory-leak --start --duration 60",
+                           "  camel cmd memory-leak --stop",
+                           "  camel cmd memory-leak --status",
+                           "  camel cmd memory-leak --query",
+                           "  camel cmd memory-leak --query --min-size 1MB",
+                           "  camel cmd memory-leak --query --stacktrace",
+                           "  camel cmd memory-leak --start --mode dual" })
+public class CamelMemoryLeak extends ActionBaseCommand {
+
+    @Argument(description = "Name or pid of running Camel integration")
+    String name = "*";
+
+    @Option(name = "start", hasValue = false, description = "Start a JFR recording for OldObjectSample events")
+    boolean start;
+
+    @Option(name = "stop", hasValue = false, description = "Stop the active recording and display results")
+    boolean stop;
+
+    @Option(name = "status", hasValue = false, description = "Check recording status")
+    boolean status;
+
+    @Option(name = "query", hasValue = false, description = "Query cached results from the last recording")
+    boolean query;
+
+    @Option(name = "mode",
+            description = "Recording mode: dual (default, two recordings with trend comparison) or single (one recording)",
+            defaultValue = "dual")
+    String mode;
+
+    @Option(name = "duration", description = "Recording duration in seconds (auto-stops after this time)", defaultValue = "60")
+    int duration;
+
+    @Option(name = "top", description = "Show only the top N samples", defaultValue = "50")
+    int top;
+
+    @Option(name = "min-size",
+            description = "Only show samples with total size above this value (e.g. 1024, 10KB, 1MB). Default 1KB in dual mode to filter noise",
+            defaultValue = "0")
+    String minSize;
+
+    @Option(name = "stacktrace", hasValue = false, description = "Show allocation stack trace for each sample")
+    boolean stacktrace;
+
+    @Override
+    public Integer doCall() throws Exception {
+        // a --min-size that is not a size is a usage error, before the integration is asked anything
+        parseSize(minSize);
+        long pid = findOne(name).pid();
+
+        if (start && "dual".equalsIgnoreCase(mode)) {
+            return doDualRecording(pid);
+        }
+
+        String command;
+        if (start) {
+            command = "start";
+        } else if (stop) {
+            command = "stop";
+        } else if (query) {
+            command = "query";
+        } else {
+            command = "status";
+        }
+
+        ActionResult result = jfrAction(pid, command, start ? duration : 0);
+        if (result.reply() == null) {
+            printer().printErr("Response from running Camel with PID " + pid + " not received within timeout");
+            return CliExitCode.TIMEOUT;
+        } else if (!result.isOk()) {
+            // the integration failed the action, such as when it cannot record (an error, or an exception)
+            printer().printErr(result.error());
+            return result.exitCode();
+        }
+
+        return handleResponse(pid, result.reply());
+    }
+
+    private int doDualRecording(long pid) throws Exception {
+        int dur1 = duration;
+        int dur2 = duration * 2;
+
+        // run 1
+        printer().printf("Recording 1 of 2 (%ds)...%n", dur1);
+        int exit = step(pid, jfrAction(pid, "start", dur1), "recording", "Failed to start recording 1");
+        if (exit != 0) {
+            return exit;
+        }
+
+        waitForRecordingComplete(pid, dur1);
+
+        exit = step(pid, jfrAction(pid, "stop", 0), "completed", "Recording 1 did not complete");
+        if (exit != 0) {
+            return exit;
+        }
+
+        // run 2
+        printer().printf("Recording 2 of 2 (%ds)...%n", dur2);
+        exit = step(pid, jfrAction(pid, "start", dur2), "recording", "Failed to start recording 2");
+        if (exit != 0) {
+            return exit;
+        }
+
+        waitForRecordingComplete(pid, dur2);
+
+        exit = step(pid, jfrAction(pid, "stop", 0), "completed", "Recording 2 did not complete");
+        if (exit != 0) {
+            return exit;
+        }
+
+        // compare
+        ActionResult compared = jfrAction(pid, "compare", 0);
+        exit = step(pid, compared, null, "Failed to get comparison data");
+        if (exit != 0) {
+            return exit;
+        }
+
+        return handleResponse(pid, compared.reply());
+    }
+
+    /**
+     * How a step of the dual recording went: 0 when the integration answered with the expected status (any status when
+     * <tt>null</tt>), else the exit code, and the error is printed.
+     */
+    private int step(long pid, ActionResult result, String expectedStatus, String message) {
+        if (result.reply() == null) {
+            printer().printErr(message + ": no response from running Camel with PID " + pid + " within timeout");
+            return CliExitCode.TIMEOUT;
+        } else if (!result.isOk()) {
+            printer().printErr(message + ": " + result.error());
+            return result.exitCode();
+        } else if (expectedStatus != null && !expectedStatus.equals(result.reply().getString("status"))) {
+            printer().printErr(message);
+            return CliExitCode.FAILURE;
+        }
+        return 0;
+    }
+
+    private void waitForRecordingComplete(long pid, int dur) throws Exception {
+        long deadline = System.currentTimeMillis() + (dur + 30) * 1000L;
+        while (System.currentTimeMillis() < deadline) {
+            Thread.sleep(3000);
+            JsonObject status = jfrAction(pid, "status", 0).reply();
+            if (status != null && !"recording".equals(status.getString("status"))) {
+                break;
+            }
+        }
+    }
+
+    /**
+     * Sends a command of the JFR memory leak action, and returns the answer (without a reply when there is none in
+     * time).
+     */
+    private ActionResult jfrAction(long pid, String command, int dur) throws IOException {
+        JsonObject root = new JsonObject();
+        root.put("action", "jfr-memory-leak");
+        root.put("command", command);
+        if ("start".equals(command) && dur > 0) {
+            root.put("duration", String.valueOf(dur));
+        }
+        if (stacktrace) {
+            root.put("stacktrace", "true");
+        }
+        long minBytes = parseSize(minSize);
+        if (minBytes > 0) {
+            root.put("minSize", String.valueOf(minBytes));
+        }
+
+        int timeout = "start".equals(command) ? 15000 : 30000;
+        return ActionClient.execute(pid, root, timeout);
+    }
+
+    private int handleResponse(long pid, JsonObject jo) {
+        String responseStatus = jo.getString("status");
+
+        if ("recording".equals(responseStatus) && jo.containsKey("elapsedMs")) {
+            // the status of the recording
+            printer().println("JFR recording in progress for PID: " + pid);
+            printer().println("Elapsed: " + formatDuration(jo.getLongOrDefault("elapsedMs", 0)));
+            if (jo.containsKey("remainingMs")) {
+                printer().println("Remaining: " + formatDuration(jo.getLongOrDefault("remainingMs", 0)));
+            }
+            return 0;
+        }
+
+        if ("recording".equals(responseStatus)) {
+            printer().println("JFR recording started for PID: " + pid);
+            if (jo.containsKey("durationSeconds")) {
+                printer().println("Duration: " + jo.getInteger("durationSeconds") + " seconds (auto-stop)");
+            } else {
+                printer().println("Duration: manual (use --stop to end recording)");
+            }
+            return 0;
+        }
+
+        if ("idle".equals(responseStatus)) {
+            printer().println("No active JFR recording for PID: " + pid);
+            if (jo.containsKey("note")) {
+                printer().println(jo.getString("note"));
+            }
+            return 0;
+        }
+
+        if ("completed".equals(responseStatus) && jo.containsKey("hasCachedResults")) {
+            // the status after the recording
+            printer().println("JFR recording completed. Use --query to view results.");
+            printer().println("Cached samples: " + jo.getIntegerOrDefault("sampleCount", 0));
+            return 0;
+        }
+
+        if ("completed".equals(responseStatus)) {
+            int sampleCount = jo.getIntegerOrDefault("sampleCount", 0);
+            long durationMs = jo.getLongOrDefault("recordingDurationMs", 0);
+            printer().printf("PID: %s\tSamples: %d\tRecording duration: %s%n",
+                    pid, sampleCount, formatDuration(durationMs));
+
+            JsonArray samples = (JsonArray) jo.get("samples");
+            if (samples != null && !samples.isEmpty()) {
+                List<Row> rows = new ArrayList<>();
+                int num = 0;
+                for (int i = 0; i < samples.size(); i++) {
+                    JsonObject sample = (JsonObject) samples.get(i);
+                    long sampledSize = sample.getLongOrDefault("sampledSize", 0);
+                    num++;
+                    if (num > top) {
+                        break;
+                    }
+                    Row row = new Row();
+                    row.num = num;
+                    row.className = sample.getStringOrDefault("allocationClass", "unknown");
+                    row.count = sample.getIntegerOrDefault("count", 1);
+                    row.sampledSize = sampledSize;
+                    row.objectAge = sample.getLongOrDefault("objectAge", 0);
+                    row.chainSummary = buildChainSummary(sample);
+                    row.stackTrace = (JsonArray) sample.get("stackTrace");
+                    rows.add(row);
+                }
+                printTable(rows);
+            } else {
+                printer().println("No old object samples captured.");
+                printer().printTip("Try a longer recording duration or ensure GC occurs during recording.");
+            }
+            return 0;
+        }
+
+        if ("compared".equals(responseStatus)) {
+            JsonObject baselineInfo = (JsonObject) jo.get("baseline");
+            JsonObject currentInfo = (JsonObject) jo.get("current");
+            long baseDur = baselineInfo != null ? baselineInfo.getLongOrDefault("recordingDurationMs", 0) : 0;
+            long curDur = currentInfo != null ? currentInfo.getLongOrDefault("recordingDurationMs", 0) : 0;
+            double durRatio = jo.getDoubleOrDefault("durationRatio", 1.0);
+            // the same decimal point in every locale
+            printer().println(String.format(Locale.US, "PID: %s\tRun 1: %s\tRun 2: %s\tDuration ratio: %.1fx",
+                    pid, formatDuration(baseDur), formatDuration(curDur), durRatio));
+
+            JsonArray comps = (JsonArray) jo.get("comparisons");
+            if (comps != null && !comps.isEmpty()) {
+                List<CompRow> compRows = new ArrayList<>();
+                int num = 0;
+                for (int i = 0; i < comps.size(); i++) {
+                    JsonObject comp = (JsonObject) comps.get(i);
+                    num++;
+                    if (num > top) {
+                        break;
+                    }
+                    CompRow cr = new CompRow();
+                    cr.num = num;
+                    cr.className = comp.getStringOrDefault("allocationClass", "unknown");
+                    cr.baselineSampledSize = comp.getLongOrDefault("baselineSampledSize", 0);
+                    cr.currentSampledSize = comp.getLongOrDefault("currentSampledSize", 0);
+                    cr.growthRatio = comp.getDoubleOrDefault("growthRatio", 0);
+                    cr.trend = comp.getStringOrDefault("trend", "stable");
+                    cr.lowConfidence = comp.getBooleanOrDefault("lowConfidence", false);
+                    cr.chainSummary = buildChainSummary(comp);
+                    cr.stackTrace = (JsonArray) comp.get("stackTrace");
+                    compRows.add(cr);
+                }
+                if (stacktrace) {
+                    printComparisonTableWithStacktrace(compRows);
+                } else {
+                    printComparisonTable(compRows);
+                }
+            } else {
+                printer().println("No comparison data available.");
+            }
+            return 0;
+        }
+
+        // an integration without the jfr-memory-leak dev console answers without a status
+        printer().printErr("Running Camel with PID " + pid
+                           + " cannot record memory leaks, as it has no jfr-memory-leak dev console (camel-console)");
+        return CliExitCode.FAILURE;
+    }
+
+    private void printTable(List<Row> rows) {
+        if (stacktrace) {
+            printTableWithStacktrace(rows);
+        } else {
+            printTableCompact(rows);
+        }
+    }
+
+    private void printTableCompact(List<Row> rows) {
+        int tw = terminalWidth();
+        int fixedWidth = 6 + 8 + 12 + 12;
+        int borderOverhead = TerminalWidthHelper.noBorderOverhead(5);
+        int classWidth = TerminalWidthHelper.flexWidth(tw, fixedWidth + 30, borderOverhead, 20, 50);
+        int chainWidth = TerminalWidthHelper.flexWidth(tw, fixedWidth + classWidth, borderOverhead, 20, 60);
+
+        printer().println(AsciiTable.getTable(AsciiTable.NO_BORDERS, rows, Arrays.asList(
+                new Column().header("#").headerAlign(HorizontalAlign.RIGHT).dataAlign(HorizontalAlign.RIGHT)
+                        .with(r -> Integer.toString(r.num)),
+                new Column().header("CLASS").dataAlign(HorizontalAlign.LEFT)
+                        .maxWidth(classWidth, OverflowBehaviour.ELLIPSIS_LEFT)
+                        .with(r -> r.className),
+                new Column().header("COUNT").headerAlign(HorizontalAlign.RIGHT).dataAlign(HorizontalAlign.RIGHT)
+                        .with(r -> Integer.toString(r.count)),
+                new Column().header("SAMPLED").headerAlign(HorizontalAlign.RIGHT).dataAlign(HorizontalAlign.RIGHT)
+                        .with(r -> r.sampledSize > 0 ? formatBytes(r.sampledSize) : "-"),
+                new Column().header("AGE").headerAlign(HorizontalAlign.RIGHT).dataAlign(HorizontalAlign.RIGHT)
+                        .with(r -> formatDuration(r.objectAge)),
+                new Column().header("REFERENCE CHAIN").dataAlign(HorizontalAlign.LEFT)
+                        .maxWidth(chainWidth, OverflowBehaviour.ELLIPSIS_RIGHT)
+                        .with(r -> r.chainSummary))));
+    }
+
+    private void printTableWithStacktrace(List<Row> rows) {
+        for (Row r : rows) {
+            String sizeStr = r.sampledSize > 0 ? formatBytes(r.sampledSize) : "-";
+            printer().printf("%d) %s  count:%d  sampled:%s  age:%s%n",
+                    r.num, r.className, r.count, sizeStr, formatDuration(r.objectAge));
+            if (r.chainSummary != null && !r.chainSummary.isEmpty()) {
+                printer().println("   chain: " + r.chainSummary);
+            }
+            if (r.stackTrace != null) {
+                for (int i = 0; i < r.stackTrace.size(); i++) {
+                    JsonObject frame = (JsonObject) r.stackTrace.get(i);
+                    printer().printf("     at %s:%s%n",
+                            frame.getStringOrDefault("method", "?"),
+                            frame.getIntegerOrDefault("line", 0));
+                }
+            }
+            printer().println();
+        }
+    }
+
+    private static String buildChainSummary(JsonObject sample) {
+        JsonArray chain = (JsonArray) sample.get("referenceChain");
+        if (chain == null || chain.isEmpty()) {
+            return "";
+        }
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < chain.size() && i < 3; i++) {
+            JsonObject link = (JsonObject) chain.get(i);
+            if (i > 0) {
+                sb.append(" -> ");
+            }
+            String type = link.getString("type");
+            if (type != null) {
+                int dot = type.lastIndexOf('.');
+                sb.append(dot >= 0 ? type.substring(dot + 1) : type);
+            }
+            String field = link.getString("field");
+            if (field != null) {
+                sb.append('.').append(field);
+            }
+        }
+        if (chain.size() > 3) {
+            sb.append(" -> ...");
+        }
+        return sb.toString();
+    }
+
+    static String formatBytes(long bytes) {
+        if (bytes < 1024) {
+            return bytes + " B";
+        } else if (bytes < 1024 * 1024) {
+            return String.format(Locale.US, "%.1f KB", bytes / 1024.0);
+        } else if (bytes < 1024L * 1024 * 1024) {
+            return String.format(Locale.US, "%.1f MB", bytes / (1024.0 * 1024));
+        } else {
+            return String.format(Locale.US, "%.1f GB", bytes / (1024.0 * 1024 * 1024));
+        }
+    }
+
+    static String formatDuration(long ms) {
+        if (ms < 1000) {
+            return ms + "ms";
+        } else if (ms < 60000) {
+            return String.format(Locale.US, "%.1fs", ms / 1000.0);
+        } else {
+            long min = ms / 60000;
+            long sec = (ms % 60000) / 1000;
+            return min + "m " + sec + "s";
+        }
+    }
+
+    /**
+     * The number of bytes of a size such as 1024, 10B, 10KB, 1.5MB or 2G.
+     *
+     * @throws CliException (exit code 2) when the value is not a size
+     */
+    static long parseSize(String value) {
+        if (value == null || value.isBlank()) {
+            return 0;
+        }
+        String v = value.trim().toUpperCase(Locale.US);
+        long multiplier = 1;
+        if (v.endsWith("GB") || v.endsWith("G")) {
+            multiplier = 1024L * 1024 * 1024;
+        } else if (v.endsWith("MB") || v.endsWith("M")) {
+            multiplier = 1024L * 1024;
+        } else if (v.endsWith("KB") || v.endsWith("K")) {
+            multiplier = 1024;
+        }
+        // without the unit, which can also be B for bytes
+        v = v.replaceAll("[GMK]?B?$", "");
+        try {
+            return (long) (Double.parseDouble(v) * multiplier);
+        } catch (NumberFormatException e) {
+            throw CliException.usage("--min-size must be a size such as 1024, 10KB or 1MB, was: " + value);
+        }
+    }
+
+    private void printComparisonTable(List<CompRow> rows) {
+        int tw = terminalWidth();
+        int fixedWidth = 6 + 12 + 12 + 10 + 10;
+        int borderOverhead = TerminalWidthHelper.noBorderOverhead(6);
+        int classWidth = TerminalWidthHelper.flexWidth(tw, fixedWidth, borderOverhead, 20, 50);
+
+        printer().println(AsciiTable.getTable(AsciiTable.NO_BORDERS, rows, Arrays.asList(
+                new Column().header("#").headerAlign(HorizontalAlign.RIGHT).dataAlign(HorizontalAlign.RIGHT)
+                        .with(r -> Integer.toString(r.num)),
+                new Column().header("CLASS").dataAlign(HorizontalAlign.LEFT)
+                        .maxWidth(classWidth, OverflowBehaviour.ELLIPSIS_LEFT)
+                        .with(r -> r.className),
+                new Column().header("RUN1").headerAlign(HorizontalAlign.RIGHT).dataAlign(HorizontalAlign.RIGHT)
+                        .with(r -> r.baselineSampledSize > 0 ? formatBytes(r.baselineSampledSize) : "-"),
+                new Column().header("RUN2").headerAlign(HorizontalAlign.RIGHT).dataAlign(HorizontalAlign.RIGHT)
+                        .with(r -> r.currentSampledSize > 0 ? formatBytes(r.currentSampledSize) : "-"),
+                new Column().header("GROWTH").headerAlign(HorizontalAlign.RIGHT).dataAlign(HorizontalAlign.RIGHT)
+                        .with(r -> formatGrowth(r)),
+                new Column().header("TREND").dataAlign(HorizontalAlign.LEFT)
+                        .with(r -> trendLabel(r.trend) + (r.lowConfidence ? " ⚠" : "")))));
+    }
+
+    private void printComparisonTableWithStacktrace(List<CompRow> rows) {
+        for (CompRow r : rows) {
+            String run1 = r.baselineSampledSize > 0 ? formatBytes(r.baselineSampledSize) : "-";
+            String run2 = r.currentSampledSize > 0 ? formatBytes(r.currentSampledSize) : "-";
+            String growth = formatGrowth(r);
+            String warn = r.lowConfidence ? " ⚠" : "";
+            printer().printf("%d) %s  run1:%s  run2:%s  growth:%s  %s%s%n",
+                    r.num, r.className, run1, run2, growth, trendLabel(r.trend), warn);
+            if (r.chainSummary != null && !r.chainSummary.isEmpty()) {
+                printer().println("   chain: " + r.chainSummary);
+            }
+            if (r.stackTrace != null) {
+                for (int i = 0; i < r.stackTrace.size(); i++) {
+                    JsonObject frame = (JsonObject) r.stackTrace.get(i);
+                    printer().printf("     at %s:%s%n",
+                            frame.getStringOrDefault("method", "?"),
+                            frame.getIntegerOrDefault("line", 0));
+                }
+            }
+            printer().println();
+        }
+    }
+
+    private static String formatGrowth(CompRow r) {
+        if (r.growthRatio <= 0) {
+            return "-";
+        }
+        int pct = (int) Math.round((r.growthRatio - 1.0) * 100);
+        String label = (pct >= 0 ? "+" : "") + pct + "%";
+        return r.lowConfidence ? "~" + label : label;
+    }
+
+    private static String trendLabel(String trend) {
+        if (trend == null) {
+            return "-";
+        }
+        return switch (trend) {
+            case "growing" -> "↑ leak!";
+            case "suspicious" -> "↑ leak?";
+            case "stable" -> "→ stable";
+            case "shrinking" -> "↓";
+            case "new" -> "new";
+            case "gone" -> "gone";
+            default -> trend;
+        };
+    }
+
+    private static class CompRow {
+        int num;
+        String className;
+        long baselineSampledSize;
+        long currentSampledSize;
+        double growthRatio;
+        String trend;
+        boolean lowConfidence;
+        String chainSummary;
+        JsonArray stackTrace;
+    }
+
+    private static class Row {
+        int num;
+        String className;
+        int count;
+        long sampledSize;
+        long objectAge;
+        String chainSummary;
+        JsonArray stackTrace;
+    }
+}

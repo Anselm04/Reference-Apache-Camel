@@ -1,0 +1,156 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.camel.component.whatsapp;
+
+import java.io.InputStream;
+import java.nio.charset.StandardCharsets;
+import java.util.HexFormat;
+import java.util.Map;
+
+import javax.crypto.Mac;
+import javax.crypto.spec.SecretKeySpec;
+
+import org.apache.camel.Exchange;
+import org.apache.camel.RoutesBuilder;
+import org.apache.camel.builder.RouteBuilder;
+import org.apache.camel.component.mock.MockEndpoint;
+import org.apache.camel.component.webhook.WebhookConfiguration;
+import org.apache.camel.component.webhook.WebhookEndpoint;
+import org.apache.camel.test.AvailablePortFinder;
+import org.assertj.core.api.Assertions;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.extension.RegisterExtension;
+
+public class WhatsAppWebhookTest extends WhatsAppTestSupport {
+
+    private static final String WEBHOOK_SECRET = "my-app-secret";
+
+    @RegisterExtension
+    AvailablePortFinder.Port port = AvailablePortFinder.find();
+
+    @Test
+    public void testWebhookRegistration() throws Exception {
+        String challenge = "987";
+        WebhookConfiguration config
+                = ((WebhookEndpoint) context().getRoute("webhook").getConsumer().getEndpoint()).getConfiguration();
+        String url = config.computeFullExternalUrl() + "?hub.mode=subscribe&hub.verify_token=" + VERIFY_TOKEN
+                     + "&hub.challenge=" + challenge;
+
+        MockEndpoint mock = getMockEndpoint("mock:endpoint");
+        mock.expectedBodiesReceived(challenge);
+        mock.expectedMinimumMessageCount(1);
+
+        template().sendBodyAndHeader("netty-http:" + url, null, Exchange.HTTP_METHOD, "GET");
+        mock.assertIsSatisfied();
+    }
+
+    @Test
+    public void testWebhookRegistrationEncodedQuery() throws Exception {
+        WebhookConfiguration config
+                = ((WebhookEndpoint) context().getRoute("webhook").getConsumer().getEndpoint()).getConfiguration();
+        // a parameter with an empty value, and an encoded challenge
+        String query = "empty=&hub.mode=subscribe&hub.verify_token=" + VERIFY_TOKEN + "&hub.challenge=a%26b";
+
+        MockEndpoint mock = getMockEndpoint("mock:endpoint");
+        mock.expectedBodiesReceived("a&b");
+
+        template().sendBodyAndHeaders("netty-http:" + config.computeFullExternalUrl(), null,
+                Map.of(Exchange.HTTP_METHOD, "GET", Exchange.HTTP_QUERY, query));
+        mock.assertIsSatisfied();
+    }
+
+    @Test
+    public void testWebhookRegistrationFailed() throws Exception {
+        String challenge = "987";
+        WebhookConfiguration config
+                = ((WebhookEndpoint) context().getRoute("webhook").getConsumer().getEndpoint()).getConfiguration();
+        String url = config.computeFullExternalUrl() + "?hub.mode=subscribe&hub.verify_token=" + WRONG_VERIFY_TOKEN
+                     + "&hub.challenge=" + challenge;
+
+        MockEndpoint mock = getMockEndpoint("mock:endpoint");
+        mock.expectedMinimumMessageCount(1);
+
+        Assertions
+                .assertThatThrownBy(() -> template().sendBodyAndHeader("netty-http:" + url, null, Exchange.HTTP_METHOD, "GET"))
+                .rootCause()
+                .hasMessageContaining("statusCode: 403");
+        mock.assertIsSatisfied();
+    }
+
+    @Test
+    public void testWebhook() throws Exception {
+        WebhookConfiguration config
+                = ((WebhookEndpoint) context().getRoute("webhook").getConsumer().getEndpoint()).getConfiguration();
+        String url = config.computeFullExternalUrl();
+
+        byte[] content;
+        try (InputStream in = getClass().getClassLoader().getResourceAsStream("webhook-request.json")) {
+            content = in.readAllBytes();
+        }
+        MockEndpoint mock = getMockEndpoint("mock:endpoint");
+        mock.expectedMinimumMessageCount(1);
+
+        String reply = template().requestBodyAndHeaders("netty-http:" + url, content,
+                Map.of(Exchange.CONTENT_TYPE, "application/json", "X-Hub-Signature-256", sign(content)), String.class);
+
+        mock.assertIsSatisfied();
+        Assertions.assertThat(mock.getExchanges().get(0).getIn().getBody(String.class)).contains("\"type\": \"text\"");
+        Assertions.assertThat(reply).isNullOrEmpty();
+    }
+
+    @Test
+    public void testWebhookEventWithoutSignatureIsRejected() throws Exception {
+        WebhookConfiguration config
+                = ((WebhookEndpoint) context().getRoute("webhook").getConsumer().getEndpoint()).getConfiguration();
+        String url = config.computeFullExternalUrl();
+
+        MockEndpoint mock = getMockEndpoint("mock:endpoint");
+        mock.expectedMessageCount(0);
+
+        Assertions
+                .assertThatThrownBy(() -> template().sendBodyAndHeader("netty-http:" + url,
+                        "{\"object\":\"whatsapp_business_account\"}", Exchange.CONTENT_TYPE, "application/json"))
+                .rootCause()
+                .hasMessageContaining("statusCode: 403");
+        mock.assertIsSatisfied();
+    }
+
+    private static String sign(byte[] payload) throws Exception {
+        Mac mac = Mac.getInstance("HmacSHA256");
+        mac.init(new SecretKeySpec(WEBHOOK_SECRET.getBytes(StandardCharsets.UTF_8), "HmacSHA256"));
+        return "sha256=" + HexFormat.of().formatHex(mac.doFinal(payload));
+    }
+
+    protected WhatsAppApiConfig getWhatsAppApiConfig() {
+        return WhatsAppApiConfig.mock(port.getPort());
+    }
+
+    @Override
+    protected RoutesBuilder createRouteBuilder() {
+        return new RouteBuilder() {
+            @Override
+            public void configure() {
+                restConfiguration().host("localhost").port(port.getPort());
+
+                from("webhook:whatsapp:" + phoneNumberId + "?webhookAutoRegister=false&webhookSecret=" + WEBHOOK_SECRET)
+                        .id("webhook")
+                        .convertBodyTo(String.class).to("mock:endpoint");
+            }
+        };
+    }
+
+}

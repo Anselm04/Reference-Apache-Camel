@@ -1,0 +1,121 @@
+= Azure Event Grid Component
+:doctitle: Azure Event Grid
+:shortname: azure-eventgrid
+:artifactid: camel-azure-eventgrid
+:description: Send events to Azure Event Grid topics.
+:since: 4.17
+:supportlevel: Stable
+:tabs-sync-option:
+:component-header: Only producer is supported
+//Manually maintained attributes
+:group: Azure
+
+*Since Camel {since}*
+
+*{component-header}*
+
+The Azure Event Grid component provides the capability to publish events to
+https://learn.microsoft.com/en-us/azure/event-grid/overview[Azure Event Grid] topics
+using https://learn.microsoft.com/en-us/azure/event-grid/cloud-event-schema[CloudEvents].
+
+Azure Event Grid is an eventing service for the cloud that enables event-driven architectures.
+It provides event routing from any source to any destination with rich filtering capabilities.
+
+*Prerequisites*
+
+You must have a valid Microsoft Azure account and an Event Grid topic.
+More information is available at the https://learn.microsoft.com/en-us/azure/event-grid/[Azure Event Grid documentation].
+
+Maven users will need to add the following dependency to their `pom.xml`
+for this component:
+
+[source,xml]
+----
+<dependency>
+    <groupId>org.apache.camel</groupId>
+    <artifactId>camel-azure-eventgrid</artifactId>
+    <version>x.x.x</version>
+    <!-- use the same version as your Camel core version -->
+</dependency>
+----
+
+== URI Format
+
+[source,text]
+----
+azure-eventgrid:topicEndpoint
+----
+
+
+// component options: START
+include::partial$component-configure-options.adoc[]
+include::partial$component-endpoint-options.adoc[]
+include::partial$component-endpoint-headers.adoc[]
+// component options: END
+
+== Authentication
+
+The component supports the following credential types via the `credentialType` option:
+
+ACCESS_KEY:: Uses the Event Grid topic access key for authentication (default).
+Set the `accessKey` option with your topic key.
+TOKEN_CREDENTIAL:: Uses a `TokenCredential` implementation (e.g., Azure Identity `DefaultAzureCredential`).
+Set the `tokenCredential` option.
+AZURE_IDENTITY:: Uses Azure Identity default credential chain automatically.
+
+== Usage
+
+=== Sending events
+
+The producer publishes events as CloudEvents to the configured Event Grid topic endpoint:
+
+[tabs]
+====
+Java::
++
+[source,java]
+----
+from("direct:start")
+    .to("azure-eventgrid:https://my-topic.eastus-1.eventgrid.azure.net/api/events?accessKey=RAW(myKey)");
+----
+
+XML::
++
+[source,xml]
+----
+<route>
+    <from uri="direct:start"/>
+    <to uri="azure-eventgrid:https://my-topic.eastus-1.eventgrid.azure.net/api/events?accessKey=RAW(myKey)"/>
+</route>
+----
+
+YAML::
++
+[source,yaml]
+----
+- route:
+    from:
+      uri: direct:start
+      steps:
+        - to:
+            uri: azure-eventgrid:https://my-topic.eastus-1.eventgrid.azure.net/api/events
+            parameters:
+              accessKey: "RAW(myKey)"
+----
+====
+
+=== The data of the event
+
+The message body is the data of the CloudEvent:
+
+* A `Map` or a POJO is serialized to JSON by the Azure SDK, and a number becomes a JSON number.
+* Text that is a JSON object or array is sent as it is, and other text as a JSON string.
+* Bytes, a stream or a file (also the file of a file consumer) are sent as binary data, in the `data_base64` field of
+the CloudEvent. To send JSON held in bytes or a stream as JSON, convert it to a `String` first, for example with
+`convertBodyTo(String.class)`.
+* A `List` is sent as one event per element.
+
+A message without a body fails. The source of the events is `/camel`. The `CamelAzureEventGridEventType`,
+`CamelAzureEventGridSubject`, `CamelAzureEventGridId` and `CamelAzureEventGridEventTime` headers set the type, the
+subject, the id and the time of the events; without them the type is `Camel.Event`, the subject `/camel/event`, the id
+a random UUID and the time the current time.

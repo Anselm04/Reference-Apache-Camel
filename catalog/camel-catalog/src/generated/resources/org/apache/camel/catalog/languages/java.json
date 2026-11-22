@@ -1,0 +1,36 @@
+{
+  "language": {
+    "kind": "language",
+    "name": "java",
+    "title": "Java",
+    "description": "Evaluates a Java (Java compiled once at runtime) expression",
+    "deprecated": false,
+    "firstVersion": "4.3.0",
+    "label": "language",
+    "javaType": "org.apache.camel.language.joor.JavaLanguage",
+    "supportLevel": "Stable",
+    "groupId": "org.apache.camel",
+    "artifactId": "camel-joor",
+    "version": "4.24.0-SNAPSHOT",
+    "modelName": "java",
+    "modelJavaType": "org.apache.camel.model.language.JavaExpression"
+  },
+  "bodyTypes": {
+    "expressionIn": { "carriers": [ "any" ], "description": "The body as it is, in the variable body of type Object: bodyAs(type) converts it" },
+    "expressionOut": { "carriers": [ "unknown" ], "javaTypeOption": "resultType", "description": "What the script returns" }
+  },
+  "languageProperties": {
+    "configResource": { "index": 0, "kind": "property", "displayName": "Config Resource", "group": "advanced", "label": "advanced", "required": false, "type": "string", "javaType": "java.lang.String", "deprecated": false, "autowired": false, "secret": false, "defaultValue": "classpath:camel-joor.properties?optional=true", "description": "The resource with the configuration of the Java language, such as its imports and aliases. Can also be ref:name of a String bean with the configuration." },
+    "preCompile": { "index": 1, "kind": "property", "displayName": "Pre Compile", "group": "advanced", "label": "advanced", "required": false, "type": "boolean", "javaType": "boolean", "deprecated": false, "autowired": false, "secret": false, "defaultValue": true, "description": "Whether the expression should be pre compiled once during initialization phase. If this is turned off, then the expression is reloaded and compiled on each evaluation." },
+    "singleQuotes": { "index": 2, "kind": "property", "displayName": "Single Quotes", "group": "advanced", "label": "advanced", "required": false, "type": "boolean", "javaType": "boolean", "deprecated": false, "autowired": false, "secret": false, "defaultValue": true, "description": "Whether single quotes can be used as replacement for double quotes. This is convenient when you need to work with strings inside strings." }
+  },
+  "properties": {
+    "id": { "index": 0, "kind": "attribute", "displayName": "Id", "group": "common", "required": false, "type": "string", "javaType": "java.lang.String", "deprecated": false, "autowired": false, "secret": false, "description": "The id of this node." },
+    "expression": { "index": 1, "kind": "value", "displayName": "Expression", "group": "common", "required": true, "type": "string", "javaType": "java.lang.String", "deprecated": false, "autowired": false, "secret": false, "description": "The expression value in your chosen language syntax." },
+    "preCompile": { "index": 2, "kind": "attribute", "displayName": "Pre Compile", "group": "advanced", "label": "advanced", "required": false, "type": "boolean", "javaType": "java.lang.Boolean", "deprecated": false, "autowired": false, "secret": false, "defaultValue": true, "description": "Whether the expression should be pre compiled once during initialization phase. If this is turned off, then the expression is reloaded and compiled on each evaluation." },
+    "singleQuotes": { "index": 3, "kind": "attribute", "displayName": "Single Quotes", "group": "advanced", "label": "advanced", "required": false, "type": "boolean", "javaType": "java.lang.Boolean", "deprecated": false, "autowired": false, "secret": false, "defaultValue": true, "description": "Whether single quotes can be used as replacement for double quotes. This is convenient when you need to work with strings inside strings." },
+    "resultType": { "index": 4, "kind": "attribute", "displayName": "Result Type", "group": "common", "required": false, "type": "string", "javaType": "java.lang.String", "deprecated": false, "autowired": false, "secret": false, "description": "The class of the result type (type from output)." },
+    "trim": { "index": 5, "kind": "attribute", "displayName": "Trim", "group": "advanced", "label": "advanced", "required": false, "type": "boolean", "javaType": "java.lang.Boolean", "deprecated": false, "autowired": false, "secret": false, "defaultValue": true, "description": "Whether to trim the source code to remove leading and trailing whitespaces and line breaks." },
+    "resolveResource": { "index": 6, "kind": "attribute", "displayName": "Resolve Resource", "group": "advanced", "label": "advanced", "required": false, "type": "boolean", "javaType": "java.lang.Boolean", "deprecated": false, "autowired": false, "secret": false, "defaultValue": false, "description": "Whether a result of the expression that is a String starting with resource: is loaded as a resource and its content becomes the result, e.g. a script that returns resource:templates\/order.json. The name has no scheme and is loaded from the classpath: camel run puts the files given on the command line on the classpath and export puts them in src\/main\/resources, so the same name works in both. A name with a scheme (file:, http: ...) or with .. fails. Let the route choose the name, such as a fixed folder with a name picked by the route, and do not take it straight from the message. Off by default; the resource: prefix on the expression text itself is always resolved. Applies to the expression used as a value, not as a predicate." }
+  }
+}

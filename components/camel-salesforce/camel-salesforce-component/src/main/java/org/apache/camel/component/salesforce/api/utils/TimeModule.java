@@ -1,0 +1,69 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.camel.component.salesforce.api.utils;
+
+import java.time.Instant;
+import java.time.LocalDate;
+import java.time.LocalDateTime;
+import java.time.OffsetDateTime;
+import java.time.OffsetTime;
+import java.time.Year;
+import java.time.ZonedDateTime;
+import java.time.format.DateTimeFormatter;
+
+import tools.jackson.databind.ext.javatime.deser.LocalDateDeserializer;
+import tools.jackson.databind.ext.javatime.ser.LocalDateSerializer;
+import tools.jackson.databind.ext.javatime.ser.ZonedDateTimeSerializer;
+import tools.jackson.databind.module.SimpleModule;
+import tools.jackson.databind.ser.std.ToStringSerializer;
+
+import static org.apache.camel.component.salesforce.api.utils.DateTimeHandling.ISO_OFFSET_DATE_TIME;
+
+public class TimeModule extends SimpleModule {
+
+    private static final LocalDateDeserializer LOCAL_DATE_DESERIALIZER = new LocalDateDeserializer(DateTimeFormatter.ISO_DATE);
+
+    private static final LocalDateSerializer LOCAL_DATE_SERIALIZER = new LocalDateSerializer(DateTimeFormatter.ISO_DATE);
+
+    private static final long serialVersionUID = 1L;
+
+    private static final ZonedDateTimeSerializer ZONED_DATE_TIME_SERIALIZER = new ZonedDateTimeSerializer(ISO_OFFSET_DATE_TIME);
+
+    public TimeModule() {
+        addSerializer(LocalDate.class, LOCAL_DATE_SERIALIZER);
+        addDeserializer(LocalDate.class, LOCAL_DATE_DESERIALIZER);
+
+        addSerializer(LocalDateTime.class, LocalDateTimeSerializer.INSTANCE);
+        addDeserializer(LocalDateTime.class, LocalDateTimeDeserializer.INSTANCE);
+
+        addSerializer(OffsetDateTime.class, OffsetDateTimeSerializer.INSTANCE);
+        addDeserializer(OffsetDateTime.class, OffsetDateTimeDeserializer.INSTANCE);
+
+        addSerializer(ZonedDateTime.class, ZONED_DATE_TIME_SERIALIZER);
+        addDeserializer(ZonedDateTime.class, ZonedDateTimeDeserializer.INSTANCE);
+
+        addSerializer(Instant.class, InstantSerializer.INSTANCE);
+        addDeserializer(Instant.class, InstantDeserializer.INSTANCE);
+
+        // Jackson 3 writes Year as a number
+        addSerializer(Year.class, ToStringSerializer.instance);
+
+        addSerializer(OffsetTime.class, OffsetTimeSerializer.INSTANCE);
+        addDeserializer(OffsetTime.class, OffsetTimeDeserializer.INSTANCE);
+    }
+
+}

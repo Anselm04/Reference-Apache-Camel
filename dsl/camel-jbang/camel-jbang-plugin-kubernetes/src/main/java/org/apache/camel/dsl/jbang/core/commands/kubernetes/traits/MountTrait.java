@@ -1,0 +1,329 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.camel.dsl.jbang.core.commands.kubernetes.traits;
+
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Optional;
+import java.util.Set;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+import java.util.stream.Collectors;
+
+import io.fabric8.kubernetes.api.model.ConfigMapVolumeSourceBuilder;
+import io.fabric8.kubernetes.api.model.KeyToPathBuilder;
+import io.fabric8.kubernetes.api.model.PersistentVolumeClaimVolumeSourceBuilder;
+import io.fabric8.kubernetes.api.model.SecretVolumeSourceBuilder;
+import io.fabric8.kubernetes.api.model.Volume;
+import io.fabric8.kubernetes.api.model.VolumeBuilder;
+import io.fabric8.kubernetes.api.model.VolumeMount;
+import io.fabric8.kubernetes.api.model.VolumeMountBuilder;
+import io.fabric8.kubernetes.api.model.apps.DeploymentBuilder;
+import org.apache.camel.RuntimeCamelException;
+import org.apache.camel.dsl.jbang.core.commands.kubernetes.KubernetesHelper;
+import org.apache.camel.dsl.jbang.core.commands.kubernetes.traits.model.Mount;
+import org.apache.camel.dsl.jbang.core.commands.kubernetes.traits.model.Traits;
+import org.apache.camel.tooling.model.Strings;
+import org.apache.camel.util.FileUtil;
+import org.apache.camel.util.ObjectHelper;
+
+public class MountTrait extends BaseTrait {
+
+    private static final Pattern RESOURCE_VALUE_EXPRESSION
+            = Pattern.compile("^([\\w.\\-_:]+)(/([\\w.\\-_:]+))?(@([\\w.\\-_:/]+))?$");
+
+    public static final int MOUNT_TRAIT_ORDER = ContainerTrait.CONTAINER_TRAIT_ORDER + 10;
+    public static final String CONF_DIR = "/etc/camel/conf.d";
+    public static final String RESOURCES_DIR = "/etc/camel/resources.d";
+    public static final String SECRETS = "/_secrets";
+    public static final String CONFIGMAPS = "/_configmaps";
+
+    public MountTrait() {
+        super("mount", MOUNT_TRAIT_ORDER);
+    }
+
+    @Override
+    public boolean configure(Traits traitConfig, TraitContext context) {
+        Mount mountTrait = Optional.ofNullable(traitConfig.getMount()).orElseGet(Mount::new);
+
+        if (mountTrait.getConfigs() != null) {
+            for (String config : mountTrait.getConfigs()) {
+                if (!config.startsWith("configmap:") && !config.startsWith("secret:")) {
+                    throw new RuntimeCamelException(
+                            "Unsupported config %s, must be a configmap or secret resource".formatted(config));
+                }
+            }
+        }
+
+        if (mountTrait.getResources() != null) {
+            for (String resource : mountTrait.getResources()) {
+                if (!resource.startsWith("configmap:") && !resource.startsWith("secret:")) {
+                    throw new RuntimeCamelException(
+                            "Unsupported resource %s, must be a configmap or secret resource".formatted(resource));
+                }
+            }
+        }
+
+        return true;
+    }
+
+    @Override
+    public void apply(Traits traitConfig, TraitContext context) {
+        Mount mountTrait = Optional.ofNullable(traitConfig.getMount()).orElseGet(Mount::new);
+
+        List<Volume> volumes = new ArrayList<>();
+        List<VolumeMount> volumeMounts = new ArrayList<>();
+
+        configureVolumesAndMounts(mountTrait, volumes, volumeMounts);
+
+        // Deployment
+        Optional<DeploymentBuilder> deployment = context.getDeployment();
+        deployment.ifPresent(d -> d.editOrNewSpec()
+                .editOrNewTemplate()
+                .editOrNewSpec()
+                .addAllToVolumes(volumes)
+                .editFirstContainer()
+                .addAllToVolumeMounts(volumeMounts)
+                .endContainer()
+                .endSpec()
+                .endTemplate()
+                .endSpec());
+        if (volumes.isEmpty()) {
+            return;
+        }
+        // and the other workloads: a CronJob and a Knative Service had no volumes (CAMEL-26934)
+        context.doWithCronJobs(j -> j.editOrNewSpec()
+                .editOrNewJobTemplate()
+                .editOrNewSpec()
+                .editOrNewTemplate()
+                .editOrNewSpec()
+                .addAllToVolumes(volumes)
+                .editFirstContainer()
+                .addAllToVolumeMounts(volumeMounts)
+                .endContainer()
+                .endSpec()
+                .endTemplate()
+                .endSpec()
+                .endJobTemplate()
+                .endSpec());
+        context.doWithKnativeServices(k -> k.editOrNewSpec()
+                .editOrNewTemplate()
+                .editOrNewSpec()
+                .addAllToVolumes(volumes)
+                .editFirstContainer()
+                .addAllToVolumeMounts(volumeMounts)
+                .endContainer()
+                .endSpec()
+                .endTemplate()
+                .endSpec());
+    }
+
+    private void configureVolumesAndMounts(Mount mountTrait, List<Volume> volumes, List<VolumeMount> volumeMounts) {
+        if (mountTrait.getConfigs() != null) {
+            for (String c : mountTrait.getConfigs()) {
+                mountResource(volumes, volumeMounts, parseConfig(c, MountResource.ContentType.TEXT));
+            }
+        }
+
+        if (mountTrait.getResources() != null) {
+            for (String r : mountTrait.getResources()) {
+                mountResource(volumes, volumeMounts, parseConfig(r, MountResource.ContentType.DATA));
+            }
+        }
+
+        if (mountTrait.getVolumes() != null) {
+            for (String v : mountTrait.getVolumes()) {
+                mountResource(volumes, volumeMounts, parseConfig(v, null));
+            }
+        }
+    }
+
+    private void mountResource(List<Volume> volumes, List<VolumeMount> volumeMounts, MountResource mountResource) {
+        String volumeName = uniqueVolumeName(volumes, KubernetesHelper.sanitize(mountResource.name));
+        String dstDir = Optional.ofNullable(mountResource.destinationPath).orElse("");
+        String dstFile;
+        boolean overrideFilePath = false;
+        if (!dstDir.isEmpty() && !mountResource.key.isEmpty()) {
+            dstFile = FileUtil.stripPath(dstDir);
+            overrideFilePath = true;
+        } else {
+            dstFile = mountResource.key;
+        }
+
+        Volume vol = getVolume(volumeName, mountResource, dstFile);
+        boolean readOnly = mountResource.storageType != MountResource.StorageType.PVC;
+        VolumeMount mnt = getMount(volumeName, getMountPath(mountResource, dstDir), dstFile, readOnly, overrideFilePath);
+
+        volumes.add(vol);
+        volumeMounts.add(mnt);
+    }
+
+    /**
+     * The name of a volume, unique in the pod: the volumes of a pod must have different names, and the name of a volume
+     * is the name of its configmap, secret or claim, so --config configmap:db --config secret:db, or two keys of one
+     * configmap, gave two volumes of the same name, which the API server refuses (CAMEL-26934). The first volume keeps
+     * the name, the next ones get -2, -3 and so on.
+     */
+    static String uniqueVolumeName(List<Volume> volumes, String name) {
+        Set<String> taken = volumes.stream().map(Volume::getName).collect(Collectors.toSet());
+        if (!taken.contains(name)) {
+            return name;
+        }
+        for (int i = 2;; i++) {
+            String suffix = "-" + i;
+            // a volume name is at most 63 characters (a DNS label)
+            String base = name.length() + suffix.length() > 63 ? name.substring(0, 63 - suffix.length()) : name;
+            String candidate = base + suffix;
+            if (!taken.contains(candidate)) {
+                return candidate;
+            }
+        }
+    }
+
+    private VolumeMount getMount(
+            String volumeName, String mountPath, String subPath, boolean readOnly, boolean overrideFilePath) {
+        String adjustedMountPath = mountPath + "/" + subPath;
+        if (ObjectHelper.isEmpty(subPath) || overrideFilePath) {
+            adjustedMountPath = mountPath;
+        }
+        VolumeMountBuilder mount = new VolumeMountBuilder()
+                .withName(volumeName)
+                .withMountPath(adjustedMountPath)
+                .withReadOnly(readOnly);
+
+        if (ObjectHelper.isNotEmpty(subPath)) {
+            mount.withSubPath(subPath);
+        }
+
+        return mount.build();
+    }
+
+    private Volume getVolume(String volumeName, MountResource mountResource, String mountPath) {
+        VolumeBuilder volume = new VolumeBuilder()
+                .withName(volumeName);
+
+        switch (mountResource.storageType) {
+            case CONFIGMAP:
+                ConfigMapVolumeSourceBuilder cmVolumeSource = new ConfigMapVolumeSourceBuilder()
+                        .withName(mountResource.name);
+
+                if (ObjectHelper.isNotEmpty(mountResource.key)) {
+                    cmVolumeSource.addToItems(new KeyToPathBuilder()
+                            .withKey(mountResource.key)
+                            .withPath(Optional.ofNullable(mountPath).orElse(mountResource.key))
+                            .build());
+                }
+
+                volume.withConfigMap(cmVolumeSource.build()).build();
+                break;
+            case SECRET:
+                SecretVolumeSourceBuilder volumeSource = new SecretVolumeSourceBuilder()
+                        .withSecretName(mountResource.name);
+
+                if (ObjectHelper.isNotEmpty(mountResource.key)) {
+                    volumeSource.addToItems(new KeyToPathBuilder()
+                            .withKey(mountResource.key)
+                            .withPath(Optional.ofNullable(mountPath).orElse(mountResource.key))
+                            .build());
+                }
+
+                volume.withSecret(volumeSource.build()).build();
+                break;
+            case PVC:
+                volume.withPersistentVolumeClaim(new PersistentVolumeClaimVolumeSourceBuilder()
+                        .withClaimName(mountResource.name)
+                        .build());
+                break;
+        }
+
+        return volume.build();
+    }
+
+    private String getMountPath(MountResource mountResource, String mountPoint) {
+        if (!mountPoint.isEmpty()) {
+            return mountPoint;
+        }
+
+        String baseMountPoint;
+        if (mountResource.contentType == MountResource.ContentType.DATA) {
+            baseMountPoint = RESOURCES_DIR;
+        } else {
+            baseMountPoint = CONF_DIR;
+        }
+
+        if (mountResource.storageType == MountResource.StorageType.SECRET) {
+            baseMountPoint += SECRETS;
+        } else {
+            baseMountPoint += CONFIGMAPS;
+        }
+
+        // a path in the container, which is a Linux path also when the CLI runs on Windows, where Path joined it with
+        // backslashes (CAMEL-26934)
+        return baseMountPoint + "/" + mountResource.name;
+    }
+
+    private MountResource parseConfig(String expression, MountResource.ContentType contentType) {
+        if (expression.startsWith("configmap:")) {
+            return createConfig(expression.substring("configmap:".length()), MountResource.StorageType.CONFIGMAP, contentType);
+        } else if (expression.startsWith("secret:")) {
+            return createConfig(expression.substring("secret:".length()), MountResource.StorageType.SECRET, contentType);
+        } else { // volumes
+            String[] configParts = expression.split(":", 2);
+
+            if (configParts.length != 2) {
+                throw new RuntimeCamelException(
+                        "Unsupported volume configuration '%s', expected format is \"<resourceName>:<destinationPath>\""
+                                .formatted(expression));
+            }
+
+            return new MountResource(MountResource.StorageType.PVC, null, configParts[0], "", configParts[1]);
+        }
+    }
+
+    private MountResource createConfig(
+            String expression, MountResource.StorageType storageType, MountResource.ContentType contentType) {
+        String name = expression;
+        String key = "";
+        String destPath = "";
+        Matcher resourceCoordinates = RESOURCE_VALUE_EXPRESSION.matcher(expression);
+        if (resourceCoordinates.matches()) {
+            name = resourceCoordinates.group(1);
+            key = Optional.ofNullable(resourceCoordinates.group(3)).orElse("");
+            destPath = resourceCoordinates.group(4);
+            if (!Strings.isNullOrEmpty(destPath)) {
+                destPath = destPath.replace("@", "");
+            }
+        }
+        return new MountResource(storageType, contentType, name, key, destPath);
+    }
+
+    private record MountResource(StorageType storageType, ContentType contentType, String name, String key,
+            String destinationPath) {
+        private enum ContentType {
+            DATA,
+            TEXT
+        }
+
+        private enum StorageType {
+            CONFIGMAP,
+            SECRET,
+            PVC
+        }
+    }
+
+}

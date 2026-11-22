@@ -1,0 +1,234 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.camel.component.vertx.http;
+
+import java.io.ByteArrayOutputStream;
+import java.io.File;
+import java.io.FileInputStream;
+import java.io.InputStream;
+import java.io.Reader;
+import java.io.Serializable;
+import java.net.URLDecoder;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.concurrent.Callable;
+import java.util.concurrent.RejectedExecutionException;
+import java.util.concurrent.atomic.AtomicBoolean;
+
+import io.vertx.core.AsyncResult;
+import io.vertx.core.Handler;
+import io.vertx.core.MultiMap;
+import io.vertx.core.Vertx;
+import io.vertx.core.buffer.Buffer;
+import io.vertx.core.streams.ReadStream;
+import io.vertx.ext.web.client.HttpRequest;
+import io.vertx.ext.web.client.HttpResponse;
+import io.vertx.ext.web.multipart.MultipartForm;
+import org.apache.camel.AsyncCallback;
+import org.apache.camel.CamelExchangeException;
+import org.apache.camel.Exchange;
+import org.apache.camel.Message;
+import org.apache.camel.WrappedFile;
+import org.apache.camel.component.vertx.common.VertxBufferConverter;
+import org.apache.camel.support.DefaultAsyncProducer;
+import org.apache.camel.support.MessageHelper;
+import org.apache.camel.util.MimeTypeHelper;
+
+import static org.apache.camel.component.vertx.http.VertxHttpConstants.CONTENT_TYPE_FORM_URLENCODED;
+import static org.apache.camel.component.vertx.http.VertxHttpConstants.CONTENT_TYPE_JAVA_SERIALIZED_OBJECT;
+
+public class VertxHttpProducer extends DefaultAsyncProducer {
+
+    private final VertxHttpBinding vertxHttpBinding;
+
+    public VertxHttpProducer(VertxHttpEndpoint endpoint) {
+        super(endpoint);
+        this.vertxHttpBinding = endpoint.getConfiguration().getVertxHttpBinding();
+    }
+
+    @Override
+    public VertxHttpEndpoint getEndpoint() {
+        return (VertxHttpEndpoint) super.getEndpoint();
+    }
+
+    public VertxHttpComponent getComponent() {
+        return getEndpoint().getComponent();
+    }
+
+    @Override
+    public boolean process(Exchange exchange, AsyncCallback callback) {
+        Message message = exchange.getMessage();
+
+        try {
+            HttpRequest<Buffer> request = vertxHttpBinding.prepareHttpRequest(getEndpoint(), exchange);
+            Handler<AsyncResult<HttpResponse<Buffer>>> resultHandler = createResultHandler(exchange, callback);
+
+            Object body = message.getBody();
+            if (body == null) {
+                request.send().onComplete(resultHandler);
+            } else {
+                String contentType = MessageHelper.getContentType(message);
+                boolean multipart = getEndpoint().getConfiguration().isMultipartUpload();
+                String multipartName = getEndpoint().getConfiguration().getMultipartUploadName();
+
+                // Handle vertx specific body first
+                if (body instanceof MultiMap mm) {
+                    request.sendForm(mm).onComplete(resultHandler);
+                    return false;
+                } else if (body instanceof MultipartForm mf) {
+                    request.sendMultipartForm(mf).onComplete(resultHandler);
+                    return false;
+                } else if (body instanceof ReadStream rs) {
+                    request.sendStream(rs).onComplete(resultHandler);
+                    return false;
+                } else if (body instanceof Buffer buf) {
+                    request.sendBuffer(buf).onComplete(resultHandler);
+                    return false;
+                }
+
+                if (body instanceof Reader) {
+                    // send the text of the reader, as a String body
+                    body = message.getMandatoryBody(String.class);
+                }
+
+                if (body instanceof File || body instanceof Path || body instanceof WrappedFile<?>) {
+                    // file based (could potentially also be a FTP file etc)
+                    File file = body instanceof Path ? null : message.getBody(File.class);
+                    Buffer buf;
+                    String fileName;
+                    if (body instanceof Path path) {
+                        try (InputStream is = Files.newInputStream(path)) {
+                            buf = VertxBufferConverter.toBuffer(is);
+                        }
+                        Path name = path.getFileName();
+                        fileName = name != null ? name.toString() : multipartName;
+                    } else if (file != null) {
+                        try (InputStream is = new FileInputStream(file)) {
+                            buf = VertxBufferConverter.toBuffer(is);
+                        }
+                        fileName = file.getName();
+                    } else {
+                        // not a local file, such as a remote file (ftp, sftp, smb) with its content in memory,
+                        // so send its content
+                        buf = message.getMandatoryBody(Buffer.class);
+                        fileName = message.getHeader(Exchange.FILE_NAME_ONLY, multipartName, String.class);
+                    }
+                    if (multipart) {
+                        String type = MimeTypeHelper.probeMimeType(fileName);
+                        if (type == null) {
+                            type = "application/octet-stream"; // default binary
+                        }
+                        MultipartForm form = MultipartForm.create().binaryFileUpload(multipartName, fileName, buf, type);
+                        request.sendMultipartForm(form).onComplete(resultHandler);
+                    } else {
+                        request.sendBuffer(buf).onComplete(resultHandler);
+                    }
+                } else if (body instanceof String str) {
+                    // Try to extract URL encoded form data from the message body
+                    if (CONTENT_TYPE_FORM_URLENCODED.equals(contentType)) {
+                        request.sendForm(parseForm(str)).onComplete(resultHandler);
+                    } else {
+                        // Fallback to send as Buffer
+                        Buffer buffer = VertxBufferConverter.toBuffer(str, exchange);
+                        request.sendBuffer(buffer).onComplete(resultHandler);
+                    }
+                } else {
+                    // Handle x-java-serialized-object Content-Type
+                    if (CONTENT_TYPE_JAVA_SERIALIZED_OBJECT.equals(contentType)) {
+                        if (!getComponent().isAllowJavaSerializedObject()) {
+                            throw new CamelExchangeException(
+                                    "Content-type " + CONTENT_TYPE_JAVA_SERIALIZED_OBJECT + " is not allowed", exchange);
+                        }
+                        // Send a serialized Java object message body
+                        try (ByteArrayOutputStream baos = new ByteArrayOutputStream()) {
+                            Serializable serializable = message.getMandatoryBody(Serializable.class);
+                            VertxHttpHelper.writeObjectToStream(baos, serializable);
+                            request.sendBuffer(Buffer.buffer(baos.toByteArray())).onComplete(resultHandler);
+                        }
+                    } else {
+                        Buffer buffer = message.getMandatoryBody(Buffer.class);
+                        request.sendBuffer(buffer).onComplete(resultHandler);
+                    }
+                }
+            }
+        } catch (Exception e) {
+            exchange.setException(e);
+            callback.done(true);
+            return true;
+        }
+
+        return false;
+    }
+
+    /**
+     * Parses a URL encoded form, with its values decoded (Vert.x encodes them again) and all the values of a repeated
+     * name.
+     */
+    private static MultiMap parseForm(String form) {
+        MultiMap map = MultiMap.caseInsensitiveMultiMap();
+        for (String pair : form.split("&")) {
+            if (pair.isEmpty()) {
+                continue;
+            }
+            int pos = pair.indexOf('=');
+            String name = pos < 0 ? pair : pair.substring(0, pos);
+            String value = pos < 0 ? "" : pair.substring(pos + 1);
+            map.add(URLDecoder.decode(name, StandardCharsets.UTF_8), URLDecoder.decode(value, StandardCharsets.UTF_8));
+        }
+        return map;
+    }
+
+    private Handler<AsyncResult<HttpResponse<Buffer>>> createResultHandler(Exchange exchange, AsyncCallback callback) {
+        // the Vert.x of the request: when the CamelContext stops during the call, closing the web client fails the
+        // request, and the stopped component no longer returns its Vert.x when this handler runs
+        Vertx vertx = getEndpoint().getVertx();
+        // Process the response on a thread from the Vert.x worker pool since there may be blocking code:
+        // - If a custom VertxHttpBinding is in use
+        // - If the Camel error handler routes to logic that contains blocking code
+        return response -> {
+            // the exchange is completed once: by the task, or when the worker pool refuses the task
+            AtomicBoolean completed = new AtomicBoolean();
+            try {
+                vertx.executeBlocking((Callable<Void>) () -> {
+                    try {
+                        vertxHttpBinding.handleResponse(getEndpoint(), exchange, response);
+                    } catch (Exception e) {
+                        exchange.setException(e);
+                    } finally {
+                        if (completed.compareAndSet(false, true)) {
+                            callback.done(false);
+                        }
+                    }
+                    return null;
+                }).onFailure(e -> completeWithException(exchange, callback, completed, e));
+            } catch (RejectedExecutionException e) {
+                // the worker pool of the Vert.x is already shut down (for example while the Vert.x closes): the task
+                // never runs, Vert.x fails its future and throws the exception
+                completeWithException(exchange, callback, completed, e);
+            }
+        };
+    }
+
+    private static void completeWithException(
+            Exchange exchange, AsyncCallback callback, AtomicBoolean completed, Throwable cause) {
+        if (completed.compareAndSet(false, true)) {
+            exchange.setException(cause);
+            callback.done(false);
+        }
+    }
+}

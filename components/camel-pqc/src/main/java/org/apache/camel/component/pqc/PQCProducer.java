@@ -1,0 +1,1806 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.camel.component.pqc;
+
+import java.io.File;
+import java.io.IOException;
+import java.io.InputStream;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.security.*;
+import java.security.cert.Certificate;
+import java.security.spec.PKCS8EncodedKeySpec;
+import java.security.spec.X509EncodedKeySpec;
+import java.util.Arrays;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentMap;
+import java.util.concurrent.atomic.AtomicBoolean;
+
+import javax.crypto.KeyAgreement;
+import javax.crypto.KeyGenerator;
+import javax.crypto.SecretKey;
+import javax.crypto.spec.SecretKeySpec;
+
+import org.apache.camel.CamelContext;
+import org.apache.camel.Endpoint;
+import org.apache.camel.Exchange;
+import org.apache.camel.InvalidPayloadException;
+import org.apache.camel.Message;
+import org.apache.camel.RuntimeCamelException;
+import org.apache.camel.StreamCache;
+import org.apache.camel.TypeConverter;
+import org.apache.camel.WrappedFile;
+import org.apache.camel.component.pqc.crypto.hybrid.HybridKEM;
+import org.apache.camel.component.pqc.crypto.hybrid.HybridSignature;
+import org.apache.camel.component.pqc.lifecycle.KeyLifecycleManager;
+import org.apache.camel.component.pqc.lifecycle.KeyMetadata;
+import org.apache.camel.component.pqc.metrics.PQCMetrics;
+import org.apache.camel.component.pqc.stateful.StatefulKeyState;
+import org.apache.camel.health.HealthCheck;
+import org.apache.camel.health.HealthCheckHelper;
+import org.apache.camel.health.WritableHealthCheckRepository;
+import org.apache.camel.support.DefaultProducer;
+import org.apache.camel.util.ObjectHelper;
+import org.apache.camel.util.SecureRandomHelper;
+import org.bouncycastle.jcajce.SecretKeyWithEncapsulation;
+import org.bouncycastle.jcajce.interfaces.LMSPrivateKey;
+import org.bouncycastle.jcajce.interfaces.XMSSMTPrivateKey;
+import org.bouncycastle.jcajce.interfaces.XMSSPrivateKey;
+import org.bouncycastle.jcajce.spec.KEMExtractSpec;
+import org.bouncycastle.jcajce.spec.KEMGenerateSpec;
+import org.bouncycastle.jce.provider.BouncyCastleProvider;
+import org.bouncycastle.pqc.jcajce.provider.BouncyCastlePQCProvider;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+/**
+ * A Producer which sign or verify a payload
+ */
+public class PQCProducer extends DefaultProducer {
+
+    private static final Logger LOG = LoggerFactory.getLogger(PQCProducer.class);
+
+    // Valid symmetric key lengths per algorithm for startup validation.
+    // RC5 is excluded because it supports arbitrary key lengths (0-2040 bits).
+    private static final Map<String, int[]> VALID_SYMMETRIC_KEY_LENGTHS = Map.ofEntries(
+            Map.entry(PQCSymmetricAlgorithms.AES.name(), new int[] { 128, 192, 256 }),
+            Map.entry(PQCSymmetricAlgorithms.RC2.name(), new int[] { 40, 64, 128 }),
+            Map.entry(PQCSymmetricAlgorithms.ARIA.name(), new int[] { 128, 192, 256 }),
+            Map.entry(PQCSymmetricAlgorithms.CAMELLIA.name(), new int[] { 128, 192, 256 }),
+            Map.entry(PQCSymmetricAlgorithms.CAST5.name(), new int[] { 40, 64, 128 }),
+            Map.entry(PQCSymmetricAlgorithms.CAST6.name(), new int[] { 128, 160, 192, 224, 256 }),
+            Map.entry(PQCSymmetricAlgorithms.CHACHA7539.name(), new int[] { 256 }),
+            Map.entry(PQCSymmetricAlgorithms.DSTU7624.name(), new int[] { 128, 256, 512 }),
+            Map.entry(PQCSymmetricAlgorithms.GOST28147.name(), new int[] { 256 }),
+            Map.entry(PQCSymmetricAlgorithms.GOST3412_2015.name(), new int[] { 256 }),
+            Map.entry(PQCSymmetricAlgorithms.GRAIN128.name(), new int[] { 128 }),
+            Map.entry(PQCSymmetricAlgorithms.HC128.name(), new int[] { 128 }),
+            Map.entry(PQCSymmetricAlgorithms.HC256.name(), new int[] { 256 }),
+            Map.entry(PQCSymmetricAlgorithms.SALSA20.name(), new int[] { 128, 256 }),
+            Map.entry(PQCSymmetricAlgorithms.SEED.name(), new int[] { 128 }),
+            Map.entry(PQCSymmetricAlgorithms.SM4.name(), new int[] { 128 }),
+            Map.entry(PQCSymmetricAlgorithms.DESEDE.name(), new int[] { 128, 192 }));
+
+    // Signature algorithms not part of NIST FIPS 204/205 post-quantum standards.
+    // XMSS/XMSSMT are NIST SP 800-208 but are stateful and not in FIPS 204/205.
+    // DILITHIUM and SPHINCSPLUS are deliberately absent: they are aliases that resolve to ML-DSA and SLH-DSA
+    // respectively (see PQCSignatureAlgorithms), so warning that they are "not FIPS 204/205" and recommending
+    // ML-DSA / SLH-DSA instead would tell the user to switch to what they are already using.
+    // Package-private so the unit test can assert on the set itself rather than on the source text
+    static final Set<String> NON_FIPS_PQ_SIGNATURES = Set.of(
+            PQCSignatureAlgorithms.XMSS.name(),
+            PQCSignatureAlgorithms.XMSSMT.name(),
+            PQCSignatureAlgorithms.FALCON.name(),
+            PQCSignatureAlgorithms.SNOVA.name(),
+            PQCSignatureAlgorithms.MAYO.name());
+
+    // KEM algorithms not part of NIST FIPS 203 post-quantum standard.
+    private static final Set<String> NON_FIPS_PQ_KEMS = Set.of(
+            PQCKeyEncapsulationAlgorithms.BIKE.name(),
+            PQCKeyEncapsulationAlgorithms.HQC.name(),
+            PQCKeyEncapsulationAlgorithms.CMCE.name(),
+            PQCKeyEncapsulationAlgorithms.SABER.name(),
+            PQCKeyEncapsulationAlgorithms.FRODO.name(),
+            PQCKeyEncapsulationAlgorithms.NTRU.name(),
+            PQCKeyEncapsulationAlgorithms.NTRULPRime.name(),
+            PQCKeyEncapsulationAlgorithms.SNTRUPrime.name(),
+            PQCKeyEncapsulationAlgorithms.KYBER.name());
+
+    private static final int STREAM_BUFFER_SIZE = 8192;
+
+    private Signature signer;
+    private KeyGenerator keyGenerator;
+    private volatile KeyPair keyPair;
+
+    // Each keeps its warning to one line per producer instead of one per exchange
+    private final AtomicBoolean usageRecordFailureWarned = new AtomicBoolean();
+    private final AtomicBoolean keyUsageNotRecordedWarned = new AtomicBoolean();
+
+    // The claim is on the key material of this producer, so it is taken once, under the name the first exchange
+    // gives the key, and released when the producer stops
+    private final Object statefulClaimLock = new Object();
+    private volatile boolean statefulKeyClaimed;
+    private String claimedStatefulKeyId;
+    private PublicKey claimedStatefulPublicKey;
+    // The stored key is re-read once per name it is signed under: the mapping function runs once, so concurrent
+    // first-time signers under the same name wait for it
+    private final ConcurrentMap<String, Boolean> statefulKeyAdoptions = new ConcurrentHashMap<>();
+    private final AtomicBoolean sharedStatefulKeyWarned = new AtomicBoolean();
+
+    // Set only when this producer created the Signature itself, so it knows how to create another one.
+    // Left null when the user configured an instance, which then has to be shared and locked instead.
+    private String signerAlgorithm;
+    private String signerProvider;
+    private String classicalSignerAlgorithm;
+    // The same for the KEM KeyGenerator and the classical KeyAgreement of the hybrid KEM operations. The provider is
+    // kept as an object, so creating another KeyGenerator does not depend on it still being registered in the JVM
+    private String keyGeneratorAlgorithm;
+    private Provider keyGeneratorProvider;
+    private String classicalKeyAgreementAlgorithm;
+
+    // Hybrid cryptography fields
+    private Signature classicalSigner;
+    private KeyAgreement classicalKeyAgreement;
+    private KeyPair classicalKeyPair;
+
+    // Health check fields
+    private HealthCheck producerHealthCheck;
+    private WritableHealthCheckRepository healthCheckRepository;
+
+    // Metrics (optional; a no-op unless Micrometer and a MeterRegistry are available)
+    private PQCMetrics metrics = PQCMetrics.NOOP;
+
+    public PQCProducer(Endpoint endpoint) {
+        super(endpoint);
+    }
+
+    /**
+     * Returns the runtime key pair used by this producer. Used by the health check to read actual key state rather than
+     * the configuration snapshot.
+     */
+    KeyPair getRuntimeKeyPair() {
+        return keyPair;
+    }
+
+    @Override
+    public void process(Exchange exchange) throws Exception {
+        PQCOperations operation = determineOperation(exchange);
+        enforceKeyStatus(exchange, operation);
+        boolean success = false;
+        try {
+            switch (operation) {
+                case sign:
+                    signature(exchange);
+                    break;
+                case verify:
+                    verification(exchange);
+                    break;
+                case hybridSign:
+                    hybridSignature(exchange);
+                    break;
+                case hybridVerify:
+                    hybridVerification(exchange);
+                    break;
+                case generateSecretKeyEncapsulation:
+                    generateEncapsulation(exchange);
+                    break;
+                case extractSecretKeyEncapsulation:
+                    extractEncapsulation(exchange);
+                    break;
+                case extractSecretKeyFromEncapsulation:
+                    extractSecretKeyFromEncapsulation(exchange);
+                    break;
+                case hybridGenerateSecretKeyEncapsulation:
+                    hybridGenerateEncapsulation(exchange);
+                    break;
+                case hybridExtractSecretKeyEncapsulation:
+                    hybridExtractEncapsulation(exchange);
+                    break;
+                case hybridExtractSecretKeyFromEncapsulation:
+                    hybridExtractSecretKeyFromEncapsulation(exchange);
+                    break;
+                case generateKeyPair:
+                    lifecycleGenerateKeyPair(exchange);
+                    break;
+                case exportKey:
+                    lifecycleExportKey(exchange);
+                    break;
+                case importKey:
+                    lifecycleImportKey(exchange);
+                    break;
+                case rotateKey:
+                    lifecycleRotateKey(exchange);
+                    break;
+                case getKeyMetadata:
+                    lifecycleGetKeyMetadata(exchange);
+                    break;
+                case listKeys:
+                    lifecycleListKeys(exchange);
+                    break;
+                case expireKey:
+                    lifecycleExpireKey(exchange);
+                    break;
+                case revokeKey:
+                    lifecycleRevokeKey(exchange);
+                    break;
+                case getRemainingSignatures:
+                    statefulGetRemainingSignatures(exchange);
+                    break;
+                case getKeyState:
+                    statefulGetKeyState(exchange);
+                    break;
+                case deleteKeyState:
+                    statefulDeleteKeyState(exchange);
+                    break;
+                default:
+                    throw new IllegalArgumentException("Unsupported operation: " + operation);
+            }
+            success = true;
+        } finally {
+            metrics.recordOperation(operation.name(), currentAlgorithm(), success);
+        }
+    }
+
+    private PQCOperations determineOperation(Exchange exchange) {
+        PQCOperations operation = exchange.getIn().getHeader(PQCConstants.OPERATION, PQCOperations.class);
+        if (operation == null) {
+            return getConfiguration().getOperation();
+        }
+        checkOperationIsUsable(operation);
+        return operation;
+    }
+
+    /**
+     * Rejects a {@link PQCConstants#OPERATION} header selecting an operation this producer has no resources for.
+     * <p/>
+     * {@link #doStart()} builds the {@code Signature} only for the signature operations and the {@code KeyGenerator}
+     * only for the KEM ones, and the key material is autowired for whichever algorithm option the endpoint declares. An
+     * override that crosses from one family to the other would otherwise dereference a null and surface as a bare
+     * NullPointerException deep inside the operation.
+     */
+    private void checkOperationIsUsable(PQCOperations operation) {
+        String missing = null;
+        switch (operation) {
+            case sign, verify -> missing = signer == null ? "a Signature" : null;
+            case hybridSign, hybridVerify -> {
+                if (signer == null) {
+                    missing = "a Signature";
+                } else if (classicalSigner == null) {
+                    missing = "a classical Signature";
+                }
+            }
+            case generateSecretKeyEncapsulation, extractSecretKeyEncapsulation ->
+                missing = keyGenerator == null ? "a KeyGenerator" : null;
+            case hybridGenerateSecretKeyEncapsulation, hybridExtractSecretKeyEncapsulation -> {
+                if (keyGenerator == null) {
+                    missing = "a KeyGenerator";
+                } else if (classicalKeyAgreement == null) {
+                    missing = "a classical KeyAgreement";
+                }
+            }
+            default -> {
+                // the remaining operations work off the exchange payload or the KeyLifecycleManager
+            }
+        }
+
+        if (missing != null) {
+            throw new IllegalArgumentException(
+                    "The " + PQCConstants.OPERATION + " header requests operation '" + operation
+                                               + "', but this endpoint is configured for '"
+                                               + getConfiguration().getOperation()
+                                               + "' and so holds no " + missing
+                                               + " for it. Configure a separate endpoint for that operation, or set"
+                                               + " the matching algorithm and key material on this one.");
+        }
+    }
+
+    protected PQCConfiguration getConfiguration() {
+        return getEndpoint().getConfiguration();
+    }
+
+    private String currentAlgorithm() {
+        String alg = getConfiguration().getSignatureAlgorithm();
+        if (ObjectHelper.isEmpty(alg)) {
+            alg = getConfiguration().getKeyEncapsulationAlgorithm();
+        }
+        return ObjectHelper.isNotEmpty(alg) ? alg : "unknown";
+    }
+
+    private PQCMetrics createMetrics() {
+        CamelContext camelContext = getEndpoint().getCamelContext();
+        // Only touch Micrometer if it is actually on the classpath, keeping it an optional dependency.
+        // Use reflection to avoid a static class reference that GraalVM native image would follow.
+        if (camelContext.getClassResolver().resolveClass("io.micrometer.core.instrument.MeterRegistry") == null) {
+            return PQCMetrics.NOOP;
+        }
+        try {
+            Class<?> clazz = camelContext.getClassResolver()
+                    .resolveClass("org.apache.camel.component.pqc.metrics.PQCMicrometerMetrics");
+            if (clazz == null) {
+                return PQCMetrics.NOOP;
+            }
+            return (PQCMetrics) clazz.getMethod("create", CamelContext.class).invoke(null, camelContext);
+        } catch (Throwable t) {
+            LOG.debug("Micrometer metrics are not available for the PQC producer: {}", t.getMessage());
+            return PQCMetrics.NOOP;
+        }
+    }
+
+    private static boolean isStatefulSignatureAlgorithm(String algorithm) {
+        return PQCSignatureAlgorithms.XMSS.name().equals(algorithm)
+                || PQCSignatureAlgorithms.XMSSMT.name().equals(algorithm)
+                || PQCSignatureAlgorithms.LMS.name().equals(algorithm)
+                || PQCSignatureAlgorithms.HSS.name().equals(algorithm);
+    }
+
+    /**
+     * Enforces key status checks before cryptographic operations when strict key lifecycle mode is enabled. Looks up
+     * the key metadata via the configured {@link KeyLifecycleManager} using the {@code CamelPQCKeyId} header.
+     *
+     * <ul>
+     * <li>REVOKED keys are rejected for all operations (sign, verify, encapsulate, extract).</li>
+     * <li>EXPIRED keys are rejected for signing/encapsulation but allowed for verification/extraction.</li>
+     * <li>DEPRECATED keys produce a WARN log but still function (transition period).</li>
+     * <li>ACTIVE and PENDING_ROTATION keys are always allowed.</li>
+     * </ul>
+     */
+    private void enforceKeyStatus(Exchange exchange, PQCOperations operation) throws Exception {
+        if (!getConfiguration().isStrictKeyLifecycle()) {
+            return;
+        }
+
+        KeyLifecycleManager klm = getConfiguration().getKeyLifecycleManager();
+        if (klm == null) {
+            return;
+        }
+
+        if (!isCryptographicOperation(operation)) {
+            return;
+        }
+
+        String keyId = exchange.getMessage().getHeader(PQCConstants.KEY_ID, String.class);
+        if (ObjectHelper.isEmpty(keyId)) {
+            return;
+        }
+
+        KeyMetadata metadata = klm.getKeyMetadata(keyId);
+        if (metadata == null) {
+            return;
+        }
+
+        KeyMetadata.KeyStatus status = metadata.getStatus();
+
+        switch (status) {
+            case REVOKED:
+                throw new IllegalStateException(
+                        "Key '" + keyId + "' has been revoked and cannot be used for any cryptographic operation. "
+                                                + "Reason: " + (metadata.getDescription() != null
+                                                        ? metadata.getDescription() : "not specified"));
+            case EXPIRED:
+                if (isProducingOperation(operation)) {
+                    throw new IllegalStateException(
+                            "Key '" + keyId + "' has expired and cannot be used for " + operation
+                                                    + ". Expired keys can only be used for verification or extraction operations.");
+                }
+                LOG.info("Using expired key '{}' for {} operation (verification/extraction of existing data)", keyId,
+                        operation);
+                break;
+            case DEPRECATED:
+                LOG.warn("Key '{}' is deprecated. Consider rotating to an active key. Operation: {}", keyId, operation);
+                break;
+            case ACTIVE:
+            case PENDING_ROTATION:
+            default:
+                break;
+        }
+    }
+
+    private boolean isCryptographicOperation(PQCOperations operation) {
+        switch (operation) {
+            case sign:
+            case verify:
+            case hybridSign:
+            case hybridVerify:
+            case generateSecretKeyEncapsulation:
+            case extractSecretKeyEncapsulation:
+            case extractSecretKeyFromEncapsulation:
+            case hybridGenerateSecretKeyEncapsulation:
+            case hybridExtractSecretKeyEncapsulation:
+            case hybridExtractSecretKeyFromEncapsulation:
+                return true;
+            default:
+                return false;
+        }
+    }
+
+    private boolean isProducingOperation(PQCOperations operation) {
+        switch (operation) {
+            case sign:
+            case hybridSign:
+            case generateSecretKeyEncapsulation:
+            case hybridGenerateSecretKeyEncapsulation:
+                return true;
+            default:
+                return false;
+        }
+    }
+
+    @Override
+    public PQCEndpoint getEndpoint() {
+        return (PQCEndpoint) super.getEndpoint();
+    }
+
+    @Override
+    protected void doStart() throws Exception {
+        super.doStart();
+        validateConfiguration();
+
+        if (getConfiguration().getOperation().equals(PQCOperations.sign)
+                || getConfiguration().getOperation().equals(PQCOperations.verify)) {
+            signer = getEndpoint().getConfiguration().getSigner();
+
+            if (ObjectHelper.isEmpty(signer)) {
+                PQCSignatureAlgorithms sigAlg = PQCSignatureAlgorithms.valueOf(getConfiguration().getSignatureAlgorithm());
+                signerAlgorithm = sigAlg.getAlgorithm();
+                signerProvider = sigAlg.getBcProvider();
+                signer = Signature.getInstance(signerAlgorithm, signerProvider);
+            }
+        }
+
+        if (getConfiguration().getOperation().equals(PQCOperations.generateSecretKeyEncapsulation)
+                || getConfiguration().getOperation().equals(PQCOperations.extractSecretKeyEncapsulation)) {
+            keyGenerator = getEndpoint().getConfiguration().getKeyGenerator();
+
+            if (ObjectHelper.isEmpty(keyGenerator)) {
+                PQCKeyEncapsulationAlgorithms kemAlg
+                        = PQCKeyEncapsulationAlgorithms.valueOf(getConfiguration().getKeyEncapsulationAlgorithm());
+                keyGenerator = KeyGenerator.getInstance(kemAlg.getAlgorithm(), kemAlg.getBcProvider());
+                keyGeneratorAlgorithm = kemAlg.getAlgorithm();
+                keyGeneratorProvider = keyGenerator.getProvider();
+            }
+        }
+
+        if (ObjectHelper.isNotEmpty(getConfiguration().getKeyStore())
+                && ObjectHelper.isNotEmpty(getConfiguration().getKeyPairAlias())
+                && ObjectHelper.isNotEmpty(getConfiguration().getKeyStorePassword())) {
+            KeyStore keyStore = getConfiguration().getKeyStore();
+            PrivateKey privateKey = (PrivateKey) keyStore.getKey(getConfiguration().getKeyPairAlias(),
+                    getConfiguration().getKeyStorePassword().toCharArray());
+            Certificate cert = keyStore.getCertificate(getConfiguration().getKeyPairAlias());
+            PublicKey publicKey = cert.getPublicKey();
+            keyPair = new KeyPair(publicKey, privateKey);
+        } else {
+            keyPair = getConfiguration().getKeyPair();
+        }
+
+        // On JDK 25+, a JKS KeyStore (or user-supplied KeyPair) may contain JDK-native PQC keys
+        // (e.g. ML-DSA, ML-KEM) that Bouncy Castle's Signature / KeyGenerator SPI does not recognise,
+        // causing InvalidKeyException at initSign / initVerify time. Re-encoding through BC's KeyFactory
+        // transparently converts JDK-native keys into the BC types the rest of the component expects,
+        // and is a no-op for keys that are already BC instances.
+        if (keyPair != null) {
+            keyPair = ensureBcKeyPair(keyPair);
+        }
+
+        // Initialize hybrid signature operations
+        if (getConfiguration().getOperation().equals(PQCOperations.hybridSign)
+                || getConfiguration().getOperation().equals(PQCOperations.hybridVerify)) {
+            // Initialize PQC signer
+            signer = getEndpoint().getConfiguration().getSigner();
+            if (ObjectHelper.isEmpty(signer) && ObjectHelper.isNotEmpty(getConfiguration().getSignatureAlgorithm())) {
+                PQCSignatureAlgorithms sigAlg = PQCSignatureAlgorithms.valueOf(getConfiguration().getSignatureAlgorithm());
+                signerAlgorithm = sigAlg.getAlgorithm();
+                signerProvider = sigAlg.getBcProvider();
+                signer = Signature.getInstance(signerAlgorithm, signerProvider);
+            }
+
+            // Initialize classical signer
+            classicalSigner = getEndpoint().getConfiguration().getClassicalSigner();
+            if (ObjectHelper.isEmpty(classicalSigner)
+                    && ObjectHelper.isNotEmpty(getConfiguration().getClassicalSignatureAlgorithm())) {
+                PQCClassicalSignatureAlgorithms classAlg
+                        = PQCClassicalSignatureAlgorithms.valueOf(getConfiguration().getClassicalSignatureAlgorithm());
+                classicalSignerAlgorithm = classAlg.getAlgorithm();
+                classicalSigner = Signature.getInstance(classicalSignerAlgorithm);
+            }
+
+            // Initialize classical key pair
+            classicalKeyPair = getConfiguration().getClassicalKeyPair();
+        }
+
+        // Initialize hybrid KEM operations
+        if (getConfiguration().getOperation().equals(PQCOperations.hybridGenerateSecretKeyEncapsulation)
+                || getConfiguration().getOperation().equals(PQCOperations.hybridExtractSecretKeyEncapsulation)
+                || getConfiguration().getOperation().equals(PQCOperations.hybridExtractSecretKeyFromEncapsulation)) {
+            // Initialize PQC KEM
+            keyGenerator = getEndpoint().getConfiguration().getKeyGenerator();
+            if (ObjectHelper.isEmpty(keyGenerator)
+                    && ObjectHelper.isNotEmpty(getConfiguration().getKeyEncapsulationAlgorithm())) {
+                PQCKeyEncapsulationAlgorithms kemAlg
+                        = PQCKeyEncapsulationAlgorithms.valueOf(getConfiguration().getKeyEncapsulationAlgorithm());
+                keyGenerator = KeyGenerator.getInstance(kemAlg.getAlgorithm(), kemAlg.getBcProvider());
+                keyGeneratorAlgorithm = kemAlg.getAlgorithm();
+                keyGeneratorProvider = keyGenerator.getProvider();
+            }
+
+            // Initialize classical key agreement
+            classicalKeyAgreement = getEndpoint().getConfiguration().getClassicalKeyAgreement();
+            if (ObjectHelper.isEmpty(classicalKeyAgreement)
+                    && ObjectHelper.isNotEmpty(getConfiguration().getClassicalKEMAlgorithm())) {
+                PQCClassicalKEMAlgorithms classKemAlg
+                        = PQCClassicalKEMAlgorithms.valueOf(getConfiguration().getClassicalKEMAlgorithm());
+                classicalKeyAgreementAlgorithm = classKemAlg.getAlgorithm();
+                classicalKeyAgreement = KeyAgreement.getInstance(classicalKeyAgreementAlgorithm);
+            }
+
+            // Initialize classical key pair
+            classicalKeyPair = getConfiguration().getClassicalKeyPair();
+        }
+
+        // Register health check for stateful key monitoring
+        healthCheckRepository = HealthCheckHelper.getHealthCheckRepository(
+                getEndpoint().getCamelContext(),
+                "producers",
+                WritableHealthCheckRepository.class);
+
+        if (ObjectHelper.isNotEmpty(healthCheckRepository)) {
+            String id = getEndpoint().getId();
+            producerHealthCheck = new PQCStatefulKeyHealthCheck(getEndpoint(), this, id);
+            producerHealthCheck.setEnabled(getEndpoint().getComponent().isHealthCheckProducerEnabled());
+            healthCheckRepository.addHealthCheck(producerHealthCheck);
+        }
+
+        // Optional Micrometer metrics (no-op unless a MeterRegistry is available)
+        metrics = createMetrics();
+        String signatureAlgorithm = getConfiguration().getSignatureAlgorithm();
+        if (isStatefulSignatureAlgorithm(signatureAlgorithm)) {
+            metrics.registerStatefulKeyGauge(signatureAlgorithm, () -> {
+                KeyPair kp = getRuntimeKeyPair();
+                return kp != null && kp.getPrivate() != null ? getStatefulKeyRemaining(kp.getPrivate()) : -1;
+            });
+        }
+    }
+
+    @Override
+    protected void doStop() throws Exception {
+        if (ObjectHelper.isNotEmpty(healthCheckRepository) && ObjectHelper.isNotEmpty(producerHealthCheck)) {
+            healthCheckRepository.removeHealthCheck(producerHealthCheck);
+            producerHealthCheck = null;
+        }
+        releaseClaimedStatefulKeys();
+        metrics.close();
+        metrics = PQCMetrics.NOOP;
+        super.doStop();
+    }
+
+    /**
+     * Gives back the stateful keys this producer claimed, so another process can take them over once this one is
+     * stopped. A claim that cannot be released is logged rather than failing the stop: the operating system releases it
+     * with the process anyway.
+     */
+    private void releaseClaimedStatefulKeys() {
+        KeyLifecycleManager klm = getConfiguration().getKeyLifecycleManager();
+        synchronized (statefulClaimLock) {
+            if (statefulKeyClaimed && klm != null) {
+                try {
+                    klm.releaseStatefulKey(claimedStatefulKeyId, claimedStatefulPublicKey);
+                } catch (Exception e) {
+                    LOG.warn("Could not release the claim on the stateful key {}: {}",
+                            statefulKeyLabel(claimedStatefulKeyId), e.getMessage(), e);
+                }
+            }
+            statefulKeyClaimed = false;
+            claimedStatefulKeyId = null;
+            claimedStatefulPublicKey = null;
+        }
+        statefulKeyAdoptions.clear();
+    }
+
+    private void signature(Exchange exchange)
+            throws Exception {
+        // the claim first: it may adopt the stored key, and that is the key the exhaustion check must look at
+        claimStatefulKeyBeforeSign(exchange);
+        checkStatefulKeyBeforeSign();
+
+        Signature signerForExchange = signerForExchange();
+        byte[] signature;
+        synchronized (signerForExchange) {
+            signerForExchange.initSign(keyPair.getPrivate());
+            updateSignatureFromBody(signerForExchange, exchange.getMessage());
+            signature = signerForExchange.sign();
+        }
+
+        // sign() has already advanced the one-time index inside a stateful private key. Record that before the
+        // signature leaves this processor, so a persistence failure fails the exchange instead of emitting a
+        // signature whose index advance was never stored - on restart that index would be handed out a second time.
+        recordKeyUsageAfterSign(exchange);
+
+        exchange.getMessage().setHeader(PQCConstants.SIGNATURE, signature);
+    }
+
+    private void verification(Exchange exchange)
+            throws InvalidPayloadException, InvalidKeyException, SignatureException, IOException,
+            NoSuchAlgorithmException, NoSuchProviderException {
+        Signature signerForExchange = signerForExchange();
+        boolean verified;
+        synchronized (signerForExchange) {
+            signerForExchange.initVerify(keyPair.getPublic());
+            updateSignatureFromBody(signerForExchange, exchange.getMessage());
+            verified = signerForExchange.verify(exchange.getMessage().getHeader(PQCConstants.SIGNATURE, byte[].class));
+        }
+        exchange.getMessage().setHeader(PQCConstants.VERIFY, verified);
+    }
+
+    /**
+     * Returns the {@link Signature} to use for a single exchange.
+     * <p>
+     * {@code java.security.Signature} carries per-operation state across its init - update - sign/verify sequence and
+     * is not thread-safe, while a Camel producer is a singleton invoked concurrently. Interleaving two sequences on one
+     * instance does not merely corrupt output: a concurrent {@code initVerify} can reset the object between another
+     * exchange's updates and its {@code verify()}, so the result no longer corresponds to the message it was called
+     * for.
+     * <p>
+     * When this producer created the instance it can simply create another the same way, which removes the sharing
+     * altogether. When the user configured one - {@code PQCDefault*Material.signer} are {@code public static final}, so
+     * a configured instance can be shared JVM-wide - that instance has to be handed back as-is, and the caller
+     * serializes on whatever it gets.
+     */
+    private Signature signerForExchange() throws NoSuchAlgorithmException, NoSuchProviderException {
+        if (signerAlgorithm == null) {
+            return signer;
+        }
+        return signerProvider != null
+                ? Signature.getInstance(signerAlgorithm, signerProvider) : Signature.getInstance(signerAlgorithm);
+    }
+
+    /**
+     * The classical counterpart of {@link #signerForExchange()}, used by the hybrid operations.
+     */
+    private Signature classicalSignerForExchange() throws NoSuchAlgorithmException {
+        if (classicalSignerAlgorithm == null) {
+            return classicalSigner;
+        }
+        return Signature.getInstance(classicalSignerAlgorithm);
+    }
+
+    /**
+     * Feeds the message body into the given {@link Signature} without materialising the whole payload as a String. A
+     * {@code byte[]} body is used directly, an {@link InputStream} body is read in chunks (and reset afterwards when it
+     * is a re-readable {@link StreamCache} so downstream processors still see the payload), and a file body is read in
+     * chunks from the file (see {@link #fileContent(Object)}). A {@code String} or {@link CharSequence} body is encoded
+     * as UTF-8, and any other body is read through {@link #rawBytes(Message, Object)}, which either gets its bytes or
+     * rejects it.
+     */
+    private static void updateSignatureFromBody(Signature signature, Message message)
+            throws InvalidPayloadException, SignatureException, IOException {
+        Object body = fileContent(message.getBody());
+        if (body instanceof byte[] bytes) {
+            signature.update(bytes);
+        } else if (body instanceof Path path) {
+            try (InputStream stream = Files.newInputStream(path)) {
+                updateSignatureFromStream(signature, stream);
+            }
+        } else if (body instanceof InputStream stream) {
+            try {
+                updateSignatureFromStream(signature, stream);
+            } finally {
+                if (body instanceof StreamCache streamCache) {
+                    streamCache.reset();
+                }
+            }
+        } else if (body instanceof CharSequence text) {
+            signature.update(textToBytes(text));
+        } else {
+            signature.update(rawBytes(message, body));
+        }
+    }
+
+    /**
+     * Encodes a text body as UTF-8. The JVM default charset is platform dependent, so signing and verifying on JVMs
+     * with a different default would disagree on the bytes for a non-ASCII payload; UTF-8 keeps them in step.
+     */
+    private static byte[] textToBytes(CharSequence text) {
+        return text.toString().getBytes(StandardCharsets.UTF_8);
+    }
+
+    /**
+     * Returns the bytes of a body that is neither a {@code byte[]}, an {@link InputStream}, a file nor a
+     * {@link CharSequence}, by asking the type converter registry for a registered converter to {@code byte[]} - which
+     * covers bodies with a binary form such as a {@link java.nio.ByteBuffer}, a {@link java.io.ByteArrayOutputStream},
+     * a Netty {@code ByteBuf} or a Vert.x {@code Buffer}, so they are signed over their bytes rather than over a text
+     * rendering. A body with no such converter (for example a {@code Map} or a POJO) has no well-defined bytes to sign,
+     * so it is rejected with {@link InvalidPayloadException} rather than signed over an incidental text form. Fallback
+     * converters are not consulted, so the result does not depend on which components are on the classpath.
+     */
+    private static byte[] rawBytes(Message message, Object body) throws InvalidPayloadException {
+        Exchange exchange = message.getExchange();
+        if (body != null) {
+            // lookup finds only a registered converter, so a body with a binary form (ByteBuffer, ByteArrayOutputStream,
+            // Netty ByteBuf, Vert.x Buffer, ...) is converted, while a Map or POJO - which would only convert through a
+            // fallback converter, if any component provides one - is left for the InvalidPayloadException below, so the
+            // outcome does not depend on the classpath. tryConvertTo returns null instead of throwing on a miss.
+            TypeConverter converter = exchange.getContext().getTypeConverterRegistry().lookup(byte[].class, body.getClass());
+            if (converter != null) {
+                byte[] bytes = converter.tryConvertTo(byte[].class, exchange, body);
+                if (bytes != null) {
+                    return bytes;
+                }
+            }
+        }
+        throw new InvalidPayloadException(exchange, byte[].class, message);
+    }
+
+    private static void updateSignatureFromStream(Signature signature, InputStream stream)
+            throws SignatureException, IOException {
+        byte[] buffer = new byte[STREAM_BUFFER_SIZE];
+        int read;
+        while ((read = stream.read(buffer)) != -1) {
+            signature.update(buffer, 0, read);
+        }
+    }
+
+    /**
+     * Resolves a file body to the content to sign: a {@link WrappedFile} (the body of the file based consumers) gives
+     * its content, and a {@link File} is turned into its {@link Path}, so that the bytes of the file are read as they
+     * are. The content of a {@link WrappedFile} is a {@link File} for the local file system, otherwise the content the
+     * consumer has already loaded, such as a {@code byte[]} or an {@link InputStream}. Other bodies are not changed.
+     */
+    private static Object fileContent(Object body) {
+        if (body instanceof WrappedFile<?> wrappedFile) {
+            Object content = wrappedFile.getBody();
+            if (content != null) {
+                body = content;
+            }
+        }
+        if (body instanceof File file) {
+            return file.toPath();
+        }
+        return body;
+    }
+
+    /**
+     * Returns the message body as a byte array without a String round-trip when it is already binary. Used by the
+     * hybrid operations, which need the whole payload in memory. An {@link InputStream} is fully read (and reset
+     * afterwards when it is a re-readable {@link StreamCache}), and a file body is read from the file (see
+     * {@link #fileContent(Object)}). A {@code String} or {@link CharSequence} body is encoded as UTF-8, and any other
+     * body is read through {@link #rawBytes(Message, Object)}, which either gets its bytes or rejects it.
+     */
+    private static byte[] bodyToByteArray(Message message) throws InvalidPayloadException, IOException {
+        Object body = fileContent(message.getBody());
+        if (body instanceof byte[] bytes) {
+            return bytes;
+        } else if (body instanceof Path path) {
+            return Files.readAllBytes(path);
+        } else if (body instanceof InputStream stream) {
+            try {
+                return stream.readAllBytes();
+            } finally {
+                if (body instanceof StreamCache streamCache) {
+                    streamCache.reset();
+                }
+            }
+        } else if (body instanceof CharSequence text) {
+            return textToBytes(text);
+        } else {
+            return rawBytes(message, body);
+        }
+    }
+
+    /**
+     * Returns the KEM {@link KeyGenerator} to use for a single exchange.
+     * <p>
+     * A KEM {@code KeyGenerator} keeps the spec passed to {@code init()} until {@code generateKey()} reads it and is
+     * not thread-safe, so the two calls of one exchange must not interleave with those of another. As with
+     * {@link #signerForExchange()}, an instance this producer created is simply created again, while a configured one -
+     * an autowired bean can be shared by every endpoint, and {@code PQCDefault*Material.keyGenerator} JVM-wide - is
+     * handed back as-is, and the caller serializes on whatever it gets.
+     */
+    private KeyGenerator keyGeneratorForExchange() throws NoSuchAlgorithmException {
+        if (keyGeneratorAlgorithm == null) {
+            return keyGenerator;
+        }
+        return KeyGenerator.getInstance(keyGeneratorAlgorithm, keyGeneratorProvider);
+    }
+
+    /**
+     * The {@link KeyAgreement} counterpart of {@link #keyGeneratorForExchange()}, used by the hybrid KEM operations.
+     */
+    private KeyAgreement classicalKeyAgreementForExchange() throws NoSuchAlgorithmException {
+        if (classicalKeyAgreementAlgorithm == null) {
+            return classicalKeyAgreement;
+        }
+        // Created the same way as at start, without naming a provider: the JDK picks a provider that accepts the key
+        // when init() is called. Unlike keyGeneratorForExchange() there is therefore no Provider object to keep, and
+        // naming one here would change which provider handles the classical keys
+        return KeyAgreement.getInstance(classicalKeyAgreementAlgorithm);
+    }
+
+    private void generateEncapsulation(Exchange exchange)
+            throws InvalidAlgorithmParameterException, NoSuchAlgorithmException {
+        if (ObjectHelper.isEmpty(getConfiguration().getSymmetricKeyAlgorithm())) {
+            throw new IllegalArgumentException("Symmetric Algorithm needs to be specified");
+        }
+
+        KeyGenerator generator = keyGeneratorForExchange();
+        SecretKeyWithEncapsulation secEnc1;
+        synchronized (PQCKemLocks.lockFor(generator, keyPair.getPublic())) {
+            // initialise for creating an encapsulation and shared secret.
+            generator.init(
+                    new KEMGenerateSpec(
+                            keyPair.getPublic(),
+                            // The mapped JCE algorithm name, as the extract operations use: for the algorithms whose
+                            // enum name differs from the JCE name (GOST3412_2015 -> GOST3412-2015, DESEDE -> DESede)
+                            // the raw name is not a resolvable cipher, and the two ends of the exchange would disagree
+                            // on the identity of the key
+                            PQCSymmetricAlgorithms.valueOf(getConfiguration().getSymmetricKeyAlgorithm()).getAlgorithm(),
+                            getEndpoint().getConfiguration().getSymmetricKeyLength()),
+                    SecureRandomHelper.getSecureRandom());
+            // SecretKeyWithEncapsulation is the class to use as the secret key, it has additional
+            // methods on it for recovering the encapsulation as well.
+            secEnc1 = (SecretKeyWithEncapsulation) generator.generateKey();
+        }
+
+        exchange.getMessage().setBody(secEnc1, SecretKeyWithEncapsulation.class);
+    }
+
+    private void extractEncapsulation(Exchange exchange)
+            throws InvalidAlgorithmParameterException,
+            InvalidPayloadException, NoSuchAlgorithmException {
+        // initialise for creating an encapsulation and shared secret.
+        SecretKeyWithEncapsulation payload = exchange.getMessage().getMandatoryBody(SecretKeyWithEncapsulation.class);
+
+        if (ObjectHelper.isEmpty(getConfiguration().getSymmetricKeyAlgorithm())) {
+            throw new IllegalArgumentException("Symmetric Algorithm needs to be specified");
+        }
+
+        KeyGenerator generator = keyGeneratorForExchange();
+        SecretKeyWithEncapsulation secEnc2;
+        synchronized (PQCKemLocks.lockFor(generator, keyPair.getPrivate())) {
+            generator.init(
+                    new KEMExtractSpec(
+                            keyPair.getPrivate(), payload.getEncapsulation(),
+                            PQCSymmetricAlgorithms.valueOf(getConfiguration().getSymmetricKeyAlgorithm()).getAlgorithm(),
+                            getEndpoint().getConfiguration().getSymmetricKeyLength()),
+                    SecureRandomHelper.getSecureRandom());
+
+            // initialise for extracting the shared secret from the encapsulation.
+            secEnc2 = (SecretKeyWithEncapsulation) generator.generateKey();
+        }
+
+        exchange.getMessage().setBody(secEnc2, SecretKeyWithEncapsulation.class);
+    }
+
+    private void extractSecretKeyFromEncapsulation(Exchange exchange)
+            throws InvalidPayloadException {
+        // initialise for creating an encapsulation and shared secret.
+        SecretKeyWithEncapsulation payload = exchange.getMessage().getMandatoryBody(SecretKeyWithEncapsulation.class);
+
+        if (ObjectHelper.isEmpty(getConfiguration().getSymmetricKeyAlgorithm())) {
+            throw new IllegalArgumentException("Symmetric Algorithm needs to be specified");
+        }
+
+        // Use the mapped JCE algorithm name (as extractEncapsulation does), not the raw enum name: for algorithms
+        // whose enum name differs from the JCE name (for example GOST3412_2015 -> GOST3412-2015) the raw name is not a
+        // resolvable cipher algorithm, so the restored key would carry an unusable algorithm label
+        SecretKey restoredKey = new SecretKeySpec(
+                payload.getEncoded(),
+                PQCSymmetricAlgorithms.valueOf(getConfiguration().getSymmetricKeyAlgorithm()).getAlgorithm());
+
+        if (!getConfiguration().isStoreExtractedSecretKeyAsHeader()) {
+            exchange.getMessage().setBody(restoredKey, SecretKey.class);
+        } else {
+            exchange.getMessage().setHeader(PQCConstants.SECRET_KEY, restoredKey);
+        }
+    }
+
+    // ========== Hybrid Signature Operations ==========
+
+    private void hybridSignature(Exchange exchange)
+            throws InvalidPayloadException, InvalidKeyException, SignatureException, IOException,
+            NoSuchAlgorithmException, NoSuchProviderException {
+        // the claim first: it may adopt the stored key, and that is the key the exhaustion check must look at
+        claimStatefulKeyBeforeSign(exchange);
+        checkStatefulKeyBeforeSign();
+
+        byte[] data = bodyToByteArray(exchange.getMessage());
+
+        if (classicalSigner == null || classicalKeyPair == null) {
+            throw new IllegalStateException(
+                    "Classical signer and key pair must be configured for hybrid signature operations");
+        }
+        if (signer == null || keyPair == null) {
+            throw new IllegalStateException("PQC signer and key pair must be configured for hybrid signature operations");
+        }
+
+        // Create hybrid signature. Both Signature instances need the same per-exchange isolation as the
+        // single-algorithm paths; see signerForExchange(). The two locks are always taken PQC-first so the
+        // nesting order is the same here and in hybridVerification().
+        Signature pqcSigner = signerForExchange();
+        Signature classical = classicalSignerForExchange();
+        byte[] hybridSig;
+        synchronized (pqcSigner) {
+            synchronized (classical) {
+                hybridSig = HybridSignature.sign(
+                        data,
+                        classicalKeyPair.getPrivate(),
+                        classical,
+                        keyPair.getPrivate(),
+                        pqcSigner);
+            }
+        }
+
+        // Parse to get individual signatures for headers
+        HybridSignature.HybridSignatureComponents components = HybridSignature.parse(hybridSig);
+
+        // Recorded before the signatures are published, for the reason given in signature()
+        try {
+            recordKeyUsageAfterSign(exchange);
+        } catch (Exception e) {
+            throw new RuntimeCamelException("Failed to record key usage after hybrid signing", e);
+        }
+
+        exchange.getMessage().setHeader(PQCConstants.HYBRID_SIGNATURE, hybridSig);
+        exchange.getMessage().setHeader(PQCConstants.CLASSICAL_SIGNATURE, components.classicalSignature());
+        exchange.getMessage().setHeader(PQCConstants.PQC_SIGNATURE, components.pqcSignature());
+    }
+
+    private void hybridVerification(Exchange exchange)
+            throws InvalidPayloadException, InvalidKeyException, SignatureException, IOException,
+            NoSuchAlgorithmException, NoSuchProviderException {
+        byte[] data = bodyToByteArray(exchange.getMessage());
+
+        byte[] hybridSig = exchange.getMessage().getHeader(PQCConstants.HYBRID_SIGNATURE, byte[].class);
+        if (hybridSig == null) {
+            throw new IllegalArgumentException("Hybrid signature not found in header: " + PQCConstants.HYBRID_SIGNATURE);
+        }
+
+        if (classicalSigner == null || classicalKeyPair == null) {
+            throw new IllegalStateException(
+                    "Classical signer and key pair must be configured for hybrid verification operations");
+        }
+        if (signer == null || keyPair == null) {
+            throw new IllegalStateException("PQC signer and key pair must be configured for hybrid verification operations");
+        }
+
+        // Verify hybrid signature (both must pass). Same per-exchange isolation and same PQC-first lock order
+        // as hybridSignature().
+        Signature pqcSigner = signerForExchange();
+        Signature classical = classicalSignerForExchange();
+        boolean valid;
+        synchronized (pqcSigner) {
+            synchronized (classical) {
+                valid = HybridSignature.verify(
+                        data,
+                        hybridSig,
+                        classicalKeyPair.getPublic(),
+                        classical,
+                        keyPair.getPublic(),
+                        pqcSigner);
+            }
+        }
+
+        exchange.getMessage().setHeader(PQCConstants.HYBRID_VERIFY, valid);
+        exchange.getMessage().setHeader(PQCConstants.VERIFY, valid);
+    }
+
+    // ========== Hybrid KEM Operations ==========
+
+    private void hybridGenerateEncapsulation(Exchange exchange) throws Exception {
+        if (classicalKeyAgreement == null || classicalKeyPair == null) {
+            throw new IllegalStateException(
+                    "Classical key agreement and key pair must be configured for hybrid KEM operations");
+        }
+        if (keyGenerator == null || keyPair == null) {
+            throw new IllegalStateException("PQC key generator and key pair must be configured for hybrid KEM operations");
+        }
+        if (ObjectHelper.isEmpty(getConfiguration().getSymmetricKeyAlgorithm())) {
+            throw new IllegalArgumentException("Symmetric Algorithm needs to be specified");
+        }
+
+        String symmetricAlgorithm = getConfiguration().getSymmetricKeyAlgorithm();
+        int keyLength = getConfiguration().getSymmetricKeyLength();
+        String kdfAlgorithm = getConfiguration().getHybridKdfAlgorithm();
+
+        // Generate hybrid encapsulation. HybridKEM serializes on the KeyAgreement and KeyGenerator it is given, which
+        // only contends when they are configured instances; see keyGeneratorForExchange()
+        HybridKEM.HybridEncapsulationResult result = HybridKEM.encapsulate(
+                classicalKeyPair.getPublic(),
+                keyPair.getPublic(),
+                classicalKeyAgreementForExchange(),
+                keyGeneratorForExchange(),
+                symmetricAlgorithm,
+                keyLength,
+                kdfAlgorithm);
+
+        // Set results
+        exchange.getMessage().setBody(result.sharedSecret(), SecretKey.class);
+        exchange.getMessage().setHeader(PQCConstants.HYBRID_ENCAPSULATION, result.encapsulation());
+        exchange.getMessage().setHeader(PQCConstants.HYBRID_SECRET_KEY, result.sharedSecret());
+
+        // Parse for individual encapsulations
+        HybridKEM.HybridEncapsulationComponents components = HybridKEM.parse(result.encapsulation());
+        exchange.getMessage().setHeader(PQCConstants.CLASSICAL_ENCAPSULATION, components.classicalEncapsulation());
+        exchange.getMessage().setHeader(PQCConstants.PQC_ENCAPSULATION, components.pqcEncapsulation());
+    }
+
+    private void hybridExtractEncapsulation(Exchange exchange) throws Exception {
+        byte[] hybridEncapsulation = exchange.getMessage().getHeader(PQCConstants.HYBRID_ENCAPSULATION, byte[].class);
+        if (hybridEncapsulation == null) {
+            throw new IllegalArgumentException(
+                    "Hybrid encapsulation not found in header: " + PQCConstants.HYBRID_ENCAPSULATION);
+        }
+
+        if (classicalKeyAgreement == null || classicalKeyPair == null) {
+            throw new IllegalStateException(
+                    "Classical key agreement and key pair must be configured for hybrid KEM extraction");
+        }
+        if (keyGenerator == null || keyPair == null) {
+            throw new IllegalStateException("PQC key generator and key pair must be configured for hybrid KEM extraction");
+        }
+        if (ObjectHelper.isEmpty(getConfiguration().getSymmetricKeyAlgorithm())) {
+            throw new IllegalArgumentException("Symmetric Algorithm needs to be specified");
+        }
+
+        String symmetricAlgorithm = getConfiguration().getSymmetricKeyAlgorithm();
+        int keyLength = getConfiguration().getSymmetricKeyLength();
+        String kdfAlgorithm = getConfiguration().getHybridKdfAlgorithm();
+
+        // Extract shared secret from hybrid encapsulation, with the same per-exchange instances as above
+        SecretKey sharedSecret = HybridKEM.extract(
+                hybridEncapsulation,
+                classicalKeyPair.getPrivate(),
+                keyPair.getPrivate(),
+                classicalKeyAgreementForExchange(),
+                keyGeneratorForExchange(),
+                symmetricAlgorithm,
+                keyLength,
+                kdfAlgorithm);
+
+        exchange.getMessage().setBody(sharedSecret, SecretKey.class);
+        exchange.getMessage().setHeader(PQCConstants.HYBRID_SECRET_KEY, sharedSecret);
+    }
+
+    private void hybridExtractSecretKeyFromEncapsulation(Exchange exchange) throws Exception {
+        // Get the hybrid secret key from header or body
+        SecretKey hybridSecretKey = exchange.getMessage().getHeader(PQCConstants.HYBRID_SECRET_KEY, SecretKey.class);
+        if (hybridSecretKey == null) {
+            hybridSecretKey = exchange.getMessage().getBody(SecretKey.class);
+        }
+        if (hybridSecretKey == null) {
+            throw new IllegalArgumentException("Hybrid secret key not found in header or body");
+        }
+
+        if (ObjectHelper.isEmpty(getConfiguration().getSymmetricKeyAlgorithm())) {
+            throw new IllegalArgumentException("Symmetric Algorithm needs to be specified");
+        }
+
+        // Create a new SecretKeySpec with the mapped JCE algorithm name (not the raw enum name)
+        SecretKey restoredKey = new SecretKeySpec(
+                hybridSecretKey.getEncoded(),
+                PQCSymmetricAlgorithms.valueOf(getConfiguration().getSymmetricKeyAlgorithm()).getAlgorithm());
+
+        if (!getConfiguration().isStoreExtractedSecretKeyAsHeader()) {
+            exchange.getMessage().setBody(restoredKey, SecretKey.class);
+        } else {
+            exchange.getMessage().setHeader(PQCConstants.SECRET_KEY, restoredKey);
+        }
+    }
+
+    // ========== Key Lifecycle Operations ==========
+
+    private KeyLifecycleManager getRequiredKeyLifecycleManager() {
+        KeyLifecycleManager klm = getConfiguration().getKeyLifecycleManager();
+        if (klm == null) {
+            throw new IllegalStateException(
+                    "A KeyLifecycleManager must be configured to use key lifecycle operations. "
+                                            + "Set the keyLifecycleManager option on the PQC endpoint.");
+        }
+        return klm;
+    }
+
+    private void lifecycleGenerateKeyPair(Exchange exchange) throws Exception {
+        KeyLifecycleManager klm = getRequiredKeyLifecycleManager();
+        String algorithm = exchange.getMessage().getHeader(PQCConstants.ALGORITHM, String.class);
+        String keyId = exchange.getMessage().getHeader(PQCConstants.KEY_ID, String.class);
+
+        if (ObjectHelper.isEmpty(algorithm)) {
+            throw new IllegalArgumentException(
+                    "Algorithm header (" + PQCConstants.ALGORITHM + ") is required for generateKeyPair");
+        }
+        if (ObjectHelper.isEmpty(keyId)) {
+            throw new IllegalArgumentException("Key ID header (" + PQCConstants.KEY_ID + ") is required for generateKeyPair");
+        }
+
+        String parameterSpec = getConfiguration().getParameterSpec();
+        KeyPair generated;
+        if (ObjectHelper.isNotEmpty(parameterSpec)) {
+            // Use the parameterSpec-aware overload so the key is generated at the configured NIST security level
+            generated = klm.generateKeyPair(algorithm, keyId, PQCParameterSpecResolver.resolve(algorithm, parameterSpec));
+        } else {
+            generated = klm.generateKeyPair(algorithm, keyId);
+        }
+        exchange.getMessage().setHeader(PQCConstants.KEY_PAIR, generated);
+    }
+
+    private void lifecycleExportKey(Exchange exchange) throws Exception {
+        KeyLifecycleManager klm = getRequiredKeyLifecycleManager();
+        String formatStr = exchange.getMessage().getHeader(PQCConstants.KEY_FORMAT, String.class);
+        Boolean includePrivate = exchange.getMessage().getHeader(PQCConstants.INCLUDE_PRIVATE, Boolean.class);
+
+        KeyLifecycleManager.KeyFormat format = formatStr != null
+                ? KeyLifecycleManager.KeyFormat.valueOf(formatStr)
+                : KeyLifecycleManager.KeyFormat.DER;
+        boolean inclPriv = includePrivate != null ? includePrivate : false;
+
+        byte[] exported = klm.exportKey(keyPair, format, inclPriv);
+        exchange.getMessage().setHeader(PQCConstants.EXPORTED_KEY, exported);
+    }
+
+    private void lifecycleImportKey(Exchange exchange) throws Exception {
+        KeyLifecycleManager klm = getRequiredKeyLifecycleManager();
+        byte[] keyData = exchange.getMessage().getMandatoryBody(byte[].class);
+        String formatStr = exchange.getMessage().getHeader(PQCConstants.KEY_FORMAT, String.class);
+        String algorithm = exchange.getMessage().getHeader(PQCConstants.ALGORITHM, String.class);
+
+        KeyLifecycleManager.KeyFormat format = formatStr != null
+                ? KeyLifecycleManager.KeyFormat.valueOf(formatStr)
+                : KeyLifecycleManager.KeyFormat.DER;
+
+        if (ObjectHelper.isEmpty(algorithm)) {
+            throw new IllegalArgumentException("Algorithm header (" + PQCConstants.ALGORITHM + ") is required for importKey");
+        }
+
+        KeyPair imported = klm.importKey(keyData, format, algorithm);
+        exchange.getMessage().setHeader(PQCConstants.KEY_PAIR, imported);
+    }
+
+    private void lifecycleRotateKey(Exchange exchange) throws Exception {
+        KeyLifecycleManager klm = getRequiredKeyLifecycleManager();
+        String oldKeyId = exchange.getMessage().getHeader(PQCConstants.KEY_ID, String.class);
+        String newKeyId = exchange.getMessage().getHeader(PQCConstants.NEW_KEY_ID, String.class);
+        String algorithm = exchange.getMessage().getHeader(PQCConstants.ALGORITHM, String.class);
+
+        if (ObjectHelper.isEmpty(oldKeyId)) {
+            throw new IllegalArgumentException("Key ID header (" + PQCConstants.KEY_ID + ") is required for rotateKey");
+        }
+        if (ObjectHelper.isEmpty(newKeyId)) {
+            throw new IllegalArgumentException(
+                    "New Key ID header (" + PQCConstants.NEW_KEY_ID + ") is required for rotateKey");
+        }
+        if (ObjectHelper.isEmpty(algorithm)) {
+            throw new IllegalArgumentException("Algorithm header (" + PQCConstants.ALGORITHM + ") is required for rotateKey");
+        }
+
+        KeyPair rotated = klm.rotateKey(oldKeyId, newKeyId, algorithm);
+        exchange.getMessage().setHeader(PQCConstants.KEY_PAIR, rotated);
+    }
+
+    private void lifecycleGetKeyMetadata(Exchange exchange) throws Exception {
+        KeyLifecycleManager klm = getRequiredKeyLifecycleManager();
+        String keyId = exchange.getMessage().getHeader(PQCConstants.KEY_ID, String.class);
+
+        if (ObjectHelper.isEmpty(keyId)) {
+            throw new IllegalArgumentException("Key ID header (" + PQCConstants.KEY_ID + ") is required for getKeyMetadata");
+        }
+
+        KeyMetadata metadata = klm.getKeyMetadata(keyId);
+        exchange.getMessage().setHeader(PQCConstants.KEY_METADATA, metadata);
+    }
+
+    private void lifecycleListKeys(Exchange exchange) throws Exception {
+        KeyLifecycleManager klm = getRequiredKeyLifecycleManager();
+        List<KeyMetadata> keys = klm.listKeys();
+        exchange.getMessage().setHeader(PQCConstants.KEY_LIST, keys);
+    }
+
+    private void lifecycleExpireKey(Exchange exchange) throws Exception {
+        KeyLifecycleManager klm = getRequiredKeyLifecycleManager();
+        String keyId = exchange.getMessage().getHeader(PQCConstants.KEY_ID, String.class);
+
+        if (ObjectHelper.isEmpty(keyId)) {
+            throw new IllegalArgumentException("Key ID header (" + PQCConstants.KEY_ID + ") is required for expireKey");
+        }
+
+        klm.expireKey(keyId);
+    }
+
+    private void lifecycleRevokeKey(Exchange exchange) throws Exception {
+        KeyLifecycleManager klm = getRequiredKeyLifecycleManager();
+        String keyId = exchange.getMessage().getHeader(PQCConstants.KEY_ID, String.class);
+        String reason = exchange.getMessage().getHeader(PQCConstants.REVOCATION_REASON, String.class);
+
+        if (ObjectHelper.isEmpty(keyId)) {
+            throw new IllegalArgumentException("Key ID header (" + PQCConstants.KEY_ID + ") is required for revokeKey");
+        }
+
+        klm.revokeKey(keyId, reason);
+    }
+
+    // ========== Stateful Key Operations ==========
+
+    private void statefulGetRemainingSignatures(Exchange exchange) {
+        if (keyPair == null || keyPair.getPrivate() == null) {
+            throw new IllegalStateException("A KeyPair with a private key is required for getRemainingSignatures");
+        }
+
+        PrivateKey privateKey = keyPair.getPrivate();
+        long remaining = getStatefulKeyRemaining(privateKey);
+
+        if (remaining < 0) {
+            throw new IllegalArgumentException(
+                    "getRemainingSignatures is only supported for stateful signature schemes (XMSS, XMSSMT, LMS/HSS). "
+                                               + "Key type: " + privateKey.getClass().getName());
+        }
+
+        exchange.getMessage().setHeader(PQCConstants.REMAINING_SIGNATURES, remaining);
+    }
+
+    private void statefulGetKeyState(Exchange exchange) {
+        if (keyPair == null || keyPair.getPrivate() == null) {
+            throw new IllegalStateException("A KeyPair with a private key is required for getKeyState");
+        }
+
+        PrivateKey privateKey = keyPair.getPrivate();
+        long remaining = getStatefulKeyRemaining(privateKey);
+
+        if (remaining < 0) {
+            throw new IllegalArgumentException(
+                    "getKeyState is only supported for stateful signature schemes (XMSS, XMSSMT, LMS/HSS). "
+                                               + "Key type: " + privateKey.getClass().getName());
+        }
+
+        long index = getStatefulKeyIndex(privateKey);
+        StatefulKeyState state = new StatefulKeyState(privateKey.getAlgorithm(), index, remaining);
+
+        exchange.getMessage().setHeader(PQCConstants.KEY_STATE, state);
+    }
+
+    private void statefulDeleteKeyState(Exchange exchange) throws Exception {
+        String keyId = exchange.getMessage().getHeader(PQCConstants.KEY_ID, String.class);
+
+        if (ObjectHelper.isEmpty(keyId)) {
+            throw new IllegalArgumentException("Key ID header (" + PQCConstants.KEY_ID + ") is required for deleteKeyState");
+        }
+
+        // Required, as for every other lifecycle operation. Reporting success for a stateful key state that was
+        // never deleted is the worst available outcome: the caller believes the exhausted or compromised state is
+        // gone and may reuse the key.
+        getRequiredKeyLifecycleManager().deleteKey(keyId);
+    }
+
+    /**
+     * Claims a stateful signature key for this process before it is used.
+     * <p/>
+     * XMSS, XMSSMT, LMS and HSS are one-time-signature schemes, and a store several processes read from - a shared
+     * directory, a vault - hands each of them the same key at the same index. The in-process ordering of
+     * {@link #recordKeyUsageAfterSign(Exchange)} does nothing about that, so the key is claimed from the
+     * {@link KeyLifecycleManager} the first time it is signed with, and held until this producer stops.
+     * <p/>
+     * The claim is on the key material, identified by its public key: it is taken once per producer, whatever name the
+     * exchanges give the key through the {@code CamelPQCKeyId} header, and also when they give none. The name is what
+     * the store knows the key by, so the stored copy is re-read once per name, after the claim.
+     */
+    private void claimStatefulKeyBeforeSign(Exchange exchange) {
+        if (keyPair == null || keyPair.getPrivate() == null
+                || getStatefulKeyRemaining(keyPair.getPrivate()) < 0) {
+            return;
+        }
+
+        KeyLifecycleManager klm = getConfiguration().getKeyLifecycleManager();
+        if (klm == null) {
+            // There is no store to claim from. recordKeyUsageAfterSign already warns that the index of this
+            // signature is not being persisted at all, which is the larger problem of the two.
+            return;
+        }
+
+        String keyId = exchange.getMessage().getHeader(PQCConstants.KEY_ID, String.class);
+        if (ObjectHelper.isEmpty(keyId)) {
+            keyId = null;
+        }
+        PublicKey publicKey = keyPair.getPublic();
+        if (keyId == null && KeyLifecycleManager.fingerprint(publicKey) == null) {
+            // Nothing identifies the key: the exchange names none and the public key gives no encoding to
+            // fingerprint. recordKeyUsageAfterSign warns that the index is not persisted in this case.
+            return;
+        }
+
+        if (!statefulKeyClaimed) {
+            synchronized (statefulClaimLock) {
+                if (!statefulKeyClaimed) {
+                    doClaimStatefulKey(klm, keyId, publicKey);
+                    // The first re-read happens before the claim is published, so no concurrent exchange, under
+                    // another name or none, signs from the key loaded at startup while the stored one is read
+                    if (keyId != null) {
+                        adoptStoredStatefulKeyIfAhead(klm, keyId);
+                        statefulKeyAdoptions.put(keyId, Boolean.TRUE);
+                    }
+                    claimedStatefulKeyId = keyId;
+                    claimedStatefulPublicKey = publicKey;
+                    statefulKeyClaimed = true;
+                }
+            }
+        }
+
+        if (keyId != null) {
+            // computeIfAbsent rather than a contains/read/add sequence, so two concurrent first-time signers under
+            // the same name cannot both re-read the stored key
+            statefulKeyAdoptions.computeIfAbsent(keyId, id -> {
+                adoptStoredStatefulKeyIfAhead(klm, id);
+                return Boolean.TRUE;
+            });
+        }
+    }
+
+    private void doClaimStatefulKey(KeyLifecycleManager klm, String keyId, PublicKey publicKey) {
+        boolean claimed;
+        try {
+            claimed = klm.claimStatefulKey(keyId, publicKey);
+        } catch (Exception e) {
+            throw new IllegalStateException(
+                    "Cannot claim the stateful key " + statefulKeyLabel(keyId) + ": " + e.getMessage(), e);
+        }
+
+        if (!claimed) {
+            if (getConfiguration().isAllowSharedStatefulKey()) {
+                if (sharedStatefulKeyWarned.compareAndSet(false, true)) {
+                    LOG.warn("Signing with the stateful key {}, which {} cannot claim for this process alone,"
+                             + " because allowSharedStatefulKey is enabled. If a second process signs with the same"
+                             + " key, both hand out the same one-time index and the key is broken.",
+                            statefulKeyLabel(keyId), klm.getClass().getSimpleName());
+                }
+            } else {
+                throw new IllegalStateException(
+                        "The stateful key " + statefulKeyLabel(keyId) + " cannot be claimed for this process: "
+                                                + klm.getClass().getSimpleName()
+                                                + " cannot guarantee that no other process holds it. "
+                                                + keyPair.getPrivate().getAlgorithm()
+                                                + " is a one-time-signature scheme, and two processes signing from the"
+                                                + " same index break the key. Use a KeyLifecycleManager that can claim"
+                                                + " a key, such as FileBasedKeyLifecycleManager, or set"
+                                                + " allowSharedStatefulKey=true if a single signer is guaranteed"
+                                                + " elsewhere.");
+            }
+        }
+    }
+
+    /**
+     * How the stateful key of this producer is referred to in messages: by the name the exchange gave it, or as the key
+     * of this endpoint when the exchange gave none.
+     */
+    private static String statefulKeyLabel(String keyId) {
+        return keyId != null ? "'" + keyId + "'" : "of this endpoint (no CamelPQCKeyId header)";
+    }
+
+    /**
+     * Re-reads the stored key once the claim is granted, and adopts it when its index has moved past the one this
+     * producer loaded.
+     * <p/>
+     * Without this the claim does not stop what it is meant to stop. {@code keyPair} is read once in
+     * {@link #doStart()}, so in a rolling update the arriving instance loads the key at some index, waits for the claim
+     * while the leaving instance keeps signing, and then starts from its own stale index - handing out every index the
+     * other instance already used. The claim only serialises the signers; it is this read that makes the second one
+     * resume where the first stopped.
+     */
+    private void adoptStoredStatefulKeyIfAhead(KeyLifecycleManager klm, String keyId) {
+        KeyPair stored;
+        try {
+            stored = klm.getKey(keyId);
+        } catch (Exception e) {
+            LOG.warn("Claimed the stateful key '{}' but could not re-read it from the store, so this producer keeps"
+                     + " the key it loaded at startup. If another process advanced that key meanwhile, signing now"
+                     + " reuses a one-time index.",
+                    keyId, e);
+            return;
+        }
+
+        if (stored == null || stored.getPrivate() == null) {
+            return;
+        }
+
+        if (isAnotherKey(stored.getPublic(), keyPair.getPublic())) {
+            LOG.warn("Claimed the stateful key '{}' but the stored public key is not the one loaded at startup, so"
+                     + " this producer keeps the key it loaded. The store holds another key under that id: a rotated"
+                     + " key, or a key directory that is shared by mistake.",
+                    keyId);
+            return;
+        }
+
+        long storedRemaining = getStatefulKeyRemaining(stored.getPrivate());
+        long loadedRemaining = getStatefulKeyRemaining(keyPair.getPrivate());
+        if (storedRemaining < 0) {
+            return;
+        }
+
+        // Fewer remaining signatures means the stored key has been used more than the one held here
+        if (storedRemaining < loadedRemaining) {
+            LOG.warn("The stored stateful key '{}' has {} signatures left while the one loaded at startup has {}."
+                     + " Another process advanced it. Adopting the stored key so this producer resumes from its"
+                     + " index instead of reusing indices that have already been handed out.",
+                    keyId, storedRemaining, loadedRemaining);
+            keyPair = stored;
+        }
+    }
+
+    /**
+     * Whether two public keys are known to be different keys. Keys whose encoding the provider does not give, or that
+     * are missing, cannot be told apart and are not reported as different.
+     */
+    private static boolean isAnotherKey(PublicKey stored, PublicKey loaded) {
+        if (stored == null || loaded == null) {
+            return false;
+        }
+        byte[] storedEncoded = stored.getEncoded();
+        byte[] loadedEncoded = loaded.getEncoded();
+        if (storedEncoded == null || loadedEncoded == null) {
+            return false;
+        }
+        return !MessageDigest.isEqual(storedEncoded, loadedEncoded);
+    }
+
+    /**
+     * Checks whether the current key is a stateful signature key (XMSS, XMSSMT, LMS/HSS) and if so, validates that it
+     * has remaining signatures available. Logs a warning when remaining signatures fall below the configured threshold.
+     *
+     * @throws IllegalStateException if the key has zero remaining signatures
+     */
+    private void checkStatefulKeyBeforeSign() {
+        if (keyPair == null || keyPair.getPrivate() == null) {
+            return;
+        }
+
+        PrivateKey privateKey = keyPair.getPrivate();
+        long remaining = getStatefulKeyRemaining(privateKey);
+        if (remaining < 0) {
+            // Not a stateful key
+            return;
+        }
+
+        if (remaining == 0) {
+            throw new IllegalStateException(
+                    "Stateful key (" + privateKey.getAlgorithm() + ") is exhausted with 0 remaining signatures. "
+                                            + "The key must not be reused — generate a new key pair.");
+        }
+
+        double threshold = getConfiguration().getStatefulKeyWarningThreshold();
+        if (threshold > 0) {
+            long totalCapacity = getStatefulKeyIndex(privateKey) + remaining;
+            if (totalCapacity > 0) {
+                double fractionRemaining = (double) remaining / totalCapacity;
+                if (fractionRemaining <= threshold) {
+                    LOG.warn(
+                            "Stateful key ({}) is approaching exhaustion: {} signatures remaining out of {} total ({} remaining). "
+                             + "Consider generating a new key pair.",
+                            privateKey.getAlgorithm(), remaining, totalCapacity,
+                            String.format("%.1f%%", fractionRemaining * 100));
+                }
+            }
+        }
+    }
+
+    /**
+     * Records the use of the signing key through the KeyLifecycleManager, if one is configured and the exchange names a
+     * key.
+     * <p/>
+     * This advances {@code usageCount}, which is what the {@code maxKeyUsage} rotation signal of
+     * {@link org.apache.camel.component.pqc.lifecycle.KeyRotationScheduler} reads. It therefore runs for every signing
+     * key, not only the stateful ones: ML-DSA, SLH-DSA and Falcon keys would otherwise sit at a usage count of zero
+     * forever and never be rotated.
+     * <p/>
+     * The key encapsulation operations do not call this method, so a KEM key still does not advance its usage count and
+     * {@code maxKeyUsage} does not apply to it.
+     * <p/>
+     * For a stateful signature key the advanced private key is stored as well, so the one-time index survives a
+     * restart.
+     */
+    private void recordKeyUsageAfterSign(Exchange exchange) throws Exception {
+        if (keyPair == null || keyPair.getPrivate() == null) {
+            return;
+        }
+
+        PrivateKey privateKey = keyPair.getPrivate();
+        boolean stateful = getStatefulKeyRemaining(privateKey) >= 0;
+
+        KeyLifecycleManager klm = getConfiguration().getKeyLifecycleManager();
+        if (klm == null) {
+            // Only the stateful risk is worth reporting here. A plain signing endpoint with no lifecycle management
+            // is an ordinary setup, and with no manager there is no maxKeyUsage threshold to miss.
+            if (stateful) {
+                warnKeyUsageNotRecorded(true, "no keyLifecycleManager is configured on the endpoint");
+            }
+            return;
+        }
+
+        String keyId = exchange.getMessage().getHeader(PQCConstants.KEY_ID, String.class);
+        if (ObjectHelper.isEmpty(keyId)) {
+            warnKeyUsageNotRecorded(stateful,
+                    "the exchange carries no " + PQCConstants.KEY_ID + " header identifying the key");
+            return;
+        }
+
+        KeyMetadata metadata;
+        try {
+            metadata = klm.getKeyMetadata(keyId);
+        } catch (Exception e) {
+            if (stateful) {
+                throw e;
+            }
+            // the read fails for the same reasons as the write below, and costs the same: only the usage count
+            warnUsageRecordFailure(keyId, e);
+            return;
+        }
+        if (metadata == null) {
+            warnKeyUsageNotRecorded(stateful, "the keyLifecycleManager holds no metadata for key '" + keyId + "'");
+            return;
+        }
+
+        metadata.updateLastUsed();
+
+        if (stateful) {
+            // storeKey writes the metadata entry as well in every manager, so calling updateKeyMetadata first would
+            // simply double the number of remote writes per signature
+            klm.storeKey(keyId, keyPair, metadata);
+        } else {
+            // Only the usage count is at stake here. Failing the exchange over it would throw away a perfectly good
+            // signature to protect a counter whose loss merely delays a rotation - unlike a stateful index, which
+            // cannot be recovered once it has been handed out twice.
+            try {
+                klm.updateKeyMetadata(keyId, metadata);
+            } catch (Exception e) {
+                warnUsageRecordFailure(keyId, e);
+            }
+        }
+    }
+
+    /**
+     * Warns, once per producer, that the usage of a non-stateful key was not recorded because its metadata could not be
+     * read from or written to the keyLifecycleManager. The signature is kept: only the usage count is lost.
+     */
+    private void warnUsageRecordFailure(String keyId, Exception e) {
+        if (usageRecordFailureWarned.compareAndSet(false, true)) {
+            LOG.warn("Could not record the usage of key '{}' through the keyLifecycleManager, so its"
+                     + " usageCount does not advance and a configured maxKeyUsage threshold may not be"
+                     + " reached. The signature itself is unaffected. Reported once per producer.",
+                    keyId, e);
+        }
+    }
+
+    /**
+     * Warns, once per producer, that a signing operation could not have its key usage recorded.
+     * <p/>
+     * For a stateful key this is the serious case: the operation has already consumed the one-time index inside the
+     * private key, so after a restart the key resumes at the old index and signs again with an index already in use,
+     * which is what the one-time property of LMS, HSS, XMSS and XMSSMT forbids.
+     * <p/>
+     * For any other key the consequence is milder: {@code usageCount} does not advance, so a configured
+     * {@code maxKeyUsage} rotation threshold is never reached. That is only worth saying when a
+     * {@code keyLifecycleManager} is configured at all - the caller suppresses it otherwise.
+     */
+    private void warnKeyUsageNotRecorded(boolean stateful, String reason) {
+        if (!keyUsageNotRecordedWarned.compareAndSet(false, true)) {
+            return;
+        }
+        if (stateful) {
+            LOG.warn("Signed with the stateful key of signature algorithm {} but its advanced index was not persisted,"
+                     + " because {}. On restart the key resumes at the previous index and may sign twice with the same"
+                     + " one-time index. Configure a keyLifecycleManager, store the key with metadata, and send the"
+                     + " {} header on every exchange. This is reported once per producer.",
+                    getConfiguration().getSignatureAlgorithm(), reason, PQCConstants.KEY_ID);
+        } else {
+            LOG.warn("Signed with the key of signature algorithm {} but its usage was not recorded, because {}."
+                     + " The usageCount of the key does not advance, so a configured maxKeyUsage rotation threshold"
+                     + " will never be reached. Send the {} header on every exchange and store the key with metadata."
+                     + " This is reported once per producer.",
+                    getConfiguration().getSignatureAlgorithm(), reason, PQCConstants.KEY_ID);
+        }
+    }
+
+    /**
+     * Returns the remaining signatures for a stateful private key, or -1 if the key is not stateful.
+     */
+    static long getStatefulKeyRemaining(PrivateKey privateKey) {
+        if (privateKey instanceof XMSSPrivateKey xmssPrivateKey) {
+            return xmssPrivateKey.getUsagesRemaining();
+        } else if (privateKey instanceof XMSSMTPrivateKey xmssmtPrivateKey) {
+            return xmssmtPrivateKey.getUsagesRemaining();
+        } else if (privateKey instanceof LMSPrivateKey lmsPrivateKey) {
+            return lmsPrivateKey.getUsagesRemaining();
+        }
+        return -1;
+    }
+
+    /**
+     * Returns the current index (number of signatures already produced) for a stateful private key, or 0 if the key is
+     * not stateful.
+     */
+    static long getStatefulKeyIndex(PrivateKey privateKey) {
+        if (privateKey instanceof XMSSPrivateKey xmssPrivateKey) {
+            return xmssPrivateKey.getIndex();
+        } else if (privateKey instanceof XMSSMTPrivateKey xmssmtPrivateKey) {
+            return xmssmtPrivateKey.getIndex();
+        } else if (privateKey instanceof LMSPrivateKey lmsPrivateKey) {
+            return lmsPrivateKey.getIndex();
+        }
+        return 0;
+    }
+
+    // ========== Configuration Validation ==========
+
+    /**
+     * Validates the producer configuration at startup to catch invalid or non-recommended algorithm combinations and
+     * key sizes early, before any cryptographic operation is attempted.
+     */
+    private void validateConfiguration() {
+        PQCConfiguration config = getConfiguration();
+        PQCOperations op = config.getOperation();
+
+        validateSymmetricKeyLength(config, op);
+        warnHybridCombinations(config, op);
+        logNistRecommendations(config);
+    }
+
+    private void validateSymmetricKeyLength(PQCConfiguration config, PQCOperations op) {
+        if (!isKEMOperation(op)) {
+            return;
+        }
+        String symAlg = config.getSymmetricKeyAlgorithm();
+        if (ObjectHelper.isEmpty(symAlg)) {
+            return;
+        }
+        int keyLen = config.getSymmetricKeyLength();
+        int[] validLengths = VALID_SYMMETRIC_KEY_LENGTHS.get(symAlg);
+        if (validLengths != null) {
+            boolean valid = false;
+            for (int len : validLengths) {
+                if (len == keyLen) {
+                    valid = true;
+                    break;
+                }
+            }
+            if (!valid) {
+                throw new IllegalArgumentException(
+                        "Invalid symmetric key length " + keyLen + " for algorithm " + symAlg
+                                                   + ". Valid key lengths: " + Arrays.toString(validLengths));
+            }
+        }
+    }
+
+    private void warnHybridCombinations(PQCConfiguration config, PQCOperations op) {
+        if (op == PQCOperations.hybridSign || op == PQCOperations.hybridVerify) {
+            String classicalAlg = config.getClassicalSignatureAlgorithm();
+            if (ObjectHelper.isNotEmpty(classicalAlg)) {
+                try {
+                    PQCClassicalSignatureAlgorithms classical = PQCClassicalSignatureAlgorithms.valueOf(classicalAlg);
+                    if (classical.isRSA()) {
+                        LOG.warn("Using RSA ({}) in hybrid signature mode. ECDSA or EdDSA (Ed25519/Ed448) "
+                                 + "is recommended for new hybrid deployments due to smaller signature sizes "
+                                 + "and better performance.",
+                                classicalAlg);
+                    }
+                } catch (IllegalArgumentException e) {
+                    // Not fatal here: the endpoint may still be configured with explicit classical key material.
+                    // It is logged because otherwise a typo surfaces much later as an opaque initialisation failure.
+                    LOG.debug("Unknown classical signature algorithm '{}', skipping its advisory checks", classicalAlg, e);
+                }
+            }
+            String pqcAlg = config.getSignatureAlgorithm();
+            if (ObjectHelper.isNotEmpty(pqcAlg) && NON_FIPS_PQ_SIGNATURES.contains(pqcAlg)) {
+                LOG.warn("PQC signature algorithm {} is not part of NIST FIPS 204/205. Consider using "
+                         + "ML-DSA (FIPS 204) or SLH-DSA (FIPS 205) for production hybrid deployments.",
+                        pqcAlg);
+            }
+        }
+
+        if (op == PQCOperations.hybridGenerateSecretKeyEncapsulation
+                || op == PQCOperations.hybridExtractSecretKeyEncapsulation
+                || op == PQCOperations.hybridExtractSecretKeyFromEncapsulation) {
+            String pqcAlg = config.getKeyEncapsulationAlgorithm();
+            if (ObjectHelper.isNotEmpty(pqcAlg) && NON_FIPS_PQ_KEMS.contains(pqcAlg)) {
+                LOG.warn("PQC KEM algorithm {} is not part of NIST FIPS 203. Consider using "
+                         + "ML-KEM (FIPS 203) for production hybrid deployments.",
+                        pqcAlg);
+            }
+        }
+    }
+
+    private void logNistRecommendations(PQCConfiguration config) {
+        String kemAlg = config.getKeyEncapsulationAlgorithm();
+        if (PQCKeyEncapsulationAlgorithms.MLKEM.name().equals(kemAlg)) {
+            LOG.info("Using ML-KEM (NIST FIPS 203). Available parameter sets: "
+                     + "ML-KEM-512 (Level 1), ML-KEM-768 (Level 3, recommended), ML-KEM-1024 (Level 5)");
+        }
+
+        String sigAlg = config.getSignatureAlgorithm();
+        if (PQCSignatureAlgorithms.MLDSA.name().equals(sigAlg)) {
+            LOG.info("Using ML-DSA (NIST FIPS 204). Available parameter sets: "
+                     + "ML-DSA-44 (Level 2), ML-DSA-65 (Level 3, recommended), ML-DSA-87 (Level 5)");
+        } else if (PQCSignatureAlgorithms.SLHDSA.name().equals(sigAlg)) {
+            LOG.info("Using SLH-DSA (NIST FIPS 205). Stateless hash-based signature scheme suitable for "
+                     + "applications where stateful key management is not feasible");
+        }
+    }
+
+    private boolean isKEMOperation(PQCOperations op) {
+        switch (op) {
+            case generateSecretKeyEncapsulation:
+            case extractSecretKeyEncapsulation:
+            case extractSecretKeyFromEncapsulation:
+            case hybridGenerateSecretKeyEncapsulation:
+            case hybridExtractSecretKeyEncapsulation:
+            case hybridExtractSecretKeyFromEncapsulation:
+                return true;
+            default:
+                return false;
+        }
+    }
+
+    /**
+     * Ensures both keys in the pair are Bouncy Castle key instances.
+     * <p>
+     * On JDK 25+, a JKS {@link KeyStore} may deserialise standardised PQC keys (ML-DSA, ML-KEM) into JDK-native key
+     * objects that Bouncy Castle's {@link Signature} / {@link KeyGenerator} SPI does not recognise, causing
+     * {@link InvalidKeyException} at {@code initSign} / {@code initVerify} time.
+     * <p>
+     * Re-encoding through BC's {@link KeyFactory} is a no-op for keys that are already BC instances and transparently
+     * converts JDK-native ones into the BC types the rest of the component expects.
+     */
+    private static KeyPair ensureBcKeyPair(KeyPair kp) {
+        PrivateKey priv = kp.getPrivate();
+        PublicKey pub = kp.getPublic();
+
+        boolean privIsBc = priv == null || priv.getClass().getName().startsWith("org.bouncycastle.");
+        boolean pubIsBc = pub == null || pub.getClass().getName().startsWith("org.bouncycastle.");
+        if (privIsBc && pubIsBc) {
+            return kp;
+        }
+
+        try {
+            String alg = priv != null ? priv.getAlgorithm() : pub.getAlgorithm();
+            KeyFactory kf = getBcKeyFactory(alg);
+
+            if (!privIsBc) {
+                priv = kf.generatePrivate(new PKCS8EncodedKeySpec(priv.getEncoded()));
+            }
+            if (!pubIsBc) {
+                pub = kf.generatePublic(new X509EncodedKeySpec(pub.getEncoded()));
+            }
+            return new KeyPair(pub, priv);
+        } catch (Exception e) {
+            // If conversion fails (e.g. algorithm not known to BC), return the original pair
+            // and let the caller deal with any resulting exception from the crypto operation
+            LOG.debug("Could not convert KeyPair to Bouncy Castle key types: {}", e.getMessage());
+            return kp;
+        }
+    }
+
+    /**
+     * Returns a BC {@link KeyFactory} for the given JCE algorithm name, trying the main BC provider first and falling
+     * back to the BC PQC provider.
+     */
+    private static KeyFactory getBcKeyFactory(String algorithm)
+            throws NoSuchAlgorithmException, NoSuchProviderException {
+        try {
+            return KeyFactory.getInstance(algorithm, BouncyCastleProvider.PROVIDER_NAME);
+        } catch (NoSuchAlgorithmException e) {
+            return KeyFactory.getInstance(algorithm, BouncyCastlePQCProvider.PROVIDER_NAME);
+        }
+    }
+
+}

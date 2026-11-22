@@ -1,0 +1,343 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.camel.component.google.mail.stream;
+
+import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
+import java.util.LinkedList;
+import java.util.List;
+import java.util.Queue;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
+
+import com.google.api.client.util.Base64;
+import com.google.api.services.gmail.Gmail;
+import com.google.api.services.gmail.model.ListMessagesResponse;
+import com.google.api.services.gmail.model.Message;
+import com.google.api.services.gmail.model.MessagePart;
+import com.google.api.services.gmail.model.MessagePartHeader;
+import com.google.api.services.gmail.model.ModifyMessageRequest;
+import org.apache.camel.Endpoint;
+import org.apache.camel.Exchange;
+import org.apache.camel.ExchangePattern;
+import org.apache.camel.ExchangePropertyKey;
+import org.apache.camel.Processor;
+import org.apache.camel.spi.Synchronization;
+import org.apache.camel.support.EmptyAsyncCallback;
+import org.apache.camel.support.ScheduledBatchPollingConsumer;
+import org.apache.camel.util.CastUtils;
+import org.apache.camel.util.ObjectHelper;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+/**
+ * The GoogleMail consumer.
+ */
+public class GoogleMailStreamConsumer extends ScheduledBatchPollingConsumer {
+
+    private static final Logger LOG = LoggerFactory.getLogger(GoogleMailStreamConsumer.class);
+    // messages whose exchanges are being processed, which a later poll must not consume again
+    private final Set<String> inProgress = ConcurrentHashMap.newKeySet();
+    private String unreadLabelId;
+    private List<String> labelsIds;
+
+    public GoogleMailStreamConsumer(Endpoint endpoint, Processor processor, String unreadLabelId, List<String> labelsIds) {
+        super(endpoint, processor);
+        this.unreadLabelId = unreadLabelId;
+        this.labelsIds = labelsIds;
+    }
+
+    protected GoogleMailStreamConfiguration getConfiguration() {
+        return getEndpoint().getConfiguration();
+    }
+
+    protected Gmail getClient() {
+        return getEndpoint().getClient();
+    }
+
+    @Override
+    public GoogleMailStreamEndpoint getEndpoint() {
+        return (GoogleMailStreamEndpoint) super.getEndpoint();
+    }
+
+    @Override
+    protected int poll() throws Exception {
+        Gmail.Users.Messages.List request = getClient().users().messages().list("me");
+        if (ObjectHelper.isNotEmpty(getConfiguration().getQuery())) {
+            request.setQ(getConfiguration().getQuery());
+        }
+        if (ObjectHelper.isNotEmpty(getConfiguration().getMaxResults())) {
+            request.setMaxResults(getConfiguration().getMaxResults());
+        }
+        if (ObjectHelper.isNotEmpty(labelsIds)) {
+            request.setLabelIds(labelsIds);
+        }
+
+        Queue<Exchange> answer = new LinkedList<>();
+
+        // taken before the messages are listed: a message that is in flight now can complete, and be marked as read
+        // and released, after it was listed and before the loop below looks at it, and must then not be consumed again
+        // from the stale listing
+        Set<String> inProgressAtPollStart = Set.copyOf(inProgress);
+
+        ListMessagesResponse c = request.execute();
+
+        // okay we have some response from Google so lets mark the consumer as ready
+        forceConsumerAsReady();
+
+        if (c.getMessages() != null) {
+            try {
+                for (Message message : c.getMessages()) {
+                    addExchange(message.getId(), answer, inProgressAtPollStart);
+                }
+            } catch (Exception e) {
+                // none of the messages of this poll is processed
+                releaseInProgress(answer);
+                throw e;
+            }
+        }
+
+        return processBatch(CastUtils.cast(answer));
+    }
+
+    private void addExchange(String id, Queue<Exchange> answer, Set<String> inProgressAtPollStart) throws Exception {
+        // skip the message if an exchange of a previous poll is still processing it, or was when this poll started
+        if (inProgressAtPollStart.contains(id) || !inProgress.add(id)) {
+            LOG.trace("Skipping message {} as it is already in progress", id);
+            return;
+        }
+        try {
+            Message mess = getClient().users().messages().get("me", id).setFormat(messageFormat()).execute();
+            answer.add(createExchange(getEndpoint().getExchangePattern(), mess));
+        } catch (Exception e) {
+            inProgress.remove(id);
+            throw e;
+        }
+    }
+
+    private void releaseInProgress(Queue<?> notProcessed) {
+        for (Object notRouted : notProcessed) {
+            Exchange exchange = (Exchange) notRouted;
+            inProgress.remove(exchange.getIn().getHeader(GoogleMailStreamConstants.MAIL_ID, String.class));
+            // the exchange is never routed, so nothing else releases it to the exchange factory
+            releaseExchange(exchange, false);
+        }
+    }
+
+    @Override
+    public int processBatch(Queue<Object> exchanges) {
+        int total = exchanges.size();
+
+        for (int index = 0; index < total && isBatchAllowed(); index++) {
+            // only loop if we are started (allowed to run)
+            final Exchange exchange = ObjectHelper.cast(Exchange.class, exchanges.poll());
+            // add current index and total as properties
+            exchange.setProperty(ExchangePropertyKey.BATCH_INDEX, index);
+            exchange.setProperty(ExchangePropertyKey.BATCH_SIZE, total);
+            exchange.setProperty(ExchangePropertyKey.BATCH_COMPLETE, index == total - 1);
+
+            // update pending number of exchanges
+            pendingExchanges = total - index - 1;
+
+            // the mail to mark as read (or unread) once the exchange is done. It is taken now, as the route may change
+            // or remove the mail id header, or replace the message, before it ends
+            final String id = exchange.getIn().getHeader(GoogleMailStreamConstants.MAIL_ID, String.class);
+            // add on completion to handle after work when the exchange is done
+            exchange.getExchangeExtension().addOnCompletion(new Synchronization() {
+                public void onComplete(Exchange exchange) {
+                    try {
+                        processCommit(exchange, unreadLabelId, id);
+                    } finally {
+                        inProgress.remove(id);
+                    }
+                }
+
+                public void onFailure(Exchange exchange) {
+                    try {
+                        processRollback(exchange, unreadLabelId, id);
+                    } finally {
+                        inProgress.remove(id);
+                    }
+                }
+
+                @Override
+                public String toString() {
+                    return "GoogleMailStreamConsumerOnCompletion";
+                }
+            });
+
+            getAsyncProcessor().process(exchange, EmptyAsyncCallback.get());
+        }
+        // the remaining exchanges are not processed as the consumer is stopping
+        releaseInProgress(exchanges);
+
+        return total;
+    }
+
+    /**
+     * Strategy to mark the mail of the {@link GoogleMailStreamConstants#MAIL_ID} header as read after being processed.
+     *
+     * @deprecated use {@link #processCommit(Exchange, String, String)}, which the consumer calls instead
+     */
+    @Deprecated(since = "4.24.0")
+    protected void processCommit(Exchange exchange, String unreadLabelId) {
+        processCommit(exchange, unreadLabelId, exchange.getIn().getHeader(GoogleMailStreamConstants.MAIL_ID, String.class));
+    }
+
+    /**
+     * Strategy to mark the mail as read after being processed.
+     *
+     * @param exchange      the exchange
+     * @param unreadLabelId the id of the UNREAD label
+     * @param id            the id of the mail the exchange was created from
+     */
+    protected void processCommit(Exchange exchange, String unreadLabelId, String id) {
+        try {
+            if (getConfiguration().isMarkAsRead()) {
+                LOG.trace("Marking email {} as read", id);
+
+                List<String> remove = new ArrayList<>();
+                remove.add(unreadLabelId);
+                ModifyMessageRequest mods = new ModifyMessageRequest().setRemoveLabelIds(remove);
+                getClient().users().messages().modify("me", id, mods).execute();
+
+                LOG.trace("Marked email {} as read", id);
+            }
+        } catch (Exception e) {
+            getExceptionHandler().handleException("Error occurred mark as read mail. This exception is ignored.", exchange, e);
+        }
+
+    }
+
+    /**
+     * Strategy when processing the exchange failed, for the mail of the {@link GoogleMailStreamConstants#MAIL_ID}
+     * header.
+     *
+     * @deprecated use {@link #processRollback(Exchange, String, String)}, which the consumer calls instead
+     */
+    @Deprecated(since = "4.24.0")
+    protected void processRollback(Exchange exchange, String unreadLabelId) {
+        processRollback(exchange, unreadLabelId,
+                exchange.getIn().getHeader(GoogleMailStreamConstants.MAIL_ID, String.class));
+    }
+
+    /**
+     * Strategy when processing the exchange failed.
+     *
+     * @param exchange      the exchange
+     * @param unreadLabelId the id of the UNREAD label
+     * @param id            the id of the mail the exchange was created from
+     */
+    protected void processRollback(Exchange exchange, String unreadLabelId, String id) {
+        if (!getConfiguration().isMarkAsRead()) {
+            // the mail was never marked as read, so there is nothing to roll back
+            return;
+        }
+        try {
+            LOG.warn("Exchange failed, so marking mail {} as unread again", exchange);
+
+            List<String> add = new ArrayList<>();
+            add.add(unreadLabelId);
+            ModifyMessageRequest mods = new ModifyMessageRequest().setAddLabelIds(add);
+            getClient().users().messages().modify("me", id, mods).execute();
+        } catch (Exception e) {
+            getExceptionHandler().handleException("Error occurred marking the mail as unread. This exception is ignored.",
+                    exchange, e);
+        }
+    }
+
+    public Exchange createExchange(ExchangePattern pattern, Message mail) {
+        Exchange exchange = createExchange(true);
+        exchange.setPattern(pattern);
+        org.apache.camel.Message message = exchange.getIn();
+        exchange.getIn().setHeader(GoogleMailStreamConstants.MAIL_ID, mail.getId());
+        exchange.getIn().setHeader(GoogleMailStreamConstants.MAIL_THREAD_ID, mail.getThreadId());
+        exchange.getIn().setHeader(GoogleMailStreamConstants.MAIL_LABEL_IDS, mail.getLabelIds());
+        if (getConfiguration().isRaw()) {
+            message.setBody(mail.getRaw());
+        } else {
+            String body = extractBody(mail.getPayload());
+            if (body != null) {
+                message.setBody(body);
+            }
+        }
+        if (mail.getPayload() != null && mail.getPayload().getHeaders() != null) {
+            configureHeaders(message, mail.getPayload().getHeaders());
+        }
+        return exchange;
+    }
+
+    /**
+     * The message format the consumer has to ask for. The raw field of a message is only populated when the RAW format
+     * is requested, the payload only when the FULL format is.
+     */
+    String messageFormat() {
+        return getConfiguration().isRaw() ? "RAW" : "FULL";
+    }
+
+    /**
+     * Returns the decoded content of the first part carrying data, walking into nested multiparts. A message that is
+     * not multipart at all keeps its content directly on the payload.
+     */
+    private String extractBody(MessagePart part) {
+        if (part == null) {
+            return null;
+        }
+
+        if (part.getBody() != null && part.getBody().getData() != null) {
+            byte[] bodyBytes = Base64.decodeBase64(part.getBody().getData().trim());
+            return new String(bodyBytes, StandardCharsets.UTF_8);
+        }
+
+        List<MessagePart> parts = part.getParts();
+        if (parts != null) {
+            for (MessagePart child : parts) {
+                String body = extractBody(child);
+                if (body != null) {
+                    return body;
+                }
+            }
+        }
+
+        return null;
+    }
+
+    private void configureHeaders(org.apache.camel.Message message, List<MessagePartHeader> headers) {
+        for (MessagePartHeader header : headers) {
+            String headerName = header.getName();
+            if ("SUBJECT".equalsIgnoreCase(headerName)) {
+                message.setHeader(GoogleMailStreamConstants.MAIL_SUBJECT, header.getValue());
+            }
+            if ("TO".equalsIgnoreCase(headerName)) {
+                message.setHeader(GoogleMailStreamConstants.MAIL_TO, header.getValue());
+            }
+            if ("FROM".equalsIgnoreCase(headerName)) {
+                message.setHeader(GoogleMailStreamConstants.MAIL_FROM, header.getValue());
+            }
+            if ("CC".equalsIgnoreCase(headerName)) {
+                message.setHeader(GoogleMailStreamConstants.MAIL_CC, header.getValue());
+            }
+            if ("BCC".equalsIgnoreCase(headerName)) {
+                message.setHeader(GoogleMailStreamConstants.MAIL_BCC, header.getValue());
+            }
+            if ("MESSAGE-ID".equalsIgnoreCase(headerName)) {
+                message.setHeader(GoogleMailStreamConstants.MAIL_MESSAGE_ID, header.getValue());
+            }
+        }
+    }
+
+}

@@ -1,0 +1,523 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.camel.component.google.storage;
+
+import java.io.File;
+import java.util.Date;
+import java.util.LinkedHashMap;
+import java.util.LinkedList;
+import java.util.List;
+import java.util.Map;
+import java.util.Queue;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
+
+import com.google.api.gax.paging.Page;
+import com.google.cloud.storage.Blob;
+import com.google.cloud.storage.BlobId;
+import com.google.cloud.storage.Bucket;
+import com.google.cloud.storage.CopyWriter;
+import com.google.cloud.storage.Storage;
+import com.google.cloud.storage.Storage.CopyRequest;
+import com.google.cloud.storage.StorageException;
+import org.apache.camel.CamelContext;
+import org.apache.camel.Exchange;
+import org.apache.camel.ExchangePattern;
+import org.apache.camel.ExchangePropertyKey;
+import org.apache.camel.Expression;
+import org.apache.camel.Message;
+import org.apache.camel.Processor;
+import org.apache.camel.RuntimeCamelException;
+import org.apache.camel.spi.Language;
+import org.apache.camel.spi.Synchronization;
+import org.apache.camel.support.EmptyAsyncCallback;
+import org.apache.camel.support.ScheduledBatchPollingConsumer;
+import org.apache.camel.support.builder.OutputStreamBuilder;
+import org.apache.camel.util.CastUtils;
+import org.apache.camel.util.ObjectHelper;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+public class GoogleCloudStorageConsumer extends ScheduledBatchPollingConsumer {
+
+    private static final Logger LOG = LoggerFactory.getLogger(GoogleCloudStorageConsumer.class);
+
+    private final Language language;
+    // objects whose exchanges are being processed, which a later poll must not consume again
+    private final Set<String> inProgress = ConcurrentHashMap.newKeySet();
+    // the objects that were in progress when the current poll started, before it listed or got the objects. Only the
+    // thread that polls reads and writes it.
+    private Set<String> inProgressAtPollStart = Set.of();
+
+    public GoogleCloudStorageConsumer(GoogleCloudStorageEndpoint endpoint, Processor processor) {
+        super(endpoint, processor);
+        this.language = getEndpoint().getCamelContext().resolveLanguage("file");
+    }
+
+    @Override
+    protected void doStart() throws Exception {
+        super.doStart();
+
+        if (getConfiguration().isMoveAfterRead()) {
+            Bucket bucket = getStorageClient().get(getConfiguration().getDestinationBucket());
+            if (bucket != null) {
+                LOG.trace("Bucket [{}] already exists", bucket.getName());
+                return;
+            } else {
+                LOG.trace("Destination Bucket [{}] doesn't exist yet", getConfiguration().getDestinationBucket());
+                if (getConfiguration().isAutoCreateBucket()) {
+                    // creates the new bucket because it doesn't exist yet
+                    GoogleCloudStorageEndpoint.createNewBucket(getConfiguration().getDestinationBucket(), getConfiguration(),
+                            getStorageClient());
+                }
+            }
+        }
+    }
+
+    @Override
+    protected int poll() throws Exception {
+        // must reset for each poll
+        shutdownRunningTask = null;
+        pendingExchanges = 0;
+
+        String fileName = getConfiguration().getObjectName();
+        String bucketName = getConfiguration().getBucketName();
+        Queue<Exchange> exchanges;
+        String filter = getConfiguration().getFilter();
+
+        // taken before the objects are listed (or got): an object that is in flight now can complete, and be deleted
+        // and released, after it was listed and before createExchanges looks at it, and must then not be consumed
+        // again from the stale listing
+        inProgressAtPollStart = Set.copyOf(inProgress);
+
+        if (fileName != null) {
+            LOG.trace("Getting object in bucket [{}] with file name [{}]...", bucketName, fileName);
+
+            Blob blob = getStorageClient().get(bucketName, fileName);
+
+            // okay we have some response from Google so lets mark the consumer as ready
+            forceConsumerAsReady();
+
+            if (blob == null) {
+                LOG.trace("No object found in bucket [{}] with file name [{}]", bucketName, fileName);
+                return 0;
+            }
+
+            exchanges = createExchanges(blob, fileName);
+        } else {
+            LOG.trace("Queueing objects in bucket [{}]...", bucketName);
+
+            Page<Blob> page;
+            if (ObjectHelper.isEmpty(getConfiguration().getPrefix())) {
+                page = getStorageClient().list(bucketName);
+            } else {
+                Storage.BlobListOption option = Storage.BlobListOption.prefix(getConfiguration().getPrefix());
+                page = getStorageClient().list(bucketName, option);
+            }
+
+            // okay we have some response from Google so lets mark the consumer as ready
+            forceConsumerAsReady();
+
+            List<Blob> bloblist = new LinkedList<>();
+            for (Blob blob : page.iterateAll()) {
+                if (filter != null && !filter.isEmpty()) {
+                    if (blob.getBlobId().getName().matches(filter)) {
+                        bloblist.add(blob);
+                    }
+                } else {
+                    bloblist.add(blob);
+                }
+            }
+
+            if (LOG.isTraceEnabled()) {
+                LOG.trace("Found {} objects in bucket [{}]...", bloblist.size(), bucketName);
+            }
+
+            exchanges = createExchanges(bloblist);
+        }
+
+        return processBatch(CastUtils.cast(exchanges));
+    }
+
+    protected Queue<Exchange> createExchanges(Blob blob, String key) {
+        Queue<Exchange> answer = new LinkedList<>();
+        addExchange(blob, key, answer);
+        return answer;
+    }
+
+    protected Queue<Exchange> createExchanges(List<Blob> blobList) {
+        if (LOG.isTraceEnabled()) {
+            LOG.trace("Received {} messages in this poll", blobList.size());
+        }
+
+        Queue<Exchange> answer = new LinkedList<>();
+        // the listed objects that could not be got, other than those that no longer exist, by name
+        Map<String, RuntimeException> failures = new LinkedHashMap<>();
+        // whether at least one listed object could be got
+        boolean anyGot = false;
+        for (Blob blob : blobList) {
+            if (includeObject(blob)) {
+                String key = blob.getBlobId().getName();
+                try {
+                    anyGot |= addExchange(blob, key, answer);
+                } catch (IllegalArgumentException e) {
+                    // the object name is rejected as a local download path: skip this object only, so a single
+                    // object with such a name does not stop the rest of the bucket from being consumed
+                    getExceptionHandler().handleException(
+                            "Skipping object " + key + " in bucket " + getConfiguration().getBucketName()
+                                                          + " as it cannot be downloaded: " + e.getMessage(),
+                            e);
+                } catch (RuntimeException e) {
+                    // a failure to get one listed object (access denied, a key that cannot decrypt it) does not fail
+                    // the poll as long as another listed object could be got: the object is skipped, the other listed
+                    // objects are consumed, and a later poll tries it again
+                    failures.put(key, e);
+                }
+            }
+        }
+
+        if (!failures.isEmpty()) {
+            if (!anyGot) {
+                // none of the listed objects could be got, so this is not about one object (expired credentials, no
+                // permission to get objects, no connection): the poll fails, and the backoff of the scheduled consumer
+                // applies
+                releaseInProgress(answer);
+                Map.Entry<String, RuntimeException> first = failures.entrySet().iterator().next();
+                LOG.warn("None of the listed objects of bucket {} could be got ({} failed, the first is {}): the poll fails",
+                        getConfiguration().getBucketName(), failures.size(), first.getKey());
+                throw first.getValue();
+            }
+            for (Map.Entry<String, RuntimeException> failure : failures.entrySet()) {
+                getExceptionHandler().handleException("Error getting object " + failure.getKey() + " from bucket "
+                                                      + getConfiguration().getBucketName()
+                                                      + ". The object is skipped for this poll.",
+                        failure.getValue());
+            }
+        }
+
+        return answer;
+    }
+
+    /**
+     * Gets a listed object and adds its exchange.
+     *
+     * @return true if the object was got and its exchange added, false if it is skipped (an exchange is still
+     *         processing it, or it no longer exists)
+     */
+    private boolean addExchange(Blob blob, String key, Queue<Exchange> answer) {
+        // skip the object if an exchange of a previous poll is still processing it, or was when this poll started
+        if (inProgressAtPollStart.contains(key) || !inProgress.add(key)) {
+            LOG.trace("Skipping object {} as it is already in progress", key);
+            return false;
+        }
+        try {
+            answer.add(createExchange(blob, key));
+            return true;
+        } catch (RuntimeException e) {
+            inProgress.remove(key);
+            if (isNotFound(e)) {
+                // deleted (for example by another consumer) after it was listed
+                LOG.debug("Skipping object {} as it no longer exists", key);
+                return false;
+            }
+            throw e;
+        }
+    }
+
+    private static boolean isNotFound(Exception e) {
+        StorageException se = ObjectHelper.getException(StorageException.class, e);
+        return se != null && se.getCode() == 404;
+    }
+
+    private void releaseInProgress(Queue<?> notProcessed) {
+        for (Object notRouted : notProcessed) {
+            Exchange exchange = (Exchange) notRouted;
+            inProgress.remove(exchange.getIn().getHeader(GoogleCloudStorageConstants.OBJECT_NAME, String.class));
+            // the exchange is never routed, so nothing else releases it to the exchange factory
+            releaseExchange(exchange, false);
+        }
+    }
+
+    /**
+     * Decide whether to include the Objects in the results
+     *
+     * @param  blob the blob
+     * @return      true to include, false to exclude
+     */
+    protected boolean includeObject(Blob blob) {
+        // is the blog a folder
+        boolean folder = blob.getName().endsWith("/");
+
+        if (folder && !getConfiguration().isIncludeFolders()) {
+            // we should not include folders
+            return false;
+        }
+
+        return true;
+    }
+
+    @Override
+    public int processBatch(Queue<Object> exchanges) throws Exception {
+        int total = exchanges.size();
+
+        for (int index = 0; index < total && isBatchAllowed(); index++) {
+            // only loop if we are started (allowed to run)
+            final Exchange exchange = ObjectHelper.cast(Exchange.class, exchanges.poll());
+            // add current index and total as properties
+            exchange.setProperty(ExchangePropertyKey.BATCH_INDEX, index);
+            exchange.setProperty(ExchangePropertyKey.BATCH_SIZE, total);
+            exchange.setProperty(ExchangePropertyKey.BATCH_COMPLETE, index == total - 1);
+
+            // update pending number of exchanges
+            pendingExchanges = total - index - 1;
+
+            // the object to delete or move once the exchange is done. It is taken now, as the route may change or
+            // remove the object name header before it ends (the producer takes the name of the object to write from it)
+            final String key = exchange.getIn().getHeader(GoogleCloudStorageConstants.OBJECT_NAME, String.class);
+            // add on completion to handle after work when the exchange is done
+            exchange.getExchangeExtension().addOnCompletion(new Synchronization() {
+                public void onComplete(Exchange exchange) {
+                    try {
+                        processCommit(exchange, key);
+                    } finally {
+                        inProgress.remove(key);
+                    }
+                }
+
+                public void onFailure(Exchange exchange) {
+                    try {
+                        processRollback(exchange);
+                    } finally {
+                        inProgress.remove(key);
+                    }
+                }
+
+                @Override
+                public String toString() {
+                    return "ConsumerOnCompletion";
+                }
+            });
+
+            // use default consumer callback
+            defaultConsumerCallback(exchange, true);
+            getAsyncProcessor().process(exchange, EmptyAsyncCallback.get());
+        }
+        // the remaining exchanges are not processed as the consumer is stopping
+        releaseInProgress(exchanges);
+
+        return total;
+    }
+
+    /**
+     * Strategy to delete or move the object after being processed, the object named by the
+     * {@link GoogleCloudStorageConstants#OBJECT_NAME} header.
+     *
+     * @param      exchange the exchange
+     * @deprecated          use {@link #processCommit(Exchange, String)}, which the consumer calls instead
+     */
+    @Deprecated(since = "4.24.0")
+    protected void processCommit(Exchange exchange) {
+        processCommit(exchange, exchange.getIn().getHeader(GoogleCloudStorageConstants.OBJECT_NAME, String.class));
+    }
+
+    /**
+     * Strategy to delete or move the object after being processed.
+     *
+     * @param exchange the exchange
+     * @param key      the name of the object the exchange was created from, in the bucket of the endpoint
+     */
+    protected void processCommit(Exchange exchange, String key) {
+        final String bucketName = getConfiguration().getBucketName();
+        try {
+            if (getConfiguration().isMoveAfterRead()) {
+                LOG.trace("Moving object from bucket {} with key {} to bucket {}...", bucketName, key,
+                        getConfiguration().getDestinationBucket());
+
+                BlobId sourceBlobId = BlobId.of(bucketName, key);
+                BlobId targetBlobId = BlobId.of(getConfiguration().getDestinationBucket(), key);
+                CopyRequest request = CopyRequest.of(sourceBlobId, targetBlobId);
+                CopyWriter copyWriter = getStorageClient().copy(request);
+
+                LOG.trace("Moved object from bucket {} with key {} to bucketName {} -> {}", bucketName, key,
+                        getConfiguration().getDestinationBucket(), copyWriter.getResult());
+            }
+            if (getConfiguration().isDeleteAfterRead()) {
+                LOG.trace("Deleting object from bucket {} with key {}...", bucketName, key);
+
+                boolean b = getStorageClient().delete(bucketName, key);
+
+                LOG.trace("Deleted object from bucket {} with key {}, result={}", bucketName, key, b);
+            }
+        } catch (Exception e) {
+            getExceptionHandler().handleException("Error occurred during moving or deleting object. This exception is ignored.",
+                    exchange, e);
+        }
+    }
+
+    /**
+     * Strategy when processing the exchange failed.
+     *
+     * @param exchange the exchange
+     */
+    protected void processRollback(Exchange exchange) {
+        Exception cause = exchange.getException();
+        if (cause != null) {
+            LOG.warn("Exchange failed, so rolling back message status: {}", exchange, cause);
+        } else {
+            LOG.warn("Exchange failed, so rolling back message status: {}", exchange);
+        }
+    }
+
+    protected GoogleCloudStorageConfiguration getConfiguration() {
+        return getEndpoint().getConfiguration();
+    }
+
+    protected Storage getStorageClient() {
+        return getEndpoint().getStorageClient();
+    }
+
+    @Override
+    public GoogleCloudStorageEndpoint getEndpoint() {
+        return (GoogleCloudStorageEndpoint) super.getEndpoint();
+    }
+
+    public Exchange createExchange(Blob blob, String key) {
+        return createExchange(getEndpoint().getExchangePattern(), blob, key);
+    }
+
+    public Exchange createExchange(ExchangePattern pattern, Blob blob, String key) {
+        if (LOG.isTraceEnabled()) {
+            LOG.trace("Getting object with key [{}] from bucket [{}]...", key, getConfiguration().getBucketName());
+            LOG.trace("Got object [{}]", blob);
+        }
+
+        Exchange exchange = createExchange(true);
+        try {
+            populateExchange(exchange, pattern, blob, key);
+        } catch (RuntimeException e) {
+            // the object is not consumed (its name is rejected as a local path, or its download failed, for example
+            // as it no longer exists), so the exchange created for it is not routed either
+            releaseExchange(exchange, false);
+            throw e;
+        }
+        return exchange;
+    }
+
+    private void populateExchange(Exchange exchange, ExchangePattern pattern, Blob blob, String key) {
+        exchange.setPattern(pattern);
+        Message message = exchange.getIn();
+
+        if (getConfiguration().isIncludeBody()) {
+            // download as file
+            if (getConfiguration().getDownloadFileName() != null) {
+                // create a dummy exchange as Exchange is needed for expression evaluation
+                String result
+                        = evaluateFileExpression(exchange, getConfiguration().getDownloadFileName(), blob.getName());
+                if (result != null) {
+                    File file = new File(result);
+                    blob.downloadTo(file.toPath());
+                    message.setBody(file);
+                }
+            } else {
+                // store blob data in the message body
+                try {
+                    // if stream caching is enabled then use that so we can stream accordingly
+                    // for example to overflow to disk for big streams
+                    OutputStreamBuilder osb = OutputStreamBuilder.withExchange(exchange);
+                    blob.downloadTo(osb);
+                    message.setBody(osb.build());
+                } catch (Exception e) {
+                    throw new RuntimeCamelException(e);
+                }
+            }
+        } else {
+            // store raw blob
+            message.setBody(blob);
+        }
+
+        message.setHeader(GoogleCloudStorageConstants.OBJECT_NAME, key);
+        message.setHeader(GoogleCloudStorageConstants.BUCKET_NAME, getConfiguration().getBucketName());
+        //OTHER METADATA
+        message.setHeader(GoogleCloudStorageConstants.CACHE_CONTROL, blob.getCacheControl());
+        message.setHeader(GoogleCloudStorageConstants.METADATA_COMPONENT_COUNT, blob.getComponentCount());
+        message.setHeader(GoogleCloudStorageConstants.CONTENT_DISPOSITION, blob.getContentDisposition());
+        message.setHeader(GoogleCloudStorageConstants.CONTENT_ENCODING, blob.getContentEncoding());
+        message.setHeader(GoogleCloudStorageConstants.METADATA_CONTENT_LANGUAGE, blob.getContentLanguage());
+        message.setHeader(GoogleCloudStorageConstants.CONTENT_TYPE, blob.getContentType());
+        message.setHeader(GoogleCloudStorageConstants.METADATA_CUSTOM_TIME, blob.getCustomTime());
+        message.setHeader(GoogleCloudStorageConstants.METADATA_CRC32C_HEX, blob.getCrc32cToHexString());
+        message.setHeader(GoogleCloudStorageConstants.METADATA_ETAG, blob.getEtag());
+        message.setHeader(GoogleCloudStorageConstants.METADATA_GENERATION, blob.getGeneration());
+        message.setHeader(GoogleCloudStorageConstants.METADATA_BLOB_ID, blob.getBlobId());
+        message.setHeader(GoogleCloudStorageConstants.METADATA_KMS_KEY_NAME, blob.getKmsKeyName());
+        message.setHeader(GoogleCloudStorageConstants.CONTENT_MD5, blob.getMd5ToHexString());
+        message.setHeader(GoogleCloudStorageConstants.METADATA_MEDIA_LINK, blob.getMediaLink());
+        message.setHeader(GoogleCloudStorageConstants.METADATA_METAGENERATION, blob.getMetageneration());
+        message.setHeader(GoogleCloudStorageConstants.CONTENT_LENGTH, blob.getSize());
+        message.setHeader(GoogleCloudStorageConstants.METADATA_STORAGE_CLASS, blob.getStorageClass());
+        message.setHeader(GoogleCloudStorageConstants.METADATA_CREATE_TIME, blob.getCreateTime());
+        message.setHeader(GoogleCloudStorageConstants.METADATA_LAST_UPDATE, new Date(blob.getUpdateTime()));
+    }
+
+    protected String evaluateFileExpression(Exchange exchange, String downloadFileName, String blogName) {
+        CamelContext camelContext = exchange.getContext();
+        // use blob as file name
+        exchange.getMessage().setHeader(GoogleCloudStorageConstants.FILE_NAME, blogName);
+
+        // the local path is resolved from GoogleCloudStorageConstants.FILE_NAME set above, which carries the remote
+        // object name and is therefore untrusted input, no matter whether the token is appended here or already part
+        // of the configured downloadFileName. An absolute object name, or one with a .. segment, is rejected whatever
+        // the configuration looks like, and the resolved path is then confined:
+        // - plain directory (no expression): the object name is appended to it and the configured value itself is the
+        //   directory the download must stay within
+        // - directory followed by an expression (for example /tmp/downloads/${file:name}): the static directory
+        //   prefix before the first expression token is the directory the download must stay within
+        // - fully dynamic value with no static directory prefix (for example ${file:name}): the route author did not
+        //   configure any directory, so a relative result must stay within the working directory
+        if (blogName != null) {
+            GoogleCloudStorageFileNameHelper.assertSafeObjectName(blogName);
+        }
+
+        String eval = downloadFileName;
+        final String confinementDirectory;
+        final boolean confineToDirectory;
+        if (downloadFileName.contains("$")) {
+            confinementDirectory = GoogleCloudStorageFileNameHelper.staticDirectoryPrefix(downloadFileName);
+            confineToDirectory = !confinementDirectory.isEmpty();
+        } else {
+            eval = downloadFileName + "/${file:name}";
+            confinementDirectory = downloadFileName;
+            confineToDirectory = true;
+        }
+        Expression exp = language.createExpression(eval);
+        exp.init(camelContext);
+
+        String result = exp.evaluate(exchange, String.class);
+        if (exchange.getException() != null) {
+            throw RuntimeCamelException.wrapRuntimeCamelException(exchange.getException());
+        }
+        if (result != null) {
+            if (confineToDirectory) {
+                GoogleCloudStorageFileNameHelper.assertWithinDirectory(confinementDirectory, result, blogName);
+            } else {
+                GoogleCloudStorageFileNameHelper.assertWithinWorkingDirectory(result, blogName);
+            }
+        }
+        return result;
+    }
+
+}

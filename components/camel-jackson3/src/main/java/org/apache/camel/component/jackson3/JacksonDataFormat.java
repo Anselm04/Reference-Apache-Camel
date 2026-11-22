@@ -1,0 +1,157 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.camel.component.jackson3;
+
+import java.io.OutputStream;
+
+import org.apache.camel.Exchange;
+import org.apache.camel.spi.BodyType;
+import org.apache.camel.spi.BodyType.Carrier;
+import org.apache.camel.spi.BodyTypes;
+import org.apache.camel.spi.Metadata;
+import org.apache.camel.spi.annotations.Dataformat;
+import org.apache.camel.support.JsonPayloadHelper;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import tools.jackson.core.StreamReadConstraints;
+import tools.jackson.core.json.JsonFactory;
+import tools.jackson.databind.ObjectMapper;
+import tools.jackson.databind.json.JsonMapper;
+
+/**
+ * Marshal POJOs to JSON and back using Jackson.
+ */
+@Dataformat("jackson")
+@Metadata(excludeProperties = "library,permissions,dateFormatPattern")
+@BodyTypes(marshalIn = @BodyType(value = Carrier.ANY,
+                                 description = "A Map, a List or a POJO to write as JSON. Text, bytes or a stream that is"
+                                               + " JSON already is written as it is"),
+           marshalOut = @BodyType(value = Carrier.STREAM, format = "json",
+                                  description = "The JSON in the stream cache, or a byte array when stream caching is off"),
+           unmarshalIn = @BodyType(value = { Carrier.TEXT, Carrier.BYTES, Carrier.STREAM, Carrier.FILE }, format = "json"),
+           unmarshalOut = @BodyType(value = { Carrier.MAP, Carrier.LIST },
+                                    dependsOn = { "collectionType", "useList", "allowUnmarshallType", "allowJmsType" },
+                                    javaTypeOption = "unmarshalType",
+                                    byOption = @BodyType.When(option = "useList", value = "true", carriers = Carrier.LIST),
+                                    description = "A Map (LinkedHashMap) for a JSON object, a List (ArrayList) for an array"))
+public class JacksonDataFormat extends AbstractJacksonDataFormat {
+
+    private static final Logger LOG = LoggerFactory.getLogger(JacksonDataFormat.class);
+
+    /**
+     * Use the default Jackson {@link ObjectMapper} and {@link Object}
+     */
+    public JacksonDataFormat() {
+    }
+
+    /**
+     * Use the default Jackson {@link ObjectMapper} and with a custom unmarshal type
+     *
+     * @param unmarshalType the custom unmarshal type
+     */
+    public JacksonDataFormat(Class<?> unmarshalType) {
+        super(unmarshalType);
+    }
+
+    /**
+     * Use the default Jackson {@link ObjectMapper} and with a custom unmarshal type and JSON view
+     *
+     * @param unmarshalType the custom unmarshal type
+     * @param jsonView      marker class to specify properties to be included during marshalling. See also
+     */
+    public JacksonDataFormat(Class<?> unmarshalType, Class<?> jsonView) {
+        super(unmarshalType, jsonView);
+    }
+
+    /**
+     * Use a custom Jackson mapper and an unmarshal type
+     *
+     * @param mapper        the custom mapper
+     * @param unmarshalType the custom unmarshal type
+     */
+    public JacksonDataFormat(ObjectMapper mapper, Class<?> unmarshalType) {
+        super(mapper, unmarshalType);
+    }
+
+    /**
+     * Use a custom Jackson mapper, unmarshal type and JSON view
+     *
+     * @param mapper        the custom mapper
+     * @param unmarshalType the custom unmarshal type
+     * @param jsonView      marker class to specify properties to be included during marshalling. See also
+     */
+    public JacksonDataFormat(ObjectMapper mapper, Class<?> unmarshalType, Class<?> jsonView) {
+        super(mapper, unmarshalType, jsonView);
+    }
+
+    @Override
+    public String getDataFormatName() {
+        return "jackson";
+    }
+
+    @Override
+    protected ObjectMapper createNewObjectMapper() {
+        ObjectMapper om = JsonMapper.builder().build();
+        int len = getMaxStringLength();
+        if (len > 0) {
+            LOG.debug("Creating ObjectMapper with maxStringLength: {}", len);
+            StreamReadConstraints constraints = StreamReadConstraints
+                    .builder()
+                    .maxStringLength(len)
+                    .build();
+            JsonFactory jsonFactory = JsonFactory.builder()
+                    .streamReadConstraints(constraints)
+                    .build();
+            om = JsonMapper.builder(jsonFactory).build();
+        }
+        return om;
+    }
+
+    @Override
+    protected Class<? extends ObjectMapper> getObjectMapperClass() {
+        return ObjectMapper.class;
+    }
+
+    @Override
+    protected String getDefaultContentType() {
+        return "application/json";
+    }
+
+    /**
+     * Whether a body that already is JSON text is written as it is. A subclass that writes another format than JSON,
+     * such as protobuf, returns false.
+     */
+    protected boolean isWriteJsonAsIs() {
+        return true;
+    }
+
+    /**
+     * A body that is already the JSON text is written as it is (CAMEL-25329), see {@link JsonPayloadHelper}: a file, a
+     * stream, bytes, or a String holding a JSON object or array. Any other String, and every object, is marshalled as
+     * before.
+     */
+    @Override
+    public void marshal(Exchange exchange, Object graph, OutputStream stream) throws Exception {
+        if (isWriteJsonAsIs() && JsonPayloadHelper.writeIfAlreadyJson(exchange, graph, stream) >= 0) {
+            if (isContentTypeHeader()) {
+                exchange.getMessage().setHeader(Exchange.CONTENT_TYPE, getDefaultContentType());
+            }
+            return;
+        }
+        super.marshal(exchange, graph, stream);
+    }
+}

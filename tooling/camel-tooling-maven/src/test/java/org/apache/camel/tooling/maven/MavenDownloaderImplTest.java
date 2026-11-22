@@ -1,0 +1,1273 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.camel.tooling.maven;
+
+import java.io.File;
+import java.io.IOException;
+import java.net.ConnectException;
+import java.net.ServerSocket;
+import java.net.Socket;
+import java.net.SocketTimeoutException;
+import java.net.UnknownHostException;
+import java.net.http.HttpConnectTimeoutException;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.security.MessageDigest;
+import java.util.Base64;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.concurrent.Callable;
+import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.TimeUnit;
+
+import org.apache.camel.util.FileUtil;
+import org.apache.commons.codec.binary.Hex;
+import org.apache.http.Header;
+import org.apache.http.conn.ConnectTimeoutException;
+import org.apache.http.entity.StringEntity;
+import org.apache.http.impl.bootstrap.HttpServer;
+import org.apache.http.impl.bootstrap.ServerBootstrap;
+import org.eclipse.aether.artifact.DefaultArtifact;
+import org.eclipse.aether.resolution.ArtifactRequest;
+import org.eclipse.aether.resolution.ArtifactResult;
+import org.junit.jupiter.api.AfterAll;
+import org.junit.jupiter.api.BeforeAll;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.condition.EnabledIfSystemProperty;
+import org.junit.jupiter.api.io.TempDir;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.junit.jupiter.api.Assertions.fail;
+
+/**
+ * Tests for MavenDownloaderImpl using MIMA (Minimal Maven).
+ * <p>
+ * Note: Most tests are disabled by default and require -DenableMavenDownloaderTests=true because they download from
+ * Maven Central and can be slow/flaky in CI environments.
+ */
+class MavenDownloaderImplTest {
+
+    private static final Logger LOG = LoggerFactory.getLogger(MavenDownloaderImplTest.class);
+
+    private static HttpServer localServer;
+
+    @TempDir
+    File tempDir;
+
+    @BeforeAll
+    public static void startMavenMirror() throws Exception {
+        localServer = ServerBootstrap.bootstrap()
+                .setListenerPort(AvailablePortFinder.getNextAvailable(9234, 10000))
+                .registerHandler("/maven/*", (req, res, context) -> {
+                    Header authz = req.getFirstHeader("Authorization");
+                    if (authz == null) {
+                        res.addHeader("WWW-Authenticate", "Basic realm=Camel");
+                        res.setStatusCode(401);
+                        return;
+                    }
+                    String creds = new String(Base64.getDecoder().decode(authz.getValue().split(" ")[1]));
+                    if (!"camel:passw0rd".equals(creds)) {
+                        res.setStatusCode(403);
+                        return;
+                    }
+                    LOG.info("Request: {}", req.getRequestLine());
+                    String request = req.getRequestLine().getUri().substring("/maven".length());
+                    if (request.endsWith(".jar") || request.endsWith(".pom")) {
+                        res.setEntity(new StringEntity(request));
+                    } else {
+                        try {
+                            MessageDigest md = null;
+                            if (request.endsWith(".md5")) {
+                                md = MessageDigest.getInstance("MD5");
+                                request = request.substring(0, request.length() - 4);
+                            } else if (request.endsWith(".sha1")) {
+                                md = MessageDigest.getInstance("SHA");
+                                request = request.substring(0, request.length() - 5);
+                            }
+                            if (md != null) {
+                                byte[] digest = md.digest(request.getBytes(StandardCharsets.UTF_8));
+                                res.setEntity(new StringEntity(Hex.encodeHexString(digest)));
+                            }
+                        } catch (Exception e) {
+                            throw new RuntimeException(e);
+                        }
+                    }
+                    res.setStatusCode(200);
+                })
+                .create();
+        localServer.start();
+    }
+
+    @AfterAll
+    public static void stopMavenMirror() {
+        if (localServer != null) {
+            localServer.shutdown(2, TimeUnit.SECONDS);
+        }
+    }
+
+    @Test
+    void testRemoteSnapshotHasBaseVersion() {
+        // a SNAPSHOT downloaded from a remote repository is resolved with its timestamped version
+        ArtifactResult result = new ArtifactResult(new ArtifactRequest());
+        result.setArtifact(new DefaultArtifact("org.apache.camel:camel-api:jar:4.24.0-20261112.143700-31")
+                .setFile(new File("camel-api-4.24.0-20261112.143700-31.jar")));
+
+        MavenArtifact artifact = MavenDownloaderImpl.toMavenArtifact(result);
+
+        assertEquals("org.apache.camel:camel-api:4.24.0-SNAPSHOT", artifact.getGav().toString());
+        assertEquals("camel-api-4.24.0-20261112.143700-31.jar", artifact.getFile().getName());
+    }
+
+    @Test
+    @EnabledIfSystemProperty(named = "enableMavenDownloaderTests", matches = "true")
+    void testResolveSimpleArtifact() throws Exception {
+        try (MavenDownloaderImpl downloader = new MavenDownloaderImpl()) {
+            downloader.build();
+
+            // Resolve a small, stable artifact
+            List<MavenArtifact> artifacts = downloader.resolveArtifacts(
+                    List.of("org.apache.commons:commons-lang3:3.12.0"),
+                    null,
+                    false, // non-transitive
+                    false  // no Apache snapshots
+            );
+
+            assertEquals(1, artifacts.size());
+            MavenArtifact artifact = artifacts.get(0);
+            assertEquals("org.apache.commons", artifact.getGav().getGroupId());
+            assertEquals("commons-lang3", artifact.getGav().getArtifactId());
+            assertEquals("3.12.0", artifact.getGav().getVersion());
+            assertNotNull(artifact.getFile());
+            assertTrue(artifact.getFile().exists());
+            assertTrue(artifact.getFile().getName().endsWith(".jar"));
+        }
+    }
+
+    @Test
+    @EnabledIfSystemProperty(named = "enableMavenDownloaderTests", matches = "true")
+    void testResolveTransitiveDependencies() throws Exception {
+        try (MavenDownloaderImpl downloader = new MavenDownloaderImpl()) {
+            downloader.build();
+
+            // Resolve with transitive dependencies - slf4j-simple depends on slf4j-api
+            List<MavenArtifact> artifacts = downloader.resolveArtifacts(
+                    List.of("org.slf4j:slf4j-simple:1.7.36"),
+                    null,
+                    true, // transitive
+                    false);
+
+            // Should have at least slf4j-simple + slf4j-api
+            assertTrue(artifacts.size() >= 2,
+                    "Expected at least 2 artifacts (slf4j-simple + slf4j-api), got " + artifacts.size());
+
+            boolean hasSimple = artifacts.stream()
+                    .anyMatch(a -> "slf4j-simple".equals(a.getGav().getArtifactId()));
+            boolean hasApi = artifacts.stream()
+                    .anyMatch(a -> "slf4j-api".equals(a.getGav().getArtifactId()));
+
+            assertTrue(hasSimple, "Should contain slf4j-simple");
+            assertTrue(hasApi, "Should contain slf4j-api (transitive dependency)");
+        }
+    }
+
+    @Test
+    @EnabledIfSystemProperty(named = "enableMavenDownloaderTests", matches = "true")
+    void testResolveMultipleArtifacts() throws Exception {
+        try (MavenDownloaderImpl downloader = new MavenDownloaderImpl()) {
+            downloader.build();
+
+            List<MavenArtifact> artifacts = downloader.resolveArtifacts(
+                    List.of(
+                            "org.apache.commons:commons-lang3:3.12.0",
+                            "commons-io:commons-io:2.11.0"),
+                    null,
+                    false,
+                    false);
+
+            assertEquals(2, artifacts.size());
+        }
+    }
+
+    @Test
+    @EnabledIfSystemProperty(named = "enableMavenDownloaderTests", matches = "true")
+    void testResolveAvailableVersions() throws Exception {
+        try (MavenDownloaderImpl downloader = new MavenDownloaderImpl()) {
+            downloader.build();
+
+            List<MavenGav> versions = downloader.resolveAvailableVersions(
+                    "org.apache.commons",
+                    "commons-lang3",
+                    null // use Maven Central
+            );
+
+            assertFalse(versions.isEmpty(), "Should find multiple versions of commons-lang3");
+            assertTrue(versions.size() > 10, "Should have many versions of commons-lang3");
+
+            // Check that versions contain expected versions
+            boolean has3_12 = versions.stream()
+                    .anyMatch(v -> "3.12.0".equals(v.getVersion()));
+            assertTrue(has3_12, "Should contain version 3.12.0");
+
+            LOG.info("Found {} versions of commons-lang3", versions.size());
+        }
+    }
+
+    @Test
+    @EnabledIfSystemProperty(named = "enableMavenDownloaderTests", matches = "true")
+    void testCustomLocalRepository() throws Exception {
+        File customLocalRepo = new File(tempDir, "custom-local-repo");
+        Files.createDirectories(customLocalRepo.toPath());
+
+        try (MavenDownloaderImpl downloader = new MavenDownloaderImpl()) {
+            downloader.build();
+
+            // Create customized downloader with custom local repository
+            MavenDownloader customDownloader = downloader.customize(
+                    customLocalRepo.getAbsolutePath(),
+                    5000,  // connect timeout
+                    10000  // request timeout
+            );
+
+            List<MavenArtifact> artifacts = customDownloader.resolveArtifacts(
+                    List.of("org.apache.commons:commons-lang3:3.12.0"),
+                    null,
+                    false,
+                    false);
+
+            assertEquals(1, artifacts.size());
+
+            // Verify artifact was downloaded to custom local repository
+            File expectedPath = new File(
+                    customLocalRepo,
+                    "org/apache/commons/commons-lang3/3.12.0/commons-lang3-3.12.0.jar");
+            assertTrue(expectedPath.exists(),
+                    "Artifact should be in custom local repository: " + expectedPath);
+        }
+    }
+
+    @Test
+    @EnabledIfSystemProperty(named = "enableMavenDownloaderTests", matches = "true")
+    void testOfflineMode() throws Exception {
+        // First download the artifact to local repo
+        try (MavenDownloaderImpl downloader = new MavenDownloaderImpl()) {
+            downloader.build();
+            downloader.resolveArtifacts(
+                    List.of("org.apache.commons:commons-lang3:3.12.0"),
+                    null,
+                    false,
+                    false);
+        }
+
+        // Now try in offline mode - should work from cache
+        try (MavenDownloaderImpl downloader = new MavenDownloaderImpl()) {
+            downloader.setOffline(true);
+            downloader.build();
+
+            List<MavenArtifact> artifacts = downloader.resolveArtifacts(
+                    List.of("org.apache.commons:commons-lang3:3.12.0"),
+                    null,
+                    false,
+                    false);
+
+            assertEquals(1, artifacts.size());
+            assertTrue(artifacts.get(0).getFile().exists());
+        }
+
+        // Try to download an artifact not in cache - should fail in offline mode
+        try (MavenDownloaderImpl downloader = new MavenDownloaderImpl()) {
+            downloader.setOffline(true);
+            downloader.build();
+
+            downloader.resolveArtifacts(
+                    List.of("org.apache.commons:commons-lang3:99.99.99"), // non-existent version
+                    null,
+                    false,
+                    false);
+            fail("Should have failed in offline mode for non-cached artifact");
+        } catch (MavenResolutionException e) {
+            // Expected
+            LOG.info("Expected failure in offline mode: {}", e.getMessage());
+        }
+    }
+
+    @Test
+    @EnabledIfSystemProperty(named = "enableMavenDownloaderTests", matches = "true")
+    void testPreferLocalResolvesFromCache() throws Exception {
+        File customLocalRepo = new File(tempDir, "prefer-local-repo");
+        Files.createDirectories(customLocalRepo.toPath());
+
+        // First, download the artifact into the custom local repo (online)
+        try (MavenDownloaderImpl downloader = new MavenDownloaderImpl()) {
+            downloader.build();
+
+            MavenDownloader customDownloader = downloader.customize(
+                    customLocalRepo.getAbsolutePath(), 5000, 10000);
+
+            customDownloader.resolveArtifacts(
+                    List.of("org.apache.commons:commons-lang3:3.12.0"),
+                    null, false, false);
+        }
+
+        // Verify artifact is in custom local repo
+        File cachedJar = new File(
+                customLocalRepo,
+                "org/apache/commons/commons-lang3/3.12.0/commons-lang3-3.12.0.jar");
+        assertTrue(cachedJar.exists(), "Artifact should have been downloaded to custom local repo");
+
+        // Now create a new downloader with preferLocal=true, Maven Central disabled,
+        // and a non-existent fake repo. Without preferLocal, this would fail because
+        // there are no reachable remote repos. With preferLocal, it should succeed
+        // by using the local cache without checking the remote repositories.
+        try (MavenDownloaderImpl downloader = new MavenDownloaderImpl()) {
+            downloader.setPreferLocal(true);
+            downloader.setMavenCentralEnabled(false);
+            downloader.setMavenApacheSnapshotEnabled(false);
+            downloader.setMavenSettingsLocation("false"); // disable settings.xml repos
+            downloader.setRepos("http://localhost:1/non-existent-repo"); // unreachable repo
+            downloader.build();
+
+            MavenDownloader customDownloader = downloader.customize(
+                    customLocalRepo.getAbsolutePath(), 1000, 1000);
+
+            List<MavenArtifact> artifacts = customDownloader.resolveArtifacts(
+                    List.of("org.apache.commons:commons-lang3:3.12.0"),
+                    null, false, false);
+
+            assertEquals(1, artifacts.size());
+            assertTrue(artifacts.get(0).getFile().exists());
+            LOG.info("preferLocal resolved artifact from local cache without contacting remote repos");
+        }
+    }
+
+    @Test
+    @EnabledIfSystemProperty(named = "enableMavenDownloaderTests", matches = "true")
+    void testPreferLocalDownloadsMissingArtifact() throws Exception {
+        // With preferLocal=true, if the artifact is NOT in the local repo,
+        // it is still downloaded
+        try (MavenDownloaderImpl downloader = new MavenDownloaderImpl()) {
+            downloader.setPreferLocal(true);
+            downloader.build();
+
+            List<MavenArtifact> artifacts = downloader.resolveArtifacts(
+                    List.of("org.apache.commons:commons-lang3:3.12.0"),
+                    null, false, false);
+
+            assertEquals(1, artifacts.size());
+            assertTrue(artifacts.get(0).getFile().exists());
+            LOG.info("preferLocal fell back to online resolution for non-cached artifact");
+        }
+    }
+
+    @Test
+    @EnabledIfSystemProperty(named = "enableMavenDownloaderTests", matches = "true")
+    void testDisableMavenCentral() throws Exception {
+        try (MavenDownloaderImpl downloader = new MavenDownloaderImpl()) {
+            downloader.setMavenCentralEnabled(false);
+            downloader.build();
+
+            try {
+                downloader.resolveArtifacts(
+                        List.of("org.apache.commons:commons-lang3:3.12.0"),
+                        null,
+                        false,
+                        false);
+                fail("Should fail when Maven Central is disabled");
+            } catch (MavenResolutionException e) {
+                // Expected
+                LOG.info("Expected failure with Maven Central disabled: {}", e.getMessage());
+            }
+        }
+    }
+
+    @Test
+    @EnabledIfSystemProperty(named = "enableMavenDownloaderTests", matches = "true")
+    void testCustomRepository() throws Exception {
+        try (MavenDownloaderImpl downloader = new MavenDownloaderImpl()) {
+            downloader.setMavenCentralEnabled(false);
+            // Add Maven Central as a custom repository to verify custom repo support works
+            downloader.setRepos("https://repo1.maven.org/maven2");
+            downloader.build();
+
+            List<MavenArtifact> artifacts = downloader.resolveArtifacts(
+                    List.of("org.apache.commons:commons-lang3:3.12.0"),
+                    null,
+                    false,
+                    false);
+
+            assertEquals(1, artifacts.size());
+        }
+    }
+
+    @Test
+    @EnabledIfSystemProperty(named = "enableMavenDownloaderTests", matches = "true")
+    void testExtraRepositories() throws Exception {
+        try (MavenDownloaderImpl downloader = new MavenDownloaderImpl()) {
+            downloader.setMavenCentralEnabled(false);
+            downloader.build();
+
+            // Pass extra repository as parameter to resolveArtifacts
+            List<MavenArtifact> artifacts = downloader.resolveArtifacts(
+                    List.of("org.apache.commons:commons-lang3:3.12.0"),
+                    Set.of("https://repo1.maven.org/maven2"), // extra repository
+                    false,
+                    false);
+
+            assertEquals(1, artifacts.size());
+        }
+    }
+
+    @Test
+    @EnabledIfSystemProperty(named = "enableMavenDownloaderTests", matches = "true")
+    void testApacheSnapshots() throws Exception {
+        try (MavenDownloaderImpl downloader = new MavenDownloaderImpl()) {
+            downloader.setMavenCentralEnabled(true);
+            downloader.setMavenApacheSnapshotEnabled(true);
+            downloader.build();
+
+            assertNotNull(downloader.getRepositoryResolver(),
+                    "Repository resolver should be initialized with Apache Snapshots enabled");
+
+            // Try to resolve a recent Camel SNAPSHOT (may not always be available)
+            // This test verifies that Apache Snapshots repository can be used
+            try {
+                List<MavenGav> versions = downloader.resolveAvailableVersions(
+                        "org.apache.camel",
+                        "camel-core",
+                        "https://repository.apache.org/snapshots");
+                // If this succeeds, Apache Snapshots is accessible
+                assertNotNull(versions, "Resolved versions list should not be null");
+            } catch (MavenResolutionException e) {
+                // This may fail if there are no snapshots or network issues
+                // Just log and continue
+                LOG.warn("Could not access Apache Snapshots: {}", e.getMessage());
+            }
+        }
+    }
+
+    @Test
+    @EnabledIfSystemProperty(named = "enableMavenDownloaderTests", matches = "true")
+    void testDownloadListener() throws Exception {
+        final int[] downloadingCount = { 0 };
+        final int[] downloadedCount = { 0 };
+
+        RemoteArtifactDownloadListener listener = new RemoteArtifactDownloadListener() {
+            @Override
+            public void artifactDownloading(
+                    String groupId, String artifactId, String version,
+                    String repositoryId, String repositoryUrl) {
+                downloadingCount[0]++;
+                LOG.info("Downloading: {}:{}:{} from {}", groupId, artifactId, version, repositoryUrl);
+            }
+
+            @Override
+            public void artifactDownloaded(
+                    String groupId, String artifactId, String version,
+                    String repositoryId, String repositoryUrl, long elapsedMs) {
+                downloadedCount[0]++;
+                LOG.info("Downloaded: {}:{}:{} from {} in {}ms", groupId, artifactId, version, repositoryUrl, elapsedMs);
+            }
+        };
+
+        File customLocalRepo = new File(tempDir, "empty-local-repo");
+        Files.createDirectories(customLocalRepo.toPath());
+
+        try (MavenDownloaderImpl downloader = new MavenDownloaderImpl()) {
+            downloader.setRemoteArtifactDownloadListener(listener);
+            downloader.build();
+
+            MavenDownloader customDownloader = downloader.customize(
+                    customLocalRepo.getAbsolutePath(),
+                    5000,
+                    10000);
+
+            List<MavenArtifact> artifacts = customDownloader.resolveArtifacts(
+                    List.of("org.apache.commons:commons-lang3:3.12.0"),
+                    null,
+                    true, // transitive - will download multiple artifacts
+                    false);
+
+            assertFalse(artifacts.isEmpty());
+
+            // Note: Listener is only called for remote downloads, not cache hits
+            // So counts might be 0 if artifacts were already in default local repo
+            LOG.info("Download events: downloading={}, downloaded={}", downloadingCount[0], downloadedCount[0]);
+        }
+    }
+
+    @Test
+    void testBuildAndStop() throws Exception {
+        // Test basic lifecycle without network access
+        try (MavenDownloaderImpl downloader = new MavenDownloaderImpl()) {
+            downloader.setMavenCentralEnabled(true);
+            downloader.setMavenApacheSnapshotEnabled(false);
+            downloader.build();
+
+            // Verify it built successfully
+            assertNotNull(downloader.getRepositoryResolver());
+        }
+    }
+
+    @Test
+    void testInvalidArtifactCoordinates() throws Exception {
+        try (MavenDownloaderImpl downloader = new MavenDownloaderImpl()) {
+            downloader.build();
+
+            try {
+                downloader.resolveArtifacts(
+                        List.of("invalid:coordinates"), // Missing version
+                        null,
+                        false,
+                        false);
+                fail("Should fail with invalid coordinates");
+            } catch (Exception e) {
+                // Expected - could be IllegalArgumentException or MavenResolutionException
+                LOG.info("Expected failure with invalid coordinates: {}", e.getMessage());
+            }
+        }
+    }
+
+    @Test
+    @EnabledIfSystemProperty(named = "enableMavenDownloaderTests", matches = "true")
+    void testNonExistentArtifact() throws Exception {
+        try (MavenDownloaderImpl downloader = new MavenDownloaderImpl()) {
+            downloader.build();
+
+            try {
+                downloader.resolveArtifacts(
+                        List.of("org.apache.camel:non-existent-artifact:99.99.99"),
+                        null,
+                        false,
+                        false);
+                fail("Should fail when artifact doesn't exist");
+            } catch (MavenResolutionException e) {
+                // Expected
+                assertNotNull(e.getMessage());
+                assertFalse(e.getRepositories().isEmpty(), "Should include repository URLs in exception");
+                LOG.info("Expected failure for non-existent artifact: {}", e.getMessage());
+            }
+        }
+    }
+
+    @Test
+    void testDisableSettings() throws Exception {
+        try (MavenDownloaderImpl downloader = new MavenDownloaderImpl()) {
+            // Setting to "false" disables settings.xml processing
+            downloader.setMavenSettingsLocation("false");
+            downloader.build();
+
+            // Verify the downloader built successfully without settings.xml
+            assertNotNull(downloader.getRepositoryResolver(),
+                    "Repository resolver should be initialized even with settings.xml disabled");
+        }
+    }
+
+    @Test
+    void testRepositoryResolver() throws Exception {
+        try (MavenDownloaderImpl downloader = new MavenDownloaderImpl()) {
+            // Use the default resolver
+            downloader.build();
+
+            // Verify default resolver was created
+            assertNotNull(downloader.getRepositoryResolver());
+        }
+    }
+
+    @Test
+    void testAuthenticationAndMirrors() throws Exception {
+        // This test verifies that MIMA correctly handles:
+        // 1. Settings.xml with server authentication
+        // 2. Repository mirrors
+        // 3. The id=url format for preserving repository IDs
+        //
+        // The id=url format (e.g., "test-server=http://...") preserves the repository ID,
+        // which is required for settings.xml server authentication matching:
+        //   <server><id>test-server</id><username>...</username></server>
+
+        String localSettings = "src/test/resources/.m2/settings.xml";
+        String localSettingsSecurity = "src/test/resources/.m2/settings-security.xml";
+
+        // Read the settings and update the port to our test server
+        String settingsContent = Files.readString(new File(localSettings).toPath());
+        settingsContent = settingsContent.replaceAll("http://localhost:0/",
+                "http://localhost:" + localServer.getLocalPort() + "/");
+
+        // Write to temp file
+        File tempSettings = new File(tempDir, "settings.xml");
+        Files.writeString(tempSettings.toPath(), settingsContent);
+
+        // Create custom local repository
+        File customLocalRepo = new File(tempDir, "custom-m2-repository");
+        FileUtil.removeDir(customLocalRepo);
+        Files.createDirectories(customLocalRepo.toPath());
+
+        String testRepoUrl = "http://localhost:" + localServer.getLocalPort() + "/maven/repository";
+
+        try (MavenDownloaderImpl downloader = new MavenDownloaderImpl()) {
+            downloader.setMavenSettingsLocation(tempSettings.getAbsolutePath());
+            downloader.setMavenSettingsSecurityLocation(localSettingsSecurity);
+            downloader.setMavenCentralEnabled(false); // Disable Maven Central
+            // Use id=url format to preserve repository ID for settings.xml auth matching
+            downloader.setRepos("test-server=" + testRepoUrl);
+            downloader.build();
+
+            // Customize with our local repository
+            MavenDownloader customDownloader = downloader.customize(
+                    customLocalRepo.getAbsolutePath(),
+                    5000,
+                    10000);
+
+            // Try to resolve an artifact - should go through the mirror with authentication
+            List<MavenArtifact> artifacts = customDownloader.resolveArtifacts(
+                    List.of("org.apache.camel:camel-anything:3.42.0"),
+                    null,
+                    false,
+                    false);
+
+            assertEquals(1, artifacts.size());
+            MavenArtifact artifact = artifacts.get(0);
+            assertTrue(artifact.getFile().isFile());
+
+            // Verify the content - our mock server returns the path as content
+            String content = Files.readString(artifact.getFile().toPath());
+            assertTrue(content.contains("/mirror/org/apache/camel/camel-anything/3.42.0/camel-anything-3.42.0.jar"),
+                    "Should have downloaded from mirror, got: " + content);
+
+            LOG.info("Authentication and mirror test passed - artifact resolved through authenticated mirror");
+        }
+    }
+
+    @Test
+    void testExtraDefaultRepositoriesFromSystemProperty() throws Exception {
+        // This test verifies that MIMA correctly loads extra default repositories from system properties.
+
+        // Use the local test server that requires authentication
+        String testRepoUrl = "http://localhost:" + localServer.getLocalPort() + "/maven/repository";
+        String extraReposValue = "test-server=" + testRepoUrl;
+
+        File customLocalRepo = new File(tempDir, "extra-repos-test-m2");
+        Files.createDirectories(customLocalRepo.toPath());
+
+        String artifactCoords = "org.apache.camel:camel-test:9.99.9-non-exist";
+
+        // Callable that captures local variables and performs artifact resolution
+        Callable<List<MavenArtifact>> resolve = () -> {
+            try (MavenDownloaderImpl downloader = new MavenDownloaderImpl()) {
+                downloader.setMavenCentralEnabled(false);
+                downloader.setMavenApacheSnapshotEnabled(false);
+                downloader.build();
+
+                MavenDownloader customDownloader = downloader.customize(
+                        customLocalRepo.getAbsolutePath(),
+                        5000,
+                        10000);
+
+                return customDownloader.resolveArtifacts(
+                        List.of(artifactCoords),
+                        null,
+                        false,
+                        false);
+            }
+        };
+
+        String originalValue = System.getProperty("camel.extra.repos");
+        try {
+            // NEGATIVE TEST: without the extra repo, the resolution fails because of no artifact can be resolved, definitely not authentication failure
+            System.clearProperty("camel.extra.repos");
+
+            try {
+                resolve.call();
+                fail("Should have failed without extra repos system property");
+            } catch (MavenResolutionException e) {
+                // Expected - no repositories configured
+                assertFalse(e.getMessage().contains("401") || e.getMessage().contains("Unauthorized")
+                        || e.getMessage().contains("status code"),
+                        "Should fail due to no repositories, not authentication, got: " + e.getMessage());
+            }
+
+            // POSITIVE TEST: with the extra repo configured, we have to receive authentication failure
+            System.setProperty("camel.extra.repos", extraReposValue);
+
+            try {
+                resolve.call();
+                fail("Should have failed with 401 Unauthorized (proves repo was loaded from system property)");
+            } catch (MavenResolutionException e) {
+                // Expected - repository loaded but download fails due to no authentication
+                // The 401 error proves the repository from the system property was actually used
+                assertTrue(e.getMessage().contains("401") || e.getMessage().contains("Unauthorized")
+                        || e.getMessage().contains("status code"),
+                        "Should fail with 401/authentication error (proves repository was used), got: " + e.getMessage());
+            }
+
+        } finally {
+            // Clean up system property
+            if (originalValue != null) {
+                System.setProperty("camel.extra.repos", originalValue);
+            } else {
+                System.clearProperty("camel.extra.repos");
+            }
+        }
+    }
+
+    @Test
+    void testExtraReposPrecedence() throws Exception {
+        String original = System.getProperty("camel.extra.repos");
+        String originalDefault = System.getProperty("camel.default.extra.repos.default.value");
+        try (MavenDownloaderImpl downloader = new MavenDownloaderImpl()) {
+            System.clearProperty("camel.extra.repos");
+            System.clearProperty("camel.default.extra.repos.default.value");
+            assertNull(downloader.getExtraRepos());
+
+            // the fallback for a custom distribution, then the user's system property: the first one set wins
+            System.setProperty("camel.default.extra.repos.default.value", "baseline=https://baseline.example.com/maven2");
+            assertEquals("baseline=https://baseline.example.com/maven2", downloader.getExtraRepos());
+            System.setProperty("camel.extra.repos", "user=https://user.example.com/maven2");
+            assertEquals("user=https://user.example.com/maven2", downloader.getExtraRepos());
+
+            // the configured value wins over the system properties, and empty is no extra repositories
+            downloader.setExtraRepos("explicit=https://explicit.example.com/maven2");
+            assertEquals("explicit=https://explicit.example.com/maven2", downloader.getExtraRepos());
+            downloader.setExtraRepos("");
+            assertEquals("", downloader.getExtraRepos());
+        } finally {
+            restoreProperty("camel.extra.repos", original);
+            restoreProperty("camel.default.extra.repos.default.value", originalDefault);
+        }
+    }
+
+    private static void restoreProperty(String key, String value) {
+        if (value != null) {
+            System.setProperty(key, value);
+        } else {
+            System.clearProperty(key);
+        }
+    }
+
+    @Test
+    void testResolveArtifactDescriptor() throws Exception {
+        File repo = createDescriptorFixtureRepository();
+        File localRepo = new File(tempDir, "descriptor-local-repo");
+
+        try (MavenDownloaderImpl downloader = new MavenDownloaderImpl()) {
+            downloader.setMavenCentralEnabled(false);
+            downloader.setMavenApacheSnapshotEnabled(false);
+            downloader.setMavenSettingsLocation("false");
+            downloader.setRepos(repo.toURI().toString());
+            downloader.build();
+            MavenDownloader customDownloader = downloader.customize(localRepo.getAbsolutePath(), 5000, 5000);
+
+            MavenArtifactDescriptor descriptor
+                    = customDownloader.resolveArtifactDescriptor("org.example.fixture:fixture-plugin:1.0.0", null);
+
+            assertEquals("org.example.fixture:fixture-plugin:1.0.0", descriptor.gav().toString());
+
+            // the version comes from the BOM imported by the parent
+            MavenGav core = descriptor.findDependency("org.apache.camel", "camel-jbang-core");
+            assertNotNull(core);
+            assertEquals("4.22.2", core.getVersion());
+            assertEquals("provided", core.getScope());
+            MavenGav other = descriptor.findDependency("org.example.fixture", "fixture-lib");
+            assertNotNull(other);
+            assertEquals("compile", other.getScope());
+
+            // effective model properties: literal, interpolated, and inherited from the parent
+            assertEquals("[4.22.0,4.23.0)", descriptor.properties().get("camel.jbang.plugin.camel-versions"));
+            assertEquals("4.22.2", descriptor.properties().get("fixture.derived"));
+            assertEquals("4.22.2", descriptor.properties().get("camel.version"));
+            // a value that cannot be interpolated is left out
+            assertFalse(descriptor.properties().containsKey("fixture.unresolved"));
+        }
+    }
+
+    @Test
+    void testResolveArtifactDescriptorWithExtraRepository() throws Exception {
+        File repo = createDescriptorFixtureRepository();
+        File localRepo = new File(tempDir, "descriptor-extra-local-repo");
+
+        try (MavenDownloaderImpl downloader = new MavenDownloaderImpl()) {
+            downloader.setMavenCentralEnabled(false);
+            downloader.setMavenApacheSnapshotEnabled(false);
+            downloader.setMavenSettingsLocation("false");
+            downloader.build();
+            MavenDownloader customDownloader = downloader.customize(localRepo.getAbsolutePath(), 5000, 5000);
+
+            // not found without the extra repository
+            try {
+                customDownloader.resolveArtifactDescriptor("org.example.fixture:fixture-plugin:1.0.0", null);
+                fail("Should not resolve the descriptor without the fixture repository");
+            } catch (MavenResolutionException e) {
+                // expected
+            }
+
+            MavenArtifactDescriptor descriptor = customDownloader.resolveArtifactDescriptor(
+                    "org.example.fixture:fixture-plugin:1.0.0", Set.of(repo.toURI().toString()));
+            assertEquals("4.22.2", descriptor.findDependency("org.apache.camel", "camel-jbang-core").getVersion());
+        }
+    }
+
+    @Test
+    void testResolveAvailableVersionsFresh() throws Exception {
+        File repo = new File(tempDir, "versions-repo");
+        writeMetadata(repo, "1.0.0");
+        File localRepo = new File(tempDir, "versions-local-repo");
+
+        try (MavenDownloaderImpl downloader = new MavenDownloaderImpl()) {
+            downloader.setMavenCentralEnabled(false);
+            downloader.setMavenApacheSnapshotEnabled(false);
+            downloader.setMavenSettingsLocation("false");
+            downloader.setRepos(repo.toURI().toString());
+            downloader.build();
+            MavenDownloader customDownloader = downloader.customize(localRepo.getAbsolutePath(), 5000, 5000);
+
+            assertEquals(List.of("1.0.0"), versions(customDownloader, false));
+
+            // a new release is published
+            writeMetadata(repo, "1.0.0", "1.1.0");
+
+            // the metadata downloaded before is used
+            assertEquals(List.of("1.0.0"), versions(customDownloader, false));
+            // unless fresh
+            assertEquals(List.of("1.0.0", "1.1.0"), versions(customDownloader, true));
+        }
+    }
+
+    @Test
+    void testResolveAvailableVersionsFromSettingsProfileRepository() throws Exception {
+        File repo = new File(tempDir, "profile-repo");
+        writeMetadata(repo, "2.0.0", "2.1.0");
+        File settings = new File(tempDir, "profile-settings.xml");
+        Files.writeString(settings.toPath(), """
+                <settings>
+                  <profiles>
+                    <profile>
+                      <id>plugins</id>
+                      <repositories>
+                        <repository>
+                          <id>plugins-repo</id>
+                          <url>%s</url>
+                        </repository>
+                      </repositories>
+                    </profile>
+                  </profiles>
+                  <activeProfiles>
+                    <activeProfile>plugins</activeProfile>
+                  </activeProfiles>
+                </settings>
+                """.formatted(repo.toURI()));
+        File localRepo = new File(tempDir, "profile-local-repo");
+
+        try (MavenDownloaderImpl downloader = new MavenDownloaderImpl()) {
+            downloader.setMavenCentralEnabled(false);
+            downloader.setMavenApacheSnapshotEnabled(false);
+            downloader.setMavenSettingsLocation(settings.getAbsolutePath());
+            downloader.build();
+            MavenDownloader customDownloader = downloader.customize(localRepo.getAbsolutePath(), 5000, 5000);
+
+            assertEquals(List.of("2.0.0", "2.1.0"), versions(customDownloader, true));
+        }
+    }
+
+    @Test
+    void testResolveAvailableVersionsSkipsUnreachableRepository() throws Exception {
+        File repo = new File(tempDir, "reachable-repo");
+        writeMetadata(repo, "1.0.0");
+        File localRepo = new File(tempDir, "unreachable-local-repo");
+
+        try (MavenDownloaderImpl downloader = new MavenDownloaderImpl()) {
+            downloader.setMavenCentralEnabled(false);
+            downloader.setMavenApacheSnapshotEnabled(false);
+            downloader.setMavenSettingsLocation("false");
+            downloader.setRepos(repo.toURI() + ",http://localhost:1/maven2");
+            downloader.build();
+            MavenDownloader customDownloader = downloader.customize(localRepo.getAbsolutePath(), 2000, 2000);
+
+            assertEquals(List.of("1.0.0"), versions(customDownloader, true));
+        }
+    }
+
+    @Test
+    void testResolveAvailableVersionsFailsWhenNoRepositoryCanBeReached() throws Exception {
+        File repo = new File(tempDir, "offline-repo");
+        writeMetadata(repo, "1.0.0");
+        File localRepo = new File(tempDir, "offline-local-repo");
+
+        try (MavenDownloaderImpl downloader = new MavenDownloaderImpl()) {
+            downloader.setMavenCentralEnabled(false);
+            downloader.setMavenApacheSnapshotEnabled(false);
+            downloader.setMavenSettingsLocation("false");
+            downloader.setRepos(repo.toURI().toString());
+            // offline: no repository can be reached
+            downloader.setOffline(true);
+            downloader.build();
+            MavenDownloader customDownloader = downloader.customize(localRepo.getAbsolutePath(), 2000, 2000);
+
+            try {
+                versions(customDownloader, true);
+                fail("Should fail when no repository can be reached");
+            } catch (MavenResolutionException e) {
+                assertTrue(e.getRepositories().contains(repo.toURI().toString()), e.getRepositories().toString());
+            }
+        }
+    }
+
+    private static List<String> versions(MavenDownloader downloader, boolean fresh) throws Exception {
+        return downloader.resolveAvailableVersions("org.example.fixture", "fixture-plugin", null, fresh).stream()
+                .map(MavenGav::getVersion).sorted().toList();
+    }
+
+    private static void writeMetadata(File repo, String... versions) throws Exception {
+        File dir = new File(repo, "org/example/fixture/fixture-plugin");
+        assertTrue(dir.mkdirs() || dir.isDirectory());
+        StringBuilder sb = new StringBuilder();
+        for (String v : versions) {
+            sb.append("      <version>").append(v).append("</version>\n");
+        }
+        Files.writeString(new File(dir, "maven-metadata.xml").toPath(), """
+                <?xml version="1.0" encoding="UTF-8"?>
+                <metadata>
+                  <groupId>org.example.fixture</groupId>
+                  <artifactId>fixture-plugin</artifactId>
+                  <versioning>
+                    <versions>
+                %s    </versions>
+                  </versioning>
+                </metadata>
+                """.formatted(sb));
+    }
+
+    /**
+     * A file:// repository with a plugin whose parent imports a BOM that manages camel-jbang-core.
+     */
+    private File createDescriptorFixtureRepository() throws Exception {
+        File repo = new File(tempDir, "descriptor-repo");
+        writePom(repo, "fixture-bom", """
+                <packaging>pom</packaging>
+                <dependencyManagement>
+                  <dependencies>
+                    <dependency>
+                      <groupId>org.apache.camel</groupId>
+                      <artifactId>camel-jbang-core</artifactId>
+                      <version>4.22.2</version>
+                    </dependency>
+                    <dependency>
+                      <groupId>org.example.fixture</groupId>
+                      <artifactId>fixture-lib</artifactId>
+                      <version>1.0.0</version>
+                    </dependency>
+                  </dependencies>
+                </dependencyManagement>
+                """);
+        writePom(repo, "fixture-parent", """
+                <packaging>pom</packaging>
+                <properties>
+                  <camel.version>4.22.2</camel.version>
+                </properties>
+                <dependencyManagement>
+                  <dependencies>
+                    <dependency>
+                      <groupId>org.example.fixture</groupId>
+                      <artifactId>fixture-bom</artifactId>
+                      <version>1.0.0</version>
+                      <type>pom</type>
+                      <scope>import</scope>
+                    </dependency>
+                  </dependencies>
+                </dependencyManagement>
+                """);
+        writePom(repo, "fixture-plugin", """
+                <parent>
+                  <groupId>org.example.fixture</groupId>
+                  <artifactId>fixture-parent</artifactId>
+                  <version>1.0.0</version>
+                </parent>
+                <properties>
+                  <camel.jbang.plugin.camel-versions>[4.22.0,4.23.0)</camel.jbang.plugin.camel-versions>
+                  <fixture.derived>${camel.version}</fixture.derived>
+                  <fixture.unresolved>${does.not.exist}</fixture.unresolved>
+                </properties>
+                <dependencies>
+                  <dependency>
+                    <groupId>org.apache.camel</groupId>
+                    <artifactId>camel-jbang-core</artifactId>
+                    <scope>provided</scope>
+                  </dependency>
+                  <dependency>
+                    <groupId>org.example.fixture</groupId>
+                    <artifactId>fixture-lib</artifactId>
+                  </dependency>
+                </dependencies>
+                """);
+        return repo;
+    }
+
+    @Test
+    void testAvailableArtifactsAreLeftOutWithTheirDependencies() throws Exception {
+        // app -> lib-a -> lib-a-dep, and app -> lib-b
+        File repo = new File(tempDir, "available-repo");
+        writeJar(repo, "app", dependencies("lib-a", "lib-b"));
+        writeJar(repo, "lib-a", dependencies("lib-a-dep"));
+        writeJar(repo, "lib-a-dep", "");
+        writeJar(repo, "lib-b", "");
+        File localRepo = new File(tempDir, "available-local-repo");
+
+        try (MavenDownloaderImpl downloader = new MavenDownloaderImpl()) {
+            downloader.setMavenCentralEnabled(false);
+            downloader.setMavenApacheSnapshotEnabled(false);
+            downloader.setMavenSettingsLocation("false");
+            downloader.setRepos(repo.toURI().toString());
+            downloader.build();
+            MavenDownloader customDownloader = downloader.customize(localRepo.getAbsolutePath(), 5000, 5000);
+
+            // lib-a is available, such as on the classpath
+            List<MavenArtifact> artifacts = customDownloader.resolveArtifacts(null,
+                    List.of("org.example.fixture:app:1.0.0"), null, true, false,
+                    gav -> "lib-a".equals(gav.getArtifactId()) && "1.0.0".equals(gav.getVersion()));
+
+            assertEquals(List.of("org.example.fixture:app:1.0.0", "org.example.fixture:lib-b:1.0.0"),
+                    artifacts.stream().map(a -> a.getGav().toString()).toList());
+            // not downloaded, not even the POM of lib-a
+            assertFalse(new File(localRepo, "org/example/fixture/lib-a").exists());
+            assertFalse(new File(localRepo, "org/example/fixture/lib-a-dep").exists());
+
+            // without it, all are resolved
+            artifacts = customDownloader.resolveArtifacts(null, List.of("org.example.fixture:app:1.0.0"), null, true,
+                    false, null);
+            assertEquals(4, artifacts.size());
+        }
+    }
+
+    @Test
+    void testManagedVersionIsUsedForTransitiveDependencies() throws Exception {
+        // app -> lib 2.0.0, while lib 1.0.0 is already loaded
+        File repo = new File(tempDir, "managed-repo");
+        writeJar(repo, "app", "1.0.0",
+                """
+                          <dependencies>
+                            <dependency><groupId>org.example.fixture</groupId><artifactId>lib</artifactId><version>2.0.0</version></dependency>
+                          </dependencies>
+                        """);
+        writeJar(repo, "app-native", "1.0.0",
+                """
+                          <dependencies>
+                            <dependency><groupId>org.example.fixture</groupId><artifactId>lib</artifactId><version>2.0.0</version><classifier>linux-aarch_64</classifier></dependency>
+                          </dependencies>
+                        """);
+        writeJar(repo, "lib", "1.0.0", "");
+        writeJar(repo, "lib", "2.0.0", "");
+        File native1 = new File(repo, "org/example/fixture/lib/1.0.0/lib-1.0.0-linux-aarch_64.jar");
+        Files.writeString(native1.toPath(), "native");
+        Files.writeString(new File(repo, "org/example/fixture/lib/2.0.0/lib-2.0.0-linux-aarch_64.jar").toPath(), "native");
+        File localRepo = new File(tempDir, "managed-local-repo");
+
+        try (MavenDownloaderImpl downloader = new MavenDownloaderImpl()) {
+            downloader.setMavenCentralEnabled(false);
+            downloader.setMavenApacheSnapshotEnabled(false);
+            downloader.setMavenSettingsLocation("false");
+            downloader.setRepos(repo.toURI().toString());
+            downloader.build();
+            MavenDownloader customDownloader = downloader.customize(localRepo.getAbsolutePath(), 5000, 5000);
+            List<MavenGav> managed = List.of(MavenGav.parseGav("org.example.fixture:lib:1.0.0"));
+
+            List<MavenArtifact> artifacts = customDownloader.resolveArtifacts(null,
+                    List.of("org.example.fixture:app:1.0.0"), null, true, false, null, managed);
+
+            assertEquals(List.of("org.example.fixture:app:1.0.0", "org.example.fixture:lib:1.0.0"),
+                    artifacts.stream().map(a -> a.getGav().toString()).toList());
+            // the other version is not downloaded
+            assertFalse(new File(localRepo, "org/example/fixture/lib/2.0.0").exists());
+
+            // also for another classifier than the one loaded (such as a native JAR of another platform)
+            artifacts = customDownloader.resolveArtifacts(null, List.of("org.example.fixture:app-native:1.0.0"), null,
+                    true, false, null, managed);
+            assertEquals(List.of("org.example.fixture:app-native:1.0.0", "org.example.fixture:lib:1.0.0"),
+                    artifacts.stream().map(a -> a.getGav().toString()).toList());
+            assertEquals("linux-aarch_64", artifacts.get(1).getGav().getClassifier());
+
+            // a dependency asked for directly keeps its version
+            artifacts = customDownloader.resolveArtifacts(null, List.of("org.example.fixture:lib:2.0.0"), null, true,
+                    false, null, managed);
+            assertEquals(List.of("org.example.fixture:lib:2.0.0"),
+                    artifacts.stream().map(a -> a.getGav().toString()).toList());
+        }
+    }
+
+    private static String dependencies(String... artifactIds) {
+        StringBuilder sb = new StringBuilder("  <dependencies>\n");
+        for (String artifactId : artifactIds) {
+            sb.append("    <dependency><groupId>org.example.fixture</groupId><artifactId>").append(artifactId)
+                    .append("</artifactId><version>1.0.0</version></dependency>\n");
+        }
+        return sb.append("  </dependencies>\n").toString();
+    }
+
+    private static void writeJar(File repo, String artifactId, String version, String body) throws Exception {
+        File dir = new File(repo, "org/example/fixture/" + artifactId + "/" + version);
+        assertTrue(dir.mkdirs() || dir.isDirectory());
+        String pom = """
+                <?xml version="1.0" encoding="UTF-8"?>
+                <project xmlns="http://maven.apache.org/POM/4.0.0">
+                  <modelVersion>4.0.0</modelVersion>
+                  <groupId>org.example.fixture</groupId>
+                  <artifactId>%s</artifactId>
+                  <version>%s</version>
+                %s</project>
+                """.formatted(artifactId, version, body);
+        Files.writeString(new File(dir, artifactId + "-" + version + ".pom").toPath(), pom);
+        Files.writeString(new File(dir, artifactId + "-" + version + ".jar").toPath(), artifactId);
+    }
+
+    private static void writeJar(File repo, String artifactId, String body) throws Exception {
+        writePom(repo, artifactId, body);
+        File dir = new File(repo, "org/example/fixture/" + artifactId + "/1.0.0");
+        Files.writeString(new File(dir, artifactId + "-1.0.0.jar").toPath(), artifactId);
+    }
+
+    private static void writePom(File repo, String artifactId, String body) throws Exception {
+        File dir = new File(repo, "org/example/fixture/" + artifactId + "/1.0.0");
+        assertTrue(dir.mkdirs() || dir.isDirectory());
+        String pom = """
+                <?xml version="1.0" encoding="UTF-8"?>
+                <project xmlns="http://maven.apache.org/POM/4.0.0">
+                  <modelVersion>4.0.0</modelVersion>
+                  <groupId>org.example.fixture</groupId>
+                  <artifactId>%s</artifactId>
+                  <version>1.0.0</version>
+                %s</project>
+                """.formatted(artifactId, body);
+        Files.writeString(new File(dir, artifactId + "-1.0.0.pom").toPath(), pom);
+    }
+
+    @Test
+    void testUnreachableRepositoryIsNotUsedAnymore() throws Exception {
+        File repo = createDescriptorFixtureRepository();
+        File localRepo = new File(tempDir, "unreachable-local-repo");
+        // nothing listens on this port, so the connection is refused
+        String dead = "http://localhost:" + AvailablePortFinder.getNextAvailable(20000, 30000) + "/maven";
+
+        try (MavenDownloaderImpl downloader = new MavenDownloaderImpl()) {
+            downloader.setMavenCentralEnabled(false);
+            downloader.setMavenApacheSnapshotEnabled(false);
+            downloader.setMavenSettingsLocation("false");
+            downloader.setRepos(dead + "," + repo.toURI());
+            downloader.build();
+            MavenDownloader customDownloader = downloader.customize(localRepo.getAbsolutePath(), 5000, 5000);
+
+            // an artifact no repository has: both are asked
+            assertThrows(MavenResolutionException.class,
+                    () -> customDownloader.resolveArtifacts(List.of("org.example.fixture:missing:1.0.0"), null, false,
+                            false));
+            assertEquals(Set.of(dead), downloader.getUnreachableRepositories());
+
+            // the other repository is still used
+            List<MavenArtifact> artifacts = customDownloader.resolveArtifacts(
+                    List.of("org.example.fixture:fixture-bom:pom:1.0.0"), null, false, false);
+            assertEquals(1, artifacts.size());
+
+            // the repository is not asked again, and the failure says so
+            MavenResolutionException e = assertThrows(MavenResolutionException.class,
+                    () -> customDownloader.resolveArtifacts(List.of("org.example.fixture:missing2:1.0.0"), null, false,
+                            false));
+            assertTrue(e.getRepositories().contains(dead + " (not reachable)"), e.getRepositories().toString());
+            assertFalse(e.getRepositories().contains(dead), e.getRepositories().toString());
+        }
+    }
+
+    @Test
+    void testRepositoryThatDoesNotAnswerFailsOnTheRequestTimeout() throws Exception {
+        File localRepo = new File(tempDir, "stalled-local-repo");
+        // accepts the connection, and never answers
+        try (ServerSocket server = new ServerSocket(0);
+             MavenDownloaderImpl downloader = new MavenDownloaderImpl()) {
+            List<Socket> accepted = new CopyOnWriteArrayList<>();
+            Thread acceptor = new Thread(() -> {
+                try {
+                    while (!server.isClosed()) {
+                        accepted.add(server.accept());
+                    }
+                } catch (Exception e) {
+                    // closed
+                }
+            });
+            acceptor.setDaemon(true);
+            acceptor.start();
+            String stalled = "http://localhost:" + server.getLocalPort() + "/maven";
+
+            downloader.setMavenCentralEnabled(false);
+            downloader.setMavenApacheSnapshotEnabled(false);
+            downloader.setMavenSettingsLocation("false");
+            downloader.setRepos(stalled);
+            downloader.build();
+            assertEquals(60000, downloader.getRequestTimeout());
+            MavenDownloader customDownloader = downloader.customize(localRepo.getAbsolutePath(), 5000, 1000);
+
+            long start = System.nanoTime();
+            assertThrows(MavenResolutionException.class,
+                    () -> customDownloader.resolveArtifacts(List.of("org.example.fixture:stalled:1.0.0"), null, false,
+                            false));
+            assertTrue(TimeUnit.NANOSECONDS.toSeconds(System.nanoTime() - start) < 30);
+            // a slow repository is still used
+            assertTrue(downloader.getUnreachableRepositories().isEmpty());
+            for (Socket socket : accepted) {
+                socket.close();
+            }
+        }
+    }
+
+    @Test
+    void testConnectFailures() {
+        assertNotNull(MavenDownloaderImpl.UnreachableRepositoryListener.connectFailure(
+                new RuntimeException(new ConnectException("Connection refused"))));
+        assertNotNull(MavenDownloaderImpl.UnreachableRepositoryListener.connectFailure(new UnknownHostException("nope")));
+        assertNotNull(MavenDownloaderImpl.UnreachableRepositoryListener.connectFailure(
+                new SocketTimeoutException("Connect timed out")));
+        // Apache HttpClient 4 (the HTTP transport of Maven Resolver) has its own exception for a connect timeout
+        assertNotNull(MavenDownloaderImpl.UnreachableRepositoryListener.connectFailure(
+                new RuntimeException(new ConnectTimeoutException("Connect to localhost:1234 timed out"))));
+        assertNotNull(MavenDownloaderImpl.UnreachableRepositoryListener.connectFailure(
+                new HttpConnectTimeoutException("HTTP connect timed out")));
+        // a read timeout is a slow repository, not an unreachable one
+        assertNull(MavenDownloaderImpl.UnreachableRepositoryListener.connectFailure(
+                new SocketTimeoutException("Read timed out")));
+        assertNull(MavenDownloaderImpl.UnreachableRepositoryListener.connectFailure(new IOException("Not found")));
+        assertNull(MavenDownloaderImpl.UnreachableRepositoryListener.connectFailure(null));
+    }
+
+    @Test
+    void testCamelDefaults() throws Exception {
+        try (MavenDownloaderImpl downloader = new MavenDownloaderImpl()) {
+            downloader.setMavenSettingsLocation("false");
+            downloader.build();
+
+            Map<String, Object> config = downloader.getRepositorySystemSession().getConfigProperties();
+            assertCamelDefault("60000", config, "aether.connector.requestTimeout");
+            assertCamelDefault("bf", config, "aether.dependencyCollector.impl");
+            assertCamelDefault("10", config, "aether.dependencyCollector.bf.threads");
+        }
+    }
+
+    // a system property wins over the default of Camel (the CI build sets aether.connector.requestTimeout=300000)
+    private static void assertCamelDefault(String expected, Map<String, Object> config, String key) {
+        assertEquals(System.getProperty(key, expected), String.valueOf(config.get(key)), key);
+    }
+}

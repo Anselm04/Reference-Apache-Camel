@@ -1,0 +1,1195 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.camel.component.kafka;
+
+import java.nio.charset.StandardCharsets;
+import java.time.LocalDateTime;
+import java.time.ZoneId;
+import java.util.Arrays;
+import java.util.HashMap;
+import java.util.LinkedList;
+import java.util.List;
+import java.util.Optional;
+import java.util.Properties;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.stream.Collectors;
+
+import com.fasterxml.jackson.databind.node.ArrayNode;
+import com.fasterxml.jackson.databind.node.IntNode;
+import com.fasterxml.jackson.databind.node.JsonNodeFactory;
+import com.fasterxml.jackson.databind.node.ObjectNode;
+import org.apache.camel.AggregationStrategy;
+import org.apache.camel.AsyncCallback;
+import org.apache.camel.CamelContext;
+import org.apache.camel.Exchange;
+import org.apache.camel.ExchangeExtension;
+import org.apache.camel.ExtendedCamelContext;
+import org.apache.camel.Message;
+import org.apache.camel.TypeConverter;
+import org.apache.camel.component.kafka.consumer.DefaultKafkaManualCommit;
+import org.apache.camel.component.kafka.consumer.KafkaExactlyOnceMetadata;
+import org.apache.camel.component.kafka.consumer.KafkaManualCommitFactory;
+import org.apache.camel.impl.DefaultCamelContext;
+import org.apache.camel.impl.engine.DefaultHeadersMapFactory;
+import org.apache.camel.processor.aggregate.GroupedExchangeAggregationStrategy;
+import org.apache.camel.processor.aggregate.GroupedMessageAggregationStrategy;
+import org.apache.camel.spi.Synchronization;
+import org.apache.camel.spi.UnitOfWork;
+import org.apache.camel.support.DefaultExchange;
+import org.apache.camel.support.DefaultMessage;
+import org.apache.kafka.clients.consumer.Consumer;
+import org.apache.kafka.clients.consumer.ConsumerGroupMetadata;
+import org.apache.kafka.clients.producer.Callback;
+import org.apache.kafka.clients.producer.Producer;
+import org.apache.kafka.clients.producer.ProducerConfig;
+import org.apache.kafka.clients.producer.ProducerRecord;
+import org.apache.kafka.clients.producer.RecordMetadata;
+import org.apache.kafka.common.TopicPartition;
+import org.apache.kafka.common.errors.ApiException;
+import org.apache.kafka.common.errors.SerializationException;
+import org.junit.jupiter.api.Test;
+import org.mockito.ArgumentCaptor;
+import org.mockito.Mockito;
+import tools.jackson.databind.JsonNode;
+
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertInstanceOf;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertSame;
+import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.ArgumentMatchers.isA;
+
+public class KafkaProducerTest {
+
+    private static final String SOME_INDIVIDUAL_HEADER = "someIndividualHeader";
+
+    private final KafkaProducer producer;
+    private final KafkaEndpoint endpoint;
+    private final KafkaEndpoint fromEndpoint;
+
+    private final TypeConverter converter = Mockito.mock(TypeConverter.class);
+    private final CamelContext context = Mockito.mock(DefaultCamelContext.class);
+    private final Exchange exchange = Mockito.mock(Exchange.class);
+    private final ExtendedCamelContext ecc = Mockito.mock(ExtendedCamelContext.class);
+    private final Message in = new DefaultMessage(context);
+    private final AsyncCallback callback = Mockito.mock(AsyncCallback.class);
+
+    @SuppressWarnings({ "unchecked" })
+    public KafkaProducerTest() throws Exception {
+        KafkaComponent kafka = new KafkaComponent(new DefaultCamelContext());
+        kafka.getConfiguration().setBrokers("broker1:1234,broker2:4567");
+        kafka.getConfiguration().setRecordMetadata(true);
+        kafka.init();
+
+        endpoint = kafka.createEndpoint("kafka:sometopic", "sometopic", new HashMap());
+        endpoint.doBuild();
+        assertInstanceOf(DefaultKafkaClientFactory.class, endpoint.getKafkaClientFactory());
+
+        producer = new KafkaProducer(endpoint);
+
+        fromEndpoint = kafka.createEndpoint("kafka:fromtopic", "fromtopic", new HashMap());
+        fromEndpoint.doBuild();
+        assertInstanceOf(DefaultKafkaClientFactory.class, fromEndpoint.getKafkaClientFactory());
+
+        RecordMetadata rm = new RecordMetadata(null, 0, 0, 0, 0, 0);
+        Future future = Mockito.mock(Future.class);
+        Mockito.when(future.get()).thenReturn(rm);
+        org.apache.kafka.clients.producer.KafkaProducer kp
+                = Mockito.mock(org.apache.kafka.clients.producer.KafkaProducer.class);
+        Mockito.when(kp.send(any(ProducerRecord.class))).thenReturn(future);
+
+        Mockito.when(exchange.getContext()).thenReturn(context);
+        // A real Camel Exchange always has an extension; initialize the Mockito double as well.
+        Mockito.when(exchange.getExchangeExtension()).thenReturn(Mockito.mock(ExchangeExtension.class));
+        Mockito.when(context.getTypeConverter()).thenReturn(converter);
+        Mockito.when(converter.tryConvertTo(String.class, exchange, null)).thenReturn(null);
+        Mockito.when(context.getCamelContextExtension()).thenReturn(ecc);
+        Mockito.when(ecc.getHeadersMapFactory())
+                .thenReturn(new DefaultHeadersMapFactory());
+        Mockito.when(context.getTypeConverter()).thenReturn(converter);
+
+        producer.setKafkaProducer(kp);
+        producer.setWorkerPool(Executors.newFixedThreadPool(1));
+    }
+
+    @Test
+    void exactlyOnceRequiresAnExplicitTransactionalId() {
+        endpoint.getConfiguration().setExactlyOnce(true);
+        endpoint.getConfiguration().setTransacted(true);
+
+        IllegalArgumentException failure
+                = assertThrows(IllegalArgumentException.class, producer::doStart);
+
+        assertTrue(failure.getMessage().contains("explicit transactionalId"), failure.getMessage());
+        Mockito.verify(producer.getKafkaProducer(), Mockito.never()).initTransactions();
+    }
+
+    @Test
+    void exactlyOnceStartsWithAnExplicitTransactionalId() throws Exception {
+        endpoint.getConfiguration().setExactlyOnce(true);
+        endpoint.getConfiguration().setTransactionalId("orders-instance-1-to-out");
+
+        producer.doStart();
+
+        Mockito.verify(producer.getKafkaProducer()).initTransactions();
+    }
+
+    @Test
+    void exactlyOnceTransactionalIdIsScopedToRouteId() throws Exception {
+        endpoint.getConfiguration().setExactlyOnce(true);
+        endpoint.getConfiguration().setTransactionalId("orders-instance-1-to-out");
+        producer.setRouteId("ordersRouteA");
+        producer.setKafkaProducer(null);
+
+        KafkaClientFactory factory = Mockito.mock(KafkaClientFactory.class);
+        Producer kafkaProducer = Mockito.mock(Producer.class);
+        Mockito.when(factory.getProducer(any(Properties.class))).thenReturn(kafkaProducer);
+        endpoint.setKafkaClientFactory(factory);
+
+        producer.doStart();
+
+        ArgumentCaptor<Properties> properties = ArgumentCaptor.forClass(Properties.class);
+        Mockito.verify(factory).getProducer(properties.capture());
+        assertEquals("orders-instance-1-to-out-ordersRouteA",
+                properties.getValue().getProperty(ProducerConfig.TRANSACTIONAL_ID_CONFIG));
+        assertEquals("orders-instance-1-to-out-ordersRouteB",
+                KafkaProducer.resolveExactlyOnceTransactionalId("orders-instance-1-to-out", "ordersRouteB"));
+        Mockito.verify(kafkaProducer).initTransactions();
+    }
+
+    @Test
+    void exactlyOnceProducerRejectsNonExactlyOnceDestinationAsAClaimRejection() {
+        fromEndpoint.getConfiguration().setExactlyOnce(true);
+        Mockito.when(exchange.getFromEndpoint()).thenReturn(fromEndpoint);
+        Mockito.when(exchange.getIn()).thenReturn(in);
+        Mockito.when(exchange.getMessage()).thenReturn(in);
+        KafkaExactlyOnceMetadata metadata = createSourceMetadata("orders-group", "source-exchange");
+        Mockito.when(exchange.getProperty(
+                KafkaExactlyOnceMetadata.EXCHANGE_PROPERTY, KafkaExactlyOnceMetadata.class)).thenReturn(metadata);
+
+        KafkaExactlyOnceMetadata.ClaimRejectedException failure = assertThrows(
+                KafkaExactlyOnceMetadata.ClaimRejectedException.class, () -> producer.process(exchange));
+
+        assertTrue(failure.getMessage().contains("every Kafka destination producer"), failure.getMessage());
+        assertTrue(metadata.isClaimRejected());
+        assertNull(metadata.getSendFailure(), "A rejected destination claim must not be recorded as a send failure");
+        Mockito.verify(producer.getKafkaProducer(), Mockito.never()).send(any(ProducerRecord.class));
+    }
+
+    @Test
+    void exactlyOnceProducerRejectsMissingSourceOffsetMetadataBeforeBeginningTransaction() throws Exception {
+        endpoint.getConfiguration().setExactlyOnce(true);
+        endpoint.getConfiguration().setTransactionalId("orders-instance-1-to-out");
+        producer.doStart();
+        configureExactlyOnceSource("orders-group", "source-exchange");
+
+        UnitOfWork uow = Mockito.mock(UnitOfWork.class);
+        Mockito.when(uow.isTransactedBy(any())).thenReturn(false);
+        Mockito.when(exchange.getUnitOfWork()).thenReturn(uow);
+        Mockito.when(exchange.getProperty(
+                KafkaExactlyOnceMetadata.EXCHANGE_PROPERTY, KafkaExactlyOnceMetadata.class)).thenReturn(null);
+
+        IllegalStateException failure = assertThrows(IllegalStateException.class, () -> producer.process(exchange));
+
+        assertTrue(failure.getMessage().contains("source offset metadata"), failure.getMessage());
+        Mockito.verify(producer.getKafkaProducer(), Mockito.never()).beginTransaction();
+        Mockito.verify(uow, Mockito.never()).addSynchronization(any());
+    }
+
+    @Test
+    void exactlyOnceProducerRequiresKafkaSource() throws Exception {
+        endpoint.getConfiguration().setExactlyOnce(true);
+        endpoint.getConfiguration().setTransactionalId("orders-instance-1-to-out");
+        producer.doStart();
+
+        UnitOfWork uow = Mockito.mock(UnitOfWork.class);
+        Mockito.when(uow.isTransactedBy(any())).thenReturn(false);
+        Mockito.when(exchange.getUnitOfWork()).thenReturn(uow);
+        Mockito.when(exchange.getFromEndpoint()).thenReturn(null);
+
+        IllegalStateException failure = assertThrows(IllegalStateException.class, () -> producer.process(exchange));
+
+        assertTrue(failure.getMessage().contains("Kafka consumer as the route source"), failure.getMessage());
+        Mockito.verify(producer.getKafkaProducer(), Mockito.never()).beginTransaction();
+    }
+
+    @Test
+    void exactlyOnceProducerRejectsIncompatibleSourceConfiguration() throws Exception {
+        endpoint.getConfiguration().setExactlyOnce(true);
+        endpoint.getConfiguration().setTransactionalId("orders-instance-1-to-out");
+        producer.doStart();
+
+        fromEndpoint.getConfiguration().setExactlyOnce(true);
+        fromEndpoint.getConfiguration().setAllowManualCommit(false);
+        fromEndpoint.getConfiguration().setAutoCommitEnable(false);
+        fromEndpoint.getConfiguration().setBreakOnFirstError(true);
+        fromEndpoint.getConfiguration().setGroupId("orders-group");
+        Mockito.when(exchange.getFromEndpoint()).thenReturn(fromEndpoint);
+        UnitOfWork uow = Mockito.mock(UnitOfWork.class);
+        Mockito.when(uow.isTransactedBy(any())).thenReturn(false);
+        Mockito.when(exchange.getUnitOfWork()).thenReturn(uow);
+
+        IllegalStateException failure = assertThrows(IllegalStateException.class, () -> producer.process(exchange));
+
+        assertTrue(failure.getMessage().contains("allowManualCommit=true"), failure.getMessage());
+        Mockito.verify(producer.getKafkaProducer(), Mockito.never()).beginTransaction();
+    }
+
+    @Test
+    void exactlyOnceProducerRejectsMismatchedSourceGroupMetadata() throws Exception {
+        endpoint.getConfiguration().setExactlyOnce(true);
+        endpoint.getConfiguration().setTransactionalId("orders-instance-1-to-out");
+        producer.doStart();
+
+        fromEndpoint.getConfiguration().setExactlyOnce(true);
+        fromEndpoint.getConfiguration().setAllowManualCommit(true);
+        fromEndpoint.getConfiguration().setAutoCommitEnable(false);
+        fromEndpoint.getConfiguration().setBreakOnFirstError(true);
+        fromEndpoint.getConfiguration().setGroupId("orders-group");
+        Mockito.when(exchange.getFromEndpoint()).thenReturn(fromEndpoint);
+        Mockito.when(exchange.getExchangeId()).thenReturn("source-exchange");
+        Mockito.when(exchange.getIn()).thenReturn(in);
+        Mockito.when(exchange.getMessage()).thenReturn(in);
+        KafkaExactlyOnceMetadata metadata = createSourceMetadata("another-group", "source-exchange");
+        Mockito.when(exchange.getProperty(
+                KafkaExactlyOnceMetadata.EXCHANGE_PROPERTY, KafkaExactlyOnceMetadata.class)).thenReturn(metadata);
+        UnitOfWork uow = Mockito.mock(UnitOfWork.class);
+        Mockito.when(uow.isTransactedBy(any())).thenReturn(false);
+        Mockito.when(exchange.getUnitOfWork()).thenReturn(uow);
+
+        KafkaExactlyOnceMetadata.ClaimRejectedException failure = assertThrows(
+                KafkaExactlyOnceMetadata.ClaimRejectedException.class, () -> producer.process(exchange));
+
+        assertTrue(failure.getMessage().contains("does not match"), failure.getMessage());
+        assertNull(metadata.getSendFailure(), "A rejected claim must not be recorded as a Kafka send failure");
+        Mockito.verify(producer.getKafkaProducer(), Mockito.never()).beginTransaction();
+    }
+
+    @Test
+    void aCopiedNonKafkaExchangeRejectsTheSharedExactlyOnceMetadata() throws Exception {
+        endpoint.getConfiguration().setExactlyOnce(true);
+        endpoint.getConfiguration().setTransactionalId("orders-instance-1-to-out");
+        producer.doStart();
+
+        KafkaExactlyOnceMetadata metadata = configureExactlyOnceSource("orders-group", "source-exchange");
+        Exchange copiedExchange = Mockito.mock(Exchange.class);
+        Mockito.when(copiedExchange.getFromEndpoint()).thenReturn(null);
+        Mockito.when(copiedExchange.getExchangeId()).thenReturn("copied-exchange");
+        Mockito.when(copiedExchange.getProperty(
+                KafkaExactlyOnceMetadata.EXCHANGE_PROPERTY, KafkaExactlyOnceMetadata.class)).thenReturn(metadata);
+        UnitOfWork uow = Mockito.mock(UnitOfWork.class);
+        Mockito.when(uow.isTransactedBy(any())).thenReturn(false);
+        Mockito.when(copiedExchange.getUnitOfWork()).thenReturn(uow);
+
+        IllegalStateException failure = assertThrows(IllegalStateException.class, () -> producer.process(copiedExchange));
+
+        assertTrue(failure.getMessage().contains("Kafka consumer as the route source"), failure.getMessage());
+        assertTrue(metadata.isClaimRejected(), "A rejected copy must be visible to the original source exchange");
+    }
+
+    @Test
+    void failedExactlyOnceBeginTransactionReleasesTheMetadataClaimAndProducerSlot() throws Exception {
+        endpoint.getConfiguration().setExactlyOnce(true);
+        endpoint.getConfiguration().setTransactionalId("orders-instance-1-to-out");
+        producer.doStart();
+
+        KafkaExactlyOnceMetadata metadata = configureExactlyOnceSource("orders-group", "source-exchange");
+        UnitOfWork uow = Mockito.mock(UnitOfWork.class);
+        Mockito.when(uow.isTransactedBy(any())).thenReturn(false);
+        Mockito.when(exchange.getUnitOfWork()).thenReturn(uow);
+
+        Producer kafkaProducer = producer.getKafkaProducer();
+        Mockito.doThrow(new ApiException("begin failed")).doNothing().when(kafkaProducer).beginTransaction();
+
+        assertThrows(ApiException.class, () -> producer.process(exchange));
+        assertFalse(metadata.isClaimed(), "The metadata claim must be released when beginTransaction fails");
+        Mockito.verify(exchange).setProperty(
+                eq(KafkaExactlyOnceMetadata.SEND_FAILURE_PROPERTY), isA(ApiException.class));
+
+        // A retry of the same source exchange registers a new synchronization and must discard the stale marker
+        // before the successful send, otherwise onDone would abort the successful output and commit only the offset.
+        producer.process(exchange);
+        Mockito.verify(exchange).removeProperty(KafkaExactlyOnceMetadata.SEND_FAILURE_PROPERTY);
+        assertTrue(metadata.isClaimed());
+        Mockito.verify(kafkaProducer, Mockito.times(2)).beginTransaction();
+    }
+
+    @Test
+    void rejectsRedeliveryAfterExactlyOnceSendFailureWithinActiveTransaction() throws Exception {
+        endpoint.getConfiguration().setExactlyOnce(true);
+        endpoint.getConfiguration().setTransactionalId("orders-instance-1-to-out");
+        producer.doStart();
+
+        KafkaExactlyOnceMetadata metadata = configureExactlyOnceSource("orders-group", "source-exchange");
+        UnitOfWork uow = Mockito.mock(UnitOfWork.class);
+        Mockito.when(uow.isTransactedBy(any())).thenReturn(false, true);
+        Mockito.when(exchange.getUnitOfWork()).thenReturn(uow);
+
+        Producer kafkaProducer = producer.getKafkaProducer();
+        SerializationException sendFailure = new SerializationException("serialization failed");
+        Mockito.doThrow(sendFailure).when(kafkaProducer).send(any(ProducerRecord.class));
+
+        // The first attempt has already registered its synchronization before the send fails.
+        assertThrows(SerializationException.class, () -> producer.process(exchange));
+        assertTrue(metadata.isClaimed(), "The first attempt registered a synchronization for the source offsets");
+        Mockito.verify(exchange).setProperty(KafkaExactlyOnceMetadata.SEND_FAILURE_PROPERTY, sendFailure);
+        Mockito.when(exchange.getProperty(KafkaExactlyOnceMetadata.SEND_FAILURE_PROPERTY)).thenReturn(sendFailure);
+        Mockito.when(exchange.getProperty(KafkaExactlyOnceMetadata.SEND_FAILURE_PROPERTY, Throwable.class))
+                .thenReturn(sendFailure);
+        Mockito.when(exchange.getProperty(KafkaExactlyOnceMetadata.SUPPRESS_NEXT_SEND_FAILURE_PROPERTY))
+                .thenReturn(true);
+
+        // Camel redelivers the same exchange while its original Kafka transaction is still active. Rejecting this
+        // attempt is safer than aborting/beginning in place: Camel resumes at the failed step and would not replay
+        // output records sent by earlier route steps in the transaction.
+        IllegalStateException redeliveryFailure
+                = assertThrows(IllegalStateException.class, () -> producer.process(exchange));
+        assertTrue(redeliveryFailure.getMessage().contains("must be replayed in a new transaction"));
+        Mockito.verify(exchange).setProperty(KafkaExactlyOnceMetadata.RETRY_ROLLBACK_PROPERTY, Boolean.TRUE);
+        Mockito.verify(exchange).setRollbackOnly(true);
+        Mockito.verify(exchange).removeProperty(KafkaExactlyOnceMetadata.SUPPRESS_NEXT_SEND_FAILURE_PROPERTY);
+        Mockito.verify(exchange, Mockito.never()).setProperty(
+                eq(KafkaExactlyOnceMetadata.SECONDARY_SEND_FAILURE_PROPERTY), Mockito.any());
+        Mockito.verify(kafkaProducer, Mockito.times(1)).send(any(ProducerRecord.class));
+
+        ArgumentCaptor<Synchronization> synchronizationCaptor = ArgumentCaptor.forClass(Synchronization.class);
+        Mockito.verify(uow).addSynchronization(synchronizationCaptor.capture());
+        KafkaTransactionSynchronization synchronization
+                = (KafkaTransactionSynchronization) synchronizationCaptor.getValue();
+
+        // Without a failure handler completing the retry rejection, rollback-only wins over the handled-send
+        // offset-only path. The handled-DLC case is covered by the synchronization test.
+        Mockito.when(exchange.getException()).thenReturn(null);
+        Mockito.when(exchange.isRollbackOnly()).thenReturn(true);
+        synchronization.onDone(exchange);
+
+        Mockito.verify(kafkaProducer).abortTransaction();
+        Mockito.verify(kafkaProducer, Mockito.never()).sendOffsetsToTransaction(any(), any());
+        Mockito.verify(kafkaProducer, Mockito.never()).commitTransaction();
+        Mockito.verify(exchange).setProperty(KafkaExactlyOnceMetadata.TRANSACTION_ABORTED_PROPERTY, Boolean.TRUE);
+        Mockito.verify(uow).endTransactedBy("orders-instance-1-to-out");
+    }
+
+    @Test
+    void failedExactlyOnceSynchronizationRegistrationAbortsAndReleasesTheProducerSlot() throws Exception {
+        endpoint.getConfiguration().setExactlyOnce(true);
+        endpoint.getConfiguration().setTransactionalId("orders-instance-1-to-out");
+        producer.doStart();
+
+        KafkaExactlyOnceMetadata metadata = configureExactlyOnceSource("orders-group", "source-exchange");
+        UnitOfWork uow = Mockito.mock(UnitOfWork.class);
+        Mockito.when(uow.isTransactedBy(any())).thenReturn(false);
+        Mockito.when(exchange.getUnitOfWork()).thenReturn(uow);
+        Mockito.doThrow(new IllegalStateException("registration failed")).doNothing()
+                .when(uow).addSynchronization(any());
+
+        Producer kafkaProducer = producer.getKafkaProducer();
+        assertThrows(IllegalStateException.class, () -> producer.process(exchange));
+        assertFalse(metadata.isClaimed(),
+                "The metadata claim must be released when synchronization registration fails");
+        Mockito.verify(kafkaProducer).abortTransaction();
+        Mockito.verify(uow).endTransactedBy(any());
+
+        // The second attempt proves both the metadata claim and the producer slot were released.
+        producer.process(exchange);
+        Mockito.verify(kafkaProducer, Mockito.times(2)).beginTransaction();
+    }
+
+    @Test
+    void releaseExactlyOnceTransactionUsesTheExchangeIdAcquiredAtStart() throws Exception {
+        endpoint.getConfiguration().setExactlyOnce(true);
+        endpoint.getConfiguration().setTransactionalId("orders-instance-1-to-out");
+        producer.doStart();
+
+        KafkaExactlyOnceMetadata firstMetadata = configureExactlyOnceSource("orders-group", "source-exchange");
+        UnitOfWork firstUow = Mockito.mock(UnitOfWork.class);
+        Mockito.when(firstUow.isTransactedBy(any())).thenReturn(false);
+        Mockito.when(exchange.getUnitOfWork()).thenReturn(firstUow);
+        producer.process(exchange);
+
+        Exchange secondExchange = Mockito.mock(Exchange.class);
+        Message secondMessage = new DefaultMessage(context);
+        KafkaExactlyOnceMetadata secondMetadata = createSourceMetadata("orders-group", "second-exchange");
+        Mockito.when(secondExchange.getContext()).thenReturn(context);
+        Mockito.when(secondExchange.getFromEndpoint()).thenReturn(fromEndpoint);
+        Mockito.when(secondExchange.getExchangeId()).thenReturn("second-exchange");
+        Mockito.when(secondExchange.getIn()).thenReturn(secondMessage);
+        Mockito.when(secondExchange.getMessage()).thenReturn(secondMessage);
+        Mockito.when(secondExchange.getProperty(
+                KafkaExactlyOnceMetadata.EXCHANGE_PROPERTY, KafkaExactlyOnceMetadata.class)).thenReturn(secondMetadata);
+        UnitOfWork secondUow = Mockito.mock(UnitOfWork.class);
+        Mockito.when(secondUow.isTransactedBy(any())).thenReturn(false);
+        Mockito.when(secondExchange.getUnitOfWork()).thenReturn(secondUow);
+
+        // A stale completion callback must not release another exchange's producer slot.
+        producer.releaseExactlyOnceTransaction("stale-exchange");
+        assertThrows(IllegalStateException.class, () -> producer.process(secondExchange));
+        assertTrue(firstMetadata.isClaimed());
+        assertFalse(secondMetadata.isClaimed());
+
+        // The ID stored when the first transaction acquired the slot releases it correctly.
+        producer.getKafkaProducer().commitTransaction();
+        producer.releaseExactlyOnceTransaction("source-exchange");
+        producer.process(secondExchange);
+        assertTrue(secondMetadata.isClaimed());
+        Mockito.verify(producer.getKafkaProducer(), Mockito.times(2)).beginTransaction();
+    }
+
+    private KafkaExactlyOnceMetadata configureExactlyOnceSource(String groupId, String exchangeId) {
+        KafkaConfiguration sourceConfiguration = fromEndpoint.getConfiguration();
+        sourceConfiguration.setExactlyOnce(true);
+        sourceConfiguration.setAllowManualCommit(true);
+        sourceConfiguration.setAutoCommitEnable(false);
+        sourceConfiguration.setBreakOnFirstError(true);
+        sourceConfiguration.setGroupId(groupId);
+        Mockito.when(exchange.getFromEndpoint()).thenReturn(fromEndpoint);
+        Mockito.when(exchange.getExchangeId()).thenReturn(exchangeId);
+        Mockito.when(exchange.getIn()).thenReturn(in);
+        Mockito.when(exchange.getMessage()).thenReturn(in);
+
+        KafkaExactlyOnceMetadata metadata = createSourceMetadata(groupId, exchangeId);
+        Mockito.when(exchange.getProperty(
+                KafkaExactlyOnceMetadata.EXCHANGE_PROPERTY, KafkaExactlyOnceMetadata.class)).thenReturn(metadata);
+        return metadata;
+    }
+
+    private KafkaExactlyOnceMetadata createSourceMetadata(String groupId, String exchangeId) {
+        Consumer<?, ?> consumer = Mockito.mock(Consumer.class);
+        ConsumerGroupMetadata groupMetadata = Mockito.mock(ConsumerGroupMetadata.class);
+        Mockito.when(groupMetadata.groupId()).thenReturn(groupId);
+        Mockito.when(groupMetadata.generationId()).thenReturn(1);
+        Mockito.when(groupMetadata.memberId()).thenReturn("member-1");
+        Mockito.when(groupMetadata.groupInstanceId()).thenReturn(Optional.empty());
+
+        Exchange sourceExchange = Mockito.mock(Exchange.class);
+        Mockito.when(sourceExchange.getExchangeId()).thenReturn(exchangeId);
+        DefaultKafkaManualCommit manualCommit = Mockito.mock(DefaultKafkaManualCommit.class);
+        Mockito.when(manualCommit.getCamelExchangePayload()).thenReturn(
+                new KafkaManualCommitFactory.CamelExchangePayload(
+                        sourceExchange, consumer, "test-thread", null, groupMetadata));
+        Mockito.when(manualCommit.getConsumerGroupMetadata()).thenReturn(groupMetadata);
+        Mockito.when(manualCommit.getPartition()).thenReturn(new TopicPartition("orders-in", 0));
+        Mockito.when(manualCommit.getRecordOffset()).thenReturn(0L);
+        Mockito.when(manualCommit.getLeaderEpoch()).thenReturn(Optional.empty());
+
+        return KafkaExactlyOnceMetadata.fromManualCommits(List.of(manualCommit), exchangeId);
+    }
+
+    @Test
+    public void testPropertyBuilder() {
+        Properties props = producer.getProps();
+        assertEquals("broker1:1234,broker2:4567", props.getProperty(ProducerConfig.BOOTSTRAP_SERVERS_CONFIG));
+    }
+
+    @Test
+    @SuppressWarnings({ "unchecked" })
+    public void processSendsMessage() throws Exception {
+        endpoint.getConfiguration().setTopic("sometopic");
+        Mockito.when(exchange.getIn()).thenReturn(in);
+        Mockito.when(exchange.getMessage()).thenReturn(in);
+
+        in.setHeader(KafkaConstants.PARTITION_KEY, 4);
+
+        producer.process(exchange);
+        Mockito.verify(producer.getKafkaProducer()).send(any(ProducerRecord.class));
+        assertRecordMetadataExists();
+    }
+
+    @Test
+    @SuppressWarnings({ "unchecked" })
+    public void processSendsMessageWithException() {
+        endpoint.getConfiguration().setTopic("sometopic");
+        // set up the exception here
+        Producer kp = producer.getKafkaProducer();
+        Mockito.when(kp.send(any(ProducerRecord.class))).thenThrow(new ApiException());
+        Mockito.when(exchange.getIn()).thenReturn(in);
+        Mockito.when(exchange.getMessage()).thenReturn(in);
+        in.setHeader(KafkaConstants.PARTITION_KEY, 4);
+
+        assertThrows(ApiException.class,
+                () -> producer.process(exchange));
+    }
+
+    @Test
+    public void processAsyncSendsMessage() {
+        endpoint.getConfiguration().setTopic("sometopic");
+        Mockito.when(exchange.getIn()).thenReturn(in);
+        Mockito.when(exchange.getMessage()).thenReturn(in);
+
+        in.setHeader(KafkaConstants.PARTITION_KEY, 4);
+
+        producer.process(exchange, callback);
+
+        ArgumentCaptor<Callback> callBackCaptor = ArgumentCaptor.forClass(Callback.class);
+        Mockito.verify(producer.getKafkaProducer()).send(any(ProducerRecord.class), callBackCaptor.capture());
+        Callback kafkaCallback = callBackCaptor.getValue();
+        kafkaCallback.onCompletion(new RecordMetadata(null, 0, 0, 0, 0, 0), null);
+        assertRecordMetadataExists();
+    }
+
+    @Test
+    public void processAsyncSendsMessageWithException() {
+        endpoint.getConfiguration().setTopic("sometopic");
+        Mockito.when(exchange.getIn()).thenReturn(in);
+        Mockito.when(exchange.getMessage()).thenReturn(in);
+
+        // set up the exception here
+        Producer kp = producer.getKafkaProducer();
+        Mockito.when(kp.send(any(ProducerRecord.class), any(Callback.class))).thenThrow(new ApiException());
+
+        in.setHeader(KafkaConstants.PARTITION_KEY, 4);
+
+        producer.process(exchange, callback);
+
+        ArgumentCaptor<Callback> callBackCaptor = ArgumentCaptor.forClass(Callback.class);
+        Mockito.verify(producer.getKafkaProducer()).send(any(ProducerRecord.class), callBackCaptor.capture());
+        Mockito.verify(exchange).setException(isA(ApiException.class));
+        Mockito.verify(callback).done(eq(true));
+        Callback kafkaCallback = callBackCaptor.getValue();
+        kafkaCallback.onCompletion(new RecordMetadata(null, 0, 0, 0, 0, 0), null);
+        assertRecordMetadataExists();
+    }
+
+    @Test
+    void processAsyncMidBatchDispatchFailureDefersRoutingUntilInflightSendsComplete() {
+        // CAMEL-24783: when a later record in a batch fails to dispatch, the records already dispatched still have
+        // in-flight Kafka callbacks. Routing must not continue until those callbacks have run, otherwise they would
+        // mutate a continued - and, with exchange pooling, possibly recycled - exchange.
+        endpoint.getConfiguration().setTopic("sometopic");
+        Mockito.when(exchange.getIn()).thenReturn(in);
+        Mockito.when(exchange.getMessage()).thenReturn(in);
+
+        // the first record is accepted (its callback stays in flight), the second fails to dispatch mid-batch.
+        // Kafka's send(record, callback) throws synchronously for a SerializationException (and a closed-producer
+        // IllegalStateException or an InterruptException), whereas an ApiException is reported through the callback
+        // instead - so a synchronously thrown SerializationException is what this path actually sees.
+        Producer kp = producer.getKafkaProducer();
+        Future future = Mockito.mock(Future.class);
+        Mockito.when(kp.send(any(ProducerRecord.class), any(Callback.class)))
+                .thenReturn(future)
+                .thenThrow(new SerializationException("boom"));
+
+        ArrayNode node = JsonNodeFactory.instance.arrayNode();
+        node.add(1);
+        node.add(2);
+        in.setBody(node);
+
+        boolean sync = producer.process(exchange, callback);
+
+        // the dispatch failure is recorded, but routing is deferred while the first send is still in flight
+        Mockito.verify(exchange).setException(isA(SerializationException.class));
+        assertFalse(sync);
+        Mockito.verify(callback, Mockito.never()).done(Mockito.anyBoolean());
+
+        // the first record now completes on the Kafka sender thread; only now may routing continue, exactly once
+        ArgumentCaptor<Callback> callBackCaptor = ArgumentCaptor.forClass(Callback.class);
+        Mockito.verify(kp, Mockito.times(2)).send(any(ProducerRecord.class), callBackCaptor.capture());
+        callBackCaptor.getAllValues().get(0).onCompletion(new RecordMetadata(null, 0, 0, 0, 0, 0), null);
+
+        // done() is delivered from the worker pool
+        Mockito.verify(callback, Mockito.timeout(2000)).done(eq(false));
+    }
+
+    @Test
+    public void processAsyncCompletesCallbackWhenBeginTransactionFails() throws Exception {
+        // CAMEL-24780: a failure to begin the transaction must set the exception and complete the async
+        // callback rather than escaping process(), and it must not leave the unit of work flagged as
+        // transacted without a synchronization to commit or roll it back.
+        // Exercise the real init path: doStart() derives transactionId from transactionalId and calls
+        // initTransactions() on the mock (a no-op), so no reflection on the private field is needed.
+        endpoint.getConfiguration().setTransactionalId("test-tx");
+        endpoint.getConfiguration().setTopic("sometopic");
+        producer.doStart();
+
+        Producer kp = producer.getKafkaProducer();
+        Mockito.doThrow(new ApiException("cannot begin")).when(kp).beginTransaction();
+
+        UnitOfWork uow = Mockito.mock(UnitOfWork.class);
+        Mockito.when(uow.isTransactedBy(any())).thenReturn(false);
+        Mockito.when(exchange.getUnitOfWork()).thenReturn(uow);
+        Mockito.when(exchange.getIn()).thenReturn(in);
+        Mockito.when(exchange.getMessage()).thenReturn(in);
+
+        boolean sync = producer.process(exchange, callback);
+
+        assertTrue(sync);
+        Mockito.verify(exchange).setException(isA(ApiException.class));
+        Mockito.verify(callback).done(eq(true));
+        // begin failed, so the unit of work must be left untouched (no dangling transacted flag)
+        Mockito.verify(uow, Mockito.never()).beginTransactedBy(any());
+        Mockito.verify(uow, Mockito.never()).addSynchronization(any());
+    }
+
+    @Test
+    void transactionalProducerIsRecreatedAfterAFatalError() throws Exception {
+        // CAMEL-24782: a fatal transactional error closes the shared producer; the next transaction must rebuild it
+        // through the client factory instead of leaving the route wedged on a dead (closed) producer.
+        endpoint.getConfiguration().setTransactionalId("test-tx");
+        endpoint.getConfiguration().setTopic("sometopic");
+        producer.doStart();
+
+        Producer recreated = Mockito.mock(Producer.class);
+        KafkaClientFactory factory = Mockito.mock(KafkaClientFactory.class);
+        Mockito.when(factory.getProducer(any(Properties.class))).thenReturn(recreated);
+        endpoint.setKafkaClientFactory(factory);
+
+        // a previous transaction hit a fatal error and closed the shared producer
+        producer.markProducerClosedForRecreation();
+
+        UnitOfWork uow = Mockito.mock(UnitOfWork.class);
+        Mockito.when(uow.isTransactedBy(any())).thenReturn(false);
+        Mockito.when(exchange.getUnitOfWork()).thenReturn(uow);
+        Mockito.when(exchange.getIn()).thenReturn(in);
+        Mockito.when(exchange.getMessage()).thenReturn(in);
+        in.setHeader(KafkaConstants.PARTITION_KEY, 4);
+
+        producer.process(exchange, callback);
+
+        // the shared producer was rebuilt via the factory, re-initialised for transactions, and used for this exchange
+        Mockito.verify(factory).getProducer(any(Properties.class));
+        Mockito.verify(recreated).initTransactions();
+        Mockito.verify(recreated).beginTransaction();
+        assertSame(recreated, producer.getKafkaProducer());
+    }
+
+    @Test
+    public void processSendsMessageWithTopicHeaderAndNoTopicInEndPoint() throws Exception {
+        endpoint.getConfiguration().setTopic(null);
+        Mockito.when(exchange.getIn()).thenReturn(in);
+        in.setHeader(KafkaConstants.TOPIC, "anotherTopic");
+        Mockito.when(exchange.getMessage()).thenReturn(in);
+
+        producer.process(exchange);
+
+        verifySendMessage("sometopic");
+        assertRecordMetadataExists();
+    }
+
+    @Test
+    public void processSendsMessageWithTopicHeaderAndEndPoint() throws Exception {
+        endpoint.getConfiguration().setTopic("sometopic");
+        Mockito.when(exchange.getIn()).thenReturn(in);
+        Mockito.when(exchange.getMessage()).thenReturn(in);
+
+        in.setHeader(KafkaConstants.PARTITION_KEY, 4);
+        in.setHeader(KafkaConstants.TOPIC, "anotherTopic");
+        in.setHeader(KafkaConstants.KEY, "someKey");
+
+        producer.process(exchange);
+
+        // the header is preserved
+        assertNotNull(in.getHeader(KafkaConstants.TOPIC));
+
+        verifySendMessage(4, "sometopic", "someKey");
+        assertRecordMetadataExists();
+    }
+
+    @Test
+    public void processSendsMessageWithOverrideTopicHeaderAndEndPoint() throws Exception {
+        endpoint.getConfiguration().setTopic("sometopic");
+        Mockito.when(exchange.getIn()).thenReturn(in);
+        Mockito.when(exchange.getMessage()).thenReturn(in);
+
+        in.setHeader(KafkaConstants.PARTITION_KEY, 4);
+        in.setHeader(KafkaConstants.OVERRIDE_TOPIC, "anotherTopic");
+        in.setHeader(KafkaConstants.KEY, "someKey");
+
+        // test using a string value instead of long
+        String time = String.valueOf(LocalDateTime.now().atZone(ZoneId.systemDefault()).toInstant().toEpochMilli());
+        in.setHeader(KafkaConstants.OVERRIDE_TIMESTAMP, time);
+
+        producer.process(exchange);
+
+        // the header is now removed
+        assertNull(in.getHeader(KafkaConstants.OVERRIDE_TOPIC));
+
+        verifySendMessage(4, "anotherTopic", "someKey");
+        assertRecordMetadataExists();
+    }
+
+    @Test
+    public void processRequiresTopicInEndpointOrInHeader() throws Exception {
+        endpoint.getConfiguration().setTopic(null);
+        Mockito.when(exchange.getIn()).thenReturn(in);
+        Mockito.when(exchange.getMessage()).thenReturn(in);
+        in.setHeader(KafkaConstants.PARTITION_KEY, 4);
+        in.setHeader(KafkaConstants.KEY, "someKey");
+
+        producer.process(exchange);
+
+        verifySendMessage("sometopic", "someKey");
+        assertRecordMetadataExists();
+    }
+
+    @Test
+    public void processRequiresTopicInConfiguration() throws Exception {
+        endpoint.getConfiguration().setTopic("configTopic");
+        Mockito.when(exchange.getIn()).thenReturn(in);
+        Mockito.when(exchange.getMessage()).thenReturn(in);
+        in.setHeader(KafkaConstants.PARTITION_KEY, 4);
+        in.setHeader(KafkaConstants.KEY, "someKey");
+
+        producer.process(exchange);
+
+        verifySendMessage("configTopic", "someKey");
+        assertRecordMetadataExists();
+    }
+
+    @Test
+    public void processDoesNotRequirePartitionHeader() throws Exception {
+        endpoint.getConfiguration().setTopic("sometopic");
+        Mockito.when(exchange.getIn()).thenReturn(in);
+        Mockito.when(exchange.getMessage()).thenReturn(in);
+
+        producer.process(exchange);
+
+        assertRecordMetadataExists();
+    }
+
+    @Test
+    public void processSendsMessageWithPartitionKeyHeader() throws Exception {
+        endpoint.getConfiguration().setTopic("someTopic");
+        Mockito.when(exchange.getIn()).thenReturn(in);
+        Mockito.when(exchange.getMessage()).thenReturn(in);
+        in.setHeader(KafkaConstants.PARTITION_KEY, 4);
+        in.setHeader(KafkaConstants.KEY, "someKey");
+
+        producer.process(exchange);
+
+        verifySendMessage(4, "someTopic", "someKey");
+        assertRecordMetadataExists();
+    }
+
+    @Test
+    public void processSendsMessageWithPartitionKeyHeaderOnly() throws Exception {
+        endpoint.getConfiguration().setTopic("someTopic");
+        Mockito.when(exchange.getIn()).thenReturn(in);
+        Mockito.when(exchange.getMessage()).thenReturn(in);
+        in.setHeader(KafkaConstants.PARTITION_KEY, 4);
+
+        producer.process(exchange);
+
+        verifySendMessage(4, "someTopic");
+        assertRecordMetadataExists();
+    }
+
+    @Test
+    public void processSendsMessageWithMessageKeyHeader() throws Exception {
+        endpoint.getConfiguration().setTopic("someTopic");
+        Mockito.when(exchange.getIn()).thenReturn(in);
+        Mockito.when(exchange.getMessage()).thenReturn(in);
+        in.setHeader(KafkaConstants.KEY, "someKey");
+
+        producer.process(exchange);
+
+        verifySendMessage("someTopic", "someKey");
+        assertRecordMetadataExists();
+    }
+
+    @Test
+    public void processSendsMessageWithMessageTimestampHeader() throws Exception {
+        endpoint.getConfiguration().setTopic("someTopic");
+        Mockito.when(exchange.getIn()).thenReturn(in);
+        Mockito.when(exchange.getMessage()).thenReturn(in);
+        in.setHeader(KafkaConstants.KEY, "someKey");
+        in.setHeader(KafkaConstants.OVERRIDE_TIMESTAMP,
+                LocalDateTime.now().atZone(ZoneId.systemDefault()).toInstant().toEpochMilli());
+
+        producer.process(exchange);
+
+        verifySendMessage("someTopic", "someKey");
+        assertRecordMetadataTimestampExists();
+    }
+
+    @Test
+    public void processSendMessageWithTopicHeader() throws Exception {
+        endpoint.getConfiguration().setTopic("someTopic");
+        Mockito.when(exchange.getIn()).thenReturn(in);
+        Mockito.when(exchange.getMessage()).thenReturn(in);
+        in.setHeader(KafkaConstants.TOPIC, "anotherTopic");
+        in.setHeader(KafkaConstants.KEY, "someKey");
+        in.setHeader(KafkaConstants.PARTITION_KEY, 4);
+
+        producer.process(exchange);
+
+        verifySendMessage(4, "someTopic", "someKey");
+        assertRecordMetadataExists();
+    }
+
+    @Test // Message and Topic Name alone
+    public void processSendsMessageWithMessageTopicName() throws Exception {
+        endpoint.getConfiguration().setTopic("someTopic");
+        Mockito.when(exchange.getIn()).thenReturn(in);
+        Mockito.when(exchange.getMessage()).thenReturn(in);
+
+        producer.process(exchange);
+
+        verifySendMessage("someTopic");
+        assertRecordMetadataExists();
+    }
+
+    @Test
+    public void processSendsMessageWithListOfExchangesWithOverrideTopicHeaderOnEveryExchange() throws Exception {
+        endpoint.getConfiguration().setTopic("someTopic");
+        Mockito.when(exchange.getIn()).thenReturn(in);
+        Mockito.when(exchange.getMessage()).thenReturn(in);
+
+        // we set the initial topic
+        in.setHeader(KafkaConstants.OVERRIDE_TOPIC, "anotherTopic");
+        in.setHeader(KafkaConstants.KEY, "someKey");
+
+        // we add our exchanges in order to aggregate
+        final List<Exchange> nestedExchanges
+                = createListOfExchangesWithTopics(Arrays.asList("overridenTopic1", "overridenTopic2", "overridenTopic3"));
+
+        // aggregate
+        final Exchange finalAggregatedExchange = aggregateExchanges(nestedExchanges, new GroupedExchangeAggregationStrategy());
+
+        in.setBody(finalAggregatedExchange.getIn().getBody());
+        in.setHeaders(finalAggregatedExchange.getIn().getHeaders());
+
+        producer.process(exchange);
+
+        // assert results
+        verifySendMessages(Arrays.asList("overridenTopic1", "overridenTopic2", "overridenTopic3"), null);
+        assertRecordMetadataExists(3);
+        assertRecordMetadataExistsForEachAggregatedExchange();
+    }
+
+    @Test
+    public void processSendsMessageWithListOfMessagesWithOverrideTopicHeaderOnEveryExchange() throws Exception {
+        endpoint.getConfiguration().setTopic("someTopic");
+        Mockito.when(exchange.getIn()).thenReturn(in);
+        Mockito.when(exchange.getMessage()).thenReturn(in);
+
+        // we set the initial topic
+        in.setHeader(KafkaConstants.OVERRIDE_TOPIC, "anotherTopic");
+        in.setHeader(KafkaConstants.KEY, "someKey");
+
+        // we add our exchanges in order to aggregate
+        final List<Exchange> nestedExchanges
+                = createListOfExchangesWithTopics(Arrays.asList("overridenTopic1", "overridenTopic2", "overridenTopic3"));
+
+        // aggregate
+        final Exchange finalAggregatedExchange = aggregateExchanges(nestedExchanges, new GroupedMessageAggregationStrategy());
+
+        in.setBody(finalAggregatedExchange.getIn().getBody());
+        in.setHeaders(finalAggregatedExchange.getIn().getHeaders());
+
+        producer.process(exchange);
+
+        // assert results
+        verifySendMessages(Arrays.asList("overridenTopic1", "overridenTopic2", "overridenTopic3"),
+                Arrays.asList("", "", ""));
+        assertRecordMetadataExists(3);
+        assertRecordMetadataExistsForEachAggregatedMessage();
+    }
+
+    @Test
+    public void processSendsMessageWithListOfExchangesWithIndividualHeaders() throws Exception {
+        endpoint.getConfiguration().setBatchWithIndividualHeaders(true);
+        endpoint.getConfiguration().setTopic("someTopic");
+        Mockito.when(exchange.getIn()).thenReturn(in);
+        Mockito.when(exchange.getMessage()).thenReturn(in);
+
+        // we set the initial topic
+        in.setHeader(KafkaConstants.OVERRIDE_TOPIC, "anotherTopic");
+        in.setHeader(KafkaConstants.KEY, "someKey");
+        in.setHeader(SOME_INDIVIDUAL_HEADER, "default");
+
+        // we add our exchanges in order to aggregate
+        final List<Exchange> nestedExchanges
+                = createListOfExchangesWithTopics(Arrays.asList("overridenTopic1", "overridenTopic2", "overridenTopic3"));
+
+        // aggregate
+        final Exchange finalAggregatedExchange = aggregateExchanges(nestedExchanges, new GroupedExchangeAggregationStrategy());
+
+        in.setBody(finalAggregatedExchange.getIn().getBody());
+        in.setHeaders(finalAggregatedExchange.getIn().getHeaders());
+
+        producer.process(exchange);
+
+        // assert results
+        verifySendMessages(Arrays.asList("overridenTopic1", "overridenTopic2", "overridenTopic3"),
+                Arrays.asList("value-1", "value-2", "value-3"));
+        assertRecordMetadataExists(3);
+        assertRecordMetadataExistsForEachAggregatedExchange();
+    }
+
+    @Test
+    public void processSendsMessageWithListOfMessagesWithIndividualHeaders() throws Exception {
+        endpoint.getConfiguration().setBatchWithIndividualHeaders(true);
+        endpoint.getConfiguration().setTopic("someTopic");
+        Mockito.when(exchange.getIn()).thenReturn(in);
+        Mockito.when(exchange.getMessage()).thenReturn(in);
+
+        // we set the initial topic
+        in.setHeader(KafkaConstants.OVERRIDE_TOPIC, "anotherTopic");
+        in.setHeader(KafkaConstants.KEY, "someKey");
+
+        // we add our exchanges in order to aggregate
+        final List<Exchange> nestedExchanges
+                = createListOfExchangesWithTopics(Arrays.asList("overridenTopic1", "overridenTopic2", "overridenTopic3"));
+
+        // aggregate messages
+        final Exchange finalAggregatedExchange = aggregateExchanges(nestedExchanges, new GroupedMessageAggregationStrategy());
+
+        in.setBody(finalAggregatedExchange.getIn().getBody());
+        in.setHeaders(finalAggregatedExchange.getIn().getHeaders());
+
+        producer.process(exchange);
+
+        // assert results
+        verifySendMessages(Arrays.asList("overridenTopic1", "overridenTopic2", "overridenTopic3"),
+                Arrays.asList("value-1", "value-2", "value-3"));
+        assertRecordMetadataExists(3);
+        assertRecordMetadataExistsForEachAggregatedMessage();
+    }
+
+    @Test
+    public void processSendsMessageWithJackson2ScalarNode() throws Exception {
+        endpoint.getConfiguration().setTopic("sometopic");
+        Mockito.when(exchange.getIn()).thenReturn(in);
+        Mockito.when(exchange.getMessage()).thenReturn(in);
+
+        in.setBody(IntNode.valueOf(42));
+        producer.process(exchange);
+
+        verifySendMessage("sometopic");
+    }
+
+    @Test
+    public void processSendsMessagesWithJackson2ArrayNode() throws Exception {
+        endpoint.getConfiguration().setTopic("sometopic");
+        Mockito.when(exchange.getIn()).thenReturn(in);
+        Mockito.when(exchange.getMessage()).thenReturn(in);
+
+        ArrayNode node = JsonNodeFactory.instance.arrayNode();
+        node.add(1);
+        node.add(2);
+
+        in.setBody(node);
+        producer.process(exchange);
+
+        verifySendMessages(Arrays.asList("sometopic", "sometopic"), null);
+    }
+
+    @Test
+    public void processSendsMessageWithJackson2ObjectNode() throws Exception {
+        // CAMEL-25924: a Jackson 2 object node is one record, not one record per field value
+        endpoint.getConfiguration().setTopic("sometopic");
+        Mockito.when(exchange.getIn()).thenReturn(in);
+        Mockito.when(exchange.getMessage()).thenReturn(in);
+
+        ObjectNode node = JsonNodeFactory.instance.objectNode();
+        node.put("orderId", 42);
+        node.put("customer", "acme");
+        node.put("total", 9.5);
+
+        in.setBody(node);
+        producer.process(exchange);
+
+        verifySendMessage("sometopic");
+        verifySentValues(node);
+    }
+
+    @Test
+    public void processSendsMessagesWithArrayNode() throws Exception {
+        endpoint.getConfiguration().setTopic("sometopic");
+        Mockito.when(exchange.getIn()).thenReturn(in);
+        Mockito.when(exchange.getMessage()).thenReturn(in);
+
+        JsonNode first = tools.jackson.databind.node.JsonNodeFactory.instance.numberNode(1);
+        JsonNode second = tools.jackson.databind.node.JsonNodeFactory.instance.numberNode(2);
+        in.setBody(tools.jackson.databind.node.JsonNodeFactory.instance.arrayNode().add(first).add(second));
+        producer.process(exchange);
+
+        verifySendMessages(Arrays.asList("sometopic", "sometopic"), null);
+        verifySentValues(first, second);
+    }
+
+    @Test
+    public void processSendsMessageWithObjectNode() throws Exception {
+        // CAMEL-25924: an object node is one record, not one record per field value
+        endpoint.getConfiguration().setTopic("sometopic");
+        Mockito.when(exchange.getIn()).thenReturn(in);
+        Mockito.when(exchange.getMessage()).thenReturn(in);
+
+        JsonNode node
+                = tools.jackson.databind.node.JsonNodeFactory.instance.objectNode().put("orderId", 42).put("customer", "acme");
+        in.setBody(node);
+        producer.process(exchange);
+
+        verifySendMessage("sometopic");
+        verifySentValues(node);
+    }
+
+    @Test
+    public void processSendsMessageWithScalarNode() throws Exception {
+        // CAMEL-25924: a scalar node has no elements, and must be sent as one record and not dropped
+        endpoint.getConfiguration().setTopic("sometopic");
+        Mockito.when(exchange.getIn()).thenReturn(in);
+        Mockito.when(exchange.getMessage()).thenReturn(in);
+
+        JsonNode node = tools.jackson.databind.node.JsonNodeFactory.instance.numberNode(42);
+        in.setBody(node);
+        producer.process(exchange);
+
+        verifySendMessage("sometopic");
+        verifySentValues(node);
+    }
+
+    @SuppressWarnings({ "unchecked", "rawtypes" })
+    private void verifySentValues(Object... expectedValues) {
+        ArgumentCaptor<ProducerRecord> captor = ArgumentCaptor.forClass(ProducerRecord.class);
+        Mockito.verify(producer.getKafkaProducer(), Mockito.atLeastOnce()).send(captor.capture());
+        List<Object> actualValues = captor.getAllValues().stream().map(ProducerRecord::value).collect(Collectors.toList());
+        assertEquals(Arrays.asList(expectedValues), actualValues);
+    }
+
+    @SuppressWarnings({ "unchecked", "rawtypes" })
+    protected void verifySendMessage(Integer partitionKey, String topic, String messageKey) {
+        ArgumentCaptor<ProducerRecord> captor = ArgumentCaptor.forClass(ProducerRecord.class);
+        Mockito.verify(producer.getKafkaProducer()).send(captor.capture());
+        assertEquals(partitionKey, captor.getValue().partition());
+        assertEquals(messageKey, captor.getValue().key());
+        assertEquals(topic, captor.getValue().topic());
+    }
+
+    @SuppressWarnings({ "unchecked", "rawtypes" })
+    protected void verifySendMessage(Integer partitionKey, String topic) {
+        ArgumentCaptor<ProducerRecord> captor = ArgumentCaptor.forClass(ProducerRecord.class);
+        Mockito.verify(producer.getKafkaProducer()).send(captor.capture());
+        assertEquals(partitionKey, captor.getValue().partition());
+        assertEquals(topic, captor.getValue().topic());
+    }
+
+    @SuppressWarnings({ "unchecked", "rawtypes" })
+    protected void verifySendMessage(String topic, String messageKey) {
+        ArgumentCaptor<ProducerRecord> captor = ArgumentCaptor.forClass(ProducerRecord.class);
+        Mockito.verify(producer.getKafkaProducer()).send(captor.capture());
+        assertEquals(messageKey, captor.getValue().key());
+        assertEquals(topic, captor.getValue().topic());
+    }
+
+    @SuppressWarnings({ "unchecked", "rawtypes" })
+    protected void verifySendMessage(String topic) {
+        ArgumentCaptor<ProducerRecord> captor = ArgumentCaptor.forClass(ProducerRecord.class);
+        Mockito.verify(producer.getKafkaProducer()).send(captor.capture());
+        assertEquals(topic, captor.getValue().topic());
+    }
+
+    @SuppressWarnings({ "unchecked", "rawtypes" })
+    protected void verifySendMessages(final List<String> expectedTopics, final List<String> expectedIndividualHeaderValues) {
+        final ArgumentCaptor<ProducerRecord> captor = ArgumentCaptor.forClass(ProducerRecord.class);
+        Mockito.verify(producer.getKafkaProducer(), Mockito.atLeast(expectedTopics.size())).send(captor.capture());
+        final List<ProducerRecord> records = captor.getAllValues();
+        final List<String> actualTopics
+                = records.stream().map(ProducerRecord::topic).toList();
+
+        assertEquals(expectedTopics, actualTopics);
+
+        if (expectedIndividualHeaderValues == null) {
+            return;
+        }
+
+        final List<String> actualIndividualHeaderValues = records.stream()
+                .map(ProducerRecord::headers)
+                .map(headers -> headers.lastHeader(SOME_INDIVIDUAL_HEADER))
+                .map(header -> header == null ? "" : new String(header.value(), StandardCharsets.UTF_8))
+                .collect(Collectors.toList());
+
+        assertEquals(expectedIndividualHeaderValues, actualIndividualHeaderValues);
+    }
+
+    private void assertRecordMetadataTimestampExists() {
+        List<RecordMetadata> recordMetaData1 = (List<RecordMetadata>) in.getHeader(KafkaConstants.KAFKA_RECORD_META);
+        assertNotNull(recordMetaData1);
+        assertEquals(1, recordMetaData1.size(), "Expected one recordMetaData");
+        assertNotNull(recordMetaData1.get(0));
+    }
+
+    private void assertRecordMetadataExists() {
+        List<RecordMetadata> recordMetaData1 = (List<RecordMetadata>) in.getHeader(KafkaConstants.KAFKA_RECORD_META);
+        assertNotNull(recordMetaData1);
+        assertEquals(1, recordMetaData1.size(), "Expected one recordMetaData");
+        assertNotNull(recordMetaData1.get(0));
+    }
+
+    private void assertRecordMetadataExists(final int numMetadata) {
+        List<RecordMetadata> recordMetaData1 = (List<RecordMetadata>) in.getHeader(KafkaConstants.KAFKA_RECORD_META);
+        assertNotNull(recordMetaData1);
+        assertEquals(recordMetaData1.size(), numMetadata, "Expected one recordMetaData");
+        assertNotNull(recordMetaData1.get(0));
+    }
+
+    private void assertRecordMetadataExistsForEachAggregatedExchange() {
+        List<Exchange> exchanges = (List<Exchange>) in.getBody();
+        for (Exchange ex : exchanges) {
+            List<RecordMetadata> recordMetaData
+                    = (List<RecordMetadata>) ex.getMessage().getHeader(KafkaConstants.KAFKA_RECORD_META);
+            assertNotNull(recordMetaData);
+            assertEquals(1, recordMetaData.size(), "Expected one recordMetaData");
+            assertNotNull(recordMetaData.get(0));
+        }
+    }
+
+    private void assertRecordMetadataExistsForEachAggregatedMessage() {
+        List<Message> messages = (List<Message>) in.getBody();
+        for (Message msg : messages) {
+            List<RecordMetadata> recordMetaData = (List<RecordMetadata>) msg.getHeader(KafkaConstants.KAFKA_RECORD_META);
+            assertNotNull(recordMetaData);
+            assertEquals(1, recordMetaData.size(), "Expected one recordMetaData");
+            assertNotNull(recordMetaData.get(0));
+        }
+    }
+
+    private Exchange aggregateExchanges(final List<Exchange> exchangesToAggregate, final AggregationStrategy strategy) {
+        Exchange exchangeHolder = new DefaultExchange(context);
+
+        for (final Exchange innerExchange : exchangesToAggregate) {
+            exchangeHolder = strategy.aggregate(exchangeHolder, innerExchange);
+        }
+
+        strategy.onCompletion(exchangeHolder);
+
+        return exchangeHolder;
+    }
+
+    private List<Exchange> createListOfExchangesWithTopics(final List<String> topics) {
+        final List<Exchange> resultLists = new LinkedList<>();
+
+        int index = 1;
+        for (String topic : topics) {
+            final Exchange innerExchange = new DefaultExchange(context);
+            innerExchange.setExchangeId("exchange-" + index);
+            final Message msg = innerExchange.getIn();
+            msg.setMessageId("message-" + index);
+            msg.setHeader(KafkaConstants.OVERRIDE_TOPIC, topic);
+            msg.setHeader(SOME_INDIVIDUAL_HEADER, "value-" + index++);
+            resultLists.add(innerExchange);
+        }
+
+        return resultLists;
+    }
+}

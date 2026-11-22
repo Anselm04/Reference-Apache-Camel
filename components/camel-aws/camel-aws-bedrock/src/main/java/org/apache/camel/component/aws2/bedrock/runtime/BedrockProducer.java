@@ -1,0 +1,1101 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.camel.component.aws2.bedrock.runtime;
+
+import java.util.ArrayList;
+import java.util.List;
+
+import org.apache.camel.Endpoint;
+import org.apache.camel.Exchange;
+import org.apache.camel.InvalidPayloadException;
+import org.apache.camel.Message;
+import org.apache.camel.component.aws.common.AwsExceptionUtil;
+import org.apache.camel.component.aws2.bedrock.BedrockBodyHelper;
+import org.apache.camel.component.aws2.bedrock.runtime.stream.BedrockStreamHandler;
+import org.apache.camel.component.aws2.bedrock.runtime.stream.ConverseStreamHandler;
+import org.apache.camel.support.DefaultProducer;
+import org.apache.camel.util.ObjectHelper;
+import org.apache.camel.util.URISupport;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import software.amazon.awssdk.awscore.exception.AwsServiceException;
+import software.amazon.awssdk.core.SdkBytes;
+import software.amazon.awssdk.core.document.Document;
+import software.amazon.awssdk.services.bedrockruntime.BedrockRuntimeClient;
+import software.amazon.awssdk.services.bedrockruntime.model.ApplyGuardrailRequest;
+import software.amazon.awssdk.services.bedrockruntime.model.ApplyGuardrailResponse;
+import software.amazon.awssdk.services.bedrockruntime.model.ContentBlock;
+import software.amazon.awssdk.services.bedrockruntime.model.ConversationRole;
+import software.amazon.awssdk.services.bedrockruntime.model.ConverseRequest;
+import software.amazon.awssdk.services.bedrockruntime.model.ConverseResponse;
+import software.amazon.awssdk.services.bedrockruntime.model.ConverseStreamRequest;
+import software.amazon.awssdk.services.bedrockruntime.model.GuardrailConfiguration;
+import software.amazon.awssdk.services.bedrockruntime.model.GuardrailContentBlock;
+import software.amazon.awssdk.services.bedrockruntime.model.GuardrailContentSource;
+import software.amazon.awssdk.services.bedrockruntime.model.GuardrailStreamConfiguration;
+import software.amazon.awssdk.services.bedrockruntime.model.GuardrailStreamProcessingMode;
+import software.amazon.awssdk.services.bedrockruntime.model.GuardrailTextBlock;
+import software.amazon.awssdk.services.bedrockruntime.model.GuardrailTrace;
+import software.amazon.awssdk.services.bedrockruntime.model.InferenceConfiguration;
+import software.amazon.awssdk.services.bedrockruntime.model.InvokeModelRequest;
+import software.amazon.awssdk.services.bedrockruntime.model.InvokeModelResponse;
+import software.amazon.awssdk.services.bedrockruntime.model.InvokeModelWithResponseStreamRequest;
+import software.amazon.awssdk.services.bedrockruntime.model.SystemContentBlock;
+import software.amazon.awssdk.services.bedrockruntime.model.ToolConfiguration;
+import tools.jackson.core.JacksonException;
+import tools.jackson.databind.JsonNode;
+import tools.jackson.databind.ObjectMapper;
+import tools.jackson.databind.json.JsonMapper;
+
+/**
+ * A Producer which sends messages to the Amazon Bedrock Service <a href="http://aws.amazon.com/bedrock/">AWS
+ * Bedrock</a>
+ */
+public class BedrockProducer extends DefaultProducer {
+
+    private static final Logger LOG = LoggerFactory.getLogger(BedrockProducer.class);
+
+    /**
+     * Region prefixes used by Bedrock cross-region inference profile ids, e.g. {@code us.anthropic.claude-...}.
+     */
+    private static final List<String> INFERENCE_PROFILE_REGION_PREFIXES = List.of("us.", "eu.", "apac.", "us-gov.");
+    private static final ObjectMapper MAPPER = JsonMapper.builderWithJackson2Defaults().build();
+    private transient String bedrockProducerToString;
+
+    public BedrockProducer(Endpoint endpoint) {
+        super(endpoint);
+    }
+
+    @Override
+    @SuppressWarnings("deprecation")
+    public void process(Exchange exchange) throws Exception {
+        switch (determineOperation(exchange)) {
+            case invokeTextModel:
+                invokeTextModel(getEndpoint().getBedrockRuntimeClient(), exchange);
+                break;
+            case invokeImageModel:
+                invokeImageModel(getEndpoint().getBedrockRuntimeClient(), exchange);
+                break;
+            case invokeEmbeddingsModel:
+                invokeEmbeddingsModel(getEndpoint().getBedrockRuntimeClient(), exchange);
+                break;
+            case invokeTextModelStreaming:
+                invokeTextModelStreaming(getEndpoint().getBedrockRuntimeClient(), exchange);
+                break;
+            case invokeImageModelStreaming:
+                invokeImageModelStreaming(getEndpoint().getBedrockRuntimeClient(), exchange);
+                break;
+            case invokeEmbeddingsModelStreaming:
+                invokeEmbeddingsModelStreaming(getEndpoint().getBedrockRuntimeClient(), exchange);
+                break;
+            case converse:
+                converse(getEndpoint().getBedrockRuntimeClient(), exchange);
+                break;
+            case converseStream:
+                converseStream(exchange);
+                break;
+            case applyGuardrail:
+                applyGuardrail(getEndpoint().getBedrockRuntimeClient(), exchange);
+                break;
+            default:
+                throw new IllegalArgumentException("Unsupported operation");
+        }
+    }
+
+    private BedrockOperations determineOperation(Exchange exchange) {
+        BedrockOperations operation = exchange.getMessage().getHeader(BedrockConstants.OPERATION, BedrockOperations.class);
+        if (ObjectHelper.isEmpty(operation)) {
+            operation = getConfiguration().getOperation();
+        }
+        if (operation == null) {
+            throw new IllegalArgumentException(
+                    "Operation must be specified with the operation option or the " + BedrockConstants.OPERATION + " header");
+        }
+        return operation;
+    }
+
+    /**
+     * The request of the model: the message body converted to bytes, so a String, byte[], InputStream or File body is
+     * sent as is. A Map or a Jackson JsonNode is marshalled to JSON.
+     */
+    private static SdkBytes requestBody(Exchange exchange) throws InvalidPayloadException {
+        String json = BedrockBodyHelper.jsonBody(exchange);
+        if (json != null) {
+            return SdkBytes.fromUtf8String(json);
+        }
+        return SdkBytes.fromByteArray(exchange.getMessage().getMandatoryBody(byte[].class));
+    }
+
+    protected BedrockConfiguration getConfiguration() {
+        return getEndpoint().getConfiguration();
+    }
+
+    @Override
+    public String toString() {
+        if (bedrockProducerToString == null) {
+            bedrockProducerToString = "BedrockProducer[" + URISupport.sanitizeUri(getEndpoint().getEndpointUri()) + "]";
+        }
+        return bedrockProducerToString;
+    }
+
+    @Override
+    public BedrockEndpoint getEndpoint() {
+        return (BedrockEndpoint) super.getEndpoint();
+    }
+
+    private void invokeTextModel(BedrockRuntimeClient bedrockRuntimeClient, Exchange exchange) throws InvalidPayloadException {
+        if (getConfiguration().isPojoRequest()) {
+            Object payload = exchange.getMessage().getMandatoryBody();
+            if (payload instanceof InvokeModelRequest invokeModelRequest) {
+                InvokeModelResponse result;
+                try {
+                    result = bedrockRuntimeClient.invokeModel(invokeModelRequest);
+                } catch (AwsServiceException ase) {
+                    LOG.trace("Invoke Model command returned the error code {}", AwsExceptionUtil.errorCode(ase));
+                    throw ase;
+                }
+                Message message = getMessageForResponse(exchange);
+                // the request carries the model, which the endpoint may not set
+                setResponseText(invokeModelRequest.modelId(), result, message);
+            } else {
+                throw new IllegalArgumentException(
+                        "InvokeTextModel operation requires InvokeModelRequest in POJO mode");
+            }
+        } else {
+            InvokeModelRequest.Builder builder = InvokeModelRequest.builder();
+            if (ObjectHelper.isNotEmpty(exchange.getMessage().getHeader(BedrockConstants.MODEL_CONTENT_TYPE))) {
+                String contentType = exchange.getIn().getHeader(BedrockConstants.MODEL_CONTENT_TYPE, String.class);
+                builder.contentType(contentType);
+            } else {
+                throw new IllegalArgumentException("Model Content Type must be specified");
+            }
+            if (ObjectHelper.isNotEmpty(exchange.getMessage().getHeader(BedrockConstants.MODEL_ACCEPT_CONTENT_TYPE))) {
+                String acceptContentType = exchange.getIn().getHeader(BedrockConstants.MODEL_ACCEPT_CONTENT_TYPE, String.class);
+                builder.accept(acceptContentType);
+            } else {
+                throw new IllegalArgumentException("Model Accept Content Type must be specified");
+            }
+            InvokeModelRequest request = builder
+                    .body(requestBody(exchange))
+                    .modelId(getConfiguration().getModelId())
+                    .build();
+            InvokeModelResponse result;
+            try {
+                result = bedrockRuntimeClient.invokeModel(request);
+            } catch (AwsServiceException ase) {
+                LOG.trace("Invoke Model command returned the error code {}", AwsExceptionUtil.errorCode(ase));
+                throw ase;
+            }
+            Message message = getMessageForResponse(exchange);
+            setResponseText(request.modelId(), result, message);
+        }
+    }
+
+    private void invokeImageModel(BedrockRuntimeClient bedrockRuntimeClient, Exchange exchange) throws InvalidPayloadException {
+        if (getConfiguration().isPojoRequest()) {
+            Object payload = exchange.getMessage().getMandatoryBody();
+            if (payload instanceof InvokeModelRequest invokeModelRequest) {
+                InvokeModelResponse result;
+                try {
+                    result = bedrockRuntimeClient.invokeModel(invokeModelRequest);
+                } catch (AwsServiceException ase) {
+                    LOG.trace("Invoke Image Model command returned the error code {}", AwsExceptionUtil.errorCode(ase));
+                    throw ase;
+                }
+                Message message = getMessageForResponse(exchange);
+                message.setBody(result);
+            } else {
+                throw new IllegalArgumentException(
+                        "InvokeImageModel operation requires InvokeModelRequest in POJO mode");
+            }
+        } else {
+            InvokeModelRequest.Builder builder = InvokeModelRequest.builder();
+            if (ObjectHelper.isNotEmpty(exchange.getMessage().getHeader(BedrockConstants.MODEL_CONTENT_TYPE))) {
+                String contentType = exchange.getIn().getHeader(BedrockConstants.MODEL_CONTENT_TYPE, String.class);
+                builder.contentType(contentType);
+            } else {
+                throw new IllegalArgumentException("Model Content Type must be specified");
+            }
+            if (ObjectHelper.isNotEmpty(exchange.getMessage().getHeader(BedrockConstants.MODEL_ACCEPT_CONTENT_TYPE))) {
+                String acceptContentType = exchange.getIn().getHeader(BedrockConstants.MODEL_ACCEPT_CONTENT_TYPE, String.class);
+                builder.accept(acceptContentType);
+            } else {
+                throw new IllegalArgumentException("Model Accept Content Type must be specified");
+            }
+            InvokeModelRequest request = builder
+                    .body(requestBody(exchange))
+                    .modelId(getConfiguration().getModelId())
+                    .build();
+            InvokeModelResponse result;
+            try {
+                result = bedrockRuntimeClient.invokeModel(request);
+            } catch (AwsServiceException ase) {
+                LOG.trace("Invoke Model command returned the error code {}", AwsExceptionUtil.errorCode(ase));
+                throw ase;
+            }
+            Message message = getMessageForResponse(exchange);
+            try {
+                setBase64Image(result, message);
+            } catch (JacksonException e) {
+                throw new RuntimeException(e);
+            }
+        }
+    }
+
+    private void invokeEmbeddingsModel(BedrockRuntimeClient bedrockRuntimeClient, Exchange exchange)
+            throws InvalidPayloadException {
+        if (getConfiguration().isPojoRequest()) {
+            Object payload = exchange.getMessage().getMandatoryBody();
+            if (payload instanceof InvokeModelRequest invokeModelRequest) {
+                InvokeModelResponse result;
+                try {
+                    result = bedrockRuntimeClient.invokeModel(invokeModelRequest);
+                } catch (AwsServiceException ase) {
+                    LOG.trace("Invoke Image Model command returned the error code {}", AwsExceptionUtil.errorCode(ase));
+                    throw ase;
+                }
+                Message message = getMessageForResponse(exchange);
+                message.setBody(result);
+            } else {
+                throw new IllegalArgumentException(
+                        "InvokeEmbeddingsModel operation requires InvokeModelRequest in POJO mode");
+            }
+        } else {
+            InvokeModelRequest.Builder builder = InvokeModelRequest.builder();
+            if (ObjectHelper.isNotEmpty(exchange.getMessage().getHeader(BedrockConstants.MODEL_CONTENT_TYPE))) {
+                String contentType = exchange.getIn().getHeader(BedrockConstants.MODEL_CONTENT_TYPE, String.class);
+                builder.contentType(contentType);
+            } else {
+                throw new IllegalArgumentException("Model Content Type must be specified");
+            }
+            if (ObjectHelper.isNotEmpty(exchange.getMessage().getHeader(BedrockConstants.MODEL_ACCEPT_CONTENT_TYPE))) {
+                String acceptContentType = exchange.getIn().getHeader(BedrockConstants.MODEL_ACCEPT_CONTENT_TYPE, String.class);
+                builder.accept(acceptContentType);
+            } else {
+                throw new IllegalArgumentException("Model Accept Content Type must be specified");
+            }
+            InvokeModelRequest request = builder
+                    .body(requestBody(exchange))
+                    .modelId(getConfiguration().getModelId())
+                    .build();
+            InvokeModelResponse result;
+            try {
+                result = bedrockRuntimeClient.invokeModel(request);
+            } catch (AwsServiceException ase) {
+                LOG.trace("Invoke Model command returned the error code {}", AwsExceptionUtil.errorCode(ase));
+                throw ase;
+            }
+            Message message = getMessageForResponse(exchange);
+            message.setBody(result);
+        }
+    }
+
+    private static void setBase64Image(InvokeModelResponse result, Message message) {
+        JsonNode jsonString = MAPPER.readTree(result.body().asUtf8String());
+        message.setBody(jsonString.get("images"));
+    }
+
+    protected void setResponseText(InvokeModelResponse result, Message message) {
+        setResponseText(getConfiguration().getModelId(), result, message);
+    }
+
+    protected void setResponseText(String requestModelId, InvokeModelResponse result, Message message) {
+        String modelId = resolveFoundationModelId(requestModelId);
+        if (modelId == null) {
+            throw new IllegalArgumentException("Model id must be specified with the modelId option");
+        }
+        switch (modelId) {
+            // Amazon Titan Models
+            case "amazon.titan-text-express-v1":
+            case "amazon.titan-text-lite-v1":
+            case "amazon.titan-text-premier-v1:0":
+                setTitanText(result, message);
+                break;
+
+            // AI21 Labs Models
+            case "ai21.j2-ultra-v1":
+            case "ai21.j2-mid-v1":
+            case "ai21.jamba-1-5-large-v1:0":
+            case "ai21.jamba-1-5-mini-v1:0":
+                try {
+                    setAi21Text(result, message);
+                } catch (JacksonException e) {
+                    throw new RuntimeException(e);
+                }
+                break;
+
+            // Anthropic Claude Models (legacy format - deprecated)
+            case "anthropic.claude-instant-v1":
+            case "anthropic.claude-v2":
+            case "anthropic.claude-v2:1":
+                try {
+                    setAnthropicText(result, message);
+                } catch (JacksonException e) {
+                    throw new RuntimeException(e);
+                }
+                break;
+
+            // Anthropic Claude Models (v3+ format)
+            case "anthropic.claude-3-sonnet-20240229-v1:0":
+            case "anthropic.claude-3-5-sonnet-20240620-v1:0":
+            case "anthropic.claude-3-5-sonnet-20241022-v2:0":
+            case "anthropic.claude-3-haiku-20240307-v1:0":
+            case "anthropic.claude-3-5-haiku-20241022-v1:0":
+            case "anthropic.claude-3-opus-20240229-v1:0":
+            case "anthropic.claude-3-7-sonnet-20250219-v1:0":
+            case "anthropic.claude-opus-4-20250514-v1:0":
+            case "anthropic.claude-sonnet-4-20250514-v1:0":
+                try {
+                    setAnthropicV3Text(result, message);
+                } catch (JacksonException e) {
+                    throw new RuntimeException(e);
+                }
+                break;
+
+            // Mistral AI Models
+            case "mistral.mistral-7b-instruct-v0:2":
+            case "mistral.mixtral-8x7b-instruct-v0:1":
+            case "mistral.mistral-large-2402-v1:0":
+            case "mistral.mistral-large-2407-v1:0":
+            case "mistral.mistral-small-2402-v1:0":
+            case "mistral.pixtral-large-2502-v1:0":
+                try {
+                    setMistralText(result, message);
+                } catch (JacksonException e) {
+                    throw new RuntimeException(e);
+                }
+                break;
+
+            // Amazon Nova Models (using v3 format)
+            case "amazon.nova-lite-v1:0":
+            case "amazon.nova-micro-v1:0":
+            case "amazon.nova-premier-v1:0":
+            case "amazon.nova-pro-v1:0":
+                try {
+                    setAnthropicV3Text(result, message);
+                } catch (JacksonException e) {
+                    throw new RuntimeException(e);
+                }
+                break;
+
+            // Cohere Models
+            case "cohere.command-r-plus-v1:0":
+            case "cohere.command-r-v1:0":
+                try {
+                    setCohereText(result, message);
+                } catch (JacksonException e) {
+                    throw new RuntimeException(e);
+                }
+                break;
+
+            // Meta Llama Models (Llama 3+ supported)
+            case "meta.llama3-8b-instruct-v1:0":
+            case "meta.llama3-70b-instruct-v1:0":
+            case "meta.llama3-1-8b-instruct-v1:0":
+            case "meta.llama3-1-70b-instruct-v1:0":
+            case "meta.llama3-1-405b-instruct-v1:0":
+            case "meta.llama3-2-1b-instruct-v1:0":
+            case "meta.llama3-2-3b-instruct-v1:0":
+            case "meta.llama3-2-11b-instruct-v1:0":
+            case "meta.llama3-2-90b-instruct-v1:0":
+            case "meta.llama3-3-70b-instruct-v1:0":
+            case "meta.llama4-maverick-17b-instruct-v1:0":
+            case "meta.llama4-scout-17b-instruct-v1:0":
+                try {
+                    setLlamaText(result, message);
+                } catch (JacksonException e) {
+                    throw new RuntimeException(e);
+                }
+                break;
+
+            // Image generation models — use the invokeImageModel operation instead
+            case "amazon.titan-image-generator-v1":
+            case "amazon.titan-image-generator-v2:0":
+            case "amazon.nova-canvas-v1:0":
+            case "stability.sd3-5-large-v1:0":
+            case "stability.stable-image-control-sketch-v1:0":
+            case "stability.stable-image-control-structure-v1:0":
+            case "stability.stable-image-core-v1:1":
+                throw new IllegalArgumentException(
+                        "Model " + modelId
+                                                   + " is an image generation model and cannot be used with the invokeTextModel operation. Use the invokeImageModel operation instead.");
+
+            // Embedding models — use the invokeEmbeddingsModel operation instead
+            case "amazon.titan-embed-text-v1":
+            case "amazon.titan-embed-text-v2:0":
+            case "amazon.titan-embed-image-v1":
+            case "cohere.embed-english-v3":
+            case "cohere.embed-multilingual-v3":
+                throw new IllegalArgumentException(
+                        "Model " + modelId
+                                                   + " is an embedding model and cannot be used with the invokeTextModel operation. Use the invokeEmbeddingsModel operation instead.");
+
+            // Rerank models — not supported by the invokeTextModel operation
+            case "amazon.rerank-v1:0":
+            case "cohere.rerank-v3-5:0":
+                throw new IllegalArgumentException(
+                        "Model " + modelId
+                                                   + " is a rerank model and cannot be used with the invokeTextModel operation.");
+
+            // Video and speech models — not supported by the invokeTextModel operation
+            case "amazon.nova-reel-v1:0":
+            case "amazon.nova-reel-v1:1":
+            case "amazon.nova-sonic-v1:0":
+                throw new IllegalArgumentException(
+                        "Model " + modelId
+                                                   + " is a video/speech generation model and cannot be used with the invokeTextModel operation.");
+
+            default:
+                setResponseTextByModelFamily(modelId, result, message);
+        }
+    }
+
+    /**
+     * Resolves the underlying foundation-model id for a model reference. Bedrock also accepts cross-region inference
+     * profile ids (for example {@code us.anthropic.claude-3-5-sonnet-20241022-v2:0}) and inference-profile or
+     * provisioned-throughput ARNs in place of the plain model id. They all address the same foundation model, so they
+     * must be handled the same way.
+     */
+    protected static String resolveFoundationModelId(String modelId) {
+        if (modelId == null) {
+            return null;
+        }
+        String resolved = modelId;
+        // an ARN carries the profile or model id in its last path segment
+        if (resolved.startsWith("arn:")) {
+            int slash = resolved.lastIndexOf('/');
+            if (slash >= 0 && slash < resolved.length() - 1) {
+                resolved = resolved.substring(slash + 1);
+            }
+        }
+        for (String prefix : INFERENCE_PROFILE_REGION_PREFIXES) {
+            if (resolved.startsWith(prefix)) {
+                return resolved.substring(prefix.length());
+            }
+        }
+        return resolved;
+    }
+
+    /**
+     * Fallback for model ids that are not listed explicitly, typically a model released after this component was built.
+     * Dispatching on the vendor/family prefix lets a new model of a known family work instead of failing, since the
+     * response format is defined by the family rather than the individual model.
+     */
+    private void setResponseTextByModelFamily(String modelId, InvokeModelResponse result, Message message) {
+        if (modelId == null) {
+            throw new IllegalStateException("Model id must be specified");
+        }
+        // families that do not produce a text completion must keep failing rather than being parsed as text
+        if (nonTextModelKind(modelId) != null) {
+            throw new IllegalArgumentException(
+                    "Model " + modelId
+                                               + " is not a text generation model and cannot be used with the invokeTextModel operation.");
+        }
+        try {
+            if (modelId.startsWith("amazon.titan-text")) {
+                setTitanText(result, message);
+            } else if (modelId.startsWith("anthropic.claude") || modelId.startsWith("amazon.nova")) {
+                setAnthropicV3Text(result, message);
+            } else if (modelId.startsWith("meta.llama")) {
+                setLlamaText(result, message);
+            } else if (modelId.startsWith("mistral.")) {
+                setMistralText(result, message);
+            } else if (modelId.startsWith("cohere.command")) {
+                setCohereText(result, message);
+            } else if (modelId.startsWith("ai21.")) {
+                setAi21Text(result, message);
+            } else {
+                throw new IllegalStateException("Unexpected model: " + modelId);
+            }
+        } catch (JacksonException e) {
+            throw new RuntimeException(e);
+        }
+    }
+
+    /**
+     * The kind of model, by its vendor/family name, when the model does not generate text, or null for a text model.
+     */
+    private static String nonTextModelKind(String modelId) {
+        if (modelId.startsWith("stability.") || modelId.contains("image-generator") || modelId.contains("-canvas")) {
+            return "an image generation model";
+        } else if (modelId.contains("embed")) {
+            return "an embedding model";
+        } else if (modelId.contains("rerank")) {
+            return "a rerank model";
+        } else if (modelId.contains("-reel") || modelId.contains("-sonic")) {
+            return "a video/speech generation model";
+        }
+        return null;
+    }
+
+    private void setTitanText(InvokeModelResponse result, Message message) {
+        message.setBody(result.body().asUtf8String());
+    }
+
+    private void setAi21Text(InvokeModelResponse result, Message message) {
+        JsonNode jsonString = MAPPER.readTree(result.body().asUtf8String());
+        // Jurassic-2 answers with completions, Jamba with choices
+        JsonNode completions = jsonString.get("completions");
+        message.setBody(completions != null ? completions : jsonString.get("choices"));
+    }
+
+    private void setAnthropicText(InvokeModelResponse result, Message message) {
+        JsonNode jsonString = MAPPER.readTree(result.body().asUtf8String());
+        setTextBody(jsonString.get("completion"), message);
+    }
+
+    private void setAnthropicV3Text(InvokeModelResponse result, Message message) {
+        JsonNode jsonString = MAPPER.readTree(result.body().asUtf8String());
+        message.setBody(jsonString);
+    }
+
+    private void setMistralText(InvokeModelResponse result, Message message) {
+        JsonNode jsonString = MAPPER.readTree(result.body().asUtf8String());
+        message.setBody(jsonString);
+    }
+
+    private void setCohereText(InvokeModelResponse result, Message message) {
+        JsonNode jsonString = MAPPER.readTree(result.body().asUtf8String());
+        setTextBody(jsonString.get("text"), message);
+    }
+
+    private void setLlamaText(InvokeModelResponse result, Message message) {
+        JsonNode jsonString = MAPPER.readTree(result.body().asUtf8String());
+        setTextBody(jsonString.get("generation"), message);
+    }
+
+    /**
+     * A text result is a String body: it does not depend on the Jackson type converters of camel-jackson3.
+     */
+    private static void setTextBody(JsonNode text, Message message) {
+        message.setBody(text == null || text.isNull() ? null : text.asString());
+    }
+
+    private void invokeTextModelStreaming(BedrockRuntimeClient bedrockRuntimeClient, Exchange exchange)
+            throws InvalidPayloadException {
+        if (getConfiguration().isPojoRequest()) {
+            Object payload = exchange.getMessage().getMandatoryBody();
+            if (payload instanceof InvokeModelWithResponseStreamRequest streamRequest) {
+                processStreamingRequest(streamRequest, exchange);
+            } else {
+                throw new IllegalArgumentException(
+                        "Streaming invoke operations require InvokeModelWithResponseStreamRequest in POJO mode");
+            }
+        } else {
+            InvokeModelWithResponseStreamRequest.Builder builder = InvokeModelWithResponseStreamRequest.builder();
+            if (ObjectHelper.isNotEmpty(exchange.getMessage().getHeader(BedrockConstants.MODEL_CONTENT_TYPE))) {
+                String contentType = exchange.getIn().getHeader(BedrockConstants.MODEL_CONTENT_TYPE, String.class);
+                builder.contentType(contentType);
+            } else {
+                throw new IllegalArgumentException("Model Content Type must be specified");
+            }
+            if (ObjectHelper.isNotEmpty(exchange.getMessage().getHeader(BedrockConstants.MODEL_ACCEPT_CONTENT_TYPE))) {
+                String acceptContentType = exchange.getIn().getHeader(BedrockConstants.MODEL_ACCEPT_CONTENT_TYPE, String.class);
+                builder.accept(acceptContentType);
+            } else {
+                throw new IllegalArgumentException("Model Accept Content Type must be specified");
+            }
+            InvokeModelWithResponseStreamRequest request = builder
+                    .body(requestBody(exchange))
+                    .modelId(getConfiguration().getModelId())
+                    .build();
+            processStreamingRequest(request, exchange);
+        }
+    }
+
+    private void invokeImageModelStreaming(BedrockRuntimeClient bedrockRuntimeClient, Exchange exchange)
+            throws InvalidPayloadException {
+        // the image and embedding models do not stream their response, so this is the same as text streaming,
+        // and an image or embedding model fails with a message that points to the operation to use
+        invokeTextModelStreaming(bedrockRuntimeClient, exchange);
+    }
+
+    private void invokeEmbeddingsModelStreaming(BedrockRuntimeClient bedrockRuntimeClient, Exchange exchange)
+            throws InvalidPayloadException {
+        // the image and embedding models do not stream their response, so this is the same as text streaming,
+        // and an image or embedding model fails with a message that points to the operation to use
+        invokeTextModelStreaming(bedrockRuntimeClient, exchange);
+    }
+
+    /**
+     * The model of a streaming request, resolved to its foundation model to choose the parser of its chunks. A model
+     * that does not generate text fails: its chunks have no text to give.
+     */
+    private static String streamingModelId(InvokeModelWithResponseStreamRequest request) {
+        String modelId = resolveFoundationModelId(request.modelId());
+        if (modelId == null) {
+            throw new IllegalArgumentException("Model id must be specified with the modelId option");
+        }
+        String kind = nonTextModelKind(modelId);
+        if (kind != null) {
+            String hint = "";
+            if (kind.startsWith("an image")) {
+                hint = " Use the invokeImageModel operation instead.";
+            } else if (kind.startsWith("an embedding")) {
+                hint = " Use the invokeEmbeddingsModel operation instead.";
+            }
+            throw new IllegalArgumentException(
+                    "Model " + modelId + " is " + kind
+                                               + " and cannot be used with the streaming operations, which give the generated text."
+                                               + hint);
+        }
+        return modelId;
+    }
+
+    private void processStreamingRequest(
+            InvokeModelWithResponseStreamRequest request,
+            Exchange exchange) {
+
+        // the request carries the model, which the endpoint may not set in POJO mode
+        String modelId = streamingModelId(request);
+        try {
+            String streamOutputMode = getConfiguration().getStreamOutputMode();
+            if (streamOutputMode == null) {
+                streamOutputMode = "complete";
+            }
+
+            // Check if mode is overridden in headers
+            if (ObjectHelper.isNotEmpty(exchange.getMessage().getHeader(BedrockConstants.STREAM_OUTPUT_MODE))) {
+                streamOutputMode = exchange.getIn().getHeader(BedrockConstants.STREAM_OUTPUT_MODE, String.class);
+            }
+
+            Message message = getMessageForResponse(exchange);
+            BedrockStreamHandler.StreamMetadata metadata = new BedrockStreamHandler.StreamMetadata();
+
+            if ("chunks".equals(streamOutputMode)) {
+                // Chunks mode - emit each chunk as separate message
+                List<String> allChunks = new ArrayList<>();
+                getEndpoint().getBedrockRuntimeAsyncClient().invokeModelWithResponseStream(
+                        request,
+                        BedrockStreamHandler.createChunksHandler(
+                                modelId,
+                                metadata,
+                                allChunks,
+                                null))
+                        .join();
+
+                message.setBody(allChunks);
+                if (getConfiguration().isIncludeStreamingMetadata()) {
+                    setStreamingMetadata(message, metadata);
+                }
+            } else {
+                // Complete mode - accumulate all chunks and return complete response
+                StringBuilder fullText = new StringBuilder();
+                getEndpoint().getBedrockRuntimeAsyncClient().invokeModelWithResponseStream(
+                        request,
+                        BedrockStreamHandler.createCompleteHandler(
+                                modelId,
+                                metadata,
+                                fullText))
+                        .join();
+
+                message.setBody(fullText.toString());
+                if (getConfiguration().isIncludeStreamingMetadata()) {
+                    setStreamingMetadata(message, metadata);
+                }
+            }
+
+        } catch (AwsServiceException ase) {
+            LOG.trace("Invoke Model Streaming command returned the error code {}", AwsExceptionUtil.errorCode(ase));
+            throw ase;
+        }
+    }
+
+    private void setStreamingMetadata(Message message, BedrockStreamHandler.StreamMetadata metadata) {
+        if (ObjectHelper.isNotEmpty(metadata.getCompletionReason())) {
+            message.setHeader(BedrockConstants.STREAMING_COMPLETION_REASON, metadata.getCompletionReason());
+        }
+        if (ObjectHelper.isNotEmpty(metadata.getTokenCount())) {
+            message.setHeader(BedrockConstants.STREAMING_TOKEN_COUNT, metadata.getTokenCount());
+        }
+        message.setHeader(BedrockConstants.STREAMING_CHUNK_COUNT, metadata.getChunkCount());
+    }
+
+    private void converse(BedrockRuntimeClient bedrockRuntimeClient, Exchange exchange) throws InvalidPayloadException {
+        ConverseRequest request;
+
+        if (getConfiguration().isPojoRequest()) {
+            Object payload = exchange.getMessage().getMandatoryBody();
+            if (payload instanceof ConverseRequest converseRequest) {
+                request = converseRequest;
+            } else {
+                throw new IllegalArgumentException(
+                        "Converse operation requires ConverseRequest in POJO mode");
+            }
+        } else {
+            // Build request from headers and body
+            ConverseRequest.Builder builder = ConverseRequest.builder();
+
+            // Set model ID
+            builder.modelId(getConfiguration().getModelId());
+
+            // Get messages from header or body
+            builder.messages(determineConverseMessages(exchange, "Converse"));
+
+            // Optional: System prompts
+            @SuppressWarnings("unchecked")
+            List<SystemContentBlock> system
+                    = exchange.getMessage().getHeader(BedrockConstants.CONVERSE_SYSTEM, List.class);
+            if (ObjectHelper.isNotEmpty(system)) {
+                builder.system(system);
+            }
+
+            // Optional: Inference configuration
+            InferenceConfiguration inferenceConfig
+                    = exchange.getMessage().getHeader(BedrockConstants.CONVERSE_INFERENCE_CONFIG, InferenceConfiguration.class);
+            if (ObjectHelper.isNotEmpty(inferenceConfig)) {
+                builder.inferenceConfig(inferenceConfig);
+            }
+
+            // Optional: Tool configuration
+            ToolConfiguration toolConfig
+                    = exchange.getMessage().getHeader(BedrockConstants.CONVERSE_TOOL_CONFIG, ToolConfiguration.class);
+            if (ObjectHelper.isNotEmpty(toolConfig)) {
+                builder.toolConfig(toolConfig);
+            }
+
+            // Optional: Additional model request fields
+            Document additionalFields = exchange.getMessage()
+                    .getHeader(BedrockConstants.CONVERSE_ADDITIONAL_MODEL_REQUEST_FIELDS,
+                            Document.class);
+            if (ObjectHelper.isNotEmpty(additionalFields)) {
+                builder.additionalModelRequestFields(additionalFields);
+            }
+
+            // Optional: Guardrail configuration
+            GuardrailConfiguration guardrailConfig
+                    = exchange.getMessage().getHeader(BedrockConstants.GUARDRAIL_CONFIG,
+                            GuardrailConfiguration.class);
+            if (ObjectHelper.isNotEmpty(guardrailConfig)) {
+                builder.guardrailConfig(guardrailConfig);
+            } else if (ObjectHelper.isNotEmpty(getConfiguration().getGuardrailIdentifier())) {
+                // Build from endpoint configuration
+                builder.guardrailConfig(GuardrailConfiguration.builder()
+                        .guardrailIdentifier(getConfiguration().getGuardrailIdentifier())
+                        .guardrailVersion(getConfiguration().getGuardrailVersion())
+                        .trace(getConfiguration().isGuardrailTrace()
+                                ? GuardrailTrace.ENABLED
+                                : GuardrailTrace.DISABLED)
+                        .build());
+            }
+
+            request = builder.build();
+        }
+
+        try {
+            ConverseResponse response = bedrockRuntimeClient.converse(request);
+
+            Message message = getMessageForResponse(exchange);
+
+            // Set the output message content as body
+            if (ObjectHelper.isNotEmpty(response.output()) && ObjectHelper.isNotEmpty(response.output().message())) {
+                software.amazon.awssdk.services.bedrockruntime.model.Message outputMessage = response.output().message();
+                message.setHeader(BedrockConstants.CONVERSE_OUTPUT_MESSAGE, outputMessage);
+
+                // Extract text content from the message
+                StringBuilder textContent = new StringBuilder();
+                for (ContentBlock content : outputMessage.content()) {
+                    if (ObjectHelper.isNotEmpty(content.text())) {
+                        textContent.append(content.text());
+                    }
+                }
+                message.setBody(textContent.toString());
+            }
+
+            // Set metadata headers
+            if (ObjectHelper.isNotEmpty(response.stopReason())) {
+                message.setHeader(BedrockConstants.CONVERSE_STOP_REASON, response.stopReason().toString());
+            }
+            if (ObjectHelper.isNotEmpty(response.usage())) {
+                message.setHeader(BedrockConstants.CONVERSE_USAGE, response.usage());
+            }
+            if (ObjectHelper.isNotEmpty(response.trace()) && ObjectHelper.isNotEmpty(response.trace().guardrail())) {
+                message.setHeader(BedrockConstants.GUARDRAIL_TRACE, response.trace().guardrail());
+            }
+
+        } catch (AwsServiceException ase) {
+            LOG.trace("Converse command returned the error code {}", AwsExceptionUtil.errorCode(ase));
+            throw ase;
+        }
+    }
+
+    /**
+     * The messages of converse and converseStream: the CamelAwsBedrockConverseMessages header, or else the body as text
+     * as one user message.
+     */
+    private static List<software.amazon.awssdk.services.bedrockruntime.model.Message> determineConverseMessages(
+            Exchange exchange, String operation) {
+        @SuppressWarnings("unchecked")
+        List<software.amazon.awssdk.services.bedrockruntime.model.Message> messages
+                = exchange.getMessage().getHeader(BedrockConstants.CONVERSE_MESSAGES, List.class);
+        if (ObjectHelper.isNotEmpty(messages)) {
+            return messages;
+        }
+        String text = exchange.getMessage().getBody(String.class);
+        if (ObjectHelper.isEmpty(text)) {
+            throw new IllegalArgumentException(
+                    operation + " operation requires messages in header " + BedrockConstants.CONVERSE_MESSAGES
+                                               + " or a text body");
+        }
+        return List.of(software.amazon.awssdk.services.bedrockruntime.model.Message.builder()
+                .role(ConversationRole.USER)
+                .content(ContentBlock.fromText(text))
+                .build());
+    }
+
+    private void converseStream(Exchange exchange) throws InvalidPayloadException {
+        ConverseStreamRequest request;
+
+        if (getConfiguration().isPojoRequest()) {
+            Object payload = exchange.getMessage().getMandatoryBody();
+            if (payload instanceof ConverseStreamRequest streamRequest) {
+                request = streamRequest;
+            } else {
+                throw new IllegalArgumentException(
+                        "ConverseStream operation requires ConverseStreamRequest in POJO mode");
+            }
+        } else {
+            // Build request from headers and body
+            ConverseStreamRequest.Builder builder = ConverseStreamRequest.builder();
+
+            // Set model ID
+            builder.modelId(getConfiguration().getModelId());
+
+            // Get messages from header or body
+            builder.messages(determineConverseMessages(exchange, "ConverseStream"));
+
+            // Optional: System prompts
+            @SuppressWarnings("unchecked")
+            List<SystemContentBlock> system
+                    = exchange.getMessage().getHeader(BedrockConstants.CONVERSE_SYSTEM, List.class);
+            if (ObjectHelper.isNotEmpty(system)) {
+                builder.system(system);
+            }
+
+            // Optional: Inference configuration
+            InferenceConfiguration inferenceConfig
+                    = exchange.getMessage().getHeader(BedrockConstants.CONVERSE_INFERENCE_CONFIG, InferenceConfiguration.class);
+            if (ObjectHelper.isNotEmpty(inferenceConfig)) {
+                builder.inferenceConfig(inferenceConfig);
+            }
+
+            // Optional: Tool configuration
+            ToolConfiguration toolConfig
+                    = exchange.getMessage().getHeader(BedrockConstants.CONVERSE_TOOL_CONFIG, ToolConfiguration.class);
+            if (ObjectHelper.isNotEmpty(toolConfig)) {
+                builder.toolConfig(toolConfig);
+            }
+
+            // Optional: Additional model request fields
+            Document additionalFields = exchange.getMessage()
+                    .getHeader(BedrockConstants.CONVERSE_ADDITIONAL_MODEL_REQUEST_FIELDS,
+                            Document.class);
+            if (ObjectHelper.isNotEmpty(additionalFields)) {
+                builder.additionalModelRequestFields(additionalFields);
+            }
+
+            // Optional: Guardrail configuration (use GuardrailStreamConfiguration for streaming)
+            Object guardrailConfig = exchange.getMessage().getHeader(BedrockConstants.GUARDRAIL_CONFIG);
+            if (guardrailConfig instanceof GuardrailStreamConfiguration streamConfig) {
+                builder.guardrailConfig(streamConfig);
+            } else if (guardrailConfig instanceof GuardrailConfiguration config) {
+                // the GuardrailConfiguration of the converse operation, as the docs name it. It has no
+                // streamProcessingMode, so Bedrock uses its default (sync): pass a GuardrailStreamConfiguration
+                // to choose async
+                builder.guardrailConfig(GuardrailStreamConfiguration.builder()
+                        .guardrailIdentifier(config.guardrailIdentifier())
+                        .guardrailVersion(config.guardrailVersion())
+                        .trace(config.traceAsString())
+                        .build());
+            } else if (ObjectHelper.isNotEmpty(getConfiguration().getGuardrailIdentifier())) {
+                // Build from endpoint configuration
+                builder.guardrailConfig(GuardrailStreamConfiguration
+                        .builder()
+                        .guardrailIdentifier(getConfiguration().getGuardrailIdentifier())
+                        .guardrailVersion(getConfiguration().getGuardrailVersion())
+                        .trace(getConfiguration().isGuardrailTrace()
+                                ? GuardrailTrace.ENABLED
+                                : GuardrailTrace.DISABLED)
+                        .streamProcessingMode(getConfiguration().isGuardrailTrace()
+                                ? GuardrailStreamProcessingMode.ASYNC
+                                : GuardrailStreamProcessingMode.SYNC)
+                        .build());
+            }
+
+            request = builder.build();
+        }
+
+        processConverseStreamingRequest(request, exchange);
+    }
+
+    private void processConverseStreamingRequest(ConverseStreamRequest request, Exchange exchange) {
+        try {
+            String streamOutputMode = getConfiguration().getStreamOutputMode();
+            if (streamOutputMode == null) {
+                streamOutputMode = "complete";
+            }
+
+            // Check if mode is overridden in headers
+            if (ObjectHelper.isNotEmpty(exchange.getMessage().getHeader(BedrockConstants.STREAM_OUTPUT_MODE))) {
+                streamOutputMode = exchange.getIn().getHeader(BedrockConstants.STREAM_OUTPUT_MODE, String.class);
+            }
+
+            Message message = getMessageForResponse(exchange);
+            ConverseStreamHandler.StreamMetadata metadata
+                    = new ConverseStreamHandler.StreamMetadata();
+
+            if ("chunks".equals(streamOutputMode)) {
+                // Chunks mode - emit each chunk as separate message
+                List<String> allChunks = new ArrayList<>();
+                getEndpoint().getBedrockRuntimeAsyncClient().converseStream(
+                        request,
+                        ConverseStreamHandler.createChunksHandler(
+                                metadata,
+                                allChunks,
+                                null))
+                        .join();
+
+                message.setBody(allChunks);
+                if (getConfiguration().isIncludeStreamingMetadata()) {
+                    setConverseStreamingMetadata(message, metadata);
+                }
+            } else {
+                // Complete mode - accumulate all chunks and return complete response
+                StringBuilder fullText = new StringBuilder();
+                getEndpoint().getBedrockRuntimeAsyncClient().converseStream(
+                        request,
+                        ConverseStreamHandler.createCompleteHandler(
+                                metadata,
+                                fullText))
+                        .join();
+
+                message.setBody(fullText.toString());
+                if (getConfiguration().isIncludeStreamingMetadata()) {
+                    setConverseStreamingMetadata(message, metadata);
+                }
+            }
+
+        } catch (AwsServiceException ase) {
+            LOG.trace("Converse Stream command returned the error code {}", AwsExceptionUtil.errorCode(ase));
+            throw ase;
+        }
+    }
+
+    private void setConverseStreamingMetadata(
+            Message message,
+            ConverseStreamHandler.StreamMetadata metadata) {
+        if (ObjectHelper.isNotEmpty(metadata.getStopReason())) {
+            message.setHeader(BedrockConstants.CONVERSE_STOP_REASON, metadata.getStopReason());
+        }
+        if (ObjectHelper.isNotEmpty(metadata.getUsage())) {
+            message.setHeader(BedrockConstants.CONVERSE_USAGE, metadata.getUsage());
+        }
+        if (ObjectHelper.isNotEmpty(metadata.getGuardrailTrace())) {
+            message.setHeader(BedrockConstants.GUARDRAIL_TRACE, metadata.getGuardrailTrace());
+        }
+        message.setHeader(BedrockConstants.STREAMING_CHUNK_COUNT, metadata.getChunkCount());
+    }
+
+    private void applyGuardrail(BedrockRuntimeClient bedrockRuntimeClient, Exchange exchange) throws InvalidPayloadException {
+        ApplyGuardrailRequest request;
+
+        if (getConfiguration().isPojoRequest()) {
+            Object payload = exchange.getMessage().getMandatoryBody();
+            if (payload instanceof ApplyGuardrailRequest guardrailRequest) {
+                request = guardrailRequest;
+            } else {
+                throw new IllegalArgumentException(
+                        "ApplyGuardrail operation requires ApplyGuardrailRequest in POJO mode");
+            }
+        } else {
+            // Build request from headers and configuration
+            ApplyGuardrailRequest.Builder builder
+                    = ApplyGuardrailRequest.builder();
+
+            // Guardrail identifier from header or configuration
+            String guardrailIdentifier
+                    = exchange.getMessage().getHeader(BedrockConstants.GUARDRAIL_IDENTIFIER, String.class);
+            if (ObjectHelper.isEmpty(guardrailIdentifier)) {
+                guardrailIdentifier = getConfiguration().getGuardrailIdentifier();
+            }
+            if (ObjectHelper.isEmpty(guardrailIdentifier)) {
+                throw new IllegalArgumentException(
+                        "ApplyGuardrail operation requires guardrailIdentifier in configuration or header");
+            }
+            builder.guardrailIdentifier(guardrailIdentifier);
+
+            // Guardrail version from configuration
+            builder.guardrailVersion(getConfiguration().getGuardrailVersion());
+
+            // Source (INPUT or OUTPUT)
+            String source = exchange.getMessage().getHeader(BedrockConstants.GUARDRAIL_SOURCE, String.class);
+            if (ObjectHelper.isEmpty(source)) {
+                source = "INPUT"; // Default to INPUT
+            }
+            builder.source(GuardrailContentSource.fromValue(source));
+
+            // Content blocks from header, or the text of the body
+            @SuppressWarnings("unchecked")
+            List<GuardrailContentBlock> content
+                    = exchange.getMessage().getHeader(BedrockConstants.GUARDRAIL_CONTENT, List.class);
+            if (ObjectHelper.isNotEmpty(content)) {
+                builder.content(content);
+            } else {
+                String text = exchange.getMessage().getBody(String.class);
+                if (ObjectHelper.isEmpty(text)) {
+                    throw new IllegalArgumentException(
+                            "ApplyGuardrail operation requires content in header " + BedrockConstants.GUARDRAIL_CONTENT
+                                                       + " or a text body");
+                }
+                builder.content(GuardrailContentBlock.fromText(GuardrailTextBlock.builder().text(text).build()));
+            }
+
+            request = builder.build();
+        }
+
+        try {
+            ApplyGuardrailResponse response
+                    = bedrockRuntimeClient.applyGuardrail(request);
+
+            Message message = getMessageForResponse(exchange);
+
+            // Set action as body
+            message.setBody(response.action().toString());
+
+            // Set output content and assessments as headers
+            if (response.hasOutputs()) {
+                message.setHeader(BedrockConstants.GUARDRAIL_OUTPUT, response.outputs());
+            }
+            if (response.hasAssessments()) {
+                // Store assessments as a header for detailed analysis
+                message.setHeader(BedrockConstants.GUARDRAIL_ASSESSMENTS, response.assessments());
+            }
+            if (ObjectHelper.isNotEmpty(response.usage())) {
+                message.setHeader(BedrockConstants.GUARDRAIL_USAGE, response.usage());
+            }
+
+        } catch (AwsServiceException ase) {
+            LOG.trace("ApplyGuardrail command returned the error code {}", AwsExceptionUtil.errorCode(ase));
+            throw ase;
+        }
+    }
+
+    public static Message getMessageForResponse(final Exchange exchange) {
+        return exchange.getMessage();
+    }
+
+}

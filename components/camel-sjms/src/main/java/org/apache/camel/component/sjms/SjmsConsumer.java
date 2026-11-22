@@ -1,0 +1,252 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.camel.component.sjms;
+
+import java.util.concurrent.locks.Lock;
+import java.util.concurrent.locks.ReentrantLock;
+
+import jakarta.jms.Connection;
+
+import org.apache.camel.Endpoint;
+import org.apache.camel.FailedToCreateConsumerException;
+import org.apache.camel.Processor;
+import org.apache.camel.StatefulService;
+import org.apache.camel.Suspendable;
+import org.apache.camel.support.DefaultConsumer;
+import org.apache.camel.support.service.ServiceHelper;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import static org.apache.camel.component.sjms.SjmsHelper.closeConnection;
+
+public class SjmsConsumer extends DefaultConsumer implements Suspendable {
+
+    private static final Logger LOG = LoggerFactory.getLogger(SjmsConsumer.class);
+
+    private volatile boolean initialized;
+    // serializes the start and the stop of the listener container by doStart and the asynchronous start and stop tasks.
+    // A synchronous start (doStart, under the lock of the consumer) may therefore wait for an asynchronous stop task
+    // that is still in a slow container.stop()
+    private final Lock listenerContainerLock = new ReentrantLock();
+    private final MessageListenerContainer listenerContainer;
+
+    public SjmsConsumer(Endpoint endpoint, Processor processor, MessageListenerContainer listenerContainer) {
+        super(endpoint, processor);
+        this.listenerContainer = listenerContainer;
+    }
+
+    @Override
+    public SjmsEndpoint getEndpoint() {
+        return (SjmsEndpoint) super.getEndpoint();
+    }
+
+    @Override
+    protected void doStart() throws Exception {
+        super.doStart();
+
+        if (getEndpoint().isAsyncStartListener()) {
+            getEndpoint().getAsyncStartStopExecutorService().submit(new Runnable() {
+                @Override
+                public void run() {
+                    try {
+                        startListenerContainerAsync();
+                    } catch (Exception e) {
+                        LOG.warn("Error starting listener container on destination: {}. This exception will be ignored.",
+                                getDestinationName(), e);
+                    }
+                }
+
+                @Override
+                public String toString() {
+                    return "AsyncStartListenerTask[" + getDestinationName() + "]";
+                }
+            });
+        } else {
+            // after an asynchronous stop task that is still stopping the listener container
+            listenerContainerLock.lock();
+            try {
+                prepareAndStartListenerContainer();
+            } finally {
+                listenerContainerLock.unlock();
+            }
+        }
+
+        // mark as initialized for the first time
+        initialized = true;
+    }
+
+    @Override
+    protected void doStop() throws Exception {
+        if (listenerContainer != null) {
+
+            if (getEndpoint().isAsyncStopListener()) {
+                getEndpoint().getAsyncStartStopExecutorService().submit(new Runnable() {
+                    @Override
+                    public void run() {
+                        try {
+                            stopListenerContainerAsync();
+                        } catch (Exception e) {
+                            LOG.warn("Error stopping listener container on destination: {}. This exception will be ignored.",
+                                    getDestinationName(), e);
+                        }
+                    }
+
+                    @Override
+                    public String toString() {
+                        return "AsyncStopListenerTask[" + getDestinationName() + "]";
+                    }
+                });
+            } else {
+                stopAndDestroyListenerContainer();
+            }
+        }
+
+        super.doStop();
+    }
+
+    /**
+     * Run by the asynchronous start task, which may run after this consumer was stopped (and started again).
+     */
+    private void startListenerContainerAsync() {
+        // startListenerContainer takes the lock of the consumer while this holds listenerContainerLock. doStart takes
+        // them in the other order, but only without asyncStartListener, so never next to this task
+        listenerContainerLock.lock();
+        try {
+            if (!isRunAllowed()) {
+                LOG.debug("Consumer stopped before its listener container on destination: {} was started. Not starting it.",
+                        getDestinationName());
+                return;
+            }
+            prepareAndStartListenerContainer();
+            if (!isRunAllowed()) {
+                // stopped while the listener container was starting (the stop found nothing to stop yet)
+                LOG.debug("Consumer stopped while its listener container on destination: {} was starting. Stopping it.",
+                        getDestinationName());
+                stopAndDestroyListenerContainer();
+            }
+        } finally {
+            listenerContainerLock.unlock();
+        }
+    }
+
+    /**
+     * Run by the asynchronous stop task, which may run after this consumer was started again.
+     */
+    private void stopListenerContainerAsync() {
+        // not under the lock of the consumer, so that a route stop does not wait for this task
+        listenerContainerLock.lock();
+        try {
+            if (isRunAllowed()) {
+                LOG.debug("Consumer started again before its listener container on destination: {} was stopped."
+                          + " Keeping it.",
+                        getDestinationName());
+                return;
+            }
+            stopAndDestroyListenerContainer();
+        } finally {
+            listenerContainerLock.unlock();
+        }
+    }
+
+    @Override
+    protected void doSuspend() throws Exception {
+        // stop receiving messages while suspended. A listener container that is not started yet (autoStartup=false,
+        // or asyncStartListener=true and the start task did not run yet) is left alone: startListenerContainer
+        // suspends it when it starts it
+        if (listenerContainer instanceof StatefulService container && container.isStarted()) {
+            container.suspend();
+        }
+    }
+
+    @Override
+    protected void doResume() throws Exception {
+        if (listenerContainer instanceof StatefulService container && container.isSuspended()) {
+            container.resume();
+        }
+    }
+
+    public MessageListenerContainer getListenerContainer() {
+        return listenerContainer;
+    }
+
+    protected void prepareAndStartListenerContainer() {
+        listenerContainer.afterPropertiesConfigured(getEndpoint().getCamelContext());
+
+        // only start listener if auto start is enabled or we are explicit invoking start later
+        if (initialized || getEndpoint().isAutoStartup()) {
+            // should we pre test connections before starting?
+            if (getEndpoint().isTestConnectionOnStartup()) {
+                testConnectionOnStartup();
+            }
+            startListenerContainer();
+        }
+    }
+
+    /**
+     * Pre tests the connection before starting the listening.
+     * <p/>
+     * In case of connection failure the exception is thrown which prevents Camel from starting.
+     *
+     * @throws FailedToCreateConsumerException is thrown if testing the connection failed
+     */
+    protected void testConnectionOnStartup() throws FailedToCreateConsumerException {
+        try {
+            LOG.debug("Testing JMS Connection on startup for destination: {}", getDestinationName());
+            Connection con = listenerContainer.getConnectionFactory().createConnection();
+            closeConnection(con);
+            LOG.debug("Successfully tested JMS Connection on startup for destination: {}", getDestinationName());
+        } catch (Exception e) {
+            String msg = "Cannot get JMS Connection on startup for destination " + getDestinationName();
+            throw new FailedToCreateConsumerException(getEndpoint(), msg, e);
+        }
+    }
+
+    private String getDestinationName() {
+        return getEndpoint().getDestinationName();
+    }
+
+    /**
+     * Starts the JMS listener container
+     * <p/>
+     * Can be used to start this consumer later if it was configured to not auto startup.
+     */
+    public void startListenerContainer() {
+        LOG.trace("Starting listener container {} on destination {}", listenerContainer, getDestinationName());
+        ServiceHelper.startService(listenerContainer);
+        LOG.debug("Started listener container {} on destination {}", listenerContainer, getDestinationName());
+        // the consumer may have been suspended while its listener container was not started (doSuspend left it alone)
+        lock.lock();
+        try {
+            if (isSuspendingOrSuspended() && listenerContainer instanceof StatefulService container
+                    && container.isStarted()) {
+                LOG.debug("Suspending listener container {} on destination {}, as the consumer is suspended",
+                        listenerContainer, getDestinationName());
+                container.suspend();
+            }
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    protected void stopAndDestroyListenerContainer() {
+        if (listenerContainer != null) {
+            ServiceHelper.stopAndShutdownService(listenerContainer);
+        }
+        initialized = false;
+    }
+
+}

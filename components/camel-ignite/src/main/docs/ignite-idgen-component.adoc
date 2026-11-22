@@ -1,0 +1,55 @@
+= Ignite ID Generator Component
+:doctitle: Ignite ID Generator
+:shortname: ignite-idgen
+:artifactid: camel-ignite
+:description: Interact with Ignite Atomic Sequences and ID Generators .
+:since: 2.17
+:supportlevel: Stable
+:tabs-sync-option:
+:component-header: Only producer is supported
+//Manually maintained attributes
+:group: Ignite
+
+*Since Camel {since}*
+
+*{component-header}*
+
+The Ignite ID Generator endpoint is one of camel-ignite endpoints that allow you to interact with https://apacheignite.readme.io/docs/id-generator[Ignite Atomic Sequences and ID Generators].
+
+`ADD_AND_GET` and `GET_AND_ADD` add the number in the body to the sequence, and fail without a body.
+The other operations do not use the body.
+The operation is the `operation` option, or the `CamelIgniteIdGenOperation` header; without either, the producer fails.
+
+// component options: START
+include::partial$component-configure-options.adoc[]
+include::partial$component-endpoint-options.adoc[]
+include::partial$component-endpoint-headers.adoc[]
+// component options: END
+
+== Usage
+
+The component needs an Ignite node: xref:ignite-summary.adoc[Ignite] describes the ways to give it one.
+A node of its own with the default configuration takes one line in `application.properties`.
+On Java 17 and later, Ignite also needs the `--add-opens` JVM options that its documentation lists.
+
+[source,properties]
+----
+camel.component.ignite-idgen.ignite-configuration = #class:org.apache.ignite.configuration.IgniteConfiguration
+----
+
+Each `INCREMENT_AND_GET` returns the next number of the `orderIds` sequence, which starts after its `initialValue`:
+
+[source,yaml]
+----
+- route:
+    from:
+      uri: direct:nextOrderId
+      steps:
+        - to:
+            uri: ignite-idgen:orderIds
+            parameters:
+              operation: INCREMENT_AND_GET
+              initialValue: 1000
+        - log:
+            message: "Order id: ${body}"
+----

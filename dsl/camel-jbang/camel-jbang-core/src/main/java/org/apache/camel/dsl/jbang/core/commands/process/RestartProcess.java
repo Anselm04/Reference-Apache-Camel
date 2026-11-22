@@ -1,0 +1,208 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.camel.dsl.jbang.core.commands.process;
+
+import java.io.File;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.ArrayList;
+import java.util.List;
+
+import org.aesh.command.CommandDefinition;
+import org.aesh.command.option.Argument;
+import org.aesh.command.option.Option;
+import org.apache.camel.dsl.jbang.core.common.BackgroundLog;
+import org.apache.camel.dsl.jbang.core.common.CliException;
+import org.apache.camel.dsl.jbang.core.common.CommandLineHelper;
+import org.apache.camel.dsl.jbang.core.common.ProcessFinder;
+import org.apache.camel.dsl.jbang.core.common.ProcessFinder.CamelProcess;
+import org.apache.camel.dsl.jbang.core.common.ProcessHelper;
+import org.apache.camel.dsl.jbang.core.common.TimeoutConverter;
+import org.apache.camel.dsl.jbang.run.common.PathUtils;
+import org.apache.camel.util.TimeUtils;
+import org.apache.camel.util.json.JsonObject;
+
+@CommandDefinition(name = "restart", description = "Restarts running Camel integrations (stop + re-launch)",
+                   generateHelp = true,
+                   footer = {
+                           "Examples:",
+                           "  camel restart hello",
+                           "  camel restart 12345" })
+public class RestartProcess extends ProcessBaseCommand {
+
+    /**
+     * The phase of a Camel that has started (see the status file).
+     */
+    private static final int STARTED = 5;
+
+    @Argument(paramLabel = "name", required = true, description = "Name or pid of running Camel integration")
+    String name;
+
+    @Option(name = "timeout",
+            description = "How long to wait for the integration to stop, and again to start, in millis or as a"
+                          + " duration such as 30s",
+            defaultValue = "60000", converter = TimeoutConverter.class)
+    long timeout = 60000;
+
+    @Override
+    public Integer doCall() throws Exception {
+        CamelProcess process = ProcessFinder.requireOne(name);
+        long pid = process.pid();
+        ProcessHandle ph = ProcessHandle.of(pid)
+                .orElseThrow(() -> CliException.notFound("No running Camel integration matches: " + name));
+        String displayName = process.name();
+
+        // capture the command line before stopping: all of it, also where the JDK cuts a long one short (Linux)
+        List<String> cmd = ProcessHelper.commandLine(ph);
+        if (cmd == null) {
+            // a command line in one text, unless it was cut short: relaunched, its classpath would be broken
+            String commandLine = ph.info().commandLine().orElse("");
+            cmd = ProcessHelper.isCut(commandLine) ? List.of() : parseCommandLine(commandLine);
+        }
+
+        // get working directory from status file
+        String directory = null;
+        JsonObject runtime = (JsonObject) process.status().get("runtime");
+        if (runtime != null) {
+            directory = runtime.getString("directory");
+        }
+
+        if (cmd.isEmpty()) {
+            throw CliException.failure("Cannot restart: command line not available for PID " + pid);
+        }
+
+        stop(ph, displayName);
+        BackgroundLog.remove(pid);
+
+        // re-launch, with its output in a log file that stays (the path is printed)
+        ProcessBuilder pb = new ProcessBuilder(cmd);
+        if (directory != null) {
+            pb.directory(new File(directory));
+        }
+        BackgroundLog.Started run = BackgroundLog.start(pb);
+        Process started = run.process();
+        Path log = run.log();
+
+        awaitStarted(started, displayName, log);
+        printer().println("Restarted Camel integration: " + displayName + " (PID: " + started.pid() + ")");
+        printer().println("Log: " + BackgroundLog.logOf(started.pid(), log));
+        return 0;
+    }
+
+    /**
+     * Stops the integration like camel stop does, and terminates it when it does not stop in time: the old one must be
+     * gone before the new one starts.
+     */
+    private void stop(ProcessHandle ph, String displayName) {
+        long pid = ph.pid();
+        printer().println("Stopping Camel integration: " + displayName + " (PID: " + pid + ")");
+        Path pidFile = CommandLineHelper.getCamelDir().resolve(Long.toString(pid));
+        if (Files.exists(pidFile)) {
+            PathUtils.deleteFile(pidFile);
+        } else {
+            ph.destroy();
+        }
+        if (StopProcess.awaitExit(pid, System.currentTimeMillis() + timeout)) {
+            return;
+        }
+        printer().printWarn("Camel integration (PID: " + pid + ") did not stop within "
+                            + TimeUtils.printDuration(timeout) + "; terminating it");
+        ph.destroy();
+        if (StopProcess.awaitExit(pid, System.currentTimeMillis() + 10000)) {
+            return;
+        }
+        ph.destroyForcibly();
+        if (!StopProcess.awaitExit(pid, System.currentTimeMillis() + 5000)) {
+            throw CliException.timeout("Camel integration (PID: " + pid + ") did not stop, so it is not restarted");
+        }
+    }
+
+    /**
+     * Waits until the new integration has started.
+     *
+     * @throws CliException with exit code 1 when it stopped right away, or 124 when it did not start in time (it is
+     *                      left running)
+     */
+    private void awaitStarted(Process started, String displayName, Path log) throws Exception {
+        long deadline = System.currentTimeMillis() + timeout;
+        while (System.currentTimeMillis() < deadline) {
+            if (!started.isAlive()) {
+                printer().printDiagnostic(BackgroundLog.tail(log, 20));
+                throw CliException.failure("Camel integration " + displayName + " stopped right after the restart (exit code "
+                                           + started.exitValue() + "); the log is in " + log);
+            }
+            JsonObject status = loadStatus(started.pid());
+            if (status != null && status.get("context") instanceof JsonObject context
+                    && context.getIntegerOrDefault("phase", 0) == STARTED) {
+                return;
+            }
+            Thread.sleep(ProcessFinder.STATUS_POLL_INTERVAL);
+        }
+        throw CliException.timeout("Camel integration " + displayName + " (PID: " + started.pid() + ") did not start within "
+                                   + TimeUtils.printDuration(timeout) + "; it is still starting, the log is in "
+                                   + log);
+    }
+
+    /**
+     * The arguments of a command line in one text (as Windows has it): a space separates them, except between quotes,
+     * and a backslash is a character, except in front of a quote, where 2n backslashes are n backslashes and the quote
+     * starts or ends a quoted part, and 2n + 1 backslashes are n backslashes and a quote character.
+     */
+    static List<String> parseCommandLine(String commandLine) {
+        List<String> tokens = new ArrayList<>();
+        StringBuilder current = new StringBuilder();
+        boolean inQuotes = false;
+        int length = commandLine.length();
+
+        for (int i = 0; i < length; i++) {
+            char c = commandLine.charAt(i);
+            if (c == '\\') {
+                int backslashes = 1;
+                while (i + backslashes < length && commandLine.charAt(i + backslashes) == '\\') {
+                    backslashes++;
+                }
+                if (i + backslashes < length && commandLine.charAt(i + backslashes) == '"') {
+                    current.append("\\".repeat(backslashes / 2));
+                    if (backslashes % 2 == 1) {
+                        current.append('"');
+                    } else {
+                        inQuotes = !inQuotes;
+                    }
+                    // the quote too
+                    i += backslashes;
+                } else {
+                    // such as in a Windows path
+                    current.append("\\".repeat(backslashes));
+                    i += backslashes - 1;
+                }
+            } else if (c == '"') {
+                inQuotes = !inQuotes;
+            } else if (c == ' ' && !inQuotes) {
+                if (!current.isEmpty()) {
+                    tokens.add(current.toString());
+                    current.setLength(0);
+                }
+            } else {
+                current.append(c);
+            }
+        }
+        if (!current.isEmpty()) {
+            tokens.add(current.toString());
+        }
+        return tokens;
+    }
+}

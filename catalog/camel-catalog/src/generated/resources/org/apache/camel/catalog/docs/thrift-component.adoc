@@ -1,0 +1,208 @@
+= Thrift Component
+:doctitle: Thrift
+:shortname: thrift
+:artifactid: camel-thrift
+:description: Call and expose remote procedures (RPC) with Apache Thrift data format and serialization mechanism.
+:since: 2.20
+:supportlevel: Stable
+:tabs-sync-option:
+:component-header: Both producer and consumer are supported
+
+*Since Camel {since}*
+
+*{component-header}*
+
+The Thrift component allows you to call or expose Remote Procedure Call (RPC) services
+using https://thrift.apache.org/[Apache Thrift] binary communication protocol and serialization mechanism.
+
+Maven users will need to add the following dependency to their `pom.xml`
+for this component:
+
+[source,xml]
+----
+<dependency>
+    <groupId>org.apache.camel</groupId>
+    <artifactId>camel-thrift</artifactId>
+    <version>x.x.x</version>
+    <!-- use the same version as your Camel core version -->
+</dependency>
+----
+
+== URI format
+
+----
+thrift://service[?options]
+----
+
+
+// component options: START
+include::partial$component-configure-options.adoc[]
+include::partial$component-endpoint-options.adoc[]
+include::partial$component-endpoint-headers.adoc[]
+// component options: END
+
+== Thrift method parameters mapping
+
+Parameters in the called procedure must be passed as a list of objects inside the message body. The primitives are converted from the objects on the fly.
+To correctly find the corresponding method, all types must be transmitted regardless of the values. Please see an example below, how to pass
+different parameters to the method with the Camel body:
+
+._Java-only: passing different parameter types in the Thrift method request body_
+[source,java]
+----
+List requestBody = new ArrayList();
+
+requestBody.add((boolean)true);
+requestBody.add((byte)THRIFT_TEST_NUM1);
+requestBody.add((short)THRIFT_TEST_NUM1);
+requestBody.add((int)THRIFT_TEST_NUM1);
+requestBody.add((long)THRIFT_TEST_NUM1);
+requestBody.add((double)THRIFT_TEST_NUM1);
+requestBody.add("empty"); // String parameter
+requestBody.add(ByteBuffer.allocate(10)); // binary parameter
+requestBody.add(new Work(THRIFT_TEST_NUM1, THRIFT_TEST_NUM2, Operation.MULTIPLY)); // Struct parameter
+requestBody.add(new ArrayList<Integer>()); // list parameter
+requestBody.add(new HashSet<String>()); // set parameter
+requestBody.add(new HashMap<String, Long>()); // map parameter 
+
+Object responseBody = template.requestBody("direct:thrift-alltypes", requestBody);
+----
+
+A method with one argument can also take that argument as the body itself, without a list, and it is mapped the same way:
+an `Integer` body calls a method with one `i32` argument. A method whose one argument is a list still needs it wrapped in a list.
+
+Incoming parameters in the service consumer will also be passed to the message body as a list of objects.
+
+The body at the end of the consumer route is the result of the method, converted to its return type. For a method with a
+return type, no body, or a body that does not convert to that type, fails the call: the client gets a `TApplicationException`
+instead of a null result, or `0` for a numeric result. The body is ignored for a `void` method.
+
+== Examples
+
+Below is a simple synchronous method invoke with host and port parameters
+
+[tabs]
+====
+Java::
++
+[source,java]
+----
+from("direct:thrift-calculate")
+    .to("thrift://localhost:1101/org.apache.camel.component.thrift.generated.Calculator?method=calculate&synchronous=true");
+----
+
+XML::
++
+[source,xml]
+----
+<route>
+  <from uri="direct:thrift-calculate"/>
+  <to uri="thrift://localhost:1101/org.apache.camel.component.thrift.generated.Calculator?method=calculate&amp;synchronous=true"/>
+</route>
+----
+
+YAML::
++
+[source,yaml]
+----
+- route:
+    from:
+      uri: direct:thrift-calculate
+      steps:
+        - to:
+            uri: thrift://localhost:1101/org.apache.camel.component.thrift.generated.Calculator
+            parameters:
+              method: calculate
+              synchronous: true
+----
+====
+
+Thrift service consumer with asynchronous communication
+
+[tabs]
+====
+Java::
++
+[source,java]
+----
+from("thrift://localhost:1101/org.apache.camel.component.thrift.generated.Calculator")
+    .to("direct:thrift-service");
+----
+
+XML::
++
+[source,xml]
+----
+<route>
+  <from uri="thrift://localhost:1101/org.apache.camel.component.thrift.generated.Calculator"/>
+  <to uri="direct:thrift-service"/>
+</route>
+----
+
+YAML::
++
+[source,yaml]
+----
+- route:
+    from:
+      uri: thrift://localhost:1101/org.apache.camel.component.thrift.generated.Calculator
+      steps:
+        - to:
+            uri: direct:thrift-service
+----
+====
+
+It's possible to automate Java code generation for .thrift files using *thrift-maven-plugin*, but before start the thrift compiler binary distribution for your operating system must be present on the running host.
+
+== SSL/TLS
+
+Set `negotiationType=SSL` and configure `sslParameters` to use SSL/TLS. SSL/TLS requires the synchronous communication
+mode (`synchronous=true`), on the producer and on the consumer: an endpoint that combines `negotiationType=SSL` with
+`synchronous=false` (the default) fails to start. The `SASL` negotiation type is not supported, and an endpoint
+configured with it fails to start.
+
+The consumer creates its server socket from the SSL context of `sslParameters`, so all of its settings apply: the key
+managers (required, with the `keyPassword` of a key protected by a password), the trust managers, the secure socket
+protocols and cipher suites, and the server parameters. For example, require a client certificate with `serverParameters.clientAuthentication=REQUIRE` and trust managers that
+trust the certificates of the clients:
+
+[source,java]
+----
+KeyStoreParameters keyStore = new KeyStoreParameters();
+keyStore.setResource("file:server-keystore.jks");
+keyStore.setPassword("changeit");
+KeyManagersParameters keyManagers = new KeyManagersParameters();
+keyManagers.setKeyStore(keyStore);
+keyManagers.setKeyPassword("changeit");
+
+KeyStoreParameters trustStore = new KeyStoreParameters();
+trustStore.setResource("file:client-truststore.jks");
+trustStore.setPassword("changeit");
+TrustManagersParameters trustManagers = new TrustManagersParameters();
+trustManagers.setKeyStore(trustStore);
+
+SSLContextServerParameters serverParameters = new SSLContextServerParameters();
+serverParameters.setClientAuthentication("REQUIRE");
+
+SSLContextParameters sslParameters = new SSLContextParameters();
+sslParameters.setKeyManagers(keyManagers);
+sslParameters.setTrustManagers(trustManagers);
+sslParameters.setServerParameters(serverParameters);
+context.getRegistry().bind("sslParams", sslParameters);
+
+from("thrift://0.0.0.0:1101/org.apache.camel.component.thrift.generated.Calculator?negotiationType=SSL&sslParameters=#sslParams&synchronous=true")
+    .to("direct:thrift-service");
+----
+
+== Errors sent to the client
+
+When the exchange of a consumer fails, the Thrift client receives an error. An exception that the Thrift method
+declares in the IDL (such as `throws (1:InvalidOperation ouch)`) belongs to the service contract and is sent as it is.
+Any other exception is sent as a generic `TApplicationException` of type `INTERNAL_ERROR`, without the message of the
+exception, as long as the `muteException` option is enabled (the default). Set `muteException=false` to send the
+message of the exception to the client.
+
+== For more information, see these resources
+
+https://github.com/apache/thrift/[Thrift project GitHub]
+https://thrift.apache.org/tutorial/java [Apache Thrift Java tutorial]

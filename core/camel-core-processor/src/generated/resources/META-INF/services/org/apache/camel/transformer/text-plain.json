@@ -1,0 +1,34 @@
+{
+  "transformer": {
+    "kind": "transformer",
+    "name": "text-plain",
+    "title": "Text Plain",
+    "deprecated": false,
+    "javaType": "org.apache.camel.processor.transformer.StringDataTypeTransformer",
+    "groupId": "org.apache.camel",
+    "artifactId": "camel-core-processor",
+    "version": "4.24.0-SNAPSHOT"
+  },
+  "bodyTypes": {
+    "transformerIn": {
+      "carriers": [
+        "text",
+        "bytes",
+        "stream",
+        "file",
+        "value",
+        "null"
+      ],
+      "description": "Text, bytes, a stream, a file or a value such as a number, and a null body stays null; a Map, a List or an object would become its toString()"
+    },
+    "transformerOut": {
+      "carriers": [
+        "text",
+        "null"
+      ],
+      "javaType": "java.lang.String",
+      "description": "A String, or null for a null body"
+    }
+  }
+}
+

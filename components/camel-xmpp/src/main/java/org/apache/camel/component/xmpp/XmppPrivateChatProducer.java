@@ -1,0 +1,158 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.camel.component.xmpp;
+
+import java.io.IOException;
+
+import org.apache.camel.Exchange;
+import org.apache.camel.RuntimeCamelException;
+import org.apache.camel.RuntimeExchangeException;
+import org.apache.camel.support.DefaultProducer;
+import org.apache.camel.util.StringHelper;
+import org.jivesoftware.smack.SmackException;
+import org.jivesoftware.smack.XMPPException;
+import org.jivesoftware.smack.chat2.Chat;
+import org.jivesoftware.smack.chat2.ChatManager;
+import org.jivesoftware.smack.packet.Message;
+import org.jivesoftware.smack.tcp.XMPPTCPConnection;
+import org.jxmpp.jid.impl.JidCreate;
+import org.jxmpp.stringprep.XmppStringprepException;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+public class XmppPrivateChatProducer extends DefaultProducer {
+    private static final Logger LOG = LoggerFactory.getLogger(XmppPrivateChatProducer.class);
+    private final XmppEndpoint endpoint;
+    private XMPPTCPConnection connection;
+    private final String participant;
+
+    public XmppPrivateChatProducer(XmppEndpoint endpoint, String participant) {
+        super(endpoint);
+        this.endpoint = endpoint;
+        this.participant = participant;
+        StringHelper.notEmpty(participant, "participant");
+
+        LOG.debug("Creating XmppPrivateChatProducer to participant {}", participant);
+    }
+
+    @Override
+    public void process(Exchange exchange) {
+
+        // make sure we are connected
+        try {
+            if (connection == null) {
+                connection = endpoint.acquireConnection(this);
+            }
+
+            // connect and log in again when needed: another user of the account's connection, or Smack's
+            // ReconnectionManager, can have connected it again without having logged it in yet, and the server does
+            // not deliver what is sent before the login
+            this.reconnect();
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new RuntimeCamelException("Interrupted while connecting to XMPP server.", e);
+        } catch (Exception e) {
+            throw new RuntimeCamelException("Could not connect to XMPP server.", e);
+        }
+
+        String participant = endpoint.getParticipant();
+        String thread = endpoint.getChatId();
+        if (participant == null) {
+            participant = getParticipant();
+        } else {
+            thread = "Chat:" + participant + ":" + endpoint.getUser();
+        }
+
+        Message message = new Message();
+        try {
+            message.setTo(JidCreate.from(participant));
+            message.setThread(thread);
+            message.setType(Message.Type.normal);
+
+            ChatManager chatManager = ChatManager.getInstanceFor(connection);
+            Chat chat = getOrCreateChat(chatManager, participant);
+
+            endpoint.getBinding().populateXmppMessage(message, exchange);
+
+            if (LOG.isDebugEnabled()) {
+                LOG.debug("Sending XMPP message to {} from {} : {}", participant, endpoint.getUser(), message.getBody());
+            }
+            chat.send(message);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new RuntimeExchangeException(
+                    "Interrupted while sending XMPP message to " + participant + " from " + endpoint.getUser() + " : " + message
+                                               + " to: " + XmppEndpoint.getConnectionMessage(connection),
+                    exchange, e);
+        } catch (Exception e) {
+            throw new RuntimeExchangeException(
+                    "Could not send XMPP message to " + participant + " from " + endpoint.getUser() + " : " + message
+                                               + " to: " + XmppEndpoint.getConnectionMessage(connection),
+                    exchange, e);
+        }
+    }
+
+    private Chat getOrCreateChat(ChatManager chatManager, final String participant) throws XmppStringprepException {
+        // this starts a new chat or retrieves the pre-existing one in a threadsafe manner
+        return chatManager.chatWith(JidCreate.entityBareFrom(participant));
+    }
+
+    private void reconnect() throws InterruptedException, IOException, SmackException, XMPPException {
+        lock.lock();
+        try {
+            // the connection is shared by the consumers and producers of the account
+            endpoint.reconnect(connection);
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    @Override
+    protected void doStart() throws Exception {
+        if (connection == null) {
+            try {
+                connection = endpoint.acquireConnection(this);
+            } catch (SmackException e) {
+                if (endpoint.isTestConnectionOnStartup()) {
+                    throw new RuntimeCamelException(
+                            "Could not establish connection to XMPP server: " + endpoint.getConnectionDescription(), e);
+                } else {
+                    LOG.warn("Could not connect to XMPP server: {} Producer will attempt lazy connection when needed.",
+                            e.getMessage());
+                }
+            }
+        }
+        super.doStart();
+    }
+
+    @Override
+    protected void doStop() throws Exception {
+        if (connection != null) {
+            // the connection is shared with the other consumers and producers of the account
+            endpoint.releaseConnection(this);
+        }
+        connection = null;
+        super.doStop();
+    }
+
+    // Properties
+    // -------------------------------------------------------------------------
+
+    public String getParticipant() {
+        return participant;
+    }
+}

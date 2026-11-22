@@ -1,0 +1,385 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.camel.component.netty.http;
+
+import java.net.URI;
+import java.util.Map;
+
+import org.apache.camel.Category;
+import org.apache.camel.Consumer;
+import org.apache.camel.PollingConsumer;
+import org.apache.camel.Processor;
+import org.apache.camel.Producer;
+import org.apache.camel.component.netty.NettyConfiguration;
+import org.apache.camel.component.netty.NettyEndpoint;
+import org.apache.camel.component.netty.NettyServerBootstrapConfiguration;
+import org.apache.camel.http.base.OAuthHttpSecuritySupport;
+import org.apache.camel.http.base.OAuthProfileAwareHttpEndpoint;
+import org.apache.camel.http.base.cookie.CookieHandler;
+import org.apache.camel.spi.BodyType;
+import org.apache.camel.spi.BodyType.Carrier;
+import org.apache.camel.spi.BodyTypes;
+import org.apache.camel.spi.HeaderFilterStrategy;
+import org.apache.camel.spi.HeaderFilterStrategyAware;
+import org.apache.camel.spi.Metadata;
+import org.apache.camel.spi.UriEndpoint;
+import org.apache.camel.spi.UriParam;
+import org.apache.camel.support.SynchronousDelegateProducer;
+import org.apache.camel.util.ObjectHelper;
+import org.apache.camel.util.StringHelper;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+/**
+ * Netty HTTP server and client using the Netty 4.x.
+ */
+@UriEndpoint(firstVersion = "2.14.0", scheme = "netty-http", extendsScheme = "netty", title = "Netty HTTP",
+             syntax = "netty-http:protocol://host:port/path", category = { Category.NETWORKING, Category.HTTP },
+             lenientProperties = true, headersClass = NettyHttpConstants.class)
+@Metadata(excludeProperties = "textline,delimiter,autoAppendDelimiter,decoderMaxLineLength,encoding,allowDefaultCodec,udpConnectionlessSending,networkInterface"
+                              + ",clientMode,reconnect,reconnectInterval,useByteBuf,udpByteArrayCodec,broadcast,correlationManager",
+          annotations = {
+                  "protocol=http",
+          })
+@BodyTypes(consumerOut = @BodyType(value = Carrier.STREAM,
+                                   javaType = "org.apache.camel.component.netty.http.NettyChannelBufferStreamCache",
+                                   dependsOn = "nettyHttpBinding",
+                                   byOption = {
+                                           @BodyType.When(option = "disableStreamCache", value = "true",
+                                                          carriers = { Carrier.POJO, Carrier.STREAM }),
+                                           @BodyType.When(option = "protocol", value = "proxy", carriers = Carrier.POJO,
+                                                          javaType = "io.netty.buffer.ByteBuf") },
+                                   description = "The request body as the stream cache of Camel, which can be read many"
+                                                 + " times; empty for a request without a body, such as a GET. The fields of"
+                                                 + " a form POST are also headers. With disableStreamCache the Netty ByteBuf"
+                                                 + " of the request, or an InputStream for a chunked request, read once"),
+           consumerReply = @BodyType(value = {
+                   Carrier.NULL, Carrier.TEXT, Carrier.BYTES, Carrier.STREAM, Carrier.FILE,
+                   Carrier.VALUE },
+                                     description = "The response body: text, bytes, a stream, a file, or a Netty ByteBuf or"
+                                                   + " HttpResponse; no body sends 204. A Map, a List or a POJO is written as"
+                                                   + " its toString(): marshal it first. A"
+                                                   + " failed exchange sends 500 with an empty body (muteException)"),
+           producerIn = @BodyType(value = { Carrier.NULL, Carrier.TEXT, Carrier.BYTES, Carrier.STREAM, Carrier.FILE },
+                                  description = "The request body: text, bytes, a stream or a file, or a Netty ByteBuf or"
+                                                + " HttpRequest. A Map, a List or a POJO fails: marshal it first. Without"
+                                                + " the CamelHttpMethod header, no body sends a GET and a body a POST"),
+           producerOut = @BodyType(value = Carrier.BYTES, javaType = "byte[]", dependsOn = { "nettyHttpBinding", "sync" },
+                                   byOption = @BodyType.When(option = "disableStreamCache", value = "true",
+                                                             carriers = { Carrier.POJO, Carrier.STREAM }),
+                                   description = "The response body as a byte array, empty for a response without a body."
+                                                 + " With disableStreamCache the Netty ByteBuf of the response, or an"
+                                                 + " InputStream for a chunked response; the ByteBuf is released when the"
+                                                 + " exchange is done"))
+public class NettyHttpEndpoint extends NettyEndpoint implements HeaderFilterStrategyAware, OAuthProfileAwareHttpEndpoint {
+
+    private static final Logger LOG = LoggerFactory.getLogger(NettyHttpEndpoint.class);
+    static final String PROXY_NOT_SUPPORTED_MESSAGE = "Netty Http Producer does not support proxy mode";
+
+    private OAuthHttpSecuritySupport oauthHttpSecurity;
+    // the http address: scheme, host, port, path and the query parameters that are not endpoint options
+    private String addressUri;
+
+    @UriParam
+    private NettyHttpConfiguration configuration;
+    @UriParam(label = "advanced", name = "configuration",
+              javaType = "org.apache.camel.component.netty.http.NettyHttpConfiguration",
+              description = "To use a custom configured NettyHttpConfiguration for configuring this endpoint.")
+    private Object httpConfiguration; // to include in component docs as NettyHttpConfiguration is a @UriParams class
+    @UriParam(label = "advanced")
+    private NettyHttpBinding nettyHttpBinding;
+    @UriParam(label = "advanced")
+    private HeaderFilterStrategy headerFilterStrategy;
+    @UriParam(label = "consumer,advanced")
+    private boolean traceEnabled;
+    @UriParam(label = "consumer,advanced")
+    private String httpMethodRestrict;
+    @UriParam(label = "consumer,advanced")
+    @Metadata(deprecationNote = "The shared Netty HTTP server was added for OSGi/Karaf, so that several applications"
+                                + " in one JVM could use the same port. Use a netty-http consumer per port, where several routes"
+                                + " can use the same port, or the platform-http component.")
+    @Deprecated
+    private NettySharedHttpServer nettySharedHttpServer;
+    @UriParam(label = "consumer,advanced", javaType = "org.apache.camel.component.netty.NettyServerBootstrapConfiguration")
+    private NettyServerBootstrapConfiguration bootstrapConfiguration;
+    @UriParam(label = "consumer,security")
+    private NettyHttpSecurityConfiguration securityConfiguration;
+    @UriParam(label = "consumer,security", prefix = "securityConfiguration.", multiValue = true)
+    private Map<String, Object> securityOptions; // to include in component docs
+    @UriParam(label = "consumer,security", displayName = "OAuth Profile",
+              description = "OAuth profile name for validating incoming Authorization: Bearer tokens. "
+                            + "When set, the request is authenticated before the route is processed. "
+                            + "This requires an OAuthTokenValidationFactory; camel-oauth provides the default implementation. "
+                            + "Requires usingExecutorService=true and sync=true (the defaults), and is not supported "
+                            + "with nettySharedHttpServer.")
+    private String oauthProfile;
+    @UriParam(label = "producer")
+    private CookieHandler cookieHandler;
+
+    public NettyHttpEndpoint(String endpointUri, NettyHttpComponent component, NettyConfiguration configuration) {
+        super(endpointUri, component, configuration);
+    }
+
+    @Override
+    public NettyHttpComponent getComponent() {
+        return (NettyHttpComponent) super.getComponent();
+    }
+
+    @Override
+    public Consumer createConsumer(Processor processor) throws Exception {
+        if (ObjectHelper.isNotEmpty(oauthProfile) && !getConfiguration().isUsingExecutorService()) {
+            throw new IllegalArgumentException(
+                    "The netty-http oauthProfile option requires usingExecutorService=true so token validation "
+                                               + "does not run on a Netty event-loop thread");
+        }
+        if (ObjectHelper.isNotEmpty(oauthProfile) && nettySharedHttpServer != null) {
+            throw new IllegalArgumentException(
+                    "The netty-http oauthProfile option is not supported with nettySharedHttpServer because "
+                                               + "the shared pipeline does not use the endpoint executor service");
+        }
+        if (ObjectHelper.isNotEmpty(oauthProfile) && !getConfiguration().isSync()) {
+            throw new IllegalArgumentException(
+                    "The netty-http oauthProfile option requires sync=true so token validation rejection "
+                                               + "responses can be returned to the client");
+        }
+
+        NettyHttpConsumer answer = new NettyHttpConsumer(this, processor, getConfiguration());
+        configureConsumer(answer);
+
+        if (nettySharedHttpServer != null) {
+            answer.setNettyServerBootstrapFactory(nettySharedHttpServer.getServerBootstrapFactory());
+            LOG.info("NettyHttpConsumer: {} is using NettySharedHttpServer on port: {}", answer,
+                    nettySharedHttpServer.getPort());
+        } else {
+            // reuse pipeline factory for the same address
+            HttpServerBootstrapFactory factory = getComponent().getOrCreateHttpNettyServerBootstrapFactory(answer);
+            // force using our server bootstrap factory
+            answer.setNettyServerBootstrapFactory(factory);
+            LOG.debug("Created NettyHttpConsumer: {} using HttpServerBootstrapFactory: {}", answer, factory);
+        }
+        return answer;
+    }
+
+    @Override
+    public Producer createProducer() throws Exception {
+        if (ObjectHelper.isNotEmpty(oauthProfile)) {
+            throw new IllegalArgumentException("The netty-http oauthProfile option is only supported on consumers");
+        }
+        if (isProxyProtocol()) {
+            doFail(new IllegalArgumentException(PROXY_NOT_SUPPORTED_MESSAGE));
+        }
+
+        Producer answer = new NettyHttpProducer(this, getConfiguration());
+        if (getConfiguration().isSynchronous()) {
+            return new SynchronousDelegateProducer(answer);
+        } else {
+            return answer;
+        }
+    }
+
+    @Override
+    public PollingConsumer createPollingConsumer() throws Exception {
+        throw new UnsupportedOperationException("This component does not support polling consumer");
+    }
+
+    @Override
+    public boolean isLenientProperties() {
+        // true to allow dynamic URI options to be configured and passed to external system for eg. the HttpProducer
+        return true;
+    }
+
+    @Override
+    public void setConfiguration(NettyConfiguration configuration) {
+        super.setConfiguration(configuration);
+        this.configuration = (NettyHttpConfiguration) configuration;
+    }
+
+    @Override
+    public NettyHttpConfiguration getConfiguration() {
+        return (NettyHttpConfiguration) super.getConfiguration();
+    }
+
+    public NettyHttpBinding getNettyHttpBinding() {
+        return nettyHttpBinding;
+    }
+
+    /**
+     * To use a custom org.apache.camel.component.netty.http.NettyHttpBinding for binding to/from Netty and Camel
+     * Message API.
+     */
+    public void setNettyHttpBinding(NettyHttpBinding nettyHttpBinding) {
+        this.nettyHttpBinding = nettyHttpBinding;
+    }
+
+    @Override
+    public HeaderFilterStrategy getHeaderFilterStrategy() {
+        return headerFilterStrategy;
+    }
+
+    /**
+     * To use a custom org.apache.camel.spi.HeaderFilterStrategy to filter headers.
+     */
+    @Override
+    public void setHeaderFilterStrategy(HeaderFilterStrategy headerFilterStrategy) {
+        this.headerFilterStrategy = headerFilterStrategy;
+        getNettyHttpBinding().setHeaderFilterStrategy(headerFilterStrategy);
+    }
+
+    public boolean isTraceEnabled() {
+        return traceEnabled;
+    }
+
+    /**
+     * Specifies whether to enable HTTP TRACE for this Netty HTTP consumer. By default TRACE is turned off.
+     */
+    public void setTraceEnabled(boolean traceEnabled) {
+        this.traceEnabled = traceEnabled;
+    }
+
+    public String getHttpMethodRestrict() {
+        return httpMethodRestrict;
+    }
+
+    /**
+     * To disable HTTP methods on the Netty HTTP consumer. You can specify multiple separated by comma.
+     */
+    public void setHttpMethodRestrict(String httpMethodRestrict) {
+        this.httpMethodRestrict = httpMethodRestrict;
+    }
+
+    /**
+     * @deprecated the shared Netty HTTP server was added for OSGi/Karaf. Use one netty-http consumer per port, or the
+     *             platform-http component.
+     */
+    @Deprecated
+    public NettySharedHttpServer getNettySharedHttpServer() {
+        return nettySharedHttpServer;
+    }
+
+    /**
+     * To use a shared Netty HTTP server, so that several applications in one JVM can use the same port.
+     *
+     * @deprecated the shared Netty HTTP server was added for OSGi/Karaf. Use one netty-http consumer per port, or the
+     *             platform-http component.
+     */
+    @Deprecated
+    public void setNettySharedHttpServer(NettySharedHttpServer nettySharedHttpServer) {
+        this.nettySharedHttpServer = nettySharedHttpServer;
+    }
+
+    public NettyServerBootstrapConfiguration getBootstrapConfiguration() {
+        return bootstrapConfiguration;
+    }
+
+    /**
+     * To use a custom configured NettyServerBootstrapConfiguration for configuring this endpoint. When set via URI
+     * (e.g. {@code ?bootstrapConfiguration=#myBean}), its properties are merged into the endpoint configuration by
+     * {@code NettyHttpComponent.createEndpoint()}. Note: this parameter is URI-resolved by the component and is not
+     * applied when set programmatically via this setter.
+     */
+    public void setBootstrapConfiguration(NettyServerBootstrapConfiguration bootstrapConfiguration) {
+        this.bootstrapConfiguration = bootstrapConfiguration;
+    }
+
+    public NettyHttpSecurityConfiguration getSecurityConfiguration() {
+        return securityConfiguration;
+    }
+
+    /**
+     * Refers to a org.apache.camel.component.netty.http.NettyHttpSecurityConfiguration for configuring secure web
+     * resources.
+     */
+    public void setSecurityConfiguration(NettyHttpSecurityConfiguration securityConfiguration) {
+        this.securityConfiguration = securityConfiguration;
+    }
+
+    public Map<String, Object> getSecurityOptions() {
+        return securityOptions;
+    }
+
+    /**
+     * To configure NettyHttpSecurityConfiguration using key/value pairs from the map
+     */
+    public void setSecurityOptions(Map<String, Object> securityOptions) {
+        this.securityOptions = securityOptions;
+    }
+
+    public String getOauthProfile() {
+        return oauthProfile;
+    }
+
+    public void setOauthProfile(String oauthProfile) {
+        this.oauthProfile = oauthProfile;
+    }
+
+    public OAuthHttpSecuritySupport getOauthHttpSecurity() {
+        return oauthHttpSecurity;
+    }
+
+    public CookieHandler getCookieHandler() {
+        return cookieHandler;
+    }
+
+    /**
+     * Configure a cookie handler to maintain a HTTP session
+     */
+    public void setCookieHandler(CookieHandler cookieHandler) {
+        this.cookieHandler = cookieHandler;
+    }
+
+    @Override
+    protected void doInit() throws Exception {
+        super.doInit();
+
+        ObjectHelper.notNull(nettyHttpBinding, "nettyHttpBinding", this);
+        ObjectHelper.notNull(headerFilterStrategy, "headerFilterStrategy", this);
+
+        if (securityConfiguration != null) {
+            StringHelper.notEmpty(securityConfiguration.getRealm(), "realm", securityConfiguration);
+            StringHelper.notEmpty(securityConfiguration.getConstraint(), "constraint", securityConfiguration);
+
+            if (securityConfiguration.getSecurityAuthenticator() == null) {
+                // setup default JAAS authenticator if none was configured
+                JAASSecurityAuthenticator jaas = new JAASSecurityAuthenticator();
+                jaas.setName(securityConfiguration.getRealm());
+                LOG.info("No SecurityAuthenticator configured, using JAASSecurityAuthenticator as authenticator: {}", jaas);
+                securityConfiguration.setSecurityAuthenticator(jaas);
+            }
+        }
+
+        oauthHttpSecurity = OAuthHttpSecuritySupport.create(getCamelContext(), oauthProfile);
+    }
+
+    /**
+     * The HTTP address of this endpoint, which the producer sends its requests to: the scheme, host, port and path, and
+     * the query parameters that are not endpoint options.
+     */
+    public String getAddressUri() {
+        return addressUri != null ? addressUri : getEndpointUri();
+    }
+
+    void setAddressUri(String addressUri) {
+        this.addressUri = addressUri;
+    }
+
+    private boolean isProxyProtocol() {
+        String address = getAddressUri();
+        URI baseUri = URI.create(StringHelper.before(address, "?", address));
+        String protocol = baseUri.getScheme();
+        return protocol != null && protocol.equalsIgnoreCase("proxy");
+    }
+}

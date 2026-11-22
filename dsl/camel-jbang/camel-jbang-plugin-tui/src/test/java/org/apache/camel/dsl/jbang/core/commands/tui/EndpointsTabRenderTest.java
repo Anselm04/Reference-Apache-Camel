@@ -1,0 +1,259 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.camel.dsl.jbang.core.commands.tui;
+
+import java.util.ArrayList;
+import java.util.List;
+import java.util.concurrent.atomic.AtomicReference;
+
+import dev.tamboui.buffer.Buffer;
+import dev.tamboui.layout.Rect;
+import dev.tamboui.style.Color;
+import dev.tamboui.terminal.Frame;
+import dev.tamboui.text.Span;
+import dev.tamboui.tui.event.KeyEvent;
+import dev.tamboui.tui.event.KeyModifiers;
+import org.apache.camel.util.json.JsonArray;
+import org.apache.camel.util.json.JsonObject;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.junit.jupiter.api.Assertions.assertTrue;
+
+/**
+ * Higher-level rendering tests for {@link EndpointsTab}. Renders the endpoints table into a virtual terminal buffer and
+ * inspects the rendered output (text content, colors, layout).
+ */
+class EndpointsTabRenderTest {
+
+    private MonitorContext ctx;
+    private IntegrationInfo info;
+
+    @BeforeEach
+    void setUp() {
+        Theme.resetForTesting();
+        info = new IntegrationInfo();
+        info.pid = "1234";
+        info.name = "test-app";
+
+        AtomicReference<List<IntegrationInfo>> data = new AtomicReference<>(List.of(info));
+        AtomicReference<List<InfraInfo>> infraData = new AtomicReference<>(List.of());
+        ctx = new MonitorContext(data, infraData);
+        ctx.selectedPid = "1234";
+    }
+
+    @Test
+    void renderShowsTableHeaders() {
+        addEndpoint("timer", "timer://tick?period=1000", "in", "route1", 10);
+
+        EndpointsTab tab = new EndpointsTab(ctx, new MetricsCollector());
+        String rendered = TuiTestHelper.renderToString(tab, 140, 30);
+
+        assertTrue(rendered.contains("COMPONENT"), "Should show COMPONENT header");
+        assertTrue(rendered.contains("ROUTE"), "Should show ROUTE header");
+        assertTrue(rendered.contains("DIR"), "Should show DIR header");
+        assertTrue(rendered.contains("TOTAL"), "Should show TOTAL header");
+        assertTrue(rendered.contains("URI"), "Should show URI header");
+    }
+
+    @Test
+    void renderShowsEndpointData() {
+        addEndpoint("kafka", "kafka://my-topic", "in", "kafka-route", 42);
+
+        EndpointsTab tab = new EndpointsTab(ctx, new MetricsCollector());
+        String rendered = TuiTestHelper.renderToString(tab, 140, 30);
+
+        assertTrue(rendered.contains("kafka://my-topic"), "Should render endpoint URI");
+        assertTrue(rendered.contains("kafka"), "Should render component name");
+        assertTrue(rendered.contains("kafka-route"), "Should render route ID");
+    }
+
+    @Test
+    void renderComponentNameInCyan() {
+        addEndpoint("http", "http://example.com/api", "out", "http-route", 5);
+        // a second row: the first is selected, and the selection highlight hides its colors
+        addEndpoint("http", "http://example.com/api2", "out", "http-route", 5);
+
+        EndpointsTab tab = new EndpointsTab(ctx, new MetricsCollector());
+
+        Rect area = new Rect(0, 0, 140, 30);
+        Buffer buffer = Buffer.empty(area);
+        Frame frame = Frame.forTesting(buffer);
+        tab.render(frame, area);
+
+        boolean foundCyan = TuiTestHelper.findCellWithColor(buffer, "h", Theme.accent());
+        assertTrue(foundCyan, "Component name should be rendered in CYAN");
+    }
+
+    @Test
+    void renderInDirectionColor() {
+        addEndpoint("timer", "timer://tick", "in", "route1", 10);
+        addEndpoint("timer", "timer://tock", "in", "route1", 10);
+
+        EndpointsTab tab = new EndpointsTab(ctx, new MetricsCollector());
+
+        Rect area = new Rect(0, 0, 140, 30);
+        Buffer buffer = Buffer.empty(area);
+        Frame frame = Frame.forTesting(buffer);
+        tab.render(frame, area);
+
+        boolean foundGreen
+                = TuiTestHelper.findCellWithColor(buffer, TuiIcons.KEY_RIGHT, Theme.success().fg().orElse(Color.GREEN));
+        assertTrue(foundGreen, "In-direction arrow should be rendered in GREEN");
+    }
+
+    @Test
+    void renderOutDirectionInCyan() {
+        addEndpoint("log", "log://output", "out", "route1", 10);
+        addEndpoint("log", "log://output2", "out", "route1", 10);
+
+        EndpointsTab tab = new EndpointsTab(ctx, new MetricsCollector());
+
+        Rect area = new Rect(0, 0, 140, 30);
+        Buffer buffer = Buffer.empty(area);
+        Frame frame = Frame.forTesting(buffer);
+        tab.render(frame, area);
+
+        boolean foundCyanArrow = TuiTestHelper.findCellWithColor(buffer, TuiIcons.KEY_LEFT, Theme.accent());
+        assertTrue(foundCyanArrow, "Out-direction arrow should be rendered in CYAN");
+    }
+
+    @Test
+    void renderMultipleEndpointsAllAppear() {
+        addEndpoint("timer", "timer://tick", "in", "route1", 10);
+        addEndpoint("log", "log://output", "out", "route1", 10);
+
+        EndpointsTab tab = new EndpointsTab(ctx, new MetricsCollector());
+        String rendered = TuiTestHelper.renderToString(tab, 140, 30);
+
+        assertTrue(rendered.contains("timer://tick"), "Should render first endpoint URI");
+        assertTrue(rendered.contains("log://output"), "Should render second endpoint URI");
+    }
+
+    @Test
+    void renderEmptyShowsPlaceholder() {
+        // No endpoints added
+        EndpointsTab tab = new EndpointsTab(ctx, new MetricsCollector());
+        String rendered = TuiTestHelper.renderToString(tab, 140, 30);
+
+        assertTrue(rendered.contains("No endpoints"), "Should show placeholder when no endpoints exist");
+    }
+
+    @Test
+    void renderNoSelectionShowsPrompt() {
+        ctx.selectedPid = null;
+
+        EndpointsTab tab = new EndpointsTab(ctx, new MetricsCollector());
+        String rendered = TuiTestHelper.renderToString(tab, 100, 20);
+
+        assertTrue(rendered.contains("No integration selected") || rendered.contains("Select an integration"),
+                "Should show selection prompt when no integration selected");
+    }
+
+    @Test
+    void renderShowsSortColumn() {
+        addEndpoint("timer", "timer://tick", "in", "route1", 10);
+
+        EndpointsTab tab = new EndpointsTab(ctx, new MetricsCollector());
+        String rendered = TuiTestHelper.renderToString(tab, 140, 30);
+
+        assertTrue(rendered.contains("ROUTE▼"), "Column header should show sort indicator on default sort column");
+    }
+
+    @Test
+    void sortCycleChangesSortIndicator() {
+        addEndpoint("timer", "timer://tick", "in", "route1", 10);
+
+        EndpointsTab tab = new EndpointsTab(ctx, new MetricsCollector());
+
+        // Press 's' to cycle sort from "route" to "dir"
+        tab.handleKeyEvent(KeyEvent.ofChar('s', KeyModifiers.NONE));
+        String rendered = TuiTestHelper.renderToString(tab, 140, 30);
+
+        assertTrue(rendered.contains("DIR▼"), "Sort should cycle to 'dir' after pressing 's'");
+    }
+
+    @Test
+    void renderFooterHints() {
+        EndpointsTab tab = new EndpointsTab(ctx, new MetricsCollector());
+        List<Span> footerSpans = new ArrayList<>();
+        tab.renderFooter(footerSpans);
+
+        String footer = footerSpans.stream()
+                .map(Span::content)
+                .reduce("", String::concat);
+
+        assertTrue(footer.contains("Esc"), "Footer should contain Esc hint");
+        assertTrue(footer.contains("sort"), "Footer should contain sort hint");
+        // the filter is a view setting: in the view bar, with the Chart and Detail views
+        SubViewBar.Spec bar = tab.subViewBar();
+        assertTrue(bar.toggles().stream().anyMatch(t -> t.key().equals("f") && t.state().equals("all")),
+                "View bar should contain the filter");
+        assertTrue(bar.views().stream().anyMatch(v -> v.label().equals("Detail")), "View bar should list Detail");
+    }
+
+    @Test
+    void theScopeColumnTellsRemoteInternalAndLocalApart() {
+        addEndpoint("kafka", "kafka://orders", "in", "intake", 3).scope = "remote";
+        addEndpoint("direct", "direct://charge", "out", "intake", 3).scope = "internal";
+        addEndpoint("exec", "exec://wc", "out", "report", 1).scope = "local";
+
+        EndpointsTab tab = new EndpointsTab(ctx, new MetricsCollector());
+        String rendered = TuiTestHelper.renderToString(tab, 140, 30);
+
+        assertThat(rendered).contains("SCOPE").doesNotContain("REMOTE");
+        assertThat(line(rendered, "kafka://orders")).contains("remote");
+        assertThat(line(rendered, "direct://charge")).contains("internal");
+        assertThat(line(rendered, "exec://wc")).contains("local");
+        // and for the tui_get_table tool
+        JsonArray rows = (JsonArray) tab.getTableDataAsJson().get("rows");
+        assertThat(rows).extracting(r -> ((JsonObject) r).getString("scope"))
+                .containsExactlyInAnyOrder("remote", "internal", "local");
+    }
+
+    private static String line(String rendered, String uri) {
+        return rendered.lines().filter(l -> l.contains(uri)).findFirst().orElse("");
+    }
+
+    // ---- Helper methods ----
+
+    @Test
+    void anEndpointOfARouteIsSelectedWithItsDetails() {
+        addEndpoint("timer", "timer://tick", "in", "a", 10);
+        addEndpoint("http", "http://example.com/api", "out", "a", 5);
+        addEndpoint("http", "http://example.com/api", "out", "b", 5);
+        EndpointsTab tab = new EndpointsTab(ctx, new MetricsCollector());
+        TuiTestHelper.renderToString(tab, 140, 30);
+
+        // as About has it: the URI as the sources write it
+        tab.selectEndpoint("http:example.com/api", "b");
+        assertThat(tab.tableState.selected()).isEqualTo(2);
+        assertThat(TuiTestHelper.renderToString(tab, 140, 30)).contains("http://example.com/api");
+    }
+
+    private EndpointInfo addEndpoint(String component, String uri, String direction, String routeId, long hits) {
+        EndpointInfo ep = new EndpointInfo();
+        ep.component = component;
+        ep.uri = uri;
+        ep.direction = direction;
+        ep.routeId = routeId;
+        ep.hits = hits;
+        info.endpoints.add(ep);
+        return ep;
+    }
+}

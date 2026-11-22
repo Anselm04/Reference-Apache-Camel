@@ -1,0 +1,85 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.camel.component.cxf;
+
+import java.net.URL;
+
+import jakarta.xml.ws.BindingProvider;
+
+import javax.xml.namespace.QName;
+
+import org.apache.camel.non_wrapper.Person;
+import org.apache.camel.non_wrapper.PersonService;
+import org.apache.camel.non_wrapper.UnknownPersonFault;
+import org.apache.camel.non_wrapper.types.GetPerson;
+import org.apache.camel.non_wrapper.types.GetPersonResponse;
+import org.apache.camel.test.AvailablePortFinder;
+import org.apache.camel.test.spring.junit6.CamelSpringTestSupport;
+import org.junit.jupiter.api.AfterAll;
+import org.junit.jupiter.api.BeforeAll;
+import org.junit.jupiter.api.Test;
+import org.springframework.context.support.ClassPathXmlApplicationContext;
+
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertThrows;
+
+public class CxfNonWrapperTest extends CamelSpringTestSupport {
+
+    private static AvailablePortFinder.Port PORT1;
+
+    @BeforeAll
+    static void allocateCxfNonWrapperTestPorts() {
+        PORT1 = AvailablePortFinder.find();
+        System.setProperty("CxfNonWrapperTest.port1", PORT1.toString());
+    }
+
+    @AfterAll
+    static void releaseCxfNonWrapperTestPorts() {
+        System.clearProperty("CxfNonWrapperTest.port1");
+        if (PORT1 != null) {
+            PORT1.release();
+        }
+    }
+
+    int port1 = PORT1.getPort();
+
+    @Override
+    protected ClassPathXmlApplicationContext createApplicationContext() {
+        return new ClassPathXmlApplicationContext("org/apache/camel/component/cxf/nonWrapperProcessor.xml");
+    }
+
+    @Test
+    public void testInvokingServiceFromCXFClient() throws Exception {
+
+        URL wsdlURL = getClass().getClassLoader().getResource("person-non-wrapper.wsdl");
+        PersonService ss = new PersonService(wsdlURL, new QName("http://camel.apache.org/non-wrapper", "PersonService"));
+        Person client = ss.getSoap();
+        ((BindingProvider) client).getRequestContext()
+                .put(BindingProvider.ENDPOINT_ADDRESS_PROPERTY,
+                        "http://localhost:" + port1 + "/CxfNonWrapperTest/PersonService/");
+
+        GetPerson request = new GetPerson();
+        request.setPersonId("hello");
+        GetPersonResponse response = client.getPerson(request);
+
+        assertEquals("Bonjour", response.getName(), "we should get the right answer from router");
+
+        request.setPersonId("");
+        assertThrows(UnknownPersonFault.class, () -> client.getPerson(request));
+    }
+
+}

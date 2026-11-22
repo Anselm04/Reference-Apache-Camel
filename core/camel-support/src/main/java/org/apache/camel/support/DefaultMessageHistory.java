@@ -1,0 +1,200 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.camel.support;
+
+import java.util.Collection;
+import java.util.Map;
+
+import org.apache.camel.CamelContext;
+import org.apache.camel.Exchange;
+import org.apache.camel.Message;
+import org.apache.camel.MessageHistory;
+import org.apache.camel.NamedNode;
+import org.apache.camel.spi.BodyTypeRegistry;
+import org.apache.camel.spi.MessageSizeStrategy;
+
+/**
+ * Default {@link org.apache.camel.MessageHistory}.
+ */
+public class DefaultMessageHistory implements MessageHistory {
+
+    private final String routeId;
+    private final NamedNode node;
+    private final String nodeId;
+    private final MonotonicClock clock = new MonotonicClock();
+    private final Message message;
+    private boolean acceptDebugger;
+    private boolean debugSkipOver;
+    private long elapsed;
+    private String bodyType;
+    private String bodyDataType;
+    private long bodySize = -1;
+
+    public DefaultMessageHistory(String routeId, NamedNode node) {
+        this(routeId, node, null);
+    }
+
+    public DefaultMessageHistory(String routeId, NamedNode node, Message message) {
+        this.routeId = routeId;
+        this.node = node;
+        this.nodeId = node.getId();
+        this.message = message;
+    }
+
+    @Override
+    public String getRouteId() {
+        return routeId;
+    }
+
+    @Override
+    public String getBodyType() {
+        return bodyType;
+    }
+
+    public void setBodyType(String bodyType) {
+        this.bodyType = bodyType;
+    }
+
+    /**
+     * The class of the body, as {@link BodyFacts#typeName(Object)} names it, when it was a Map or a collection as this
+     * node was reached: data, which a marshal writes as text. Null for any other body. Kept as the body is captured, as
+     * the class of a nested type (such as the Map of {@code Map.of}) cannot be loaded back from its canonical name.
+     */
+    public String getBodyDataType() {
+        return bodyDataType;
+    }
+
+    @Override
+    public long getBodySize() {
+        return bodySize;
+    }
+
+    public void setBodySize(long bodySize) {
+        this.bodySize = bodySize;
+    }
+
+    /**
+     * Captures the body's type and size as the node is reached: the type is one class lookup ({@code "null"} for a null
+     * body), the size the {@link MessageSizeStrategy}'s (lengths only, no reading or conversion) and only when that
+     * strategy is enabled. For every factory that builds a history entry (CAMEL-24844). The type also goes to the
+     * {@link BodyTypeRegistry} of the CamelContext (CAMEL-25750).
+     * <p>
+     * A factory should look the registry up once and call {@link #captureBody(Exchange, BodyTypeRegistry)} instead, as
+     * this method looks it up on every call.
+     */
+    public void captureBody(Exchange exchange) {
+        CamelContext context = exchange.getContext();
+        captureBody(exchange,
+                context != null ? context.getCamelContextExtension().getContextPlugin(BodyTypeRegistry.class) : null);
+    }
+
+    /**
+     * Captures the body's type and size as the node is reached, as {@link #captureBody(Exchange)} does, and records the
+     * type in the registry, which keeps what each node was reached with across the exchanges (CAMEL-25750).
+     *
+     * @param exchange the exchange that reached the node
+     * @param registry the registry to record the type in, looked up once by the factory (null to not record it)
+     */
+    public void captureBody(Exchange exchange, BodyTypeRegistry registry) {
+        Message current = exchange.getMessage();
+        Object body = current.getBody();
+        bodyType = body != null ? BodyFacts.className(body) : "null";
+        bodyDataType = body instanceof Map<?, ?> || body instanceof Collection<?> ? BodyFacts.typeName(body) : null;
+        if (registry != null && routeId != null && nodeId != null) {
+            registry.addBodyType(routeId, nodeId, bodyType, BodyFacts.kindOf(body));
+        }
+        CamelContext context = exchange.getContext();
+        if (body == null) {
+            // no body, no size: "null" says it, and 0 would read as an empty text or byte array
+            return;
+        }
+        MessageSizeStrategy sizeStrategy = context != null ? context.getMessageSizeStrategy() : null;
+        if (sizeStrategy != null && sizeStrategy.isEnabled()) {
+            bodySize = sizeStrategy.computeBodySize(current);
+        }
+    }
+
+    @Override
+    public NamedNode getNode() {
+        return node;
+    }
+
+    @Override
+    public long getTime() {
+        return clock.getCreated();
+    }
+
+    @Override
+    public long getElapsed() {
+        return elapsed;
+    }
+
+    @Override
+    public void nodeProcessingDone() {
+        nodeProcessingDone(0);
+    }
+
+    @Override
+    public void nodeProcessingDone(long delta) {
+        elapsed = clock.elapsed();
+        if (delta > 0) {
+            elapsed = elapsed - delta;
+        }
+        if (elapsed < 0) {
+            elapsed = 0;
+        }
+    }
+
+    @Override
+    public long getElapsedSinceCreated() {
+        // the monotonic clock, as the node processing time is measured
+        return clock.elapsed();
+    }
+
+    @Override
+    public Message getMessage() {
+        return message;
+    }
+
+    @Override
+    public void setAcceptDebugger(boolean acceptDebugger) {
+        this.acceptDebugger = acceptDebugger;
+    }
+
+    @Override
+    public boolean isAcceptDebugger() {
+        return acceptDebugger;
+    }
+
+    @Override
+    public boolean isDebugSkipOver() {
+        return debugSkipOver;
+    }
+
+    @Override
+    public void setDebugSkipOver(boolean debugSkipOver) {
+        this.debugSkipOver = debugSkipOver;
+    }
+
+    @Override
+    public String toString() {
+        return "DefaultMessageHistory["
+               + "routeId=" + routeId
+               + ", node=" + nodeId
+               + ']';
+    }
+}

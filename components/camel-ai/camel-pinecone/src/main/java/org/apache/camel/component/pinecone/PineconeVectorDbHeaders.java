@@ -1,0 +1,82 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.camel.component.pinecone;
+
+import org.apache.camel.spi.Metadata;
+
+public class PineconeVectorDbHeaders {
+    @Metadata(description = "The action to be performed.", javaType = "String",
+              enums = "CREATE_COLLECTION,CREATE_SERVERLESS_INDEX,CREATE_POD_INDEX,FETCH,UPSERT,DELETE_INDEX,DELETE_COLLECTION,QUERY,QUERY_BY_ID,UPDATE,DELETE_BY_ID")
+    public static final String ACTION = "CamelPineconeAction";
+
+    @Metadata(description = "Text Field Name for Insert/Upsert operation", javaType = "String")
+    public static final String TEXT_FIELD_NAME = "CamelPineconeTextFieldName";
+
+    @Metadata(description = "Vector Field Name for Insert/Upsert operation", javaType = "String")
+    public static final String VECTOR_FIELD_NAME = "CamelPineconeVectorFieldName";
+
+    @Metadata(description = "Index Name", javaType = "String")
+    public static final String INDEX_NAME = "CamelPineconeIndexName";
+
+    @Metadata(description = "Index Pod Type", javaType = "String")
+    public static final String INDEX_POD_TYPE = "CamelPineconeIndexPodType";
+
+    @Metadata(description = "Index Pod Environment", javaType = "String")
+    public static final String INDEX_POD_ENVIRONMENT = "CamelPineconeIndexPodEnvironment";
+
+    @Metadata(description = "Collection Name for Insert/Upsert operation", javaType = "String")
+    public static final String COLLECTION_NAME = "CamelPineconeCollectionName";
+
+    @Metadata(description = "Collection Similarity Metric", javaType = "String", enums = "cosine,euclidean,dotproduct")
+    public static final String COLLECTION_SIMILARITY_METRIC = "CamelPineconeCollectionSimilarityMetric";
+
+    @Metadata(description = "Collection Dimension", javaType = "int")
+    public static final String COLLECTION_DIMENSION = "CamelPineconeCollectionDimension";
+
+    @Metadata(description = "Collection Cloud Vendor", javaType = "String", enums = "aws,gcp,azure")
+    public static final String COLLECTION_CLOUD = "CamelPineconeCollectionCloud";
+
+    @Metadata(description = "Collection Cloud Vendor Region", javaType = "String", enums = "aws,gcp,azure")
+    public static final String COLLECTION_CLOUD_REGION = "CamelPineconeCollectionCloudRegion";
+
+    @Metadata(description = "The id of the vector for UPSERT, UPDATE and QUERY_BY_ID. Without it, UPSERT generates a random UUID"
+                            + " and sets this header to it",
+              javaType = "String")
+    public static final String INDEX_ID = "CamelPineconeIndexId";
+
+    @Metadata(description = "The number of matches QUERY and QUERY_BY_ID return", javaType = "Integer", defaultValue = "10")
+    public static final String QUERY_TOP_K = "CamelPineconeQueryTopK";
+
+    @Metadata(description = "Namespace for actions (query/upsert/etc)", javaType = "String")
+    public static final String NAMESPACE = "CamelPineconeNamespace";
+
+    @Metadata(description = "Query Filter", javaType = "com.google.protobuf.Struct")
+    public static final String QUERY_FILTER = "CamelPineconeQueryFilter";
+
+    @Metadata(description = "Query Include Values", javaType = "boolean")
+    public static final String QUERY_INCLUDE_VALUES = "CamelPineconeQueryIncludeValues";
+
+    @Metadata(description = "Query Include Metadata", javaType = "boolean")
+    public static final String QUERY_INCLUDE_METADATA = "CamelPineconeQueryIncludeMetadata";
+
+    @Metadata(description = "The metadata UPSERT stores with the vector, and the fields of the metadata UPDATE sets. The"
+                            + " pinecone:embeddings data type transformer puts the text of the embedding in its text_segment"
+                            + " field, which the pinecone:rag data type transformer reads",
+              javaType = "com.google.protobuf.Struct")
+    public static final String METADATA = "CamelPineconeMetadata";
+
+}

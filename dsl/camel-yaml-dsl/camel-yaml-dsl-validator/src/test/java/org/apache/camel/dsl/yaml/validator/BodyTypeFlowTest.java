@@ -1,0 +1,386 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.camel.dsl.yaml.validator;
+
+import java.util.List;
+
+import com.networknt.schema.Error;
+import org.junit.jupiter.api.BeforeAll;
+import org.junit.jupiter.api.Test;
+
+import static org.assertj.core.api.Assertions.assertThat;
+
+/**
+ * CAMEL-24844: a route that reads the body although nothing in the file ever sets one. The answer follows the direct:
+ * edges between the routes, the way the route topology does at runtime.
+ */
+public class BodyTypeFlowTest {
+
+    private static YamlValidator validator;
+
+    @BeforeAll
+    public static void setup() throws Exception {
+        validator = new YamlValidator();
+        validator.init();
+    }
+
+    @Test
+    public void testTheBodyIsNeverSetInTheChain() {
+        // what the benchmark wrote, with the verb spelled out: a GET carries no body, getStock passes it on, and
+        // lookup reads it with jsonpath
+        String yaml = """
+                - rest:
+                    get:
+                      - path: /stock/{sku}
+                        to: direct:getStock
+                - route:
+                    id: getStock
+                    from:
+                      uri: direct:getStock
+                      steps:
+                        - to:
+                            uri: direct:lookup
+                - route:
+                    id: lookup
+                    from:
+                      uri: direct:lookup
+                      steps:
+                        - setBody:
+                            expression:
+                              jsonpath:
+                                expression: "$[?(@.sku == '${header.sku}')]"
+                """;
+        assertThat(messages(yaml))
+                .anyMatch(m -> m.contains("jsonpath reads the message body")
+                        && m.contains("has none")
+                        && m.contains("resource:file:"));
+    }
+
+    @Test
+    public void testATimerAtTheRootOfTheChain() {
+        String yaml = """
+                - route:
+                    id: tick
+                    from:
+                      uri: timer:tick
+                      steps:
+                        - to:
+                            uri: direct:lookup
+                - route:
+                    id: lookup
+                    from:
+                      uri: direct:lookup
+                      steps:
+                        - setBody:
+                            expression:
+                              jsonpath:
+                                expression: "$.sku"
+                """;
+        assertThat(messages(yaml)).anyMatch(m -> m.contains("reads the message body"));
+    }
+
+    @Test
+    public void testTheConsumersWithoutABodyComeFromTheCatalog() {
+        // CAMEL-24961: cron gives no body, and neither does an ftp consumer that does not download the file
+        String yaml = """
+                - route:
+                    id: nightly
+                    from:
+                      uri: cron:nightly
+                      parameters:
+                        schedule: 0 0 2 * * ?
+                      steps:
+                        - setHeader:
+                            name: sku
+                            jsonpath: $.sku
+                - route:
+                    id: listing
+                    from:
+                      uri: ftp:files.example.com/inbox?download=false
+                      steps:
+                        - setHeader:
+                            name: sku
+                            jsonpath: $.sku
+                - route:
+                    id: files
+                    from:
+                      uri: ftp:files.example.com/inbox
+                      steps:
+                        - setHeader:
+                            name: sku
+                            jsonpath: $.sku
+                """;
+        assertThat(messages(yaml)).satisfiesExactly(
+                m -> assertThat(m).contains("route nightly: jsonpath reads the message body"),
+                m -> assertThat(m).contains("route listing: jsonpath reads the message body"));
+    }
+
+    @Test
+    public void testAPostCarriesABodySoNothingIsSaid() {
+        String yaml = """
+                - rest:
+                    post:
+                      - path: /orders
+                        to: direct:orders
+                - route:
+                    id: orders
+                    from:
+                      uri: direct:orders
+                      steps:
+                        - setBody:
+                            expression:
+                              jsonpath:
+                                expression: "$.sku"
+                """;
+        assertThat(messages(yaml)).noneMatch(m -> m.contains("reads the message body"));
+    }
+
+    @Test
+    public void testAnOpenApiBindingHidesTheVerbSoNothingIsSaid() {
+        // the verb lives in the specification, not in the route: this is the gap, and it must stay quiet
+        String yaml = """
+                - rest:
+                    openApi:
+                      specification: stock-api.json
+                - route:
+                    id: getStock
+                    from:
+                      uri: direct:getStock
+                      steps:
+                        - setBody:
+                            expression:
+                              jsonpath:
+                                expression: "$.sku"
+                """;
+        assertThat(messages(yaml)).noneMatch(m -> m.contains("reads the message body"));
+    }
+
+    @Test
+    public void testTheReadIsThere() {
+        String yaml = """
+                - route:
+                    id: lookup
+                    from:
+                      uri: direct:lookup
+                      steps:
+                        - setBody:
+                            expression:
+                              constant:
+                                expression: resource:file:stock.json
+                        - setBody:
+                            expression:
+                              jsonpath:
+                                expression: "$[?(@.sku == '${header.sku}')]"
+                """;
+        assertThat(messages(yaml)).noneMatch(m -> m.contains("reads the message body"));
+    }
+
+    @Test
+    public void testTheCallerSetsTheBody() {
+        String yaml = """
+                - route:
+                    id: caller
+                    from:
+                      uri: timer:tick
+                      steps:
+                        - setBody:
+                            expression:
+                              constant:
+                                expression: resource:file:stock.json
+                        - to:
+                            uri: direct:lookup
+                - route:
+                    id: lookup
+                    from:
+                      uri: direct:lookup
+                      steps:
+                        - setBody:
+                            expression:
+                              jsonpath:
+                                expression: "$.sku"
+                """;
+        assertThat(messages(yaml)).noneMatch(m -> m.contains("reads the message body"));
+    }
+
+    @Test
+    public void testAConsumerThatBringsABody() {
+        String yaml = """
+                - route:
+                    id: fromFile
+                    from:
+                      uri: file:inbox
+                      steps:
+                        - setBody:
+                            expression:
+                              jsonpath:
+                                expression: "$.sku"
+                """;
+        assertThat(messages(yaml)).noneMatch(m -> m.contains("reads the message body"));
+    }
+
+    @Test
+    public void testARouteNobodyInTheFileCalls() {
+        // the caller may be in another file: say nothing
+        String yaml = """
+                - route:
+                    id: lookup
+                    from:
+                      uri: direct:lookup
+                      steps:
+                        - setBody:
+                            expression:
+                              jsonpath:
+                                expression: "$.sku"
+                """;
+        assertThat(messages(yaml)).noneMatch(m -> m.contains("reads the message body"));
+    }
+
+    private List<String> messages(String yaml) {
+        try {
+            return validator.validate(yaml).stream().map(Error::getMessage).toList();
+        } catch (Exception e) {
+            throw new AssertionError("Failed to validate:\n" + yaml, e);
+        }
+    }
+
+    @Test
+    public void testAKameletMayGiveTheBody() {
+        // a kamelet step may put any body in the message, as the body types of the EIPs in the catalog say
+        String yaml = """
+                - route:
+                    from:
+                      uri: timer:tick
+                      steps:
+                        - kamelet:
+                            name: my-source
+                        - setBody:
+                            expression:
+                              jsonpath:
+                                expression: "$.sku"
+                """;
+        assertThat(messages(yaml)).noneMatch(m -> m.contains("reads the message body"));
+        // log leaves the body as it was, so there is still none
+        String logged = """
+                - route:
+                    from:
+                      uri: timer:tick
+                      steps:
+                        - log: tick
+                        - setBody:
+                            expression:
+                              jsonpath:
+                                expression: "$.sku"
+                """;
+        assertThat(messages(logged)).anyMatch(m -> m.contains("reads the message body"));
+    }
+
+    @Test
+    public void testVariableReceiveOfFromStartsWithNoBody() {
+        // the body of the caller goes into the variable: the route starts with none
+        String yaml = """
+                - route:
+                    id: caller
+                    from:
+                      uri: file:inbox
+                      steps:
+                        - to:
+                            uri: direct:lookup
+                - route:
+                    id: lookup
+                    from:
+                      uri: direct:lookup
+                      variableReceive: stock
+                      steps:
+                        - setBody:
+                            expression:
+                              jsonpath:
+                                expression: "$.sku"
+                """;
+        assertThat(messages(yaml)).anyMatch(m -> m.contains("reads the message body"));
+    }
+
+    @Test
+    public void testAToWithVariableReceiveSetsNoBody() {
+        // the reply goes into the variable, so the timer route still has no body
+        String yaml = """
+                - route:
+                    from:
+                      uri: timer:tick
+                      steps:
+                        - to:
+                            uri: language:constant:stock
+                            variableReceive: stock
+                        - setBody:
+                            expression:
+                              jsonpath:
+                                expression: "$.sku"
+                """;
+        assertThat(messages(yaml)).anyMatch(m -> m.contains("reads the message body"));
+        // marshal of a variable needs no body
+        String marshal = """
+                - route:
+                    from:
+                      uri: timer:tick
+                      steps:
+                        - setVariable:
+                            name: order
+                            constant: "{}"
+                        - marshal:
+                            json: {}
+                            variableSend: order
+                            variableReceive: json
+                """;
+        assertThat(messages(marshal)).noneMatch(m -> m.contains("works on the message body"));
+    }
+
+    @Test
+    public void testAnUnmarshalAsTheFirstStepOfAGet() {
+        // what the benchmark wrote (r22): the lookup route of a GET starts with an unmarshal, which reads the body
+        // before it makes the new one, and a GET carries none
+        String yaml = """
+                - rest:
+                    get:
+                      - path: /contracts/{id}
+                        to: direct:lookup
+                - route:
+                    id: lookup
+                    from:
+                      uri: direct:lookup
+                      steps:
+                        - unmarshal:
+                            json: {}
+                        - setBody:
+                            simple: ${body[name]}
+                """;
+        assertThat(messages(yaml)).anyMatch(m -> m.contains("route lookup: unmarshal works on the message body")
+                && m.contains("the message reaching this route has none"));
+        // the same for a marshal and a convertBodyTo of a timer route
+        for (String step : List.of("marshal: {json: {}}", "convertBodyTo: {type: String}")) {
+            String timer = """
+                    - route:
+                        id: tick
+                        from:
+                          uri: timer:tick
+                          steps:
+                            - %s
+                    """.formatted(step);
+            assertThat(messages(timer)).as(step).anyMatch(m -> m.contains("works on the message body"));
+        }
+        // a POST carries a body
+        assertThat(messages(yaml.replace("get:", "post:"))).noneMatch(m -> m.contains("works on the message body"));
+    }
+}

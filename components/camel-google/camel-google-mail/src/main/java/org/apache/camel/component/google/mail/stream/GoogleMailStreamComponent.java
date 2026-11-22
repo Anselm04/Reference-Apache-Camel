@@ -1,0 +1,103 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.camel.component.google.mail.stream;
+
+import java.util.Map;
+
+import com.google.api.services.gmail.Gmail;
+import org.apache.camel.CamelContext;
+import org.apache.camel.Endpoint;
+import org.apache.camel.component.google.mail.BatchGoogleMailClientFactory;
+import org.apache.camel.component.google.mail.GoogleMailClientFactory;
+import org.apache.camel.spi.Metadata;
+import org.apache.camel.spi.annotations.Component;
+import org.apache.camel.support.HealthCheckComponent;
+
+/**
+ * Represents the component that manages {@link GoogleMailStreamEndpoint}.
+ */
+@Component("google-mail-stream")
+public class GoogleMailStreamComponent extends HealthCheckComponent {
+
+    @Metadata(label = "advanced")
+    private GoogleMailClientFactory clientFactory;
+    @Metadata(label = "advanced")
+    private GoogleMailStreamConfiguration configuration;
+
+    public GoogleMailStreamComponent() {
+        this(null);
+    }
+
+    public GoogleMailStreamComponent(CamelContext context) {
+        super(context);
+        this.configuration = new GoogleMailStreamConfiguration();
+    }
+
+    /**
+     * Creates a client for the given configuration with the client factory of the component. Each endpoint creates its
+     * own client from its own options and keeps it for its lifetime.
+     */
+    public Gmail getClient(GoogleMailStreamConfiguration config) {
+        if (config.getClientSecret() != null) {
+            return getClientFactory().makeClient(config.getClientId(),
+                    config.getClientSecret(), config.getScopesAsList(),
+                    config.getApplicationName(), config.getRefreshToken(),
+                    config.getAccessToken());
+        } else if (config.getServiceAccountKey() != null) {
+            return getClientFactory().makeClient(getCamelContext(), config.getServiceAccountKey(),
+                    config.getScopesAsList(), config.getApplicationName(),
+                    config.getDelegate());
+        } else {
+            throw new IllegalArgumentException(
+                    "(clientId and clientSecret) or serviceAccountKey are required to create Gmail client");
+        }
+    }
+
+    /**
+     * The client Factory
+     */
+    public GoogleMailClientFactory getClientFactory() {
+        if (clientFactory == null) {
+            clientFactory = new BatchGoogleMailClientFactory();
+        }
+        return clientFactory;
+    }
+
+    public GoogleMailStreamConfiguration getConfiguration() {
+        return configuration;
+    }
+
+    /**
+     * The configuration
+     */
+    public void setConfiguration(GoogleMailStreamConfiguration configuration) {
+        this.configuration = configuration;
+    }
+
+    public void setClientFactory(GoogleMailClientFactory clientFactory) {
+        this.clientFactory = clientFactory;
+    }
+
+    @Override
+    protected Endpoint createEndpoint(String uri, String remaining, Map<String, Object> parameters) throws Exception {
+        final GoogleMailStreamConfiguration configuration = this.configuration.copy();
+        configuration.setIndex(remaining);
+        GoogleMailStreamEndpoint endpoint = new GoogleMailStreamEndpoint(uri, this, configuration);
+        setProperties(endpoint, parameters);
+        return endpoint;
+    }
+}

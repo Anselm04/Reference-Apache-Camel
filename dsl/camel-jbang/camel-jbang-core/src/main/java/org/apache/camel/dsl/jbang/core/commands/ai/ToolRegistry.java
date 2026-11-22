@@ -1,0 +1,1930 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.camel.dsl.jbang.core.commands.ai;
+
+import java.io.IOException;
+import java.io.InputStream;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Objects;
+import java.util.function.Consumer;
+import java.util.stream.Collectors;
+
+import org.apache.camel.catalog.CamelCatalog;
+import org.apache.camel.cli.connector.RepeatedSend;
+import org.apache.camel.dsl.jbang.core.commands.action.CamelRouteStructureAction;
+import org.apache.camel.dsl.jbang.core.common.ChaosExperimentRun;
+import org.apache.camel.dsl.jbang.core.common.CliException;
+import org.apache.camel.dsl.jbang.core.common.ExampleHelper;
+import org.apache.camel.dsl.jbang.core.common.ProcessFinder;
+import org.apache.camel.dsl.jbang.core.common.RuntimeHelper;
+import org.apache.camel.tooling.model.BaseOptionModel;
+import org.apache.camel.tooling.model.ComponentModel;
+import org.apache.camel.tooling.model.EipModel;
+import org.apache.camel.util.IOHelper;
+import org.apache.camel.util.json.JsonArray;
+import org.apache.camel.util.json.JsonObject;
+import org.apache.camel.util.json.Jsoner;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import static org.apache.camel.dsl.jbang.core.commands.ai.ToolDescriptor.tool;
+
+/**
+ * Central registry of all shared AI tool descriptors. Tools registered here are available to {@code camel ask}
+ * ({@code AskTools}) and the MCP servers. The CLI tools that depend on {@code CamelJBangMain} remain in
+ * {@code AskTools}.
+ */
+public final class ToolRegistry {
+
+    private static final Logger LOG = LoggerFactory.getLogger(ToolRegistry.class);
+
+    private static final List<ToolDescriptor> TOOLS = new ArrayList<>();
+    private static final Map<String, ToolDescriptor> BY_NAME = new LinkedHashMap<>();
+
+    static {
+        registerProcessTools();
+        registerRuntimeStatusTools();
+        registerRuntimeActionTools();
+        registerDevConsoleTools();
+        registerChaosTools();
+        registerAnalysisTools();
+        registerCatalogTools();
+        registerExampleTools();
+        AuthoringTools.register(ToolRegistry::register);
+    }
+
+    private ToolRegistry() {
+    }
+
+    public static List<ToolDescriptor> allTools() {
+        return Collections.unmodifiableList(TOOLS);
+    }
+
+    /**
+     * The tools that a server over HTTP offers: the development MCP server of {@code camel run --mcp}
+     * ({@code JbangDevMcpServer}), which has no hints and does not ask. All but the chaos tools that change the rules:
+     * over HTTP chaos only lists and reports, as its developer console does (design/chaos.adoc).
+     */
+    public static List<ToolDescriptor> httpTools() {
+        // chaos_check is read-only, but the integration parses the rule, and exception= loads a class; chaos_suggest
+        // is read-only, but an action of the CLI connector, not of the console: off HTTP too
+        return TOOLS.stream()
+                .filter(t -> !t.name().startsWith("chaos_") || "chaos_list".equals(t.name())
+                        || "chaos_report".equals(t.name()))
+                .toList();
+    }
+
+    public static ToolDescriptor findTool(String name) {
+        return BY_NAME.get(name);
+    }
+
+    /**
+     * The neutral authoring tools ({@code camel_*}, see {@link AuthoringTools}) that every Camel MCP server exposes
+     * under the same names, in registration order.
+     */
+    public static List<ToolDescriptor> authoringTools() {
+        return TOOLS.stream().filter(t -> t.name().startsWith("camel_")).toList();
+    }
+
+    public static Object execute(String name, ToolContext ctx, Map<String, String> args) {
+        ToolDescriptor desc = BY_NAME.get(name);
+        if (desc == null) {
+            throw new ToolExecutionException("Unknown tool: " + name);
+        }
+        return desc.executor().execute(ctx, args);
+    }
+
+    private static void register(ToolDescriptor descriptor) {
+        TOOLS.add(descriptor);
+        BY_NAME.put(descriptor.name(), descriptor);
+    }
+
+    /** A whole number argument, or the default when it is not given. */
+    private static int intArg(Map<String, String> args, String name, int defaultValue) {
+        String value = args.get(name);
+        if (value == null || value.isBlank()) {
+            return defaultValue;
+        }
+        try {
+            return Integer.parseInt(value.trim());
+        } catch (NumberFormatException e) {
+            throw new ToolExecutionException(name + " must be a whole number, was: " + value);
+        }
+    }
+
+    // ---- Process discovery and selection ----
+
+    private static void registerProcessTools() {
+        register(tool("list_processes",
+                "List all running Camel processes with their PID and name. Use this to discover available processes before selecting one.")
+                .core(true)
+                .executor((ctx, args) -> {
+                    List<RuntimeHelper.ProcessInfo> processes = ctx.discoverProcesses();
+                    if (processes.isEmpty()) {
+                        return "No running Camel processes found. Start one with: camel run <file>";
+                    }
+                    JsonObject response = new JsonObject();
+                    response.put("count", processes.size());
+                    List<JsonObject> list = new ArrayList<>();
+                    for (RuntimeHelper.ProcessInfo p : processes) {
+                        JsonObject entry = new JsonObject();
+                        entry.put("pid", p.pid());
+                        entry.put("name", p.name());
+                        entry.put("selected", p.pid() == ctx.pid());
+                        list.add(entry);
+                    }
+                    response.put("processes", list);
+                    if (!ctx.hasProcess()) {
+                        response.put("hint", "No process selected. Use select_process to connect to one.");
+                    }
+                    return response.toJson();
+                }));
+
+        register(tool("select_process",
+                "Select a running Camel process by name or PID to inspect. Required when multiple processes are running.")
+                .param("name", "string", "Name or PID of the Camel process to connect to", true)
+                .core(true)
+                .executor((ctx, args) -> {
+                    String name = args.get("name");
+                    if (name == null || name.isBlank()) {
+                        throw new ToolExecutionException("name or PID is required");
+                    }
+                    ToolContext.refuseThisProcess(name);
+                    RuntimeHelper.ProcessInfo found = ctx.findProcess(name);
+                    if (found == null) {
+                        List<RuntimeHelper.ProcessInfo> processes = ctx.discoverProcesses();
+                        if (processes.isEmpty()) {
+                            return "No running Camel processes found.";
+                        }
+                        StringBuilder sb
+                                = new StringBuilder("No process found matching: " + name + ". Available:\n");
+                        processes.forEach(
+                                p -> sb.append("  ").append(p.name()).append(" (PID ").append(p.pid()).append(")\n"));
+                        return sb.toString();
+                    }
+                    ctx.selectProcess(found.pid());
+                    return "Connected to " + found.name() + " (PID " + found.pid()
+                           + "). Runtime tools are now active.";
+                }));
+    }
+
+    // ---- Runtime status (simple read-section) tools ----
+
+    private static void registerRuntimeStatusTools() {
+        registerCoreStatusTool("get_context", "context",
+                "Get Camel context info: name, version, state, uptime, route count, exchange statistics.");
+        registerCoreStatusTool("get_routes", "routes",
+                "List all routes with their state, uptime, messages processed, last error, and throughput.");
+        registerCoreStatusTool("get_health", "healthChecks",
+                "Get health check status for the Camel application.");
+        registerCoreStatusTool("get_endpoints", "endpoints",
+                "List all endpoints registered in the Camel context with URIs and usage stats.");
+        registerStatusTool("get_inflight", "inflight",
+                "Show currently in-flight exchanges (messages being processed).");
+        registerStatusTool("get_blocked", "blocked",
+                "Show blocked exchanges that are stuck or waiting.");
+        registerStatusTool("get_consumers", "consumers",
+                "Show consumer statistics (polling and event-driven consumers).");
+        registerCoreStatusTool("get_properties", "properties",
+                "Show configuration properties of the running Camel application.");
+        // get_memory combines memory, gc, and threads sections for a complete JVM resource view
+        register(tool("get_memory",
+                "Show JVM memory usage (heap/non-heap), garbage collection stats, and thread counts.")
+                .executor((ctx, args) -> {
+                    JsonObject root = ctx.readFullStatus();
+                    if (root == null) {
+                        return "{}";
+                    }
+                    JsonObject result = new JsonObject();
+                    if (root.containsKey("memory")) {
+                        result.put("memory", root.get("memory"));
+                    }
+                    if (root.containsKey("gc")) {
+                        result.put("gc", root.get("gc"));
+                    }
+                    if (root.containsKey("threads")) {
+                        result.put("threads", root.get("threads"));
+                    }
+                    return result.toJson();
+                }));
+        registerStatusTool("get_variables", "variables",
+                "Show exchange variables in the Camel context.");
+        registerStatusTool("get_services", "services",
+                "Show services registered in the Camel service registry.");
+        registerStatusTool("get_sql_trace", "sqlTrace",
+                "Get traced SQL query executions flowing through camel-sql and camel-jdbc components. "
+                                                        + "Returns per-query timing, row counts, category (SELECT/INSERT/UPDATE/DELETE), "
+                                                        + "route ID, and failure status. Includes summary statistics.");
+    }
+
+    private static void registerStatusTool(String name, String section, String description) {
+        register(tool(name, description)
+                .executor((ctx, args) -> ctx.readStatus(section)));
+    }
+
+    /**
+     * A status tool of the core subset: {@code camel ask} gives a local model these and the other core runtime tools
+     * (the integration's context, routes, health, endpoints and properties), not the rest (CAMEL-25676).
+     */
+    private static void registerCoreStatusTool(String name, String section, String description) {
+        register(tool(name, description)
+                .core(true)
+                .executor((ctx, args) -> ctx.readStatus(section)));
+    }
+
+    // ---- Runtime action tools (with parameters) ----
+
+    private static void registerRuntimeActionTools() {
+        register(tool("get_errors",
+                "Get captured routing errors from the running Camel application.")
+                .executor((ctx, args) -> {
+                    JsonObject errors = ctx.readErrorFile();
+                    return errors != null ? errors.toJson() : "No errors captured.";
+                }));
+
+        register(tool("get_history",
+                "Get the message history trace of the last completed exchange: every step with the message as it was"
+                                     + " there. With summary=true only the steps, each with route, node, elapsed, and the"
+                                     + " body's type and size as it reached the step (what to read to see where the body"
+                                     + " changed from text into a Map or bytes).")
+                .param("summary", "boolean", "Only the steps with route, node, elapsed, body type and size", false)
+                .core(true)
+                .executor((ctx, args) -> {
+                    JsonObject history = ctx.readHistoryFile();
+                    if (history == null) {
+                        return "No message history available.";
+                    }
+                    if ("true".equalsIgnoreCase(args.get("summary"))) {
+                        return historySummary(history).toJson();
+                    }
+                    return history.toJson();
+                }));
+
+        register(tool("get_route_source",
+                "Get the source code of routes. Use filter to limit by filename (supports wildcards).")
+                .param("filter", "string",
+                        "Filter source files by name (supports wildcards). Use * for all.", false)
+                .executor((ctx, args) -> {
+                    String filter = args.get("filter");
+                    return ctx.executeAction("source",
+                            root -> root.put("filter", filter != null ? filter : "*"));
+                }));
+
+        register(tool("get_route_dump",
+                "Dump route definitions in XML, YAML or Java DSL format.")
+                .param("routeId", "string", "Route ID or pattern such as orders* to dump (use * for all routes)", false)
+                .param("format", "string", "Output format: xml, yaml or java (default: yaml)", false)
+                .executor((ctx, args) -> {
+                    String routeId = args.get("routeId");
+                    String format = args.get("format");
+                    // the route-dump action reads the routes from "filter", as camel cmd route-dump sends it
+                    return ctx.executeAction("route-dump", root -> {
+                        root.put("filter", routeFilter(routeId));
+                        root.put("format", format != null ? format : "yaml");
+                    });
+                }));
+
+        register(tool("get_route_structure",
+                "Show the route structure as a tree of processors. With the message history on (camel run --dev), a"
+                                             + " processor has bodyTypes: the body types it has been reached with, across"
+                                             + " the messages, and bodyKinds: null, payload, data or collection. More than one"
+                                             + " kind needs attention: a step that writes fails for data, one that reads"
+                                             + " fields fails for a payload.")
+                .param("routeId", "string", "Route ID or pattern such as orders* to inspect (use * for all routes)",
+                        false)
+                .param("brief", "boolean", "Only the overall structure, without the options and expressions", false)
+                .param("varied", "boolean", "Only the steps reached with more than one body type", false)
+                .executor((ctx, args) -> {
+                    String routeId = args.get("routeId");
+                    boolean brief = "true".equalsIgnoreCase(args.get("brief"));
+                    String result = ctx.executeAction("route-structure", root -> {
+                        root.put("filter", routeFilter(routeId));
+                        root.put("brief", String.valueOf(brief));
+                    });
+                    if ("true".equalsIgnoreCase(args.get("varied"))) {
+                        result = onlyVaried(result);
+                    }
+                    return result;
+                }));
+
+        register(tool("get_processor_detail",
+                "Show configured options for all processors in a route. "
+                                              + "Returns each processor's type, id, and configured options (attributes, expressions). "
+                                              + "Use includeDocs=true to enrich the response with documentation from the Camel catalog "
+                                              + "for each EIP option and component endpoint option.")
+                .param("routeId", "string", "Route ID to inspect (use * for all routes)", false)
+                .param("includeDocs", "boolean",
+                        "If true, enrich each processor's options with documentation from the Camel catalog", false)
+                .core(true)
+                .executor((ctx, args) -> {
+                    String routeId = args.get("routeId");
+                    String result = ctx.executeAction("processor-detail",
+                            root -> root.put("routeId", routeId != null ? routeId : "*"));
+                    String includeDocs = args.get("includeDocs");
+                    if ("true".equalsIgnoreCase(includeDocs)) {
+                        try {
+                            Object parsed = Jsoner.deserialize(result);
+                            if (parsed instanceof JsonObject jo) {
+                                enrichWithDocs(jo, ctx);
+                                return jo.toJson();
+                            }
+                        } catch (Exception e) {
+                            LOG.debug("Failed to enrich processor detail with docs: {}", e.getMessage(), e);
+                        }
+                    }
+                    return result;
+                }));
+
+        register(tool("get_timeline",
+                "Get what happened per second in the last minutes (up to 5): per route the exchanges completed,"
+                                      + " recovered by a redelivery, handled by the error handler and failed, the mean, p95"
+                                      + " and max time, the exchanges in flight and the redelivery attempts; the errors per"
+                                      + " second by route and exception (chaosRule names the camel-chaos rule that made"
+                                      + " one); with camel-chaos the faults per second of each chaos rule (chaos) and the"
+                                      + " seconds a rule had a route down (down of the route); the seconds a circuit breaker"
+                                      + " was open (2) or half open (1) (circuitBreakers); and per second the failed,"
+                                      + " handled and recovered exchanges and the 3 slowest with the remote calls they made. Each series is"
+                                      + " oldest first and ends at the epoch second end. Use it to tell when something went wrong and what it did to which route.")
+                .param("seconds", "integer", "The number of seconds (default 60, at most what the integration records)",
+                        false)
+                .param("routeId", "string", "Route ID or pattern such as orders* (default all routes)", false)
+                .param("exchanges", "boolean", "Include the kept exchanges (default true)", false)
+                .executor((ctx, args) -> ctx.executeAction("timeline", root -> {
+                    String seconds = args.get("seconds");
+                    root.put("seconds", seconds != null ? seconds : "60");
+                    if (args.get("routeId") != null) {
+                        root.put("routeId", args.get("routeId"));
+                    }
+                    if (args.get("exchanges") != null) {
+                        root.put("exchanges", args.get("exchanges"));
+                    }
+                })));
+
+        register(tool("get_top_processors",
+                "Show top processor statistics: which processors are slowest and most active.")
+                .executor((ctx, args) -> ctx.executeAction("top-processors", null)));
+
+        register(tool("get_route_topology",
+                "Get the inter-route topology showing how routes connect to each other and to external endpoints.")
+                .param("metric", "string", "Include live metrics on nodes and edges (default: true)", false)
+                .param("external", "string", "Include external systems as nodes (default: true)", false)
+                .core(true)
+                .executor((ctx, args) -> ctx.executeAction("route-topology", root -> {
+                    root.put("metric", args.getOrDefault("metric", "true"));
+                    root.put("external", args.getOrDefault("external", "true"));
+                })));
+
+        register(tool("trace_control",
+                "Enable, disable, or dump message tracing.")
+                .param("action", "string", "Action: enable, disable, or dump", true)
+                .executor((ctx, args) -> {
+                    String action = args.get("action");
+                    if (action == null) {
+                        throw new ToolExecutionException("action is required (enable, disable, dump)");
+                    }
+                    return ctx.executeAction("trace", root -> {
+                        switch (action.toLowerCase()) {
+                            case "enable" -> root.put("enabled", "true");
+                            case "disable" -> root.put("enabled", "false");
+                            case "dump" -> root.put("dump", "true");
+                            default -> throw new ToolExecutionException(
+                                    "Unknown trace action: " + action + ". Use 'enable', 'disable', or 'dump'.");
+                        }
+                    });
+                }));
+
+        register(tool("send_message",
+                "Send a test message to a Camel endpoint in the running application. With repeat, or a body of"
+                                      + " file:<folder> (one message per file, in name order; 001.properties has the"
+                                      + " headers of 001.json), it sends several messages with interval millis between"
+                                      + " them, and answers with a summary: sent, failed and the errors.")
+                .param("endpoint", "string",
+                        "Endpoint URI to send to (e.g., direct:myRoute, seda:queue)", true)
+                .param("body", "string", "Message body to send (file:<path> for a file, file:<folder> for its files)",
+                        false)
+                .param("headers", "string",
+                        "Message headers as key=value pairs separated by newlines", false)
+                .param("repeat", "string",
+                        "How many messages to send in all (at most 10000), going round the files of a folder", false)
+                .param("interval", "string",
+                        "The pause between two messages in millis, or a range such as 100..500 to draw each pause at"
+                                             + " random (at most 60000)",
+                        false)
+                // the message runs through the routes and whatever they call, so it can change data
+                .readOnly(false).destructive(true)
+                .core(true)
+                .executor((ctx, args) -> {
+                    String endpoint = args.get("endpoint");
+                    if (endpoint == null || endpoint.isBlank()) {
+                        throw new ToolExecutionException("endpoint is required");
+                    }
+                    int repeat = intArg(args, "repeat", 0);
+                    try {
+                        RepeatedSend.interval(args.get("interval"));
+                    } catch (IllegalArgumentException e) {
+                        // an interval that is not a time or a range
+                        throw new ToolExecutionException(e.getMessage());
+                    }
+                    return ctx.sendMessage(endpoint, args.get("body"), args.get("headers"), repeat,
+                            args.get("interval")).toJson();
+                }));
+
+        register(tool("eval_expression",
+                "Evaluate a Camel expression in the given language against the running context.")
+                .param("language", "string",
+                        "Expression language (e.g., simple, jsonpath, xpath, jq)", true)
+                .param("expression", "string", "Expression to evaluate", true)
+                .executor((ctx, args) -> {
+                    String language = args.get("language");
+                    String expression = args.get("expression");
+                    if (language == null || language.isBlank()) {
+                        throw new ToolExecutionException("language is required");
+                    }
+                    if (expression == null || expression.isBlank()) {
+                        throw new ToolExecutionException("expression is required");
+                    }
+                    return ctx.executeAction("eval", root -> {
+                        root.put("language", language);
+                        root.put("predicate", "false");
+                        // as it is: the action file is JSON, and the integration does not unescape it
+                        root.put("template", expression);
+                    });
+                }));
+
+        register(tool("browse_endpoint",
+                "Browse messages in a Camel endpoint (e.g., browse messages queued in a SEDA endpoint).")
+                .param("endpoint", "string", "Endpoint URI to browse (e.g., seda:queue)", true)
+                .param("limit", "string",
+                        "Maximum number of messages to return (default: 50)", false)
+                .executor((ctx, args) -> {
+                    String endpoint = args.get("endpoint");
+                    if (endpoint == null || endpoint.isBlank()) {
+                        throw new ToolExecutionException("endpoint is required");
+                    }
+                    int limit = 50;
+                    String limitStr = args.get("limit");
+                    if (limitStr != null && !limitStr.isBlank()) {
+                        try {
+                            limit = Integer.parseInt(limitStr);
+                        } catch (NumberFormatException e) {
+                            // use default
+                        }
+                    }
+                    int browseLimit = limit;
+                    return ctx.executeAction("browse", root -> {
+                        root.put("filter", endpoint);
+                        root.put("limit", browseLimit);
+                    });
+                }));
+
+        register(tool("get_thread_dump",
+                "Get a JVM thread dump showing thread names, states, and stack traces.")
+                .executor((ctx, args) -> ctx.executeAction("thread-dump", null)));
+
+        register(tool("get_heap_histogram",
+                "Get a class-level heap histogram showing instance counts and byte usage per class. "
+                                            + "Useful for diagnosing memory leaks and understanding which classes dominate heap usage.")
+                .executor((ctx, args) -> ctx.executeAction("heap-histogram", null)));
+
+        register(tool("write_heap_dump",
+                "Write a heap dump (.hprof) file for deep memory analysis with tools like Eclipse MAT or VisualVM. "
+                                         + "Returns the absolute file path and size of the dump.")
+                .param("name", "string",
+                        "File name for the heap dump (without .hprof extension). Defaults to heap-dump-<timestamp>", false)
+                .param("live", "string",
+                        "Whether to dump only live objects (default true). Live dumps trigger a GC first", false)
+                .readOnly(false)
+                .executor((ctx, args) -> {
+                    String name = args.get("name");
+                    String live = args.get("live");
+                    if (name != null && !isPlainFileName(name)) {
+                        throw new ToolExecutionException(
+                                "name must be a file name without a directory (the dump is written to the process"
+                                                         + " working directory): " + name);
+                    }
+                    return ctx.executeAction("heap-dump", root -> {
+                        if (name != null && !name.isBlank()) {
+                            root.put("name", name);
+                        }
+                        if (live != null && !live.isBlank()) {
+                            root.put("live", live);
+                        }
+                    });
+                }));
+
+        register(tool("execute_sql",
+                "Execute a SQL query against a DataSource in the running Camel application. "
+                                     + "Returns structured JSON with columns, rows, and metadata for SELECT queries, "
+                                     + "or an update count for INSERT/UPDATE/DELETE.")
+                .param("query", "string", "The SQL query to execute", true)
+                .param("datasource", "string",
+                        "Name of the DataSource bean (auto-detected if only one exists)", false)
+                .param("maxRows", "string", "Maximum number of rows to return (default: 100)", false)
+                .readOnly(false).destructive(true)
+                .executor((ctx, args) -> {
+                    String sql = args.get("query");
+                    if (sql == null || sql.isBlank()) {
+                        throw new ToolExecutionException("'query' parameter is required");
+                    }
+                    String datasource = args.get("datasource");
+                    int maxRows = 100;
+                    String maxRowsStr = args.get("maxRows");
+                    if (maxRowsStr != null && !maxRowsStr.isBlank()) {
+                        try {
+                            maxRows = Integer.parseInt(maxRowsStr);
+                        } catch (NumberFormatException e) {
+                            // use default
+                        }
+                    }
+                    JsonObject result = ctx.executeSqlQuery(sql, datasource, maxRows, 30);
+                    return result.toJson();
+                }));
+
+        register(tool("get_tool_groups",
+                "Which runtime tool groups (sql, tracing, resilience, http, chaos) the integration needs, from what it "
+                                         + "has: datasources and SQL endpoints, OpenTelemetry, message tracing, "
+                                         + "Micrometer, circuit breakers, HTTP endpoints, camel-chaos. Returns the tools of "
+                                         + "each group with one line of guidance, "
+                                         + "and a fingerprint that changes only when the groups do.")
+                .param("name", "string", "Name or PID of the integration (default: the selected or only one)", false)
+                .executor((ctx, args) -> {
+                    selectNamedProcess(ctx, args);
+                    return toolGroups(ctx, ctx.readFullStatus()).toJson();
+                }));
+
+        // CAMEL-25307: what the integration serves over HTTP, and a request to it
+        register(tool("get_http_endpoints",
+                "List the HTTP endpoints the integration serves (Rest DSL and platform-http): method, path, "
+                                            + "consumes/produces, route and OpenAPI operation, the server's base URL "
+                                            + "and the contract. includeSpec=true adds the OpenAPI contract itself.")
+                .param("name", "string", "Name or PID of the integration (default: the selected or only one)", false)
+                .param("includeSpec", "boolean", "Add the OpenAPI contract of a contract-first service", false)
+                .executor((ctx, args) -> {
+                    selectNamedProcess(ctx, args);
+                    JsonObject answer = HttpEndpoints.toJson(HttpEndpoints.fromStatus(ctx.readFullStatus()));
+                    if ("true".equalsIgnoreCase(args.get("includeSpec"))) {
+                        answer.put("spec", HttpEndpoints.capSpecs(ctx.executeAction("rest-spec", null)));
+                    }
+                    return answer.toJson();
+                }));
+
+        register(tool("http_request",
+                "Send an HTTP request to the integration's own server (localhost and its port) and return the "
+                                      + "status, headers and body. Pass the path, e.g. /api/orders/1; other hosts are "
+                                      + "refused.")
+                .param("method", "string", "GET (default), POST, PUT, PATCH, DELETE, HEAD or OPTIONS", false)
+                .param("path", "string", "The path with query, e.g. /api/orders?status=open", true)
+                .param("headers", "string", "Headers as a JSON object or one 'name: value' per line", false)
+                .param("body", "string", "The request body", false)
+                .param("timeoutSeconds", "integer", "How long to wait for the answer (default 30)", false)
+                .param("name", "string", "Name or PID of the integration (default: the selected or only one)", false)
+                .readOnly(false).destructive(false)
+                .executor((ctx, args) -> {
+                    selectNamedProcess(ctx, args);
+                    HttpEndpoints.Served served = HttpEndpoints.fromStatus(ctx.readFullStatus());
+                    int timeout = 30;
+                    try {
+                        String t = args.get("timeoutSeconds");
+                        if (t != null && !t.isBlank()) {
+                            timeout = (int) Double.parseDouble(t);
+                        }
+                    } catch (NumberFormatException e) {
+                        // use default
+                    }
+                    return HttpEndpoints.request(served != null ? served.port() : 0, args.get("method"),
+                            args.get("path"), args.get("headers"), args.get("body"), timeout).toJson();
+                }));
+
+        // Route control
+        registerRouteControlTool("stop_route", "stop",
+                "Gracefully stop a route. The route will finish processing in-flight exchanges before stopping.");
+        registerRouteControlTool("start_route", "start", "Start a stopped route.");
+        registerRouteControlTool("suspend_route", "suspend",
+                "Suspend a route (pauses the consumer but keeps the route loaded).");
+        registerRouteControlTool("resume_route", "resume", "Resume a suspended route.");
+
+        register(tool("stop_application",
+                "Gracefully stop the Camel application. Finishes in-flight exchanges then shuts down cleanly.")
+                .readOnly(false).destructive(true)
+                .executor((ctx, args) -> ctx.stopApplication()));
+    }
+
+    /** Selects the process the call names, else keeps the selected one, else the only one running. */
+    private static void selectNamedProcess(ToolContext ctx, Map<String, String> args) {
+        String name = args.get("name");
+        if (name != null && !name.isBlank()) {
+            ctx.selectProcess(name);
+        } else {
+            ctx.selectSingleProcessIfNone();
+        }
+    }
+
+    /**
+     * The answer of get_tool_groups: the integration, the core tools every client has, the groups its status calls for
+     * and the status keys that called for them.
+     */
+    static JsonObject toolGroups(ToolContext ctx, JsonObject status) {
+        AppFeatures features = AppFeatures.fromStatus(status);
+        ToolGroups.Selection selection = ToolGroups.select(features);
+        JsonObject answer = new JsonObject();
+        String app = null;
+        for (RuntimeHelper.ProcessInfo p : ctx.discoverProcesses()) {
+            if (p.pid() == ctx.pid()) {
+                app = p.name();
+            }
+        }
+        if (app == null && status != null && status.get("context") instanceof Map<?, ?> context
+                && context.get("name") != null) {
+            app = context.get("name").toString();
+        }
+        answer.put("app", app);
+        answer.put("pid", ctx.pid());
+        answer.put("fingerprint", selection.fingerprint());
+        JsonArray core = new JsonArray();
+        authoringTools().stream().filter(ToolDescriptor::isCore).map(ToolDescriptor::name).forEach(core::add);
+        answer.put("core", core);
+        JsonArray groups = new JsonArray();
+        for (ToolGroups.Group g : selection.groups()) {
+            JsonObject group = new JsonObject();
+            group.put("id", g.group().id());
+            group.put("tools", new JsonArray(g.tools()));
+            group.put("guidance", g.guidance());
+            groups.add(group);
+        }
+        answer.put("groups", groups);
+        answer.put("signals", new JsonObject(features.signals()));
+        return answer;
+    }
+
+    private static void registerRouteControlTool(String name, String command, String description) {
+        register(tool(name, description)
+                .param("routeId", "string", "The ID of the route", true)
+                .readOnly(false).destructive(command.equals("stop"))
+                .executor((ctx, args) -> {
+                    String routeId = args.get("routeId");
+                    if (routeId == null || routeId.isBlank()) {
+                        throw new ToolExecutionException("routeId is required");
+                    }
+                    // a route that does not exist, or fails to stop or start, is an error of the tool
+                    ctx.sendAction("route", root -> {
+                        root.put("id", routeId);
+                        root.put("command", command);
+                    });
+                    return "Route " + routeId + ": " + command + " done";
+                }));
+    }
+
+    // ---- DevConsole tools (data available in TUI, now surfaced for AI) ----
+
+    private static void registerDevConsoleTools() {
+        register(tool("get_circuit_breakers",
+                "Get circuit breaker status from the running Camel application. Shows state (CLOSED/OPEN/HALF_OPEN), "
+                                              + "call counts, failure rates, and not-permitted calls for each breaker. "
+                                              + "Supports Resilience4j and MicroProfile Fault Tolerance implementations.")
+                .executor((ctx, args) -> {
+                    JsonObject root = ctx.readFullStatus();
+                    if (root == null) {
+                        return "No status available.";
+                    }
+                    // Circuit breaker data can be under resilience4j, fault-tolerance, or circuit-breaker sections
+                    JsonArray allBreakers = new JsonArray();
+                    collectCircuitBreakers(root, "resilience4j", allBreakers);
+                    collectCircuitBreakers(root, "fault-tolerance", allBreakers);
+                    collectCircuitBreakers(root, "circuit-breaker", allBreakers);
+
+                    JsonObject response = new JsonObject();
+                    response.put("count", allBreakers.size());
+                    response.put("circuitBreakers", allBreakers);
+                    if (allBreakers.isEmpty()) {
+                        response.put("hint",
+                                "No circuit breakers found. Add camel-resilience4j or camel-microprofile-fault-tolerance to use circuit breakers.");
+                    }
+                    return response.toJson();
+                }));
+
+        register(tool("get_startup_steps",
+                "Get startup recorder steps showing component initialization timing. "
+                                           + "Shows each startup step with duration, level, and type. "
+                                           + "Useful for diagnosing slow application startup. "
+                                           + "Requires startup recording to be enabled (camel.main.startup-recorder=backlog).")
+                .executor((ctx, args) -> ctx.executeAction("startup-recorder", null)));
+
+        register(tool("get_datasources",
+                "Get datasource connection pool status. Shows active, idle, and total connections, "
+                                         + "max pool size, and waiting threads for each datasource. "
+                                         + "Supports HikariCP and Agroal connection pools.")
+                .executor((ctx, args) -> ctx.readStatus("dataSources")));
+
+        register(tool("get_spans",
+                "Get OpenTelemetry trace spans from the running Camel application. "
+                                   + "Shows trace IDs, span names, durations, route IDs, and status. "
+                                   + "Requires OpenTelemetry tracing to be enabled (run with --observe).")
+                .param("limit", "string", "Maximum number of spans to return (default: 100)", false)
+                .executor((ctx, args) -> {
+                    String limitStr = args.get("limit");
+                    int limit = 100;
+                    if (limitStr != null && !limitStr.isBlank()) {
+                        try {
+                            limit = Integer.parseInt(limitStr);
+                        } catch (NumberFormatException e) {
+                            // use default
+                        }
+                    }
+                    int spanLimit = limit;
+                    return ctx.executeAction("span", root -> {
+                        root.put("dump", "true");
+                        root.put("limit", String.valueOf(spanLimit));
+                    });
+                }));
+
+        register(tool("get_genai",
+                "Get the GenAI calls of the running Camel application from the genai dev console "
+                                   + "(camel-ai-observability): the model calls per model with their tokens, and the "
+                                   + "newest agent runs with their model calls and tool calls in order. Agent runs "
+                                   + "and tool calls need camel.aiObservability.level=detailed, the messages full.")
+                .param("limit", "string", "The number of the newest agent runs and model calls to list (default: 20)",
+                        false)
+                .param("id", "string", "The id of one call to show with its messages", false)
+                .param("content", "string", "true to add the messages of the listed calls (level full only)", false)
+                .executor((ctx, args) -> ctx.executeAction("genai", root -> {
+                    for (String key : new String[] { "limit", "id", "content" }) {
+                        String value = args.get(key);
+                        if (value != null && !value.isBlank()) {
+                            root.put(key, value);
+                        }
+                    }
+                })));
+
+        register(tool("get_metrics",
+                "Get Micrometer metrics from the running Camel application. "
+                                     + "Shows counters, gauges, timers, long-task timers, and distributions. "
+                                     + "Useful for monitoring throughput, latency, and resource usage. "
+                                     + "Requires micrometer to be enabled (run with --observe or add camel-micrometer).")
+                .executor((ctx, args) -> ctx.readStatus("micrometer")));
+    }
+
+    // ---- camel-chaos: the rules, the report and the chaos action of the CLI connector (design/chaos.adoc) ----
+
+    private static final String CHAOS_NAME
+            = "Name or PID of the integration (default: the selected one, else the only one running, else the only one"
+              + " with chaos switched on)";
+
+    /**
+     * The chaos tools, the nine operations of camel cmd chaos-add [--dry-run], chaos-change, chaos-remove, chaos-clear,
+     * chaos-load, chaos-suggest and camel get chaos [--report]. The list and the report read the chaos console in the
+     * status of the integration; the others send the chaos action of the CLI connector, which works only when chaos is
+     * switched on and answers a rule that is not valid with the reason of the parser of camel.chaos.rules. Adding and
+     * changing a rule, and loading a scenario, are destructive: a rule makes messages fail, wait or get lost, and
+     * exception= can name any exception class. Removing and clearing only take faults away, and the report keeps the
+     * removed rules. What to try (suggest) only reads the routes.
+     */
+    private static void registerChaosTools() {
+        register(tool("chaos_list",
+                "List the chaos rules of the integration (camel-chaos, development only): id, version, the rule, the "
+                                    + "rule in plain words (description), state, where it can fire now (hooks), "
+                                    + "matches, faults fired, time left, the expectation, and the live "
+                                    + "state: observed rate next to the rate of the rule, when it last fired, faults "
+                                    + "per second over the last minute, and the effect of its faults (exchanges "
+                                    + "completed, recovered by redelivery, handled by the error handler, failed, in "
+                                    + "flight); or why chaos is off.")
+                .param("name", "string", CHAOS_NAME, false)
+                .executor((ctx, args) -> {
+                    selectChaosProcess(ctx, args);
+                    return chaosSection(ctx, "rules").toJson();
+                }));
+
+        register(tool("chaos_report",
+                "Get the chaos report of the integration (camel-chaos): the verdict (PASS or FAIL) and whether it is "
+                                      + "final, the seed, every version of every rule with what it fired and its live "
+                                      + "state, the expectations, the counts per route and the last 20 faults (rule, "
+                                      + "fault, route, endpoint or step, exchange id); or why chaos is off.")
+                .param("name", "string", CHAOS_NAME, false)
+                .executor((ctx, args) -> {
+                    selectChaosProcess(ctx, args);
+                    return chaosSection(ctx, "report").toJson();
+                }));
+
+        register(tool("chaos_add",
+                "Add a chaos rule to the integration, in the one-line form of camel.chaos.rules, e.g. "
+                                   + "'endpoint=kafka:orders* error rate=0.1 until=5m'; several rules separated by ; "
+                                   + "are added together (all or none). Returns the ids of the rules, each rule in "
+                                   + "plain words (description, or descriptions for several), and warnings for "
+                                   + "a rule that matches nothing in the integration now (often a typo: fix it with "
+                                   + "chaos_change). Chaos must be on in the integration; a rule that is not valid is "
+                                   + "refused with the reason.")
+                .param("rule", "string",
+                        "The rule in its one-line text form, as an entry of camel.chaos.rules; several rules separated by ;",
+                        true)
+                .param("name", "string", CHAOS_NAME, false)
+                .readOnly(false).destructive(true)
+                .executor((ctx, args) -> {
+                    String rule = AuthoringTools.required(args, "rule");
+                    selectChaosProcess(ctx, args);
+                    return chaos(ctx, "add", null, rule);
+                }));
+
+        register(tool("chaos_check",
+                "Check chaos rules without adding them (as camel cmd chaos-add --dry-run): each rule in plain words, "
+                                     + "where it can fire, warnings, and what it would hit now (hits: the sends, polls, "
+                                     + "routes or steps, each with its route). A rule that is not valid is refused "
+                                     + "with the reason, as chaos_add would; nothing changes.")
+                .param("rule", "string",
+                        "The rule in its one-line text form, as an entry of camel.chaos.rules; several rules separated by ;",
+                        true)
+                .param("name", "string", CHAOS_NAME, false)
+                .readOnly(true).destructive(false)
+                .executor((ctx, args) -> {
+                    String rule = AuthoringTools.required(args, "rule");
+                    selectChaosProcess(ctx, args);
+                    return chaos(ctx, "check", null, rule);
+                }));
+
+        register(tool("chaos_suggest",
+                "What to try (as camel cmd chaos-suggest): chaos rules suggested per route from what the routes do, "
+                                       + "the most worth trying first, such as an HTTP call without a circuit breaker, "
+                                       + "a dead letter channel or a hand-off to another route over seda. Each has the "
+                                       + "route, the kind of fault, the rule, why to try it, and tried=true when a rule "
+                                       + "of that kind has already faulted the route, and feed: how to send messages "
+                                       + "into the route (kind self, http, file or send, a hint such as the command, and "
+                                       + "real=true when that goes to the real system rather than a stub). Two faults "
+                                       + "at once (kind combined, after the single ones) have rules: all the rules to "
+                                       + "add together (chaos_add with them separated by ;). Nothing is added: check a "
+                                       + "rule with chaos_check and add it with chaos_add.")
+                .param("name", "string", CHAOS_NAME, false)
+                .readOnly(true).destructive(false)
+                .executor((ctx, args) -> {
+                    selectChaosProcess(ctx, args);
+                    return chaos(ctx, "suggest", null, null);
+                }));
+
+        register(tool("chaos_load",
+                "Load a chaos scenario into the integration (as camel cmd chaos-load): the rules there are now are "
+                                    + "removed and the report starts again, then the rules of the scenario are added, "
+                                    + "all or none (a line that is not valid is refused with the reason, and nothing "
+                                    + "changes). Returns the ids and each rule in plain words, and warnings for a rule "
+                                    + "that matches nothing in the integration now.")
+                .param("scenario", "string",
+                        "The scenario, the text of a .chaos file: one rule per line, # comments, and optionally a "
+                                             + "seed=<number> line for the same sequence of faults each run",
+                        true)
+                .param("scenarioName", "string",
+                        "The name of the scenario in the report, such as outage (default scenario)", false)
+                .param("name", "string", CHAOS_NAME, false)
+                .readOnly(false).destructive(true)
+                .executor((ctx, args) -> {
+                    String scenario = AuthoringTools.required(args, "scenario");
+                    String scenarioName = args.get("scenarioName");
+                    selectChaosProcess(ctx, args);
+                    return ctx.executeAction("chaos", root -> {
+                        root.put("command", "load");
+                        root.put("text", scenario);
+                        if (scenarioName != null && !scenarioName.isBlank()) {
+                            root.put("name", scenarioName);
+                        }
+                    });
+                }));
+
+        register(tool("chaos_change",
+                "Change a chaos rule of the integration: the rule with the id gets the new one-line rule and one more "
+                                      + "version; the report keeps the version it replaces. Returns the id, the new "
+                                      + "version and the new rule in plain words (description), and warnings when the "
+                                      + "new rule matches nothing in the integration now.")
+                .param("id", "string", "The id of the rule, such as r1 (chaos_list shows them)", true)
+                .param("rule", "string", "The new rule in its one-line text form", true)
+                .param("name", "string", CHAOS_NAME, false)
+                .readOnly(false).destructive(true)
+                .executor((ctx, args) -> {
+                    String id = AuthoringTools.required(args, "id");
+                    String rule = AuthoringTools.required(args, "rule");
+                    selectChaosProcess(ctx, args);
+                    return chaos(ctx, "change", id, rule);
+                }));
+
+        register(tool("chaos_remove",
+                "Remove a chaos rule of the integration: its faults stop, and the report keeps what it did.")
+                .param("id", "string", "The id of the rule, such as r1 (chaos_list shows them)", true)
+                .param("name", "string", CHAOS_NAME, false)
+                .readOnly(false).destructive(false)
+                .executor((ctx, args) -> {
+                    String id = AuthoringTools.required(args, "id");
+                    selectChaosProcess(ctx, args);
+                    return chaos(ctx, "remove", id, null);
+                }));
+
+        register(tool("chaos_clear",
+                "Remove all chaos rules of the integration: no more faults, and the report keeps what they did "
+                                     + "(with reset=true the report starts again, for a new experiment). Returns how "
+                                     + "many were removed.")
+                .param("name", "string", CHAOS_NAME, false)
+                .param("reset", "boolean",
+                        "Also start a new report: the removed rules, the counts per route and the verdict are gone",
+                        false)
+                .readOnly(false).destructive(false)
+                .executor((ctx, args) -> {
+                    selectChaosProcess(ctx, args);
+                    boolean reset = "true".equalsIgnoreCase(args.get("reset"));
+                    return ctx.executeAction("chaos", root -> {
+                        root.put("command", "clear");
+                        if (reset) {
+                            root.put("reset", true);
+                        }
+                    });
+                }));
+        // an exploration (CAMEL-26773, CAMEL-26786): camel-chaos keeps its journal and ends its rules at the deadline,
+        // so starting one is the consent to the experiments in it, which need no confirm of their own
+        register(tool("chaos_explore_start",
+                "Start a chaos exploration in the integration (as camel cmd chaos-explore-start): a time to try chaos "
+                                             + "rules in, that camel-chaos enforces. While it runs, a rule ends at the "
+                                             + "deadline at the latest, and at the deadline the rules are removed, "
+                                             + "whatever happens. Its journal (the baseline, the rules tried and the "
+                                             + "experiments) is in chaos_report. Run experiments in it with "
+                                             + "chaos_experiment, and finish it with chaos_explore_finish. One runs at a "
+                                             + "time.")
+                .param("budget", "string", "How long it runs, between 10s and 2h (default 10m)", false)
+                .param("focus", "string", "What it is about, such as a route (optional)", false)
+                .param("name", "string", CHAOS_NAME, false)
+                .readOnly(false).destructive(false)
+                .executor((ctx, args) -> {
+                    selectChaosProcess(ctx, args);
+                    return ctx.executeAction("chaos", root -> {
+                        root.put("command", "explore-start");
+                        putIfSet(root, "budget", args.get("budget"));
+                        putIfSet(root, "focus", args.get("focus"));
+                    });
+                }));
+
+        register(tool("chaos_experiment",
+                "Run one chaos experiment in the running exploration (as camel cmd chaos-experiment), in one call: it "
+                                          + "adds the rules (one of them with an expectation, expect=, that decides the "
+                                          + "hypothesis), sends the messages of feed when given (as send_message, with "
+                                          + "body, headers, repeat and interval), waits until the expectations are "
+                                          + "decided or wait is up, and ends the experiment, which removes its rules. "
+                                          + "Returns the verdict (FAIL: an expectation is unmet; PASS: all are met; "
+                                          + "INCONCLUSIVE: the wait was up before one was decided, so wait longer than "
+                                          + "its within=), the expectations with their actual values, the faults per "
+                                          + "rule, what the routes did meanwhile, the traffic sent, and the time left "
+                                          + "of the exploration (timeLeft, millis), and warnings for a rule that matched "
+                                          + "nothing (fix it and run again). chaos_suggest has rules to try and "
+                                          + "the feed of each route.")
+                .param("rule", "string",
+                        "The rules in their one-line text form, separated by ;, one of them with expect=, such as"
+                                         + " 'route=refunds error rate=every:5 expect=refunds:failed<=0 within=30s'",
+                        true)
+                .param("hypothesis", "string", "What the experiment tests, in a few words", false)
+                .param("feed", "string",
+                        "The endpoint, or the id of the route, to send the messages to (as the feed of chaos_suggest);"
+                                         + " a route that serves HTTP gets HTTP requests, or give the path to call"
+                                         + " (POST /orders/42); leave it out when the route feeds itself (a timer)",
+                        false)
+                .param("body", "string", "The body of the messages (file:<path>, or file:<folder> for a message per file)",
+                        false)
+                .param("headers", "string", "The headers of the messages as key=value pairs separated by newlines", false)
+                .param("repeat", "string", "How many messages to send in all (at most 10000)", false)
+                .param("interval", "string",
+                        "The pause between two messages in millis, or a range such as 100..500 (at most 60000)", false)
+                .param("wait", "string",
+                        "The longest wait for the verdict after the messages were sent, such as 90s (default 2m, at most"
+                                         + " 10m); it is at least the within= of the expectations",
+                        false)
+                .param("note", "string", "What to note with the experiment in the journal", false)
+                .param("name", "string", CHAOS_NAME, false)
+                // its rules make messages fail, wait or get lost, within the exploration the user started
+                .readOnly(false).destructive(true)
+                .executor((ctx, args) -> {
+                    String rule = AuthoringTools.required(args, "rule");
+                    String feed = args.get("feed");
+                    long wait;
+                    try {
+                        RepeatedSend.interval(args.get("interval"));
+                        wait = ChaosExperimentRun.waitMillis(args.get("wait"));
+                    } catch (IllegalArgumentException e) {
+                        throw new ToolExecutionException(e.getMessage());
+                    }
+                    int repeat = intArg(args, "repeat", 0);
+                    selectChaosProcess(ctx, args);
+                    ChaosExperimentRun.Feed traffic = feed != null && !feed.isBlank()
+                            ? new ChaosExperimentRun.Feed(
+                                    feed, args.get("body"), args.get("headers"), repeat,
+                                    args.get("interval"))
+                            : null;
+                    // the run checks the feed first: an experiment without messages says nothing, so the AI gets the
+                    // routes to feed instead, as a tool error (and the status is read once for it)
+                    try {
+                        return ChaosExperimentRun.run(new ChaosExperimentRun.Integration() {
+                            @Override
+                            public JsonObject chaos(String command, Consumer<JsonObject> options) {
+                                String answer = ctx.executeAction("chaos", root -> {
+                                    root.put("command", command);
+                                    options.accept(root);
+                                });
+                                return Jsoner.deserialize(answer, new JsonObject());
+                            }
+
+                            @Override
+                            public JsonObject send(ChaosExperimentRun.Feed f) {
+                                return ctx.sendMessage(f.endpoint(), f.body(), f.headers(), f.repeat(), f.interval());
+                            }
+
+                            @Override
+                            public JsonObject status() {
+                                return ctx.readFullStatus();
+                            }
+                        }, args.get("hypothesis"), rule, traffic, wait, args.get("note")).toJson();
+                    } catch (IllegalArgumentException e) {
+                        throw new ToolExecutionException(e.getMessage(), e);
+                    }
+                }));
+
+        register(tool("chaos_explore_finish",
+                "Finish the chaos exploration of the integration before its deadline (as camel cmd chaos-explore-finish):"
+                                              + " the rules are removed (an open experiment is ended), and the journal "
+                                              + "stays in chaos_report. Returns the journal: the rules tried, the "
+                                              + "experiments with their verdicts, and the baseline.")
+                .param("name", "string", CHAOS_NAME, false)
+                .readOnly(false).destructive(false)
+                .executor((ctx, args) -> {
+                    selectChaosProcess(ctx, args);
+                    return chaos(ctx, "explore-finish", null, null);
+                }));
+    }
+
+    private static void putIfSet(JsonObject root, String key, String value) {
+        if (value != null && !value.isBlank()) {
+            root.put(key, value);
+        }
+    }
+
+    /**
+     * Selects the integration of a chaos tool, as camel cmd chaos-add picks it: the one the call names, else the
+     * selected one, else the only one running, else the only one with chaos switched on. When none of them is clear,
+     * the error lists the running integrations, so the agent can name one.
+     */
+    private static void selectChaosProcess(ToolContext ctx, Map<String, String> args) {
+        String name = args.get("name");
+        if (name != null && !name.isBlank()) {
+            ctx.selectProcess(name);
+        } else if (!ctx.hasProcess() && ctx.isAutoSelectSingleProcess()) {
+            try {
+                ctx.selectProcess(ProcessFinder.requireOneForChaos(null).pid());
+            } catch (CliException e) {
+                throw new ToolExecutionException(e.getMessage());
+            }
+        }
+    }
+
+    /** Sends the chaos action, and returns the answer of the integration; a refusal is an error with its reason. */
+    private static String chaos(ToolContext ctx, String command, String id, String rule) {
+        return ctx.executeAction("chaos", root -> {
+            root.put("command", command);
+            if (id != null) {
+                root.put("id", id);
+            }
+            if (rule != null) {
+                root.put("rule", rule);
+            }
+        });
+    }
+
+    /**
+     * Whether chaos is on, and the rules or the report from the chaos console in the status of the integration; or why
+     * chaos is off.
+     */
+    static JsonObject chaosSection(ToolContext ctx, String key) {
+        JsonObject status = ctx.readFullStatus();
+        if (status == null) {
+            throw new ToolExecutionException("No status from the integration with pid " + ctx.pid() + " yet");
+        }
+        if (!(status.get("chaos") instanceof Map<?, ?> chaos)) {
+            throw new ToolExecutionException(
+                    "camel-chaos is not on the classpath of the integration with pid " + ctx.pid()
+                                             + ": run it with camel run --chaos, or add the camel-chaos dependency");
+        }
+        JsonObject answer = new JsonObject();
+        boolean on = Boolean.TRUE.equals(chaos.get("enabled")) || "true".equals(String.valueOf(chaos.get("enabled")));
+        answer.put("enabled", on);
+        if (on) {
+            Object value = chaos.get(key);
+            answer.put(key, value != null ? value : "rules".equals(key) ? new JsonArray() : new JsonObject());
+        } else {
+            answer.put("reason", chaos.get("reason"));
+        }
+        return answer;
+    }
+
+    @SuppressWarnings("unchecked")
+    private static void collectCircuitBreakers(JsonObject root, String sectionKey, JsonArray target) {
+        Object section = root.get(sectionKey);
+        if (!(section instanceof JsonObject sectionObj)) {
+            return;
+        }
+        Object breakers = sectionObj.get("circuitBreakers");
+        if (!(breakers instanceof List<?> breakerList)) {
+            return;
+        }
+        String component = switch (sectionKey) {
+            case "resilience4j" -> "resilience4j";
+            case "fault-tolerance" -> "fault-tolerance";
+            default -> "core";
+        };
+        for (Object b : breakerList) {
+            if (b instanceof JsonObject bj) {
+                JsonObject entry = new JsonObject();
+                entry.put("component", component);
+                entry.put("routeId", bj.get("routeId"));
+                entry.put("id", bj.get("id"));
+                entry.put("state", bj.get("state"));
+                entry.put("bufferedCalls", bj.get("bufferedCalls"));
+                entry.put("successfulCalls", bj.get("successfulCalls"));
+                entry.put("failedCalls", bj.get("failedCalls"));
+                entry.put("notPermittedCalls", bj.get("notPermittedCalls"));
+                entry.put("failureRate", bj.get("failureRate"));
+                // as camel get circuit-breaker shows them, when the breaker counts them
+                for (String key : new String[] { "fallbackCalls", "timedOutCalls", "bulkheadRejectedCalls" }) {
+                    if (bj.get(key) != null) {
+                        entry.put(key, bj.get(key));
+                    }
+                }
+                target.add(entry);
+            }
+        }
+    }
+
+    // ---- Analysis tools (higher-level diagnostic tools) ----
+
+    private static void registerAnalysisTools() {
+        register(tool("get_route_analysis",
+                "Analyze route definitions for common anti-patterns and structural issues. "
+                                            + "Checks each route for: error handler configuration, dead letter channel, "
+                                            + "route complexity (processor count and nesting depth), component usage, "
+                                            + "and potential issues. Returns structured analysis results per route.")
+                .param("routeId", "string", "Route ID to analyze (use * for all routes, default: *)", false)
+                .executor((ctx, args) -> {
+                    String routeId = args.get("routeId");
+                    // Get route structure for analysis
+                    String structureJson = ctx.executeAction("route-structure",
+                            root -> root.put("filter", routeFilter(routeId)));
+                    // Get route dump for error handler info
+                    String dumpJson = ctx.executeAction("route-dump", root -> {
+                        root.put("filter", routeFilter(routeId));
+                        root.put("format", "yaml");
+                    });
+                    JsonObject response = new JsonObject();
+                    response.put("routeStructure", json(structureJson));
+                    response.put("routeDump", json(dumpJson));
+                    response.put("analysisHints", buildAnalysisHints());
+                    return response.toJson();
+                }));
+
+        register(tool("get_eip_stats",
+                "Aggregate EIP (Enterprise Integration Pattern) usage statistics across all routes. "
+                                       + "Shows which processors are used, how often, and their performance metrics "
+                                       + "(total exchanges, failures, mean/max processing time). "
+                                       + "Useful for understanding route complexity and identifying bottlenecks.")
+                .executor((ctx, args) -> {
+                    // Get top processor stats which include per-processor metrics
+                    String topJson = ctx.executeAction("top-processors", null);
+                    // Get route structure for EIP type counting
+                    String structureJson = ctx.executeAction("route-structure",
+                            root -> root.put("filter", "*"));
+                    JsonObject response = new JsonObject();
+                    response.put("processorStats", json(topJson));
+                    response.put("routeStructures", json(structureJson));
+                    return response.toJson();
+                }));
+
+        register(tool("detect_config_drift",
+                "Compare the running route configuration with the original source files. "
+                                             + "Dumps the running route definitions and the source files "
+                                             + "so they can be compared to detect configuration drift. "
+                                             + "Useful for verifying that runtime matches deployment artifacts.")
+                .param("format", "string", "Dump format for comparison: yaml or xml (default: yaml)", false)
+                .executor((ctx, args) -> {
+                    String format = args.get("format");
+                    if (format == null || format.isBlank()) {
+                        format = "yaml";
+                    }
+                    // Get running route definitions
+                    String dumpFormat = format;
+                    String runningRoutes = ctx.executeAction("route-dump", root -> {
+                        root.put("filter", "*");
+                        root.put("format", dumpFormat);
+                    });
+                    // Get source files
+                    String sourceFiles = ctx.executeAction("source",
+                            root -> root.put("filter", "*"));
+                    JsonObject response = new JsonObject();
+                    response.put("runningRoutes", json(runningRoutes));
+                    response.put("sourceFiles", json(sourceFiles));
+                    response.put("format", dumpFormat);
+                    response.put("hint",
+                            "Compare the running route definitions with the source files to identify any differences. "
+                                         + "Common drift causes: dynamic route modification, runtime property resolution, "
+                                         + "and hot-reloading changes.");
+                    return response.toJson();
+                }));
+    }
+
+    /**
+     * The answer of the integration in an answer of a tool: as JSON when it is, not as JSON text in the JSON.
+     */
+    private static Object json(String answer) {
+        Object parsed = Jsoner.deserialize(answer, (JsonObject) null);
+        return parsed != null ? parsed : answer;
+    }
+
+    /** The route pattern of the route-dump and route-structure actions: all routes when none is given. */
+    private static String routeFilter(String routeId) {
+        return routeId != null && !routeId.isBlank() ? routeId : "*";
+    }
+
+    /**
+     * The route structure with only the steps reached with more than one body type, or a message that says there are
+     * none (and why there may be none).
+     */
+    static String onlyVaried(String routeStructure) {
+        try {
+            if (Jsoner.deserialize(routeStructure) instanceof JsonObject jo) {
+                JsonObject answer = CamelRouteStructureAction.onlyVaried(jo);
+                JsonArray routes = answer.getCollection("routes");
+                if (routes == null || routes.isEmpty()) {
+                    answer.put("message", "No step has been reached with more than one body type. The message history"
+                                          + " records the body types, as camel run --dev turns it on.");
+                }
+                return answer.toJson();
+            }
+        } catch (Exception e) {
+            LOG.debug("Cannot read the route structure to keep the varied steps: {}", e.getMessage(), e);
+        }
+        return routeStructure;
+    }
+
+    /** Whether a heap dump name is only a file name, so the dump stays in the process working directory. */
+    static boolean isPlainFileName(String name) {
+        return !name.contains("/") && !name.contains("\\") && !".".equals(name) && !"..".equals(name);
+    }
+
+    private static JsonObject buildAnalysisHints() {
+        JsonObject hints = new JsonObject();
+        hints.put("errorHandling",
+                "Check if routes define an errorHandler or onException clause. "
+                                   + "Routes without error handling will propagate exceptions to the caller.");
+        hints.put("deadLetterChannel",
+                "Routes processing messages from queues should have a deadLetterChannel "
+                                       + "to avoid losing messages on repeated failures.");
+        hints.put("timeout",
+                "Routes calling external services (http, rest, soap) should configure "
+                             + "connection and read timeouts to avoid hanging threads.");
+        hints.put("idempotency",
+                "Routes consuming from non-idempotent sources (JMS, Kafka without exactly-once) "
+                                 + "should use an idempotentConsumer to handle duplicate messages.");
+        hints.put("circuitBreaker",
+                "Routes calling unreliable external services should wrap calls in a "
+                                    + "circuitBreaker (resilience4j) to prevent cascade failures.");
+        hints.put("logging",
+                "Routes should include appropriate logging (log EIP) at key points "
+                             + "for operational visibility, especially on error paths.");
+        return hints;
+    }
+
+    // ---- Catalog tools ----
+
+    private static void registerCatalogTools() {
+        register(tool("catalog_components",
+                "Search the Camel component catalog by name or label.")
+                .param("filter", "string",
+                        "Filter by name, title, or description (case-insensitive substring)", false)
+                .param("label", "string",
+                        "Filter by category label (e.g., cloud, messaging, database, file)", false)
+                .executor((ctx, args) -> {
+                    String filter = args.get("filter");
+                    String label = args.get("label");
+                    CamelCatalog cat = ctx.catalog();
+                    List<JsonObject> results = cat.findComponentNames().stream()
+                            .map(cat::componentModel)
+                            .filter(Objects::nonNull)
+                            .filter(m -> matchesFilter(m.getScheme(), m.getTitle(), m.getDescription(), filter))
+                            .filter(m -> label == null || label.isBlank()
+                                    || (m.getLabel() != null
+                                            && m.getLabel().toLowerCase().contains(label.toLowerCase())))
+                            .limit(20)
+                            .map(m -> {
+                                JsonObject jo = new JsonObject();
+                                jo.put("name", m.getScheme());
+                                jo.put("title", m.getTitle());
+                                jo.put("description", m.getDescription());
+                                jo.put("label", m.getLabel());
+                                return jo;
+                            })
+                            .collect(Collectors.toList());
+                    JsonObject response = new JsonObject();
+                    response.put("count", results.size());
+                    response.put("components", results);
+                    return response.toJson();
+                }));
+
+        register(tool("catalog_component_doc",
+                "Get detailed documentation for a Camel component: URI syntax and endpoint options.")
+                .param("component", "string",
+                        "Component name (e.g., kafka, http, file, timer)", true)
+                .executor((ctx, args) -> {
+                    String component = args.get("component");
+                    if (component == null || component.isBlank()) {
+                        throw new ToolExecutionException("component name is required");
+                    }
+                    CamelCatalog cat = ctx.catalog();
+                    ComponentModel model = cat.componentModel(component);
+                    if (model == null) {
+                        return "Component not found: " + component;
+                    }
+                    JsonObject response = new JsonObject();
+                    response.put("name", model.getScheme());
+                    response.put("title", model.getTitle());
+                    response.put("description", model.getDescription());
+                    response.put("syntax", model.getSyntax());
+                    response.put("consumerOnly", model.isConsumerOnly());
+                    response.put("producerOnly", model.isProducerOnly());
+                    List<JsonObject> options = new ArrayList<>();
+                    if (model.getEndpointOptions() != null) {
+                        model.getEndpointOptions().stream()
+                                .filter(opt -> !opt.isDeprecated())
+                                .forEach(opt -> {
+                                    JsonObject jo = new JsonObject();
+                                    jo.put("name", opt.getName());
+                                    jo.put("description", opt.getDescription());
+                                    jo.put("type", opt.getType());
+                                    jo.put("required", opt.isRequired());
+                                    if (opt.getDefaultValue() != null) {
+                                        jo.put("defaultValue", opt.getDefaultValue().toString());
+                                    }
+                                    options.add(jo);
+                                });
+                    }
+                    response.put("options", options);
+                    return response.toJson();
+                }));
+
+        register(tool("catalog_eips",
+                "Search EIPs (Enterprise Integration Patterns) like split, aggregate, filter, choice, switch, multicast.")
+                .param("filter", "string",
+                        "Filter by name, title, or description (case-insensitive substring)", false)
+                .executor((ctx, args) -> {
+                    String filter = args.get("filter");
+                    CamelCatalog cat = ctx.catalog();
+                    List<JsonObject> results = cat.findModelNames().stream()
+                            .map(cat::eipModel)
+                            .filter(Objects::nonNull)
+                            .filter(m -> matchesFilter(m.getName(), m.getTitle(), m.getDescription(), filter))
+                            .limit(20)
+                            .map(m -> {
+                                JsonObject jo = new JsonObject();
+                                jo.put("name", m.getName());
+                                jo.put("title", m.getTitle());
+                                jo.put("description", m.getDescription());
+                                jo.put("label", m.getLabel());
+                                return jo;
+                            })
+                            .collect(Collectors.toList());
+                    JsonObject response = new JsonObject();
+                    response.put("count", results.size());
+                    response.put("eips", results);
+                    return response.toJson();
+                }));
+
+        // New catalog tools (previously MCP-only)
+
+        register(tool("catalog_dataformats",
+                "List available Camel data formats (e.g., json, xml, csv, avro).")
+                .param("filter", "string", "Filter by name or description", false)
+                .executor((ctx, args) -> {
+                    String filter = args.get("filter");
+                    CamelCatalog cat = ctx.catalog();
+                    List<JsonObject> results = cat.findDataFormatNames().stream()
+                            .map(cat::dataFormatModel)
+                            .filter(Objects::nonNull)
+                            .filter(m -> matchesFilter(m.getName(), m.getTitle(), m.getDescription(), filter))
+                            .limit(20)
+                            .map(m -> {
+                                JsonObject jo = new JsonObject();
+                                jo.put("name", m.getName());
+                                jo.put("title", m.getTitle());
+                                jo.put("description", m.getDescription());
+                                return jo;
+                            })
+                            .collect(Collectors.toList());
+                    JsonObject response = new JsonObject();
+                    response.put("count", results.size());
+                    response.put("dataformats", results);
+                    return response.toJson();
+                }));
+
+        register(tool("catalog_dataformat_doc",
+                "Get detailed documentation for a Camel data format.")
+                .param("dataformat", "string",
+                        "Data format name (e.g., jackson, jaxb, csv)", true)
+                .executor((ctx, args) -> {
+                    String name = args.get("dataformat");
+                    if (name == null || name.isBlank()) {
+                        throw new ToolExecutionException("dataformat name is required");
+                    }
+                    CamelCatalog cat = ctx.catalog();
+                    var model = cat.dataFormatModel(name);
+                    if (model == null) {
+                        return "Data format not found: " + name;
+                    }
+                    JsonObject response = new JsonObject();
+                    response.put("name", model.getName());
+                    response.put("title", model.getTitle());
+                    response.put("description", model.getDescription());
+                    response.put("modelJavaType", model.getModelJavaType());
+                    if (model.getOptions() != null) {
+                        List<JsonObject> options = model.getOptions().stream()
+                                .filter(opt -> !opt.isDeprecated())
+                                .map(opt -> {
+                                    JsonObject jo = new JsonObject();
+                                    jo.put("name", opt.getName());
+                                    jo.put("description", opt.getDescription());
+                                    jo.put("type", opt.getType());
+                                    jo.put("required", opt.isRequired());
+                                    if (opt.getDefaultValue() != null) {
+                                        jo.put("defaultValue", opt.getDefaultValue().toString());
+                                    }
+                                    return jo;
+                                })
+                                .collect(Collectors.toList());
+                        response.put("options", options);
+                    }
+                    return response.toJson();
+                }));
+
+        register(tool("catalog_languages",
+                "List available Camel expression languages (e.g., simple, jsonpath, xpath, jq).")
+                .param("filter", "string", "Filter by name or description", false)
+                .executor((ctx, args) -> {
+                    String filter = args.get("filter");
+                    CamelCatalog cat = ctx.catalog();
+                    List<JsonObject> results = cat.findLanguageNames().stream()
+                            .map(cat::languageModel)
+                            .filter(Objects::nonNull)
+                            .filter(m -> matchesFilter(m.getName(), m.getTitle(), m.getDescription(), filter))
+                            .limit(20)
+                            .map(m -> {
+                                JsonObject jo = new JsonObject();
+                                jo.put("name", m.getName());
+                                jo.put("title", m.getTitle());
+                                jo.put("description", m.getDescription());
+                                return jo;
+                            })
+                            .collect(Collectors.toList());
+                    JsonObject response = new JsonObject();
+                    response.put("count", results.size());
+                    response.put("languages", results);
+                    return response.toJson();
+                }));
+
+        register(tool("catalog_language_doc",
+                "Get detailed documentation for a Camel expression language.")
+                .param("language", "string",
+                        "Language name (e.g., simple, jsonpath, xpath, jq)", true)
+                .executor((ctx, args) -> {
+                    String name = args.get("language");
+                    if (name == null || name.isBlank()) {
+                        throw new ToolExecutionException("language name is required");
+                    }
+                    CamelCatalog cat = ctx.catalog();
+                    var model = cat.languageModel(name);
+                    if (model == null) {
+                        return "Language not found: " + name;
+                    }
+                    JsonObject response = new JsonObject();
+                    response.put("name", model.getName());
+                    response.put("title", model.getTitle());
+                    response.put("description", model.getDescription());
+                    response.put("modelJavaType", model.getModelJavaType());
+                    if (model.getOptions() != null) {
+                        List<JsonObject> options = model.getOptions().stream()
+                                .filter(opt -> !opt.isDeprecated())
+                                .map(opt -> {
+                                    JsonObject jo = new JsonObject();
+                                    jo.put("name", opt.getName());
+                                    jo.put("description", opt.getDescription());
+                                    jo.put("type", opt.getType());
+                                    jo.put("required", opt.isRequired());
+                                    if (opt.getDefaultValue() != null) {
+                                        jo.put("defaultValue", opt.getDefaultValue().toString());
+                                    }
+                                    return jo;
+                                })
+                                .collect(Collectors.toList());
+                        response.put("options", options);
+                    }
+                    return response.toJson();
+                }));
+
+        register(tool("catalog_eip_doc",
+                "Get detailed documentation for a Camel EIP (Enterprise Integration Pattern).")
+                .param("eip", "string",
+                        "EIP name (e.g., split, aggregate, filter, choice, switch)", true)
+                .executor((ctx, args) -> {
+                    String name = args.get("eip");
+                    if (name == null || name.isBlank()) {
+                        throw new ToolExecutionException("EIP name is required");
+                    }
+                    CamelCatalog cat = ctx.catalog();
+                    var model = cat.eipModel(name);
+                    if (model == null) {
+                        return "EIP not found: " + name;
+                    }
+                    JsonObject response = new JsonObject();
+                    response.put("name", model.getName());
+                    response.put("title", model.getTitle());
+                    response.put("description", model.getDescription());
+                    response.put("label", model.getLabel());
+                    response.put("input", model.isInput());
+                    response.put("output", model.isOutput());
+                    if (model.getOptions() != null) {
+                        List<JsonObject> options = model.getOptions().stream()
+                                .filter(opt -> !opt.isDeprecated())
+                                .map(opt -> {
+                                    JsonObject jo = new JsonObject();
+                                    jo.put("name", opt.getName());
+                                    jo.put("description", opt.getDescription());
+                                    jo.put("type", opt.getType());
+                                    jo.put("required", opt.isRequired());
+                                    if (opt.getDefaultValue() != null) {
+                                        jo.put("defaultValue", opt.getDefaultValue().toString());
+                                    }
+                                    return jo;
+                                })
+                                .collect(Collectors.toList());
+                        response.put("options", options);
+                    }
+                    return response.toJson();
+                }));
+    }
+
+    // ---- Example tools ----
+
+    /** Argument descriptions of the example tools, shared with the MCP server (CAMEL-25535). */
+    public static final String EXAMPLE_LEVEL_DESC
+            = "Only the examples of one group (level): quick-start, run, transform, route, fail-well, connect, "
+              + "connect-service, contracts, ai, cloud or showcase";
+    public static final String EXAMPLE_NAME_DESC
+            = "Example name as listed, e.g. quick-start/timer-log or fail-well/circuit-breaker (the short name without "
+              + "the group, such as timer-log, works too)";
+    public static final String EXAMPLE_FILE_DESC
+            = "File name within the example, as in its files, e.g. timer-log.camel.yaml, application.properties "
+              + "or test/timer-log.citrus.it.yaml (its Citrus test) for quick-start/timer-log";
+    /** The filter of the example list, shared with the MCP server. */
+    public static final String EXAMPLE_FILTER_DESC
+            = "Filter by name, description or tag (case-insensitive; every word must match); citrus finds the "
+              + "examples with a Citrus test";
+
+    private static void registerExampleTools() {
+        register(tool("list_examples",
+                "List the Camel CLI examples, grouped as the ladder of the examples (quick-start, run, transform, "
+                                       + "route, fail-well, connect, connect-service, contracts, ai, cloud, showcase). "
+                                       + "Returns the groups (level, title, intro) and the examples in reading order with "
+                                       + "name, title, description, level, order, tags, what they teach, the infra "
+                                       + "services they need, whether they are bundled and their files (test/ has the "
+                                       + "Citrus test, run with camel test run). "
+                                       + "Call it without arguments for the whole ladder, with level for one group.")
+                .param("filter", "string", EXAMPLE_FILTER_DESC, false)
+                .param("level", "string", EXAMPLE_LEVEL_DESC, false)
+                .param("limit", "integer", "Maximum number of examples to return (default: 50)", false)
+                .executor((ctx, args) -> {
+                    String filter = args.get("filter");
+                    String level = args.get("level");
+                    int limit = 50;
+                    String limitArg = args.get("limit");
+                    if (limitArg != null && !limitArg.isBlank()) {
+                        try {
+                            limit = Integer.parseInt(limitArg.trim());
+                            if (limit <= 0) {
+                                limit = 50;
+                            }
+                        } catch (NumberFormatException e) {
+                            throw new ToolExecutionException("limit must be a number: " + limitArg);
+                        }
+                    }
+                    List<JsonObject> catalog2 = ExampleHelper.loadCatalog();
+                    if (level != null && !level.isBlank()) {
+                        List<String> levels = new ArrayList<>(ExampleHelper.groupByLevel(catalog2).keySet());
+                        String wanted = level.trim();
+                        if (levels.stream().noneMatch(wanted::equalsIgnoreCase)) {
+                            // an old level such as beginner answered 0 examples otherwise (CAMEL-25535)
+                            throw new ToolExecutionException(
+                                    "No example at level " + wanted + "; the levels are: " + String.join(", ", levels));
+                        }
+                        level = wanted;
+                    }
+                    List<JsonObject> filtered = ExampleHelper.filterExamples(catalog2, filter);
+                    List<JsonObject> groups = new ArrayList<>();
+                    List<JsonObject> results = new ArrayList<>();
+                    int total = 0;
+                    for (Map.Entry<String, List<JsonObject>> group : ExampleHelper.groupByLevel(filtered).entrySet()) {
+                        if (level != null && !level.isBlank() && !group.getKey().equalsIgnoreCase(level)) {
+                            continue;
+                        }
+                        total += group.getValue().size();
+                        JsonObject g = new JsonObject();
+                        g.put("level", group.getKey());
+                        g.put("title", ExampleHelper.getGroupTitle(group.getKey()));
+                        g.put("intro", ExampleHelper.getGroupIntro(group.getKey()));
+                        g.put("count", group.getValue().size());
+                        groups.add(g);
+                        for (JsonObject entry : group.getValue()) {
+                            if (results.size() >= limit) {
+                                continue;
+                            }
+                            JsonObject jo = new JsonObject();
+                            jo.put("name", entry.getString("name"));
+                            jo.put("title", entry.getString("title"));
+                            jo.put("description", entry.getString("description"));
+                            jo.put("level", entry.getString("level"));
+                            if (ExampleHelper.getOrder(entry) != Integer.MAX_VALUE) {
+                                jo.put("order", ExampleHelper.getOrder(entry));
+                            }
+                            jo.put("tags", entry.get("tags"));
+                            jo.put("teaches", ExampleHelper.getTeaches(entry));
+                            jo.put("infraServices", ExampleHelper.getInfraServices(entry));
+                            String needs = ExampleHelper.getNeeds(entry);
+                            if (needs != null) {
+                                jo.put("needs", needs);
+                            }
+                            jo.put("bundled", ExampleHelper.isBundled(entry));
+                            jo.put("requiresDocker", ExampleHelper.requiresDocker(entry));
+                            jo.put("files", exampleFiles(entry));
+                            results.add(jo);
+                        }
+                    }
+                    JsonObject response = new JsonObject();
+                    response.put("count", results.size());
+                    response.put("total", total);
+                    response.put("groups", groups);
+                    response.put("examples", results);
+                    return response.toJson();
+                }));
+
+        register(tool("get_example_file",
+                "Get the content of a file from a Camel CLI example: the content of a bundled example, the GitHub "
+                                          + "URL of the file for the others. Returns the full name of the example.")
+                .param("example", "string", EXAMPLE_NAME_DESC, true)
+                .param("file", "string", EXAMPLE_FILE_DESC, true)
+                .executor((ctx, args) -> exampleFile(args.get("example"), args.get("file")).toJson()));
+    }
+
+    /**
+     * A file of an example: the catalog entry is found by its full or short name and the bundled resource is read from
+     * the entry's name, so a short name reads the file as well (CAMEL-25535).
+     */
+    static JsonObject exampleFile(String example, String file) {
+        if (example == null || example.isBlank()) {
+            throw new ToolExecutionException("example name is required");
+        }
+        if (file == null || file.isBlank()) {
+            throw new ToolExecutionException("file name is required");
+        }
+        String wanted = example.trim();
+        String fileName = file.trim();
+        JsonObject entry = resolveExample(ExampleHelper.loadCatalog(), wanted);
+        String name = entry.getString("name");
+        List<String> files = exampleFiles(entry);
+        if (!files.contains(fileName)) {
+            throw new ToolExecutionException(
+                    "File '" + fileName + "' not found in example '" + name + "'. Available files: " + files);
+        }
+        JsonObject answer = new JsonObject();
+        answer.put("example", name);
+        answer.put("file", fileName);
+        if (ExampleHelper.isBundled(entry)) {
+            // the resource path comes from the catalog entry, not from the name the caller gave
+            String resourcePath = "examples/" + name + "/" + fileName;
+            try (InputStream is = ExampleHelper.class.getClassLoader().getResourceAsStream(resourcePath)) {
+                if (is == null) {
+                    throw new ToolExecutionException("Could not read bundled file: " + resourcePath);
+                }
+                answer.put("content", IOHelper.loadText(is));
+            } catch (IOException e) {
+                throw new ToolExecutionException("Could not read bundled file: " + resourcePath + ": " + e.getMessage());
+            }
+        } else {
+            answer.put("githubUrl", ExampleHelper.getGithubUrl(entry) + "/" + fileName);
+        }
+        return answer;
+    }
+
+    /**
+     * The files of an example as the example tools list them: the files it runs with, and its Citrus test, which the
+     * catalog leaves out. A model asked to write a Citrus test had no sample to read (test-citrus-orders of the
+     * benchmark).
+     */
+    static List<String> exampleFiles(JsonObject entry) {
+        List<String> files = new ArrayList<>(ExampleHelper.getFiles(entry));
+        files.addAll(ExampleHelper.getTestFiles(entry));
+        return files;
+    }
+
+    /**
+     * The catalog entry of an example by its full name, or by its short name when only one example has it, as camel run
+     * resolves it; an ambiguous short name answers with the candidates, an unknown one with the closest names.
+     */
+    static JsonObject resolveExample(List<JsonObject> catalog, String example) {
+        if (!example.contains("/")) {
+            List<JsonObject> same = ExampleHelper.findExamplesByShortName(catalog, example);
+            if (same.size() > 1) {
+                throw new ToolExecutionException(
+                        "Ambiguous example: " + example + ". Use one of: "
+                                                 + same.stream().map(e -> e.getString("name"))
+                                                         .collect(Collectors.joining(", ")));
+            }
+        }
+        JsonObject entry = ExampleHelper.findExample(catalog, example);
+        if (entry == null) {
+            List<String> similar = ExampleHelper.suggestExamples(catalog, example);
+            throw new ToolExecutionException(
+                    "Example not found: " + example
+                                             + (similar.isEmpty()
+                                                     ? ". Use list_examples to see the examples."
+                                                     : ". Did you mean: " + String.join(", ", similar) + "?"));
+        }
+        return entry;
+    }
+
+    // ---- Processor detail enrichment ----
+
+    private static void enrichWithDocs(JsonObject json, ToolContext ctx) {
+        CamelCatalog cat = ctx.catalog();
+        JsonArray routes = (JsonArray) json.get("routes");
+        if (routes != null) {
+            for (Object routeObj : routes) {
+                if (routeObj instanceof JsonObject routeJson) {
+                    enrichRouteProcessors(routeJson, cat);
+                }
+            }
+        } else {
+            enrichRouteProcessors(json, cat);
+        }
+    }
+
+    private static void enrichRouteProcessors(JsonObject routeJson, CamelCatalog cat) {
+        JsonArray processors = (JsonArray) routeJson.get("processors");
+        if (processors == null) {
+            return;
+        }
+        for (Object obj : processors) {
+            if (!(obj instanceof JsonObject processor)) {
+                continue;
+            }
+            String type = processor.getString("type");
+            if (type == null) {
+                continue;
+            }
+            JsonObject opts = processor.getMap("options");
+            if ("from".equals(type) || "to".equals(type) || "toD".equals(type) || "wireTap".equals(type)
+                    || "enrich".equals(type) || "pollEnrich".equals(type)) {
+                enrichComponentOptions(processor, opts, cat);
+            } else {
+                enrichEipOptions(processor, type, opts, cat);
+            }
+        }
+    }
+
+    private static void enrichComponentOptions(JsonObject processor, JsonObject opts, CamelCatalog cat) {
+        String uri = processor.getString("endpointUri");
+        if (uri == null) {
+            uri = opts != null ? opts.getString("uri") : null;
+        }
+        if (uri == null) {
+            return;
+        }
+        String scheme = uri.contains(":") ? uri.substring(0, uri.indexOf(':')) : uri;
+        ComponentModel model = cat.componentModel(scheme);
+        if (model == null) {
+            return;
+        }
+        processor.put("componentDescription", model.getDescription());
+
+        if (opts != null && model.getEndpointOptions() != null) {
+            JsonObject optionDocs = new JsonObject();
+            for (BaseOptionModel opt : model.getEndpointOptions()) {
+                if (opts.containsKey(opt.getName())) {
+                    optionDocs.put(opt.getName(), buildOptionDoc(opt));
+                }
+            }
+            if (!optionDocs.isEmpty()) {
+                processor.put("optionDocs", optionDocs);
+            }
+        }
+    }
+
+    private static void enrichEipOptions(JsonObject processor, String type, JsonObject opts, CamelCatalog cat) {
+        EipModel model = cat.eipModel(type);
+        if (model == null) {
+            return;
+        }
+        processor.put("eipDescription", model.getDescription());
+
+        if (opts != null && model.getOptions() != null) {
+            JsonObject optionDocs = new JsonObject();
+            for (BaseOptionModel opt : model.getOptions()) {
+                if (opts.containsKey(opt.getName())) {
+                    optionDocs.put(opt.getName(), buildOptionDoc(opt));
+                }
+            }
+            if (!optionDocs.isEmpty()) {
+                processor.put("optionDocs", optionDocs);
+            }
+        }
+    }
+
+    private static JsonObject buildOptionDoc(BaseOptionModel opt) {
+        JsonObject doc = new JsonObject();
+        doc.put("description", opt.getDescription());
+        doc.put("type", opt.getType());
+        if (opt.getGroup() != null && !opt.getGroup().isEmpty()) {
+            doc.put("group", opt.getGroup());
+        }
+        if (opt.getDefaultValue() != null) {
+            doc.put("defaultValue", opt.getDefaultValue().toString());
+        }
+        if (opt.isRequired()) {
+            doc.put("required", true);
+        }
+        if (opt.isDeprecated()) {
+            doc.put("deprecated", true);
+        }
+        if (opt.getEnums() != null && !opt.getEnums().isEmpty()) {
+            doc.put("enum", opt.getEnums());
+        }
+        return doc;
+    }
+
+    // ---- Utility ----
+
+    static boolean matchesFilter(String name, String title, String description, String filter) {
+        if (filter == null || filter.isBlank()) {
+            return true;
+        }
+        String lf = filter.toLowerCase();
+        return (name != null && name.toLowerCase().contains(lf))
+                || (title != null && title.toLowerCase().contains(lf))
+                || (description != null && description.toLowerCase().contains(lf));
+    }
+
+    /**
+     * The steps of the last completed exchange, one line each: route, node, elapsed, and the body's type and size as it
+     * reached the step (from the message dump of the trace event), without the bodies, headers and properties.
+     */
+    static JsonObject historySummary(JsonObject history) {
+        JsonObject answer = new JsonObject();
+        if (history.get("name") != null) {
+            answer.put("name", history.get("name"));
+        }
+        JsonArray steps = new JsonArray();
+        Object traces = history.get("traces");
+        if (traces instanceof List<?> list) {
+            for (Object o : list) {
+                if (!(o instanceof JsonObject t)) {
+                    continue;
+                }
+                JsonObject step = new JsonObject();
+                for (String key : new String[] {
+                        "routeId", "nodeId", "nodeShortName", "nodeLabel", "location", "elapsed",
+                        "first", "last", "failed" }) {
+                    if (t.get(key) != null) {
+                        step.put(key, t.get(key));
+                    }
+                }
+                if (t.get("message") instanceof JsonObject m && m.get("body") instanceof JsonObject b) {
+                    if (b.get("type") != null) {
+                        step.put("bodyType", b.get("type"));
+                    }
+                    if (b.get("size") != null) {
+                        step.put("bodySize", b.get("size"));
+                    }
+                }
+                steps.add(step);
+            }
+        }
+        answer.put("steps", steps);
+        return answer;
+    }
+}

@@ -1,0 +1,304 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.camel.component.flatpack;
+
+import java.io.BufferedReader;
+import java.io.File;
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.InputStreamReader;
+import java.io.Reader;
+import java.nio.file.Path;
+
+import net.sf.flatpack.DataSet;
+import net.sf.flatpack.DefaultParserFactory;
+import net.sf.flatpack.Parser;
+import net.sf.flatpack.ParserFactory;
+import org.apache.camel.Category;
+import org.apache.camel.Component;
+import org.apache.camel.Consumer;
+import org.apache.camel.Exchange;
+import org.apache.camel.InvalidPayloadException;
+import org.apache.camel.Message;
+import org.apache.camel.Processor;
+import org.apache.camel.Producer;
+import org.apache.camel.processor.loadbalancer.LoadBalancer;
+import org.apache.camel.processor.loadbalancer.RoundRobinLoadBalancer;
+import org.apache.camel.spi.BodyType;
+import org.apache.camel.spi.BodyType.Carrier;
+import org.apache.camel.spi.BodyTypes;
+import org.apache.camel.spi.Metadata;
+import org.apache.camel.spi.UriEndpoint;
+import org.apache.camel.spi.UriParam;
+import org.apache.camel.spi.UriPath;
+import org.apache.camel.support.DefaultPollingEndpoint;
+import org.apache.camel.support.ExchangeHelper;
+import org.apache.camel.support.ResourceHelper;
+import org.apache.camel.util.IOHelper;
+import org.apache.camel.util.ObjectHelper;
+
+/**
+ * Parse fixed width and delimited files using the FlatPack library.
+ */
+@UriEndpoint(firstVersion = "1.4.0", scheme = "flatpack", title = "Flatpack", syntax = "flatpack:type:resourceUri",
+             remote = false, category = { Category.TRANSFORMATION }, headersClass = FlatpackConstants.class)
+@BodyTypes(consumerOut = @BodyType(value = Carrier.POJO, javaType = "net.sf.flatpack.DataSet",
+                                   description = "The Flatpack DataSet the producer parsed. With splitRows, one message per row,"
+                                                 + " with a DataSet of that one row that converts to a Map. With"
+                                                 + " splitRows=false, the whole DataSet: convert it to a List of Maps"),
+           producerIn = @BodyType(value = { Carrier.TEXT, Carrier.BYTES, Carrier.STREAM, Carrier.FILE }, format = "text",
+                                  description = "The fixed-width or delimited data to parse, such as a file from the file"
+                                                + " consumer, a java.io.File or a java.nio.file.Path; a Map or a List fails."
+                                                + " The rows go to the consumer of the same endpoint, and an exception there"
+                                                + " fails the producer"),
+           producerOut = @BodyType(value = Carrier.UNCHANGED))
+public class FlatpackEndpoint extends DefaultPollingEndpoint {
+
+    private LoadBalancer loadBalancer = new RoundRobinLoadBalancer();
+    private ParserFactory parserFactory = DefaultParserFactory.getInstance();
+
+    @UriPath
+    @Metadata(required = false, defaultValue = "delim")
+    private FlatpackType type;
+    @UriPath
+    @Metadata(required = true, supportFileReference = true)
+    private String resourceUri;
+
+    @UriParam(defaultValue = "true")
+    private boolean splitRows = true;
+    @UriParam
+    private boolean allowShortLines;
+    @UriParam
+    private boolean ignoreExtraColumns;
+
+    // delimited
+    @UriParam(defaultValue = ",")
+    private char delimiter = ',';
+    @UriParam
+    private char textQualifier = '"';
+    @UriParam(defaultValue = "true")
+    private boolean ignoreFirstRecord = true;
+
+    public FlatpackEndpoint() {
+    }
+
+    public FlatpackEndpoint(String endpointUri, Component component, String resourceUri) {
+        super(endpointUri, component);
+        this.resourceUri = resourceUri;
+    }
+
+    @Override
+    public boolean isRemote() {
+        return false;
+    }
+
+    @Override
+    public Producer createProducer() throws Exception {
+        return new FlatpackProducer(this);
+    }
+
+    @Override
+    public Consumer createConsumer(Processor processor) throws Exception {
+        FlatpackConsumer consumer = new FlatpackConsumer(this, processor, loadBalancer);
+        configureConsumer(consumer);
+        return consumer;
+    }
+
+    public void processDataSet(Exchange originalExchange, DataSet dataSet, int counter) throws Exception {
+        Exchange exchange = ExchangeHelper.createCorrelatedCopy(originalExchange, false);
+        Message in = exchange.getIn();
+        in.setBody(dataSet);
+        in.setHeader(FlatpackConstants.FLATPACK_COUNTER, counter);
+        loadBalancer.process(exchange);
+        if (exchange.getException() != null && originalExchange.getException() == null) {
+            // a failure in the consumer route fails the original exchange
+            originalExchange.setException(exchange.getException());
+        }
+    }
+
+    public Parser createParser(Exchange exchange) throws Exception {
+        Reader bodyReader = null;
+        try {
+            if (FlatpackType.fixed == type) {
+                bodyReader = getBodyReader(exchange);
+                return createFixedParser(resourceUri, bodyReader);
+            } else {
+                return createDelimitedParser(exchange);
+            }
+        } catch (Exception e) {
+            // must close reader in case of some exception
+            IOHelper.close(bodyReader);
+            throw e;
+        }
+    }
+
+    protected Parser createFixedParser(String resourceUri, Reader bodyReader) throws IOException {
+        InputStream is = ResourceHelper.resolveMandatoryResourceAsInputStream(getCamelContext(), resourceUri);
+        InputStreamReader reader = new InputStreamReader(is);
+        Parser parser = getParserFactory().newFixedLengthParser(reader, bodyReader);
+        if (isAllowShortLines()) {
+            parser.setHandlingShortLines(true);
+            parser.setIgnoreParseWarnings(true);
+        }
+        if (isIgnoreExtraColumns()) {
+            parser.setIgnoreExtraColumns(true);
+            parser.setIgnoreParseWarnings(true);
+        }
+        return parser;
+    }
+
+    public Parser createDelimitedParser(Exchange exchange) throws InvalidPayloadException, IOException {
+        Reader bodyReader = getBodyReader(exchange);
+
+        Parser parser;
+        if (ObjectHelper.isEmpty(getResourceUri())) {
+            parser = getParserFactory().newDelimitedParser(bodyReader, delimiter, textQualifier);
+        } else {
+            InputStream is = ResourceHelper.resolveMandatoryResourceAsInputStream(getCamelContext(), resourceUri);
+            InputStreamReader reader = new InputStreamReader(is, ExchangeHelper.getCharsetName(exchange));
+            parser = getParserFactory().newDelimitedParser(reader, bodyReader, delimiter, textQualifier, ignoreFirstRecord);
+        }
+
+        if (isAllowShortLines()) {
+            parser.setHandlingShortLines(true);
+            parser.setIgnoreParseWarnings(true);
+        }
+        if (isIgnoreExtraColumns()) {
+            parser.setIgnoreExtraColumns(true);
+            parser.setIgnoreParseWarnings(true);
+        }
+
+        return parser;
+    }
+
+    private static Reader getBodyReader(Exchange exchange) throws InvalidPayloadException {
+        Message in = exchange.getIn();
+        Object body = in.getBody();
+        if (body instanceof File || body instanceof Path) {
+            // there is no type converter from a File or Path to a Reader, only to a BufferedReader
+            return in.getMandatoryBody(BufferedReader.class);
+        }
+        return in.getMandatoryBody(Reader.class);
+    }
+
+    // Properties
+    //-------------------------------------------------------------------------
+
+    public String getResourceUri() {
+        return resourceUri;
+    }
+
+    public ParserFactory getParserFactory() {
+        return parserFactory;
+    }
+
+    public void setParserFactory(ParserFactory parserFactory) {
+        this.parserFactory = parserFactory;
+    }
+
+    public LoadBalancer getLoadBalancer() {
+        return loadBalancer;
+    }
+
+    public void setLoadBalancer(LoadBalancer loadBalancer) {
+        this.loadBalancer = loadBalancer;
+    }
+
+    public boolean isSplitRows() {
+        return splitRows;
+    }
+
+    /**
+     * Sets the Component to send each row as a separate exchange once parsed
+     */
+    public void setSplitRows(boolean splitRows) {
+        this.splitRows = splitRows;
+    }
+
+    public boolean isAllowShortLines() {
+        return this.allowShortLines;
+    }
+
+    /**
+     * Allows for lines to be shorter than expected and ignores the extra characters
+     */
+    public void setAllowShortLines(boolean allowShortLines) {
+        this.allowShortLines = allowShortLines;
+    }
+
+    /**
+     * Allows for lines to be longer than expected and ignores the extra characters
+     */
+    public void setIgnoreExtraColumns(boolean ignoreExtraColumns) {
+        this.ignoreExtraColumns = ignoreExtraColumns;
+    }
+
+    public boolean isIgnoreExtraColumns() {
+        return ignoreExtraColumns;
+    }
+
+    public FlatpackType getType() {
+        return type;
+    }
+
+    /**
+     * Whether to use fixed or delimiter
+     */
+    public void setType(FlatpackType type) {
+        this.type = type;
+    }
+
+    /**
+     * URL for loading the flatpack mapping file from classpath or file system
+     */
+    public void setResourceUri(String resourceUri) {
+        this.resourceUri = resourceUri;
+    }
+
+    public char getDelimiter() {
+        return delimiter;
+    }
+
+    /**
+     * The default character delimiter for delimited files.
+     */
+    public void setDelimiter(char delimiter) {
+        this.delimiter = delimiter;
+    }
+
+    public char getTextQualifier() {
+        return textQualifier;
+    }
+
+    /**
+     * The text qualifier for delimited files.
+     */
+    public void setTextQualifier(char textQualifier) {
+        this.textQualifier = textQualifier;
+    }
+
+    public boolean isIgnoreFirstRecord() {
+        return ignoreFirstRecord;
+    }
+
+    /**
+     * Whether the first line is ignored for delimited files (for the column headers).
+     */
+    public void setIgnoreFirstRecord(boolean ignoreFirstRecord) {
+        this.ignoreFirstRecord = ignoreFirstRecord;
+    }
+}

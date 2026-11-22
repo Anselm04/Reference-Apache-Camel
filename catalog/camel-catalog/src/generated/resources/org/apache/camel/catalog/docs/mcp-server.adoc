@@ -1,0 +1,712 @@
+= MCP Server Component
+:doctitle: MCP Server
+:shortname: mcp-server
+:artifactid: camel-mcp-server
+:description: Expose ai-tool routes as MCP tools, ai-resource routes as MCP resources and ai-prompt routes as MCP prompts
+:since: 4.22
+:supportlevel: Preview
+:tabs-sync-option:
+
+*Since Camel {since}*
+
+The camel-mcp-server module exposes Camel routes registered via the
+xref:ROOT:ai-tool-component.adoc[ai-tool] and xref:ROOT:ai-resource-component.adoc[ai-resource]
+components as tools and resources of a
+https://modelcontextprotocol.io[Model Context Protocol] (MCP) server, served
+over MCP streamable HTTP or stdio (stdin/stdout JSON-RPC). No route is needed for the
+server itself: add the dependency, configure which tags to expose, and every matching
+`ai-tool` route becomes an MCP tool and every matching `ai-resource` route an MCP
+resource or resource template, depending on whether it uses `resourceUri` or `uriTemplate`,
+discoverable by any MCP client (another Camel application, an IDE, a coding agent).
+
+NOTE: This component serves the routes of your own integration. To give your AI assistant
+Camel knowledge while you write routes (catalog, validation, inspecting running integrations),
+use the xref:manual::camel-jbang-mcp.adoc[Camel CLI MCP Server] (`camel mcp`) instead.
+
+Maven users will need to add the following dependency to their `pom.xml`:
+
+[source,xml]
+----
+<dependency>
+    <groupId>org.apache.camel</groupId>
+    <artifactId>camel-mcp-server</artifactId>
+    <version>x.x.x</version>
+    <!-- use the same version as your Camel core version -->
+</dependency>
+----
+
+== Architecture
+
+The module is split in two artifacts:
+
+* `camel-mcp-server-api` — the runtime-agnostic _bridge_ and the small
+  `McpServerEngine` SPI. The bridge owns selection (tags), execution via the
+  shared `AiToolExecutor` and `AiResourceExecutor` (per-call timeout, error
+  sanitization) and reacts to `AiToolRegistry` and `AiResourceRegistry` changes
+  when routes start and stop. It has no dependency on the MCP Java SDK.
+* `camel-mcp-server` — the serving engine for Camel Main and Camel JBang,
+  built on the official MCP Java SDK. Streamable HTTP uses a Vert.x transport
+  registered on the Camel main HTTP server's router (port `camel.server.port`,
+  lifecycle, authentication and CORS). Stdio uses the MCP Java SDK
+  `StdioServerTransportProvider` so a local IDE or agent can launch the Camel
+  process as a subprocess with MCP JSON-RPC on stdin/stdout.
+
+Engine resolution mirrors the platform-http engine: a bean of type
+`McpServerEngine` in the Camel registry wins; otherwise the engine is
+discovered on the classpath. Other runtimes plug native engines through the
+same SPI: on Quarkus the `camel-quarkus-mcp-server` extension serves through
+the Quarkiverse `quarkus-mcp-server` (configured via `+quarkus.mcp.server.*+`),
+and on Spring Boot the starter serves through the Spring AI MCP server
+(configured via `+spring.ai.mcp.server.*+`). Bridge behavior — tag selection,
+timeout, sanitization — is identical on every runtime and verified by a shared
+conformance test kit.
+
+Resource support is opt-in on the SPI: `resourceAdded` and `resourceRemoved`
+default to no-ops and an engine declares `supportsResources()` when it serves
+fixed resources. Resource-template support is independently opt-in through
+`resourceTemplateAdded`, `resourceTemplateRemoved` and
+`supportsResourceTemplates()`. Engines that do not implement either capability
+remain source-compatible because the SPI methods have defaults; the bridge logs
+a WARN when a matching route cannot be served by the selected engine.
+Resource and template behaviour is covered by the MCP resource conformance tests.
+
+An engine refuses a tool, resource or prompt it cannot serve, for example a name its
+runtime already serves, by throwing `McpServerRefusedException` from
+`toolAdded`, `resourceAdded` or `promptAdded`. The bridge logs an ERROR, as for
+its own name clashes, and does not track the refused item as published.
+
+== Usage
+
+Define tools as regular `ai-tool` routes and give them tags:
+
+[tabs]
+====
+Java::
++
+[source,java]
+----
+from("ai-tool:query_db?tags=crm" +
+    "&description=Query customer database" +
+    "&parameter.customerId=string" +
+    "&parameter.customerId.description=The customer id" +
+    "&parameter.customerId.required=true")
+    .to("jdbc:dataSource");
+----
+
+XML::
++
+[source,xml]
+----
+<route>
+  <from uri="ai-tool:query_db?tags=crm&amp;description=Query customer database&amp;parameter.customerId=string&amp;parameter.customerId.description=The customer id&amp;parameter.customerId.required=true"/>
+  <to uri="jdbc:dataSource"/>
+</route>
+----
+
+YAML::
++
+[source,yaml]
+----
+- route:
+    from:
+      uri: ai-tool:query_db
+      parameters:
+        tags: crm
+        description: "Query customer database"
+        parameter.customerId: string
+        parameter.customerId.description: "The customer id"
+        parameter.customerId.required: "true"
+      steps:
+        - to:
+            uri: jdbc:dataSource
+----
+====
+
+=== Resources
+
+Read-only content is exposed as MCP resources through `ai-resource` routes,
+selected by the same tags:
+
+[source,java]
+----
+from("ai-resource:app_config"
+    + "?resourceUri=camel:///config/app.json"
+    + "&tags=crm"
+    + "&description=Current application configuration"
+    + "&mimeType=application/json")
+    .pollEnrich("file:config?fileName=app.json&noop=true&idempotent=false", 5000);
+----
+
+An MCP client then sees the resource in `resources/list` and fetches it with
+`resources/read`. A read carries no arguments: the route is invoked with an
+empty exchange and its body is the content. The `mimeType` decides the wire
+format — textual types are sent as text, everything else as a base64 blob —
+see xref:ROOT:ai-resource-component.adoc[ai-resource] for the details.
+
+Unlike `tools/call`, `resources/read` has no in-band error flag, so a failed
+read is returned as a JSON-RPC error with the same sanitized message the
+client would get from a failing tool.
+
+Resource templates are declared with `uriTemplate` instead of `resourceUri`; each variable
+occupies one complete path segment. For example:
+
+[source,java]
+----
+from("ai-resource:customer?uriTemplate=crm://customers/{id}&tags=crm")
+    .process(exchange -> {
+        String id = exchange.getMessage().getHeader(
+            "CamelAiResourceTemplateVariable.id", String.class);
+        String uri = exchange.getMessage().getHeader("CamelAiResourceUri", String.class);
+        // Validate this untrusted client input before using it.
+    });
+----
+
+The bridge exposes these as MCP resource templates and resolves a concrete URI on
+`resources/read`. Captured values remain raw (percent-encoding is retained), are not
+property-resolved or evaluated, and must be validated by the route before use.
+
+=== Prompts
+
+Reusable prompt templates are exposed through `ai-prompt` routes. Prompt argument
+metadata is declared with `argument.NAME.description` and
+`argument.NAME.required`; argument values arrive in the route as String headers.
+
+[source,java]
+----
+from("ai-prompt:summarize_account"
+    + "?tags=crm"
+    + "&description=Summarize an account"
+    + "&argument.accountId.description=The account identifier"
+    + "&argument.accountId.required=true")
+    .setBody(simple("Summarize account ${header.accountId} and its recent activity."));
+----
+
+A String body becomes one MCP `user` message. A List body can return multiple
+messages: each element is a String (a `user` message) or a Map with `role`
+(`user` or `assistant`) and `content`. Content may be a String or an MCP
+content block. Camel Main and JBang serve prompts over both streamable HTTP
+and stdio. Changes to prompt routes are announced with
+`notifications/prompts/list_changed`.
+
+=== Tool annotation hints
+
+`ai-tool` routes can declare optional MCP `ToolAnnotations` hints
+(`title`, `readOnlyHint`, `destructiveHint`, `idempotentHint`, `openWorldHint`, `returnDirect`).
+The bridge passes them through to the MCP engine. See
+xref:ROOT:ai-tool-component.adoc#_mcp_tool_annotation_hints[MCP Tool Annotation Hints]
+for configuration examples. Hints are advisory UX metadata only — not authorization.
+
+On Camel Main and Camel JBang no code is needed — like Jolokia or
+Prometheus, the server starts from configuration properties alone.
+
+=== Streamable HTTP (default)
+
+[source,properties]
+----
+camel.server.enabled = true
+camel.server.mcp-enabled = true
+camel.server.mcp-tags = crm,notify
+camel.server.mcp-server-name = my-integration-app
+camel.server.mcp-server-title = My Integration MCP
+camel.server.mcp-server-description = Tools for customer operations
+camel.server.mcp-server-website-url = https://example.com/docs
+camel.server.mcp-instructions = Use these tools to operate the integration.
+camel.server.mcp-server-icons = [{"src":"https://example.com/icon.png","mimeType":"image/png","sizes":["48x48"],"theme":"light"}]
+----
+
+Tag patterns support wildcards: use `+*+` to expose all tagged tools, or a
+prefix pattern like `+crm*+` to expose all tags starting with `crm`:
+
+The MCP endpoint is then served at `http://<host>:<port>/mcp` on the Camel
+main HTTP server. Any MCP client can connect over streamable HTTP, for
+example another Camel integration using the
+xref:ROOT:openai-component.adoc[camel-openai] MCP client:
+
+[source,java]
+----
+from("direct:agent")
+    .to("openai:chat-completion"
+        + "?model={{llm.model}}"
+        + "&autoToolExecution=true"
+        + "&mcpServer.myCamelTools.transportType=streamableHttp"
+        + "&mcpServer.myCamelTools.url=http://localhost:8080/mcp");
+----
+
+=== Stdio (local IDE / agent subprocess)
+
+For local IDE or agent integration, serve MCP over process stdin/stdout instead
+of HTTP. Set `camel.server.mcp-transport=stdio` (or use the Camel JBang
+`--mcp-stdio` flag). Stdio mode does not require the Camel main HTTP server.
+
+[source,properties]
+----
+camel.server.mcp-enabled = true
+camel.server.mcp-transport = stdio
+camel.server.mcp-tags = crm,agent
+camel.server.mcp-server-name = my-camel-tools
+----
+
+With Camel JBang:
+
+[source,shell]
+----
+camel run tools.yaml --mcp-stdio --mcp-tags=crm,agent
+----
+
+NOTE: `--mcp-tags` configures the ai-tool MCP server (`camel.server.mcp-tags`) and works with
+`--mcp-stdio` or HTTP transport when `camel.server.mcp-enabled` is set in properties. It is
+not used by `--mcp`, which exposes dev/diagnostics MCP tools on the management HTTP server.
+
+Logging and startup summaries are routed to stderr so stdout carries MCP
+JSON-RPC only. Camel JBang configures a stderr Log4j2 appender automatically
+when `--mcp-stdio` is used or when `camel.server.mcp-transport=stdio` is set
+in the profile. On Camel Main, configure logging to stderr yourself (for
+example using the `log4j2-mcp-stdio.properties` resource shipped in
+`camel-mcp-server`). Anything else written to `System.out` while the MCP server runs, such as
+a `stream:out` endpoint or a `System.out.println` in a bean, goes to stderr as well.
+When the MCP client closes stdin, Camel stops and the process exits.
+Configure your MCP client (for example in `mcp.json`) to launch
+the Camel process as a subprocess:
+
+[source,json]
+----
+{
+  "mcpServers": {
+    "my-camel-tools": {
+      "command": "camel",
+      "args": ["run", "tools.yaml", "--mcp-stdio", "--mcp-tags=crm,agent"]
+    }
+  }
+}
+----
+
+== Options
+
+The options, configurable as `camel.server.mcp-*` properties on Camel Main /
+JBang (see the xref:main.adoc[camel-main] options) or on
+`McpServerConfiguration` programmatically:
+
+[width="100%",cols="2,5,2,1",options="header"]
+|===
+| Option | Description | Default | Owner
+
+| `camel.server.mcp-enabled` | Whether to expose ai-tool routes as MCP tools,
+  ai-resource routes as MCP resources and ai-prompt routes as MCP prompts.
+  | `false` | bridge
+| `camel.server.mcp-transport` | MCP transport: `http` (streamable HTTP on the
+  embedded server, default) or `stdio` (JSON-RPC on process stdin/stdout for
+  local agent subprocesses). Stdio exposes tools, resources (including templates) and prompts. | `http` | engine
+| `camel.server.mcp-tags` | Comma-separated list of tag patterns selecting the
+  ai-tool, ai-resource and ai-prompt routes to expose. Patterns support exact match,
+  wildcard prefix (`foo*`), and `*` to match all tags. Only routes registered
+  under a matching tag are published; the untagged default pools are never
+  exposed. When not set, nothing is published. |  | bridge
+| `camel.server.mcp-tool-timeout` | Per-call tool execution timeout in
+  milliseconds. A call exceeding the timeout returns an error result to the
+  MCP client; the underlying route keeps running until it completes on its
+  own. | `20000` | bridge
+| `camel.server.mcp-resource-timeout` | Per-read resource execution timeout in
+  milliseconds. A read exceeding the timeout returns an error to the MCP
+  client; the underlying route keeps running until it completes on its
+  own. | `20000` | bridge
+| `camel.server.mcp-prompt-timeout` | Per-request prompt execution timeout in
+  milliseconds. A request exceeding the timeout returns an error to the MCP
+  client; the underlying route may keep running until it completes. | `20000` | bridge
+| `camel.server.mcp-path` | HTTP path where the MCP endpoint is served. |
+  `/mcp` | engine
+| `camel.server.mcp-server-name` | MCP server name advertised to clients. |
+  CamelContext name | engine
+| `camel.server.mcp-server-title` | MCP server display title advertised to clients in
+  `serverInfo.title`. |  | engine
+| `camel.server.mcp-server-description` | MCP server description advertised to clients in
+  `serverInfo.description`. |  | engine
+| `camel.server.mcp-server-website-url` | MCP server website URL advertised to clients in
+  `serverInfo.websiteUrl`. |  | engine
+| `camel.server.mcp-instructions` | Top-level MCP instructions returned to clients on
+  initialize (not part of `serverInfo`). |  | engine
+| `camel.server.mcp-server-icons` | JSON array of MCP server icons advertised to clients in
+  `serverInfo.icons`. Each entry must include a `src` URL and may include
+  `mimeType`, `sizes` and `theme`. |  | engine
+| `camel.server.mcp-session-keep-alive-interval` | Keep-alive ping interval in
+  milliseconds for MCP sessions on the Vert.x streamable transport. Dead sessions
+  are evicted after consecutive ping failures. `0` disables keep-alive
+  pings. | `30000` | engine
+| `camel.server.mcp-session-idle-ttl` | Idle TTL in milliseconds for MCP
+  sessions on the Vert.x streamable transport. Sessions with no activity for
+  longer than this interval are evicted. `0` disables idle eviction. |
+  `300000` | engine
+| `camel.server.mcp-protocol-era` | The MCP protocol versions served: `dual`
+  (both the versions that open with an `initialize` handshake, 2025-11-25 and
+  earlier, and protocol version 2026-07-28, on the same endpoint), `legacy` (only
+  the former, as before Camel 4.24) or `modern` (only 2026-07-28). Serving
+  2026-07-28 is a preview. See <<_protocol_versions>>. | `dual` | engine
+| `camel.server.mcp-stateless` | Serve the clients that open with `initialize`
+  without a session: no `Mcp-Session-Id` is returned, so a restart or a request
+  reaching another instance does not end their session. Clients of 2026-07-28
+  never get a session. See <<_serving_without_sessions>>. | `false` | engine
+| `camel.server.mcp-allowed-origins` | Comma-separated list of origins allowed
+  to call the MCP endpoint, such as `+https://app.example.com+` or
+  `+http://localhost:*+` (`+:*+` matches any port). A request without an `Origin`
+  header is always served; a request with an `Origin` header that is not in the
+  list gets HTTP 403. Scheme and host are compared ignoring case, and a default
+  port may be left out. `+*+` is not supported. When not set, only loopback
+  origins are allowed. See <<_origins_and_binding>>. | loopback origins | engine
+| `camel.server.mcp-oauth-profile` | Name of the `camel-oauth` profile used to validate bearer tokens. Requires `camel-oauth` on the classpath. Supported by the Camel Main / JBang Vert.x HTTP engine. |  | engine
+| `camel.server.mcp-required-scopes` | Comma-separated OAuth scopes required to access the MCP HTTP endpoint. Requires `camel.server.mcp-oauth-profile`. |  | engine
+| `camel.server.mcp-resource-uri` | Explicit public HTTPS resource identifier for the MCP endpoint, used by RFC 9728 metadata. Requires `camel.server.mcp-oauth-profile`; its path must match `camel.server.mcp-path`. It is never inferred from request headers. |  | engine
+|===
+
+Bridge-owned options are honored identically on every runtime. Engine-owned
+options are consumed by the Vert.x HTTP engine or the stdio engine on Camel
+Main/JBang; on runtimes with a native engine (Quarkus, Spring Boot) the native
+configuration decides serving concerns and a startup WARN is logged when an
+ignored option is set.
+
+On other runtimes, or when wiring programmatically, add the
+`McpServerBridge` service to the CamelContext instead:
+
+[source,java]
+----
+McpServerConfiguration configuration = new McpServerConfiguration();
+configuration.setTags("crm,notify");
+configuration.setServerName("my-integration-app");
+configuration.setServerTitle("My Integration MCP");
+configuration.setServerDescription("Tools for customer operations");
+configuration.setServerWebsiteUrl("https://example.com/docs");
+configuration.setInstructions("Use these tools to operate the integration.");
+configuration.setServerIcons(List.of(new McpServerIcon(
+        "https://example.com/icon.png", "image/png", List.of("48x48"), "light")));
+camelContext.addService(new McpServerBridge(configuration));
+----
+
+== Protocol
+
+This section describes the engines shipped in `camel-mcp-server` for Camel
+Main and Camel JBang. On Quarkus and Spring Boot the transport is owned by
+the native engine instead — quarkus-mcp-server and the Spring Boot embedded
+HTTP server (Spring AI MCP server) respectively — and the details below do not
+apply.
+
+=== Streamable HTTP (Vert.x engine)
+
+The Vert.x engine implements the MCP streamable HTTP transport:
+
+* `POST /mcp` answering `application/json` or `text/event-stream` depending on
+  the request,
+* a long-lived `GET /mcp` SSE channel for server notifications, with
+  `Last-Event-ID` replay,
+* session management via the `Mcp-Session-Id` header and `DELETE /mcp` for
+  session termination.
+* active session eviction: keep-alive pings (default every 30 seconds) remove
+  sessions whose ping fails repeatedly, and an idle TTL (default 5 minutes)
+  removes sessions with no traffic. Configure with
+  `camel.server.mcp-session-keep-alive-interval` and
+  `camel.server.mcp-session-idle-ttl` (set either to `0` to disable).
+* an `Origin` header check on every method (`POST`, `GET` and `DELETE`), see
+  <<_origins_and_binding>>.
+
+Tools, resources and prompts appearing or disappearing (routes starting and stopping)
+emit `notifications/tools/list_changed`, `notifications/resources/list_changed`
+and `notifications/prompts/list_changed` to connected clients. Per-resource
+subscriptions (`resources/subscribe`) are not offered: the server advertises
+`resources` with `listChanged` only.
+
+The sessions, the `GET` channel and the session options above belong to the
+protocol versions that open with an `initialize` handshake; see the next section
+for protocol version 2026-07-28.
+
+=== Protocol versions
+
+The Vert.x engine serves two kinds of MCP clients on the same endpoint, and
+chooses for each request from the protocol version it carries:
+
+* Clients of the protocol versions that open with an `initialize` handshake
+  (2025-11-25 and earlier) get a session, kept in memory by the application, as
+  described above. The session ends when the application restarts (for example
+  when Camel JBang reloads it), and a request that reaches another instance finds
+  no session, so several instances need session affinity in front of them.
+* Clients of protocol version 2026-07-28 have no session: every request carries
+  its protocol version and the client capabilities, and is served on its own. A
+  restart, or a request reaching another instance, is invisible to such a client,
+  and several instances need no session affinity. It is told about changed lists
+  of tools, resources or prompts through a `subscriptions/listen` request, whose
+  answer is a stream that stays open. A request of 2026-07-28 must also carry the
+  `MCP-Protocol-Version`, `Mcp-Method` and, for `tools/call`, `resources/read` and
+  `prompts/get`, `Mcp-Name` headers; when they disagree with the body, it is
+  answered with HTTP 400 and error `-32020`. A gateway in front of several
+  instances may route on these headers, but the server compares them with the
+  body only for protocol version 2026-07-28: the `Mcp-Method` and `Mcp-Name`
+  headers of a request of an older version, or without `MCP-Protocol-Version`,
+  may name another method or tool than its body. A gateway that routes or
+  authorizes on these headers must therefore reject the requests without
+  `MCP-Protocol-Version: 2026-07-28`, or the instances must run with
+  `mcp-protocol-era = modern`.
+
+Which protocol a client uses is up to the client. Many clients still open with
+`initialize`, and some (for example the client of the MCP Python SDK) first try
+protocol version 2026-07-28 and fall back to `initialize` when the server does
+not serve it.
+
+`camel.server.mcp-protocol-era` restricts the protocol versions served:
+
+[cols="1,3"]
+|===
+| `mcp-protocol-era` | Served
+
+| `dual` (default)
+| Both, as described above.
+
+| `legacy`
+| Only the protocol versions that open with `initialize`, with sessions, as
+  before Camel 4.24. A request of protocol version 2026-07-28 is answered as
+  any request without a session.
+
+| `modern`
+| Only protocol version 2026-07-28: no session at all, so any instance can answer
+  any request. An `initialize` request is answered with HTTP 400 and an error that
+  names the supported versions, and `GET` or `DELETE` on the endpoint with
+  HTTP 405.
+|===
+
+NOTE: Serving protocol version 2026-07-28 is a preview: it is built on the
+`io.modelcontextprotocol.modern` API of the MCP Java SDK, which may still
+change in minor releases. Set `camel.server.mcp-protocol-era = legacy` to serve
+only the protocol versions that open with `initialize`.
+
+==== Serving without sessions
+
+Several instances without session affinity, autoscaling, rolling restarts or a
+reloading Camel JBang all end the sessions of the clients that open with
+`initialize`. Clients of protocol version 2026-07-28 are not affected, but many
+clients still open with `initialize`. For them, the MCP streamable HTTP transport
+lets a server keep no session at all, and `camel.server.mcp-stateless = true`
+does so:
+
+* the answer to `initialize` carries no `Mcp-Session-Id`, and every request is
+  served on its own, so any instance can answer it and a restart is invisible to
+  the client;
+* the server cannot send such a client anything outside the answer to a request:
+  the client is not notified when tools, resources or prompts change (it sees the
+  change at its next list request, and the lists do not advertise
+  `listChanged`), and features that need a server-initiated request, such as
+  sampling or elicitation, are not available;
+* a `GET` or `DELETE` on the endpoint is answered with HTTP 405, and the session
+  keep-alive and idle TTL options do not apply.
+
+[source,properties]
+----
+camel.server.mcp-enabled = true
+camel.server.mcp-tags = crm
+# no session for any client: any instance can answer any request
+camel.server.mcp-stateless = true
+----
+
+With `mcp-protocol-era = legacy` and `mcp-stateless = true`, a request of
+protocol version 2026-07-28 is answered with HTTP 400 and an `Invalid Request`
+error (`-32600`) that names the supported versions, as with sessions, so a
+client that also speaks an older version falls back to `initialize`.
+
+Origin, `Host` and OAuth checks apply to every request whatever its protocol
+version. A request without a session, of 2026-07-28 or with `mcp-stateless`, is
+authenticated on its own, so its OAuth token does not need the subject claim a
+session requires to know its owner.
+
+=== Stdio engine
+
+The stdio engine uses the MCP Java SDK `StdioServerTransportProvider`. MCP
+JSON-RPC is read from stdin and written to stdout. Logging and startup banners
+must not appear on stdout — Camel Main/JBang configure Log4j2 to write logs to
+stderr in stdio mode. While the engine runs, `System.out` points at stderr, and the
+transport writes to the original stdout. When stdin reaches its end (the client went
+away), the engine stops the CamelContext. No HTTP port is opened and no session
+management headers apply.
+
+== Security
+
+External MCP clients are *untrusted senders* under the
+xref:manual::security-model.adoc[Camel security model]. The module applies the
+following rules:
+
+* *Explicit opt-in per route*: only tools, resources and prompts whose tags
+  match the configured tag patterns are exposed. The untagged default pools are
+  never exposed, even when using the `*` wildcard.
+* *Flat namespace protection*: a tool or prompt whose name collides with an
+  already exposed item is refused with an ERROR log — never silently replaced.
+  Resources follow the same rule on their uri.
+* *Error sanitization*: route exceptions are mapped to a generic error
+  message; the cause is logged server-side and never sent to the client.
+  Argument validation messages (missing or invalid parameters) are returned
+  as-is.
+* *Returned content*: the result of a tool, resource or prompt is passed to the
+  client and the model as it is. Data that a route reads from a source outsiders can write may
+  contain prompt injection; the route author decides what goes in.
+* *Bounded execution*: every call, read and prompt request is subject to its
+  configured timeout. A timed-out route keeps running server-side until it
+  completes; the timeout bounds the MCP request, not the route.
+* *Authentication (HTTP)*: on Camel Main and Camel JBang, the Vert.x engine can validate
+  bearer tokens with the MCP OAuth options below. The embedded server's global
+  `camel.server.authentication*` settings may also apply; they are separate from
+  the MCP OAuth profile. On Quarkus and Spring Boot, authentication is owned by
+  the native runtime security.
+* *Authentication (stdio)*: stdio mode has no HTTP transport and therefore no
+  HTTP authentication layer. Trust is the parent process that launched the
+  Camel subprocess (local IDE or agent). Route authors remain fully trusted;
+  only explicitly tagged tools are exposed.
+
+
+=== OAuth bearer-token authentication (Camel Main / Camel JBang)
+
+The Vert.x streamable HTTP engine can protect the MCP endpoint with OAuth bearer tokens. Add
+xref:oauth.adoc[camel-oauth] to the runtime classpath and configure a named incoming-token validation profile.
+For production, use HTTPS for both the MCP endpoint and the authorization-server endpoints, and
+configure an expected issuer and audience.
+
+[source,properties]
+----
+camel.server.mcp-enabled = true
+camel.server.mcp-transport = http
+camel.server.mcp-path = /mcp
+camel.server.mcp-oauth-profile = keycloak
+camel.server.mcp-required-scopes = mcp:read,mcp:write
+camel.server.mcp-resource-uri = https://mcp.example.com/mcp
+
+camel.oauth.keycloak.base-uri = https://id.example.com/realms/my-realm
+camel.oauth.keycloak.expected-audience = mcp-server
+camel.oauth.keycloak.allowed-jws-algorithms = RS256
+----
+
+`camel.server.mcp-resource-uri` is the canonical, externally visible HTTPS URI of the protected
+MCP resource. It must not contain user-info, a query, or a fragment, and its path must exactly match
+`camel.server.mcp-path`. The embedded HTTP context path `camel.server.path` must remain `/` while
+OAuth is enabled; a non-root context path is rejected by the Vert.x engine because RFC 9728 requires
+the protected-resource metadata document to be discoverable from the origin root, not below the
+HTTP context-path prefix. Configure any public path prefix in `camel.server.mcp-path` and in the
+resource URI. TLS may terminate at a trusted reverse proxy, but
+the configured resource URI must be the URL that clients use. The OAuth profile's
+`allow-insecure-http` option applies only to local authorization-server discovery/JWKS/introspection
+endpoints; it does not permit an HTTP MCP resource URI.
+
+The unauthenticated RFC 9728 document is served at
+`/.well-known/oauth-protected-resource` followed by the MCP resource path. Requests without a
+bearer token or with an invalid token receive HTTP 401 and a `WWW-Authenticate` challenge containing
+`resource_metadata`; a valid token missing a required scope receives HTTP 403 with
+`error="insufficient_scope"`, the required scopes, and the metadata URL. Identity-provider
+infrastructure failures return HTTP 503. Error responses do not expose the token, client secret, or
+internal validation details.
+
+When OAuth is enabled, an MCP session is bound to the validated token's `sub` claim at
+initialization. Subsequent POST, GET, and DELETE requests must use a token with the same
+subject; requests from another subject receive the same not-found response as an unknown
+session ID. A token without a non-empty subject cannot initialize an OAuth-protected MCP
+session. This prevents a session identifier from being reused across authenticated users.
+
+For an authenticated tool call, the bridge exposes the following exchange properties:
+
+* `CamelMcpOAuthSubject`, `CamelMcpOAuthScopes`, and `CamelMcpOAuthClaims` contain the subject,
+  scopes, and claims from the validated token.
+* `CamelAiToolSecurityPrincipalName` and `CamelAiToolSecurityPrincipalRoles` expose the runtime-neutral
+  caller name and roles when available. The roles are the first of the `roles`,
+  `realm_access.roles` and `groups` claims that is an array: the claims are not merged, and
+  client roles (`resource_access`) are not read. With Keycloak, realm roles work as issued, and a
+  client role or a group needs a mapper into the `roles` claim, which is then read instead of the
+  realm roles; the group mapper writes the full path (`/finance-team`) unless its "Full group path"
+  switch is off. The `allowedRoles` option of an xref:ROOT:ai-tool-component.adoc[ai-tool] route
+  checks these roles before the route runs. Without an authenticated caller, as over stdio or on a
+  server without authentication, they are not set and a tool with `allowedRoles` refuses every call.
+* `CamelOAuthTokenValidationResult` contains the full Camel OAuth validation result for route code
+  that already consumes the standard HTTP OAuth exchange property.
+
+These options configure OAuth only on the Camel Main / JBang Vert.x HTTP engine. Camel Main stdio
+mode has no HTTP authentication layer: it logs a warning and ignores these OAuth options. Native
+Spring Boot and Quarkus MCP engines own their security configuration; passing these Camel-engine
+OAuth options to an unsupported programmatic engine fails at bridge initialization instead of
+silently leaving an endpoint unprotected.
+
+=== Origins and binding
+
+The MCP streamable HTTP transport requires a server to validate the `Origin`
+header. The Vert.x engine on Camel Main and Camel JBang does so on every request
+to the MCP endpoint (`POST`, the SSE `GET` and `DELETE`):
+
+* A request *without* an `Origin` header is served. MCP clients run as a
+  process (an IDE, an agent, another Camel integration) and send none.
+* A request *with* an `Origin` header is served only when the origin is
+  allowed. Any other origin gets HTTP 403 with a JSON-RPC error that has no
+  `id`, and no tool or resource route is called.
+* By default only loopback origins are allowed: `localhost`, `127.0.0.1` and
+  `[::1]`, over `http` or `https`, on any port. Browser-based tools on the
+  same machine, such as the MCP Inspector, keep working.
+* `camel.server.mcp-allowed-origins` replaces the default with your own list.
+  Each entry is an origin (scheme, host and port), or ends with `+:*+` to match
+  any port. Add the loopback entries again if you still need them:
+
+[source,properties]
+----
+camel.server.mcp-allowed-origins = https://app.example.com, http://localhost:*
+----
+
+Entries are compared in the form a browser sends the `Origin` header: the
+scheme and host ignoring case, and without the default port, so
+`+https://App.Example.com:443/+` and `+https://app.example.com+` are the same
+origin. An entry that can never match an `Origin` header fails the startup with
+a message saying why: `+*+` (the check cannot be turned off; clients that are
+not browsers send no `Origin` header and are always served), an entry with a
+path such as `+https://app.example.com/mcp+`, an entry without a scheme such as
+`app.example.com`, or a wildcard in the host such as `+https://*.example.com+`.
+
+A refused request is logged at `DEBUG` level by the
+`org.apache.camel.component.mcp.server.vertx.VertxMcpStreamableServerTransportProvider`
+logger, with the `Origin` (or the `Host`) it carried.
+
+The check is independent of the platform-http CORS configuration: CORS only
+adds response headers for the browser, while the origin check refuses the
+request on the server.
+
+The `Host` header can be checked as well, with
+`camel.server.mcp-allowed-hosts`. It is not set by default, and then the `Host`
+header is not checked. When set, a request whose `Host` header is missing or not
+in the list gets HTTP 421 (Misdirected Request) with a JSON-RPC error, before
+its body is read and before any session is created. This protects a server on a
+private address against DNS rebinding: a hostile web page whose own host name
+resolves to the address of the server sends its own host name in the `Host`
+header, not one from the list.
+
+[source,properties]
+----
+camel.server.mcp-allowed-hosts = mcp.example.com, localhost:*, 127.0.0.1:*
+----
+
+Each entry is a host, or a host and a port, without a scheme. A port of `+*+`
+matches any port, and also a `Host` header without a port (the default port of
+the scheme), so `localhost:*` allows `localhost`, `localhost:8080` and
+`localhost:9876`. An entry without a port matches only a `Host` header without
+a port: `mcp.example.com` is the host name a client uses on the default port,
+behind a reverse proxy for example. The host is compared ignoring case. Write an
+IPv6 address in brackets, such as `[::1]:*`. An entry with a scheme or a path,
+and `+*+`, fail the startup with a message saying why.
+
+The main HTTP server listens on all network interfaces by default
+(`camel.server.host = 0.0.0.0`). When the MCP server is only meant for clients
+on the same machine, bind it to the loopback interface:
+
+[source,properties]
+----
+camel.server.host = 127.0.0.1
+----
+
+Stdio mode has no HTTP transport and is not affected.
+
+== Runtime notes
+
+* *Camel Main / JBang (HTTP)*: requires the Camel main HTTP server
+  (`camel.server.enabled=true` with `camel-platform-http-main`, automatic
+  with Camel JBang) or a `VertxPlatformHttpServer` service. Serving is fully
+  asynchronous: tool calls are offloaded to the Vert.x worker pool and the
+  long-lived SSE channel does not occupy a worker thread.
+* *Camel Main / JBang (stdio)*: set `camel.server.mcp-transport=stdio` or use
+  `--mcp-stdio`. Does not require the HTTP server. Distinct from the `--mcp`
+  JBang flag, which exposes dev/diagnostics tools over HTTP management.
+* *Quarkus*: use the `camel-quarkus-mcp-server` extension (serves through
+  quarkus-mcp-server; the MCP Java SDK is not on the classpath).
+* *Spring Boot*: use the `camel-mcp-server-starter` (serves through the
+  Spring AI MCP server).

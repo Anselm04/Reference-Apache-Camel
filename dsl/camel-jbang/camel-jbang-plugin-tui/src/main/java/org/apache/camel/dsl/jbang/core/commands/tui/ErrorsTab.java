@@ -1,0 +1,1087 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.camel.dsl.jbang.core.commands.tui;
+
+import java.nio.file.Path;
+import java.util.ArrayList;
+import java.util.Comparator;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+
+import dev.tamboui.layout.Constraint;
+import dev.tamboui.layout.Layout;
+import dev.tamboui.layout.Rect;
+import dev.tamboui.style.Overflow;
+import dev.tamboui.style.Style;
+import dev.tamboui.terminal.Frame;
+import dev.tamboui.text.Line;
+import dev.tamboui.text.Span;
+import dev.tamboui.text.Text;
+import dev.tamboui.tui.event.KeyCode;
+import dev.tamboui.tui.event.KeyEvent;
+import dev.tamboui.tui.event.MouseEvent;
+import dev.tamboui.widgets.block.Block;
+import dev.tamboui.widgets.block.BorderType;
+import dev.tamboui.widgets.block.Borders;
+import dev.tamboui.widgets.paragraph.Paragraph;
+import dev.tamboui.widgets.scrollbar.ScrollbarState;
+import dev.tamboui.widgets.table.Cell;
+import dev.tamboui.widgets.table.Row;
+import dev.tamboui.widgets.table.Table;
+import org.apache.camel.util.json.JsonArray;
+import org.apache.camel.util.json.JsonObject;
+import org.apache.camel.util.json.Jsoner;
+
+import static org.apache.camel.dsl.jbang.core.commands.tui.TuiHelper.*;
+
+class ErrorsTab extends AbstractTableTab {
+
+    private final ScrollbarState detailScrollState = new ScrollbarState();
+    private static final String[] HANDLED_FILTER = { "all", "true", "false" };
+    private int handledIndex;
+    private String handledFilter = "all";
+    private int detailScroll;
+    private int detailHScroll;
+    private boolean wordWrap = true;
+    private boolean showProperties;
+    private boolean showVariables;
+    private boolean showHeaders = true;
+    private boolean showBody = true;
+
+    private static final int INFO_NARROW = 0;
+    private static final int INFO_WIDE = 1;
+    private static final int INFO_FULL = 2;
+
+    private final DiagramSupport diagram = new DiagramSupport();
+    private int infoPanelSize = INFO_NARROW;
+    // which of the kept exchanges of the selected kind of error the detail shows: 0 is the newest
+    private int keptIndex;
+
+    ErrorsTab(MonitorContext ctx) {
+        super(ctx, "id", "age", "route", "node", "exception");
+    }
+
+    @Override
+    protected boolean selectsFirstRow() {
+        return true;
+    }
+
+    @Override
+    protected int getRowCount() {
+        return filteredSize();
+    }
+
+    @Override
+    public void onTabSelected() {
+        // read at once, so the tab does not open on the errors of the last refresh
+        refreshWhileVisible();
+        IntegrationInfo info = ctx.findSelectedIntegration();
+        if (info != null && !info.errors.isEmpty() && tableState.selected() == null) {
+            tableState.select(0);
+        }
+    }
+
+    @Override
+    public void refreshWhileVisible() {
+        DataRefreshService data = ctx.dataService;
+        List<Long> pids = data != null ? data.selectedPidAsList() : List.of();
+        if (!pids.isEmpty()) {
+            data.refreshErrorData(pids);
+        }
+    }
+
+    @Override
+    protected boolean handleTabKeyEvent(KeyEvent ke) {
+        if (handleErrorActionKey(ke) || handleKeptKey(ke)) {
+            return true;
+        }
+        if (diagram.isShowDiagram() && diagram.isHistoryMode() && diagram.hasHistoryData()) {
+            if (diagram.isHistoryTopologyMode()) {
+                if (ke.isUp()) {
+                    diagram.selectNodeUp();
+                    diagram.scrollToSelectedNode();
+                    return true;
+                }
+                if (ke.isDown()) {
+                    diagram.selectNodeDown();
+                    diagram.scrollToSelectedNode();
+                    return true;
+                }
+                if (ke.isLeft()) {
+                    diagram.selectNodeLeft();
+                    diagram.scrollToSelectedNode();
+                    return true;
+                }
+                if (ke.isRight()) {
+                    diagram.selectNodeRight();
+                    diagram.scrollToSelectedNode();
+                    return true;
+                }
+                if (ke.isConfirm()) {
+                    diagram.historyEnterDrillDown();
+                    return true;
+                }
+            } else {
+                if (ke.isUp()) {
+                    diagram.historyNavigateUp();
+                    return true;
+                }
+                if (ke.isDown()) {
+                    diagram.historyNavigateDown();
+                    return true;
+                }
+                if (ke.isLeft()) {
+                    diagram.scrollLeft();
+                    return true;
+                }
+                if (ke.isRight()) {
+                    diagram.scrollRight();
+                    return true;
+                }
+                if (ke.isChar('t')) {
+                    diagram.historyReturnToTopology();
+                    return true;
+                }
+            }
+            if (ke.isHome()) {
+                diagram.scrollHome();
+                return true;
+            }
+            if (ke.isCharIgnoreCase('n')) {
+                diagram.setShowDescription(!diagram.isShowDescription());
+                diagram.endLoad();
+                loadDiagramForSelectedError();
+                return true;
+            }
+            if (ke.isChar('i')) {
+                infoPanelSize = (infoPanelSize + 1) % 3;
+                return true;
+            }
+            if (ke.isChar('b')) {
+                showBody = !showBody;
+                return true;
+            }
+            if (ke.isChar('h')) {
+                showHeaders = !showHeaders;
+                return true;
+            }
+            if (ke.isChar('p')) {
+                showProperties = !showProperties;
+                return true;
+            }
+            if (ke.isChar('v')) {
+                showVariables = !showVariables;
+                return true;
+            }
+            if (ke.isChar('w')) {
+                wordWrap = !wordWrap;
+                return true;
+            }
+        }
+        if (diagram.handleScrollKeys(ke)) {
+            return true;
+        }
+
+        if (ke.isCharIgnoreCase('d')) {
+            diagram.toggleDiagram(this::loadDiagramForSelectedError);
+            return true;
+        }
+
+        if (ke.isCharIgnoreCase('w')) {
+            wordWrap = !wordWrap;
+            return true;
+        }
+        if (ke.isCharIgnoreCase('f')) {
+            handledIndex = (handledIndex + 1) % HANDLED_FILTER.length;
+            handledFilter = HANDLED_FILTER[handledIndex];
+            return true;
+        }
+        if (ke.isCharIgnoreCase('p')) {
+            showProperties = !showProperties;
+            return true;
+        }
+        if (ke.isCharIgnoreCase('v')) {
+            showVariables = !showVariables;
+            return true;
+        }
+        if (ke.isCharIgnoreCase('h')) {
+            showHeaders = !showHeaders;
+            return true;
+        }
+        if (ke.isCharIgnoreCase('b')) {
+            showBody = !showBody;
+            return true;
+        }
+        if (ke.isHome()) {
+            detailScroll = 0;
+            return true;
+        }
+        if (ke.isEnd()) {
+            detailScroll = Integer.MAX_VALUE;
+            return true;
+        }
+        if (ke.isPageUp()) {
+            detailScroll = Math.max(0, detailScroll - 5);
+            return true;
+        }
+        if (ke.isPageDown()) {
+            detailScroll += 5;
+            return true;
+        }
+        if (ke.isLeft() && !wordWrap) {
+            detailHScroll = Math.max(0, detailHScroll - 4);
+            return true;
+        }
+        if (ke.isRight() && !wordWrap) {
+            detailHScroll += 4;
+            return true;
+        }
+        return false;
+    }
+
+    @Override
+    public boolean handleEscape() {
+        if (diagram.isShowDiagram() && diagram.isHistoryMode() && !diagram.isHistoryTopologyMode()) {
+            diagram.historyGoBack();
+            return true;
+        }
+        return diagram.handleEscape();
+    }
+
+    @Override
+    public boolean handleMouseEvent(MouseEvent me, Rect area) {
+        if (!diagram.isShowDiagram()) {
+            // the wheel scrolls the errors over the table, the detail over the detail
+            return super.handleMouseEvent(me, area);
+        }
+        if (diagram.handleMouseScroll(me)) {
+            return true;
+        }
+        if (me.isClick()) {
+            int clicked = diagram.isHistoryMode() && diagram.isHistoryTopologyMode()
+                    ? diagram.handleNodeClick(me) : diagram.handleEipNodeClick(me);
+            return clicked >= 0;
+        }
+        return false;
+    }
+
+    @Override
+    protected void scrollDetail(int lines) {
+        detailScroll = Math.max(0, detailScroll + lines);
+    }
+
+    @Override
+    protected void rowClicked() {
+        detailScroll = 0;
+        keptIndex = 0;
+    }
+
+    @Override
+    public void navigateUp() {
+        detailScroll = 0;
+        keptIndex = 0;
+        tableState.selectPrevious();
+    }
+
+    @Override
+    public void navigateDown() {
+        detailScroll = 0;
+        keptIndex = 0;
+        tableState.selectNext(filteredSize());
+    }
+
+    @Override
+    protected void renderContent(Frame frame, Rect area, IntegrationInfo info) {
+        if (diagram.isShowDiagram() && diagram.isHistoryMode() && diagram.hasHistoryData()) {
+            if (infoPanelSize == INFO_FULL) {
+                renderDiagramInfoPanel(frame, area, info);
+            } else {
+                Rect diagramArea = area;
+                Rect infoArea = null;
+                if (area.width() > 70) {
+                    int panelWidth = infoPanelSize == INFO_WIDE ? area.width() / 2 : 35;
+                    List<Rect> hParts = Layout.horizontal()
+                            .constraints(Constraint.length(panelWidth), Constraint.fill())
+                            .split(area);
+                    infoArea = hParts.get(0);
+                    diagramArea = hParts.get(1);
+                }
+                boolean hideOverlays = infoPanelSize == INFO_WIDE;
+                if (diagram.isHistoryTopologyMode()) {
+                    Line title = Line.from(Span.styled(
+                            String.format(" Error Topology — step %d/%d ",
+                                    diagram.getHistoryStepIndex() + 1, diagram.getHistoryStepCount()),
+                            Style.EMPTY.fg(Theme.baseFg())));
+                    diagram.setAiSourceDirectory(selectedSourceDirectory());
+                    diagram.renderHistoryTopologyDiagram(frame, diagramArea, title);
+                } else {
+                    String routeId = diagram.getHistoryDrillDownRouteId();
+                    Line title = buildErrorBreadcrumbTitle();
+                    diagram.renderHistoryRouteDiagram(frame, diagramArea, title, routeId, hideOverlays);
+                }
+                if (infoArea != null) {
+                    renderDiagramInfoPanel(frame, infoArea, info);
+                }
+            }
+            return;
+        }
+
+        List<ErrorInfo> sorted = applyFilter(info.errors);
+
+        List<Row> rows = new ArrayList<>();
+        for (ErrorInfo ei : sorted) {
+            String ago = ei.timestamp > 0
+                    ? org.apache.camel.util.TimeUtils.printSince(ei.timestamp) : "";
+            String handledStr = ei.handled ? "true" : "false";
+            Style handledStyle = ei.handled
+                    ? Theme.success() : Theme.error();
+            String shortException = shortExceptionType(ei.exceptionType);
+
+            rows.add(Row.from(
+                    // short, as on the Activity tab, so MESSAGE has room; the detail below has the full id
+                    Cell.from(shortExchangeId(ei.exchangeId != null ? ei.exchangeId : "")),
+                    Cell.from(ago),
+                    Cell.from(Span.styled(ei.routeId != null ? ei.routeId : "", Style.EMPTY.fg(Theme.accent()))),
+                    Cell.from(ei.nodeId != null ? ei.nodeId : ""),
+                    Cell.from(Span.styled(handledStr, handledStyle)),
+                    countCell(kindCount(keptOfKind(info.errors, ei))),
+                    ChaosMarks.markedCell(ChaosMarks.ruleOf(ctx, info, ei.exchangeId, ei.properties), shortException),
+                    Cell.from(ei.exceptionMessage != null ? ei.exceptionMessage : "")));
+        }
+
+        if (rows.isEmpty()) {
+            // in the first column, as the empty state of the other tabs, short enough not to be cut there
+            rows.add(emptyRow("No errors", 8));
+        }
+
+        ErrorInfo selectedError = shownError(info);
+        boolean showDetail = selectedError != null;
+        List<Rect> chunks = showDetail
+                ? Layout.vertical()
+                        .constraints(Constraint.length(13), Constraint.fill())
+                        .split(area)
+                : List.of(area);
+
+        Table table = Table.builder()
+                .rows(rows)
+                .header(Row.from(
+                        Cell.from(Span.styled(sortLabel("ID", "id"), sortStyle("id"))),
+                        Cell.from(Span.styled(sortLabel("AGO", "age"), sortStyle("age"))),
+                        Cell.from(Span.styled(sortLabel("ROUTE", "route"), sortStyle("route"))),
+                        Cell.from(Span.styled(sortLabel("NODE", "node"), sortStyle("node"))),
+                        Cell.from(Span.styled("HANDLED", Style.EMPTY.bold())),
+                        Cell.from(Span.styled("COUNT", Style.EMPTY.bold())),
+                        Cell.from(Span.styled(sortLabel("EXCEPTION", "exception"), sortStyle("exception"))),
+                        Cell.from(Span.styled("MESSAGE", Style.EMPTY.bold()))))
+                .widths(
+                        Constraint.length(14),
+                        Constraint.length(8),
+                        Constraint.length(20),
+                        Constraint.length(20),
+                        Constraint.length(8),
+                        Constraint.length(6),
+                        Constraint.length(30),
+                        Constraint.fill())
+                .highlightStyle(Theme.selectionBg())
+                .highlightSpacing(Table.HighlightSpacing.ALWAYS)
+                .block(Block.builder().borderType(BorderType.ROUNDED).borders(Borders.ALL).borderStyle(ctx.paneBorder(true))
+                        .title(title(sorted.size(), info.errorCount)).build())
+                .build();
+
+        lastTableArea = chunks.get(0);
+        lastDetailArea = showDetail ? chunks.get(1) : null;
+        frame.renderStatefulWidget(table, chunks.get(0), tableState);
+        renderScrollbar(frame, table, filteredSize());
+
+        if (showDetail) {
+            renderDetail(frame, chunks.get(1), selectedError, info);
+        }
+    }
+
+    @Override
+    public SubViewBar.Spec subViewBar() {
+        if (ctx.findSelectedIntegration() == null) {
+            return null;
+        }
+        boolean diagramShown = diagram.isShowDiagram();
+        boolean historyDiagram = diagramShown && diagram.isHistoryMode() && diagram.hasHistoryData();
+        List<SubViewBar.View> views = List.of(
+                new SubViewBar.View("Errors", !diagramShown, true, () -> pressKey('d')),
+                new SubViewBar.View("Diagram", diagramShown, diagramShown || selectedErrorHasHistory(), () -> pressKey('d')));
+        List<SubViewBar.Toggle> toggles = new ArrayList<>();
+        if (!diagramShown) {
+            toggles.add(new SubViewBar.Toggle("f", "handled", handledFilter));
+        }
+        if (historyDiagram) {
+            toggles.add(new SubViewBar.Toggle("n", "description", diagram.isShowDescription() ? "on" : "off"));
+        }
+        if (!diagramShown || historyDiagram) {
+            toggles.add(new SubViewBar.Toggle("w", "wrap", wordWrap ? "on" : "off"));
+        }
+        return new SubViewBar.Spec("d", views, toggles, false);
+    }
+
+    @Override
+    public void renderFooter(List<Span> spans) {
+        if (diagram.isShowDiagram()) {
+            if (diagram.isHistoryMode() && diagram.hasHistoryData()) {
+                String infoLabel = switch (infoPanelSize) {
+                    case INFO_WIDE -> "info [wide]";
+                    case INFO_FULL -> "info [full]";
+                    default -> "info [narrow]";
+                };
+                if (diagram.isHistoryTopologyMode()) {
+                    hint(spans, "d", "close");
+                    hint(spans, TuiIcons.HINT_NAV, "navigate");
+                    hint(spans, "Enter", "drill-down");
+                    hint(spans, "i", infoLabel);
+                    hintShowBhpv(spans, showBody, showHeaders, showProperties, showVariables);
+                } else {
+                    hint(spans, "d", "close");
+                    hint(spans, "Esc", "back");
+                    hint(spans, TuiIcons.HINT_SCROLL, "step through path");
+                    hint(spans, TuiIcons.HINT_H, "h-scroll");
+                    hint(spans, "t", "topology");
+                    hint(spans, "i", infoLabel);
+                    hintShowBhpv(spans, showBody, showHeaders, showProperties, showVariables);
+                }
+                return;
+            }
+            diagram.renderFooterHints(spans);
+            return;
+        }
+        hint(spans, "Esc", "back");
+        hint(spans, "PgUp/Dn", "detail");
+        if (!wordWrap) {
+            hint(spans, TuiIcons.HINT_H, "h-scroll");
+        }
+        hint(spans, "Home/End", "top/end");
+        hint(spans, "s", "sort");
+        if (keptOfSelectedKind().size() > 1) {
+            hint(spans, "[ ]", "older/newer");
+        }
+        if (chaosRuleOfSelectedError() != null) {
+            hint(spans, "!", "chaos rule of it");
+        }
+        hintShowBhpv(spans, showBody, showHeaders, showProperties, showVariables);
+    }
+
+    /** [ and ]: the older or newer exchange of the selected kind of error, of the few the registry keeps. */
+    private boolean handleKeptKey(KeyEvent ke) {
+        if (!(ke.isChar('[') || ke.isChar(']')) || diagram.isShowDiagram()) {
+            return false;
+        }
+        int kept = keptOfSelectedKind().size();
+        if (kept > 1) {
+            keptIndex = Math.clamp(keptIndex + (ke.isChar('[') ? 1 : -1), 0, kept - 1);
+            detailScroll = 0;
+        }
+        return true;
+    }
+
+    /** The keys that act on the selected error: fix with AI (Shift+F8), and a chaos rule of it (!). */
+    private boolean handleErrorActionKey(KeyEvent ke) {
+        if (ke.isKey(KeyCode.F8) && ke.hasShift()) {
+            // fix with AI: the selected error, on the source line it happened at
+            askAiToFixSelectedError();
+            return true;
+        }
+        String rule = ke.isChar('!') && !diagram.isShowDiagram() ? chaosRuleOfSelectedError() : null;
+        if (rule != null) {
+            // the same failure again as a chaos rule, to prove a fix against it (CAMEL-26723)
+            ctx.chaosRule.accept(rule);
+            return true;
+        }
+        return false;
+    }
+
+    /**
+     * The chaos rule that makes the selected error again, or null: when chaos is on in the integration, and the error
+     * is a real one (not made by a chaos rule).
+     */
+    String chaosRuleOfSelectedError() {
+        ErrorInfo error = selectedError();
+        IntegrationInfo info = ctx.findSelectedIntegration();
+        if (error == null || ctx.chaosRule == null || !ChaosHere.available(info)
+                || ChaosMarks.ruleOf(ctx, info, error.exchangeId, error.properties) != null) {
+            return null;
+        }
+        return ChaosFromError.rule(error);
+    }
+
+    @Override
+    public void renderFKeyHints(List<Span> spans) {
+        // with the global F-keys (after Esc back), as fix with AI is an F-key of every screen that has it
+        ErrorInfo error = selectedError();
+        if (!diagram.isShowDiagram() && ctx.askAiCallback != null && error != null) {
+            IntegrationInfo info = ctx.findSelectedIntegration();
+            boolean chaos = info != null && ChaosMarks.ruleOf(ctx, info, error.exchangeId, error.properties) != null;
+            hint(spans, "Shift+F8", chaos ? "explain with AI" : "fix with AI");
+        }
+    }
+
+    /** The error the detail shows (the kept exchange of the kind of error selected in the table), or null. */
+    private ErrorInfo selectedError() {
+        IntegrationInfo info = ctx.findSelectedIntegration();
+        return info != null ? shownError(info) : null;
+    }
+
+    /** The row selected in the table: the newest entry of its kind of error, or null. */
+    private ErrorInfo selectedRow(IntegrationInfo info) {
+        List<ErrorInfo> rows = applyFilter(info.errors);
+        Integer sel = tableState.selected();
+        return sel != null && sel >= 0 && sel < rows.size() ? rows.get(sel) : null;
+    }
+
+    /** The kept exchange of the selected kind of error that the detail shows ([ and ] step through them), or null. */
+    private ErrorInfo shownError(IntegrationInfo info) {
+        ErrorInfo row = selectedRow(info);
+        if (row == null) {
+            return null;
+        }
+        List<ErrorInfo> kept = keptOfKind(info.errors, row);
+        return kept.get(Math.min(keptIndex, kept.size() - 1));
+    }
+
+    /** The kept exchanges of the selected kind of error, newest first; empty when none is selected. */
+    private List<ErrorInfo> keptOfSelectedKind() {
+        IntegrationInfo info = ctx.findSelectedIntegration();
+        ErrorInfo row = info != null ? selectedRow(info) : null;
+        return row != null ? keptOfKind(info.errors, row) : List.of();
+    }
+
+    /**
+     * Asks the AI to fix the selected error (Shift+F8), as the Source editor does for a line that fails at runtime: the
+     * source line of the processor it happened at, and its exception.
+     */
+    private void askAiToFixSelectedError() {
+        IntegrationInfo info = ctx.findSelectedIntegration();
+        ErrorInfo error = selectedError();
+        if (info == null || error == null || ctx.askAiCallback == null) {
+            return;
+        }
+        String rule = ChaosMarks.ruleOf(ctx, info, error.exchangeId, error.properties);
+        if (rule != null) {
+            // made on purpose by a chaos rule: explain it, it is not a bug to fix (CAMEL-26702)
+            ctx.askAiCallback.ask(ChaosAiPrompt.ofError(info, info.chaos != null ? info.chaos.rule(rule) : null, rule,
+                    error));
+            return;
+        }
+        String source = RuntimeFailures.sourceOf(info.routes, error);
+        Path file = RuntimeFailures.fileOf(FilesBrowser.resolveSourceDirectory(info), source);
+        int line = file != null ? LiveRunLines.lineOf(source, file.getFileName().toString()) : -1;
+        if (line < 0) {
+            if (ctx.notificationCallback != null) {
+                ctx.notificationCallback.accept("The source line of this error is not known, ask the AI with F8", false);
+            }
+            return;
+        }
+        ctx.askAiCallback.fixFailure(file, line + 1, RuntimeFailures.failureOf(error),
+                RuntimeFailures.lineText(file, line));
+    }
+
+    /**
+     * The title: how many kinds of error are listed, and how many errors happened when that is more. The registry keeps
+     * the newest few exchanges of each kind of error (CAMEL-24911), and the table has a row per kind.
+     */
+    static String title(int listed, int happened) {
+        if (happened > listed) {
+            return " Errors [" + listed + "] " + happened + " happened, a row per kind ";
+        }
+        return " Errors [" + listed + "] ";
+    }
+
+    /** How often a kind of error happened. */
+    private static Cell countCell(long count) {
+        return count > 1
+                ? Cell.from(Span.styled(Long.toString(count), Theme.error().bold()))
+                : Cell.from("1");
+    }
+
+    /**
+     * How often a kind of error happened: its counter (CAMEL-24911), or at least the exchanges kept of it, as an
+     * integration before Camel 4.21 does not count.
+     */
+    private static long kindCount(List<ErrorInfo> kept) {
+        long count = 1;
+        for (ErrorInfo ei : kept) {
+            count = Math.max(count, ei.repeatCount);
+        }
+        return Math.max(count, kept.size());
+    }
+
+    /** The kind of an error, as the registry counts it: the same exception at the same node of the same route. */
+    private static String kindOf(ErrorInfo ei) {
+        return ei.routeId + "|" + ei.nodeId + "|" + ei.exceptionType;
+    }
+
+    /** The newest entry of each kind of error, in the order of the list: the one with the highest count. */
+    static List<ErrorInfo> newestOfEachKind(List<ErrorInfo> errors) {
+        Map<String, ErrorInfo> newest = new LinkedHashMap<>();
+        for (ErrorInfo ei : errors) {
+            newest.merge(kindOf(ei), ei,
+                    (a, b) -> b.repeatCount > a.repeatCount
+                            || b.repeatCount == a.repeatCount && b.timestamp > a.timestamp ? b : a);
+        }
+        // a kind keeps the place of its newest entry in the sorted list
+        List<ErrorInfo> rows = new ArrayList<>();
+        for (ErrorInfo ei : errors) {
+            if (newest.get(kindOf(ei)) == ei) {
+                rows.add(ei);
+            }
+        }
+        return rows;
+    }
+
+    /** The kept exchanges of the kind of error of this row, newest first. */
+    static List<ErrorInfo> keptOfKind(List<ErrorInfo> errors, ErrorInfo row) {
+        String kind = kindOf(row);
+        List<ErrorInfo> kept = new ArrayList<>();
+        for (ErrorInfo ei : errors) {
+            if (kind.equals(kindOf(ei))) {
+                kept.add(ei);
+            }
+        }
+        kept.sort(Comparator.comparingLong((ErrorInfo ei) -> ei.repeatCount)
+                .thenComparingLong(ei -> ei.timestamp).reversed());
+        return kept;
+    }
+
+    /**
+     * How often this kind of error happened and how long it has been going on (CAMEL-24911), and which of its kept
+     * exchanges the detail shows, with the keys to the others when they work there.
+     */
+    private static void addRepeatLines(List<Line> lines, List<ErrorInfo> kept, int shown, boolean keys) {
+        long count = kindCount(kept);
+        if (count > 1) {
+            long first = kept.get(0).repeatFirstTimestamp;
+            String since = first > 0 ? " (since " + org.apache.camel.util.TimeUtils.printSince(first) + " ago)" : "";
+            lines.add(Line.from(
+                    Span.styled(" Repeated: ", Theme.muted()),
+                    Span.styled(count + " times", Theme.error().bold()),
+                    Span.styled(since, Style.EMPTY.dim())));
+        }
+        if (kept.size() > 1) {
+            int nr = kept.size() - shown;
+            String which = shown == 0 ? " (the newest)" : nr == 1 ? " (the oldest)" : "";
+            lines.add(Line.from(
+                    Span.styled(" Kept:     ", Theme.muted()),
+                    Span.raw("exchange " + nr + " of " + kept.size() + which),
+                    Span.styled(keys ? "   [ ] older/newer" : "", Style.EMPTY.dim())));
+        }
+    }
+
+    private void renderDetail(Frame frame, Rect area, ErrorInfo ei, IntegrationInfo info) {
+        List<Line> lines = new ArrayList<>();
+
+        HistoryTab.addExchangeInfoLines(lines,
+                ei.exchangeId, ei.routeId, ei.nodeId, null, ei.location,
+                ei.elapsed, ei.threadName, !ei.handled);
+        List<ErrorInfo> kept = keptOfKind(info.errors, ei);
+        addRepeatLines(lines, kept, Math.max(0, kept.indexOf(ei)), true);
+        ChaosMarks.addDetailLine(lines, ctx, info, ei.exchangeId, ei.properties);
+
+        // exception with stack trace
+        String exception = null;
+        if (ei.exceptionType != null) {
+            if (ei.stackTrace != null) {
+                String st = ei.stackTrace;
+                try {
+                    st = Jsoner.unescape(st);
+                } catch (Exception e) {
+                    // ignore
+                }
+                if (st.startsWith(ei.exceptionType)) {
+                    // stackTrace already contains the exception type and message
+                    exception = st;
+                } else {
+                    StringBuilder sb = new StringBuilder();
+                    sb.append(ei.exceptionType);
+                    if (ei.exceptionMessage != null) {
+                        String msg = ei.exceptionMessage;
+                        try {
+                            msg = Jsoner.unescape(msg);
+                        } catch (Exception e) {
+                            // ignore
+                        }
+                        sb.append(": ").append(msg);
+                    }
+                    sb.append("\n").append(st);
+                    exception = sb.toString();
+                }
+            } else {
+                StringBuilder sb = new StringBuilder();
+                sb.append(ei.exceptionType);
+                if (ei.exceptionMessage != null) {
+                    String msg = ei.exceptionMessage;
+                    try {
+                        msg = Jsoner.unescape(msg);
+                    } catch (Exception e) {
+                        // ignore
+                    }
+                    sb.append(": ").append(msg);
+                }
+                exception = sb.toString();
+            }
+        }
+        HistoryTab.addExceptionLines(lines, exception);
+
+        // message history
+        if (ei.messageHistory != null && ei.messageHistory.length > 0) {
+            lines.add(Line.from(Span.styled(" Message History:", Theme.notice().bold())));
+            for (int i = 0; i < ei.messageHistory.length; i++) {
+                String s = TuiHelper.fixControlChars(ei.messageHistory[i]);
+                boolean lastAndFailed = !ei.handled && i == ei.messageHistory.length - 1;
+                int bracket = s.indexOf('[');
+                if (bracket > 0) {
+                    String routeId = s.substring(0, bracket);
+                    String rest = s.substring(bracket);
+                    if (lastAndFailed) {
+                        lines.add(Line.from(
+                                Span.styled("   " + routeId, Theme.error()),
+                                Span.styled(rest, Theme.error())));
+                    } else {
+                        lines.add(Line.from(
+                                Span.styled("   " + routeId, Style.EMPTY.fg(Theme.accent())),
+                                Span.styled(rest, Theme.muted())));
+                    }
+                } else {
+                    lines.add(Line.from(Span.styled("   " + s,
+                            lastAndFailed ? Theme.error() : Style.EMPTY)));
+                }
+            }
+            lines.add(Line.from(Span.raw("")));
+        }
+
+        // exchange properties, variables, headers, body
+        if (showProperties && !ei.properties.isEmpty()) {
+            HistoryTab.addKvLines(lines, " Exchange Properties:", ei.properties, ei.propertyTypes, false, null);
+        }
+        if (showVariables && !ei.variables.isEmpty()) {
+            HistoryTab.addKvLines(lines, " Exchange Variables:", ei.variables, ei.variableTypes, false, null);
+        }
+        if (showHeaders && !ei.headers.isEmpty()) {
+            HistoryTab.addKvLines(lines, " Headers:", ei.headers, ei.headerTypes, false, null);
+        }
+        if (showBody) {
+            HistoryTab.addBodyLines(lines, ei.body, ei.bodyType, ei.bodySize, false);
+        }
+
+        int[] scroll = { detailScroll };
+        int[] hScroll = { detailHScroll };
+        HistoryTab.renderDetailPanel(frame, area, lines, wordWrap, hScroll, scroll, detailScrollState, " Detail ",
+                ctx.paneBorder(false), null);
+        detailScroll = scroll[0];
+        detailHScroll = hScroll[0];
+    }
+
+    private int sortError(ErrorInfo a, ErrorInfo b) {
+        int result = switch (sort) {
+            case "id" -> compareStr(a.exchangeId, b.exchangeId);
+            case "route" -> compareStr(a.routeId, b.routeId);
+            case "node" -> compareStr(a.nodeId, b.nodeId);
+            case "exception" -> compareStr(a.exceptionType, b.exceptionType);
+            default -> Long.compare(b.timestamp, a.timestamp); // newest first
+        };
+        return sortReversed ? -result : result;
+    }
+
+    private static String shortExceptionType(String type) {
+        if (type == null) {
+            return "";
+        }
+        int dot = type.lastIndexOf('.');
+        if (dot > 0) {
+            return type.substring(dot + 1);
+        }
+        return type;
+    }
+
+    @Override
+    public SelectionContext getSelectionContext() {
+        IntegrationInfo info = ctx.findSelectedIntegration();
+        if (info == null || info.errors.isEmpty()) {
+            return null;
+        }
+        List<ErrorInfo> filtered = applyFilter(info.errors);
+        List<String> items = filtered.stream()
+                .map(e -> e.exchangeId != null ? e.exchangeId : "")
+                .toList();
+        Integer sel = tableState.selected();
+        return new SelectionContext("table", items, sel != null ? sel : -1, items.size(), "Errors");
+    }
+
+    /** The rows of the table: a row per kind of error (its newest entry), sorted, and filtered by handled. */
+    private List<ErrorInfo> applyFilter(List<ErrorInfo> errors) {
+        List<ErrorInfo> list = new ArrayList<>(errors);
+        list.sort(this::sortError);
+        if (!"all".equals(handledFilter)) {
+            boolean filterVal = "true".equals(handledFilter);
+            list.removeIf(e -> e.handled != filterVal);
+        }
+        return newestOfEachKind(list);
+    }
+
+    private int filteredSize() {
+        IntegrationInfo info = ctx.findSelectedIntegration();
+        return info != null ? applyFilter(info.errors).size() : 0;
+    }
+
+    private Line buildErrorBreadcrumbTitle() {
+        Style nameStyle = Theme.label().bold();
+        List<Span> spans = new ArrayList<>();
+        spans.add(Span.styled(" Error [", Style.EMPTY.fg(Theme.baseFg())));
+        var stack = diagram.getHistoryNavigationStack();
+        if (stack.isEmpty()) {
+            spans.add(Span.styled(diagram.getHistoryDrillDownRouteId(), nameStyle));
+        } else {
+            for (var it = stack.descendingIterator(); it.hasNext();) {
+                spans.add(Span.styled(it.next(), nameStyle));
+                spans.add(Span.styled(" → ", Theme.muted()));
+            }
+            spans.add(Span.styled(diagram.getHistoryDrillDownRouteId(), nameStyle));
+        }
+        spans.add(Span.styled(String.format("] — step %d/%d ",
+                diagram.getHistoryStepIndex() + 1, diagram.getHistoryStepCount()),
+                Style.EMPTY.fg(Theme.baseFg())));
+        return Line.from(spans);
+    }
+
+    private void renderDiagramInfoPanel(Frame frame, Rect area, IntegrationInfo info) {
+        ErrorInfo ei = shownError(info);
+
+        List<Line> lines = new ArrayList<>();
+        if (ei == null) {
+            frame.renderWidget(
+                    Paragraph.builder()
+                            .text(Text.from(Line.from(Span.styled("No error selected", Style.EMPTY.dim()))))
+                            .block(Block.builder().borderType(BorderType.ROUNDED).borders(Borders.ALL)
+                                    .borderStyle(ctx.paneBorder(false)).title(" Info ").build())
+                            .build(),
+                    area);
+            return;
+        }
+
+        lines.add(Line.from(
+                Span.styled(" Exchange: ", Theme.muted()),
+                Span.raw(ei.exchangeId != null ? ei.exchangeId : "")));
+        lines.add(Line.from(
+                Span.styled(" Route:    ", Theme.muted()),
+                Span.styled(ei.routeId != null ? ei.routeId : "", Style.EMPTY.fg(Theme.accent()))));
+        lines.add(Line.from(
+                Span.styled(" Node:     ", Theme.muted()),
+                Span.raw(ei.nodeId != null ? ei.nodeId : "")));
+        if (ei.elapsed >= 0) {
+            lines.add(Line.from(
+                    Span.styled(" Elapsed:  ", Theme.muted()),
+                    Span.raw(ei.elapsed + "ms")));
+        }
+        if (ei.threadName != null) {
+            lines.add(Line.from(
+                    Span.styled(" Thread:   ", Theme.muted()),
+                    Span.raw(ei.threadName)));
+        }
+        Style handledStyle = ei.handled ? Theme.success() : Theme.error().bold();
+        lines.add(Line.from(
+                Span.styled(" Handled:  ", Theme.muted()),
+                Span.styled(ei.handled ? "true" : "false", handledStyle)));
+        List<ErrorInfo> kept = keptOfKind(info.errors, ei);
+        addRepeatLines(lines, kept, Math.max(0, kept.indexOf(ei)), false);
+
+        if (ei.exceptionType != null) {
+            lines.add(Line.from(Span.raw("")));
+            lines.add(Line.from(Span.styled(" Exception", Theme.error().bold())));
+            lines.add(Line.from(Span.raw(" " + ei.exceptionType)));
+            if (ei.exceptionMessage != null) {
+                lines.add(Line.from(Span.raw(" " + ei.exceptionMessage)));
+            }
+        }
+
+        if (showBody && ei.body != null) {
+            lines.add(Line.from(Span.raw("")));
+            lines.add(Line.from(
+                    Span.styled(" Body", Theme.muted()),
+                    ei.bodyType != null ? Span.styled(" (" + ei.bodyType + ")", Style.EMPTY.dim()) : Span.raw("")));
+            for (String line : ei.body.split("\n")) {
+                lines.add(Line.from(Span.raw(" " + line)));
+            }
+        }
+
+        if (showHeaders && !ei.headers.isEmpty()) {
+            lines.add(Line.from(Span.raw("")));
+            lines.add(Line.from(Span.styled(" Headers", Theme.muted())));
+            addKvLines(lines, ei.headers);
+        }
+
+        if (showProperties && !ei.properties.isEmpty()) {
+            lines.add(Line.from(Span.raw("")));
+            lines.add(Line.from(Span.styled(" Properties", Theme.muted())));
+            addKvLines(lines, ei.properties);
+        }
+
+        if (showVariables && !ei.variables.isEmpty()) {
+            lines.add(Line.from(Span.raw("")));
+            lines.add(Line.from(Span.styled(" Variables", Theme.muted())));
+            addKvLines(lines, ei.variables);
+        }
+
+        Paragraph.Builder pb = Paragraph.builder()
+                .text(Text.from(lines))
+                .block(Block.builder().borderType(BorderType.ROUNDED).borders(Borders.ALL).borderStyle(ctx.paneBorder(false))
+                        .title(" Info ").build());
+        if (wordWrap) {
+            pb.overflow(Overflow.WRAP_WORD);
+        }
+        frame.renderWidget(pb.build(), area);
+    }
+
+    private static void addKvLines(List<Line> lines, Map<String, Object> map) {
+        for (var entry : map.entrySet()) {
+            String val = entry.getValue() != null ? entry.getValue().toString() : "null";
+            lines.add(Line.from(
+                    Span.styled(" " + entry.getKey(), Theme.muted()),
+                    Span.raw(" = " + val)));
+        }
+    }
+
+    private static void hintShowBhpv(List<Span> spans, boolean body, boolean headers, boolean props, boolean vars) {
+        spans.add(Span.styled(" show ", Theme.hintKey()));
+        spans.add(Span.raw(" "));
+        spans.add(Span.styled(body ? "B" : "b", body ? Style.EMPTY.fg(Theme.baseFg()).bold() : Style.EMPTY.dim()));
+        spans.add(Span.styled(headers ? "H" : "h", headers ? Style.EMPTY.fg(Theme.baseFg()).bold() : Style.EMPTY.dim()));
+        spans.add(Span.styled(props ? "P" : "p", props ? Style.EMPTY.fg(Theme.baseFg()).bold() : Style.EMPTY.dim()));
+        spans.add(Span.styled(vars ? "V" : "v", vars ? Style.EMPTY.fg(Theme.baseFg()).bold() : Style.EMPTY.dim()));
+        spans.add(Span.raw("  "));
+    }
+
+    // ---- Diagram ----
+
+    /** Whether the selected error has the message history its diagram is drawn from. */
+    private boolean selectedErrorHasHistory() {
+        IntegrationInfo info = ctx.findSelectedIntegration();
+        if (info == null || info.errors.isEmpty()) {
+            return false;
+        }
+        ErrorInfo selected = shownError(info);
+        return selected != null && selected.messageHistory != null && selected.messageHistory.length > 0;
+    }
+
+    private void loadDiagramForSelectedError() {
+        if (ctx.selectedPid == null || ctx.runner == null) {
+            return;
+        }
+        if (!diagram.beginLoad()) {
+            return;
+        }
+
+        IntegrationInfo info = ctx.findSelectedIntegration();
+        if (info == null || info.errors.isEmpty()) {
+            diagram.endLoad();
+            return;
+        }
+
+        ErrorInfo selectedError = shownError(info);
+        if (selectedError == null || selectedError.messageHistory == null || selectedError.messageHistory.length == 0) {
+            diagram.endLoad();
+            return;
+        }
+
+        String pid = ctx.selectedPid;
+        String[] messageHistory = selectedError.messageHistory;
+
+        diagram.setLoadingPlaceholder();
+
+        ctx.backgroundExecutor.execute(() -> {
+            try {
+                diagram.loadHighlightedNativeDiagramInBackground(ctx, pid, messageHistory, true, -1);
+            } finally {
+                diagram.endLoad();
+            }
+        });
+    }
+
+    /**
+     * The part of an exchange id that tells the exchanges apart: Camel ids are the context's prefix and a counter
+     * (AD50EEC2B14A8A3-0000000000000001), so the counter without its leading zeros (…-1). The detail shows the full id.
+     */
+    static String shortExchangeId(String id) {
+        if (id == null) {
+            return "";
+        }
+        int dash = id.lastIndexOf('-');
+        if (dash < 0 || dash == id.length() - 1) {
+            return id;
+        }
+        String counter = id.substring(dash + 1).replaceFirst("^0+(?=.)", "");
+        return id.substring(0, Math.min(dash, 6)) + "…-" + counter;
+    }
+
+    @Override
+    public String description() {
+        return "Routing errors with exception details, stack traces, and exchange context";
+    }
+
+    @Override
+    public String getHelpText() {
+        return DocHelper.loadHelpText("errors");
+    }
+
+    @Override
+    public JsonObject getTableDataAsJson() {
+        IntegrationInfo info = ctx.findSelectedIntegration();
+        if (info == null) {
+            return null;
+        }
+        JsonObject result = new JsonObject();
+        result.put("tab", "Errors");
+        JsonArray rows = new JsonArray();
+        for (ErrorInfo ei : info.errors) {
+            JsonObject row = new JsonObject();
+            row.put("routeId", ei.routeId);
+            row.put("nodeId", ei.nodeId);
+            row.put("exchangeId", ei.exchangeId);
+            row.put("handled", ei.handled);
+            if (ei.repeatCount > 1) {
+                row.put("repeatCount", ei.repeatCount);
+            }
+            row.put("timestamp", ei.timestamp);
+            row.put("elapsed", ei.elapsed);
+            if (ei.exceptionType != null) {
+                row.put("exceptionType", ei.exceptionType);
+            }
+            if (ei.exceptionMessage != null) {
+                row.put("exceptionMessage", ei.exceptionMessage);
+            }
+            if (ei.stackTrace != null) {
+                row.put("stackTrace", ei.stackTrace);
+            }
+            if (ei.body != null) {
+                row.put("body", ei.body);
+            }
+            if (!ei.headers.isEmpty()) {
+                row.put("headers", new JsonObject(ei.headers));
+            }
+            rows.add(row);
+        }
+        result.put("rows", rows);
+        result.put("totalRows", info.errors.size());
+        Integer sel = tableState.selected();
+        result.put("selectedIndex", sel != null ? sel : -1);
+        return result;
+    }
+}

@@ -1,0 +1,516 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.camel.support.cache;
+
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.RejectedExecutionException;
+import java.util.concurrent.atomic.AtomicBoolean;
+
+import org.apache.camel.AsyncCallback;
+import org.apache.camel.AsyncProcessor;
+import org.apache.camel.AsyncProducer;
+import org.apache.camel.CamelContext;
+import org.apache.camel.Endpoint;
+import org.apache.camel.Exchange;
+import org.apache.camel.ExchangePattern;
+import org.apache.camel.ExchangePropertyKey;
+import org.apache.camel.FailedToCreateProducerException;
+import org.apache.camel.Processor;
+import org.apache.camel.Producer;
+import org.apache.camel.spi.EndpointUtilizationStatistics;
+import org.apache.camel.spi.InternalProcessorFactory;
+import org.apache.camel.spi.ProducerCache;
+import org.apache.camel.spi.SharedInternalProcessor;
+import org.apache.camel.support.AsyncCallbackToCompletableFutureAdapter;
+import org.apache.camel.support.CamelContextHelper;
+import org.apache.camel.support.DefaultEndpointUtilizationStatistics;
+import org.apache.camel.support.PluginHelper;
+import org.apache.camel.support.SendHelper;
+import org.apache.camel.support.service.ServiceHelper;
+import org.apache.camel.support.service.ServiceSupport;
+import org.apache.camel.util.StopWatch;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+/**
+ * Default implementation of {@link ProducerCache}.
+ */
+public class DefaultProducerCache extends ServiceSupport implements ProducerCache {
+    private static final Logger LOG = LoggerFactory.getLogger(DefaultProducerCache.class);
+
+    private final CamelContext camelContext;
+    private final ProducerServicePool producers;
+    private final Object source;
+    private final SharedInternalProcessor sharedInternalProcessor;
+
+    private EndpointUtilizationStatistics statistics;
+    private boolean eventNotifierEnabled = true;
+    private boolean extendedStatistics;
+    private final int maxCacheSize;
+
+    private AsyncProducer lastUsedProducer;
+
+    public DefaultProducerCache(Object source, CamelContext camelContext, int cacheSize) {
+        this.source = source;
+        this.camelContext = camelContext;
+        this.maxCacheSize = cacheSize <= 0 ? CamelContextHelper.getMaximumCachePoolSize(camelContext) : cacheSize;
+        if (cacheSize >= 0) {
+            this.producers = createServicePool(camelContext, maxCacheSize);
+        } else {
+            // no cache then empty
+            this.producers = null;
+        }
+
+        // only if JMX is enabled
+        if (camelContext.getManagementStrategy() != null && camelContext.getManagementStrategy().getManagementAgent() != null) {
+            this.extendedStatistics
+                    = camelContext.getManagementStrategy().getManagementAgent().getStatisticsLevel().isExtended();
+        } else {
+            this.extendedStatistics = false;
+        }
+
+        // internal processor used for sending
+        sharedInternalProcessor
+                = PluginHelper.getInternalProcessorFactory(this.camelContext)
+                        .createSharedCamelInternalProcessor(camelContext);
+    }
+
+    protected ProducerServicePool createServicePool(CamelContext camelContext, int cacheSize) {
+        InternalProcessorFactory pf = PluginHelper.getInternalProcessorFactory(getCamelContext());
+        return new ProducerServicePool(pf::createAsyncProducer, Producer::getEndpoint, cacheSize);
+    }
+
+    @Override
+    public boolean isEventNotifierEnabled() {
+        return eventNotifierEnabled;
+    }
+
+    @Override
+    public void setEventNotifierEnabled(boolean eventNotifierEnabled) {
+        this.eventNotifierEnabled = eventNotifierEnabled;
+    }
+
+    public boolean isExtendedStatistics() {
+        return extendedStatistics;
+    }
+
+    /**
+     * Whether extended JMX statistics is enabled for {@link org.apache.camel.spi.EndpointUtilizationStatistics}
+     */
+    public void setExtendedStatistics(boolean extendedStatistics) {
+        this.extendedStatistics = extendedStatistics;
+    }
+
+    public CamelContext getCamelContext() {
+        return camelContext;
+    }
+
+    @Override
+    public Object getSource() {
+        return source;
+    }
+
+    @Override
+    public AsyncProducer acquireProducer(Endpoint endpoint) {
+        // Try to favor thread locality as some data in the producer's cache may be shared among threads,
+        // triggering cases of false sharing
+        // copy reference to avoid need for synchronization and be thread safe
+        AsyncProducer lastUsedProducerRef = lastUsedProducer;
+        if (lastUsedProducerRef != null && endpoint == lastUsedProducerRef.getEndpoint() && endpoint.isSingletonProducer()) {
+            return lastUsedProducerRef;
+        }
+
+        try {
+            AsyncProducer producer = producers.acquire(endpoint);
+            if (statistics != null) {
+                statistics.onHit(endpoint.getEndpointUri());
+            }
+
+            lastUsedProducer = producer;
+
+            return producer;
+        } catch (Exception e) {
+            throw new FailedToCreateProducerException(endpoint, e);
+        }
+    }
+
+    @Override
+    public void releaseProducer(Endpoint endpoint, AsyncProducer producer) {
+        producers.release(endpoint, producer);
+    }
+
+    @Override
+    public Exchange send(Endpoint endpoint, Exchange exchange, Processor resultProcessor) {
+        if (camelContext.isStopped()) {
+            exchange.setException(new RejectedExecutionException("CamelContext is stopped"));
+            return exchange;
+        }
+
+        AsyncProducer producer = acquireProducer(endpoint);
+        try {
+            // now lets dispatch
+            LOG.debug(">>>> {} {}", endpoint, exchange);
+
+            // set property which endpoint we send to
+            exchange.setProperty(ExchangePropertyKey.TO_ENDPOINT, endpoint.getEndpointUri());
+
+            // send the exchange using the processor
+            StopWatch watch = null;
+            try {
+                if (eventNotifierEnabled && camelContext.getCamelContextExtension().isEventNotificationApplicable()) {
+                    watch = SendHelper.notifySending(exchange, endpoint);
+                }
+
+                // invoke the synchronous method (with the send hook around the producer if any); the producer is
+                // called through a SyncSend, which completes the send once also when the producer throws
+                sharedInternalProcessor.process(exchange,
+                        new SyncSend(endpoint, SendHelper.withSendHook(camelContext, producer)), resultProcessor);
+
+            } catch (Exception e) {
+                // ensure exceptions is caught and set on the exchange
+                exchange.setException(e);
+            } finally {
+                // emit event that the exchange was sent to the endpoint
+                SendHelper.notifySent(exchange, endpoint, watch);
+            }
+            return exchange;
+        } finally {
+            releaseProducer(endpoint, producer);
+        }
+    }
+
+    @Override
+    public CompletableFuture<Exchange> asyncSendExchange(
+            Endpoint endpoint,
+            ExchangePattern pattern,
+            Processor processor,
+            Processor resultProcessor,
+            Exchange exchange,
+            CompletableFuture<Exchange> future) {
+        if (exchange == null) {
+            exchange = pattern != null ? endpoint.createExchange(pattern) : endpoint.createExchange();
+        }
+        return doAsyncSendExchange(endpoint, processor, resultProcessor, exchange, future);
+    }
+
+    protected CompletableFuture<Exchange> doAsyncSendExchange(
+            Endpoint endpoint,
+            Processor processor,
+            Processor resultProcessor,
+            Exchange exchange,
+            CompletableFuture<Exchange> f) {
+        CompletableFuture<Exchange> future = f != null ? f : new CompletableFuture<>();
+        AsyncProducerCallback cb = (p, e, c) -> asyncDispatchExchange(endpoint, p, resultProcessor, e, c);
+        try {
+            if (processor instanceof AsyncProcessor asyncProcessor) {
+                asyncProcessor.process(exchange,
+                        doneSync -> doInAsyncProducer(endpoint, exchange, ds -> future.complete(exchange), cb));
+            } else {
+                if (processor != null) {
+                    processor.process(exchange);
+                }
+                doInAsyncProducer(endpoint, exchange, ds -> future.complete(exchange), cb);
+            }
+        } catch (Exception e) {
+            // populate failed so return
+            exchange.setException(e);
+            future.complete(exchange);
+        }
+        return future;
+    }
+
+    @Override
+    public boolean doInAsyncProducer(
+            Endpoint endpoint,
+            Exchange exchange,
+            AsyncCallback callback,
+            AsyncProducerCallback producerCallback) {
+
+        AsyncProducer producer;
+        try {
+            // get the producer and we do not mind if its pooled as we can handle returning it back to the pool
+            producer = acquireProducer(endpoint);
+
+            if (producer == null) {
+                if (isStopped()) {
+                    LOG.warn("Ignoring exchange sent after processor is stopped: {}", exchange);
+                    callback.done(true);
+                    return true;
+                } else {
+                    exchange.setException(
+                            new IllegalStateException("No producer, this processor has not been started: " + this));
+                    callback.done(true);
+                    return true;
+                }
+            }
+        } catch (Exception e) {
+            exchange.setException(e);
+            callback.done(true);
+            return true;
+        }
+
+        SentCallback sent = null;
+        try {
+            // emit event that the exchange is being sent, and record timing for sending the exchange using the producer
+            final StopWatch watch;
+            if (eventNotifierEnabled && camelContext.getCamelContextExtension().isEventNotificationApplicable()) {
+                watch = SendHelper.notifySending(exchange, endpoint);
+            } else {
+                watch = null;
+            }
+
+            // invoke the callback, which calls the producer (with the send hook around it if any)
+            sent = new SentCallback(endpoint, exchange, producer, watch, callback);
+            return producerCallback.doInAsyncProducer(SendHelper.withSendHook(camelContext, producer), exchange, sent);
+        } catch (Throwable e) {
+            if (sent != null && !sent.compareAndSet(false, true)) {
+                // the producer called the callback and then threw: the exchange is already continued (maybe on
+                // another thread), so it is not completed a second time and the exception is not set on it
+                LOG.warn("The producer of {} threw an exception after it completed the exchange. This exception is ignored.",
+                        endpoint, e);
+                return sent.doneSync;
+            }
+            // ensure exceptions is caught and set on the exchange
+            exchange.setException(e);
+            if (sent != null) {
+                // the producer threw before it called the callback: complete the send as if it had called it
+                sent.complete(true);
+            } else {
+                callback.done(true);
+            }
+            return true;
+        }
+    }
+
+    /**
+     * The callback of a send in {@link #doInAsyncProducer}: emits the sent event, releases the producer and calls the
+     * callback of the caller, once (also when the producer calls its callback and then throws).
+     */
+    private final class SentCallback extends AtomicBoolean implements AsyncCallback {
+        private final Endpoint endpoint;
+        private final Exchange exchange;
+        private final AsyncProducer producer;
+        private final StopWatch watch;
+        private final AsyncCallback callback;
+        private volatile boolean doneSync;
+
+        private SentCallback(Endpoint endpoint, Exchange exchange, AsyncProducer producer, StopWatch watch,
+                             AsyncCallback callback) {
+            this.endpoint = endpoint;
+            this.exchange = exchange;
+            this.producer = producer;
+            this.watch = watch;
+            this.callback = callback;
+        }
+
+        @Override
+        public void done(boolean doneSync) {
+            if (compareAndSet(false, true)) {
+                complete(doneSync);
+            } else {
+                LOG.warn("The producer of {} completed the exchange after the send was completed (more than once, or after"
+                         + " it threw). This is ignored.",
+                        endpoint);
+            }
+        }
+
+        private void complete(boolean doneSync) {
+            this.doneSync = doneSync;
+            try {
+                // emit event that the exchange was sent to the endpoint
+                SendHelper.notifySent(exchange, endpoint, watch);
+
+                // release back to the pool
+                releaseProducer(endpoint, producer);
+            } finally {
+                callback.done(doneSync);
+            }
+        }
+    }
+
+    protected boolean asyncDispatchExchange(
+            Endpoint endpoint, AsyncProducer producer,
+            Processor resultProcessor, Exchange exchange, AsyncCallback callback) {
+        // now lets dispatch
+        LOG.debug(">>>> {} {}", endpoint, exchange);
+
+        // set property which endpoint we send to
+        exchange.setProperty(ExchangePropertyKey.TO_ENDPOINT, endpoint.getEndpointUri());
+
+        // send the exchange using the processor; an exception thrown by the producer is handled by doInAsyncProducer,
+        // which knows whether the producer called the callback before it threw. doInAsyncProducer also emits the
+        // sending and sent events of the send
+        return sharedInternalProcessor.process(exchange, callback, producer, resultProcessor);
+    }
+
+    /**
+     * The producer of a synchronous {@link #send}: calls the producer, and calls the callback once, also when the
+     * producer throws after it called the callback (the exception is then logged, and not set on the exchange, as in
+     * {@link #doInAsyncProducer}) or before it (the exception is then set on the exchange, as when the producer sets
+     * it). One object per send. An {@link Error} is thrown on as before.
+     */
+    private static final class SyncSend extends AtomicBoolean implements AsyncProcessor, AsyncCallback {
+        private final Endpoint endpoint;
+        private final AsyncProcessor producer;
+        private AsyncCallback callback;
+        private volatile boolean doneSync;
+
+        private SyncSend(Endpoint endpoint, AsyncProcessor producer) {
+            this.endpoint = endpoint;
+            this.producer = producer;
+        }
+
+        @Override
+        public boolean process(Exchange exchange, AsyncCallback callback) {
+            this.callback = callback;
+            try {
+                return producer.process(exchange, this);
+            } catch (RuntimeException e) {
+                if (!compareAndSet(false, true)) {
+                    // the producer called the callback and then threw: the send is already completed
+                    LOG.warn("The producer of {} threw an exception after it completed the exchange. This exception is"
+                             + " ignored.",
+                            endpoint, e);
+                    return doneSync;
+                }
+                exchange.setException(e);
+                callback.done(true);
+                return true;
+            }
+        }
+
+        @Override
+        public void done(boolean doneSync) {
+            if (compareAndSet(false, true)) {
+                this.doneSync = doneSync;
+                callback.done(doneSync);
+            } else {
+                // not passed on (SendProcessor.SentCallback passes it on to the route step around it, which ignores
+                // it): here the callback runs the after advices of the shared processor, such as the end of the unit
+                // of work, and completes the sync send, which must happen once
+                LOG.warn("The producer of {} completed the exchange after the send was completed (more than once, or after"
+                         + " it threw). This is ignored.",
+                        endpoint);
+            }
+        }
+
+        @Override
+        public void process(Exchange exchange) throws Exception {
+            // a transacted exchange: the sync method of the producer, as before (no callback that can be called twice);
+            // SharedCamelInternalProcessor.processTransacted sets an exception it throws on the exchange
+            producer.process(exchange);
+        }
+
+        @Override
+        public CompletableFuture<Exchange> processAsync(Exchange exchange) {
+            AsyncCallbackToCompletableFutureAdapter<Exchange> future = new AsyncCallbackToCompletableFutureAdapter<>(exchange);
+            process(exchange, future);
+            return future.getFuture();
+        }
+
+        @Override
+        public String toString() {
+            return producer.toString();
+        }
+    }
+
+    @Override
+    protected void doBuild() throws Exception {
+        ServiceHelper.buildService(producers);
+    }
+
+    @Override
+    protected void doInit() throws Exception {
+        if (extendedStatistics) {
+            int max = maxCacheSize == 0 ? CamelContextHelper.getMaximumCachePoolSize(camelContext) : maxCacheSize;
+            statistics = new DefaultEndpointUtilizationStatistics(max);
+        }
+        ServiceHelper.initService(producers);
+    }
+
+    @Override
+    protected void doStart() throws Exception {
+        if (statistics != null) {
+            statistics.clear();
+        }
+        ServiceHelper.startService(producers);
+    }
+
+    @Override
+    protected void doStop() throws Exception {
+        ServiceHelper.stopService(producers);
+        // Clearing lastUsedProducer to remove reference to potentially stopped Producer
+        lastUsedProducer = null;
+    }
+
+    @Override
+    protected void doShutdown() throws Exception {
+        ServiceHelper.stopAndShutdownServices(producers);
+    }
+
+    @Override
+    public int size() {
+        int size = producers != null ? producers.size() : 0;
+        LOG.trace("size = {}", size);
+        return size;
+    }
+
+    @Override
+    public int getCapacity() {
+        return maxCacheSize;
+    }
+
+    @Override
+    public void purge() {
+        lock.lock();
+        try {
+            try {
+                if (producers != null) {
+                    producers.stop();
+                    // the last used producer has been stopped, so it must not be reused
+                    lastUsedProducer = null;
+                    producers.start();
+                }
+            } catch (Exception e) {
+                LOG.debug("Error restarting producers", e);
+            }
+            if (statistics != null) {
+                statistics.clear();
+            }
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    @Override
+    public void cleanUp() {
+        if (producers != null) {
+            producers.cleanUp();
+        }
+    }
+
+    @Override
+    public EndpointUtilizationStatistics getEndpointUtilizationStatistics() {
+        return statistics;
+    }
+
+    @Override
+    public String toString() {
+        return "ProducerCache for source: " + source + ", capacity: " + getCapacity();
+    }
+
+}

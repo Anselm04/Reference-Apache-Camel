@@ -1,0 +1,135 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.camel.component.weaviate.transform;
+
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+
+import dev.langchain4j.data.embedding.Embedding;
+import dev.langchain4j.data.segment.TextSegment;
+import org.apache.camel.Message;
+import org.apache.camel.ai.CamelLangchain4jAttributes;
+import org.apache.camel.component.weaviate.WeaviateVectorDbAction;
+import org.apache.camel.component.weaviate.WeaviateVectorDbHeaders;
+import org.apache.camel.spi.BodyType;
+import org.apache.camel.spi.BodyType.Carrier;
+import org.apache.camel.spi.BodyTypes;
+import org.apache.camel.spi.DataType;
+import org.apache.camel.spi.DataTypeTransformer;
+import org.apache.camel.spi.Transformer;
+import org.apache.camel.util.ObjectHelper;
+
+/**
+ * Maps a LangChain4j Embeddings to a Weaviate Create/UpdateByID to write an embeddings vector on a Weaviate Database.
+ */
+@DataTypeTransformer(name = "weaviate:embeddings",
+                     description = "Prepares the message to become an object writable by Weaviate component")
+@BodyTypes(transformerIn = @BodyType(value = Carrier.ANY,
+                                     description = "A LangChain4j TextSegment, or a String the converter of"
+                                                   + " camel-langchain4j-embeddings turns into one, whose text goes in the"
+                                                   + " CamelWeaviateProperties header for CREATE and UPDATE_BY_ID; another"
+                                                   + " body stores no text. The embedding comes from the"
+                                                   + " CamelLangChain4jEmbeddingsVector header, which must be set, and the"
+                                                   + " CamelWeaviateAction header must be CREATE, UPDATE_BY_ID or QUERY"),
+           transformerOut = @BodyType(value = Carrier.LIST, javaType = "java.util.List<java.lang.Float>",
+                                      description = "The vector of the embedding"))
+public class WeaviateEmbeddingsDataTypeTransformer extends Transformer {
+
+    @Override
+    public void transform(Message message, DataType fromType, DataType toType) {
+        Embedding embedding = message.getHeader(CamelLangchain4jAttributes.CAMEL_LANGCHAIN4J_EMBEDDING_VECTOR, Embedding.class);
+        if (embedding == null) {
+            throw new IllegalArgumentException(
+                    "Missing embedding vector header '" + CamelLangchain4jAttributes.CAMEL_LANGCHAIN4J_EMBEDDING_VECTOR
+                                               + "'. Ensure the langchain4j-embeddings component is called before this transformer.");
+        }
+        String textFieldName = message.getHeader(WeaviateVectorDbHeaders.TEXT_FIELD_NAME, () -> "text", String.class);
+        String collectionName = message.getHeader(WeaviateVectorDbHeaders.COLLECTION_NAME, () -> "embeddings", String.class);
+        String keyName = message.getHeader(WeaviateVectorDbHeaders.KEY_NAME, () -> "id", String.class);
+        Object keyValue = message.getHeader(WeaviateVectorDbHeaders.KEY_VALUE, () -> null);
+        TextSegment text = message.getBody(TextSegment.class);
+        final WeaviateVectorDbAction action = message.getHeader(WeaviateVectorDbHeaders.ACTION, WeaviateVectorDbAction.class);
+        if (action == null) {
+            // the transformer runs before the endpoint, so it cannot see the action option of the endpoint
+            throw new IllegalStateException(
+                    "The weaviate:embeddings transformer needs the " + WeaviateVectorDbHeaders.ACTION
+                                            + " header, CREATE, UPDATE_BY_ID or QUERY: it does not see the action option of the endpoint");
+        }
+        switch (action) {
+            case CREATE ->
+                createEmbeddingOperation(message, embedding, textFieldName, text, collectionName, keyValue,
+                        keyName);
+            case UPDATE_BY_ID ->
+                updateEmbeddingOperation(message, embedding, textFieldName, text, collectionName, keyValue,
+                        keyName);
+            case QUERY ->
+                queryEmbeddingOperation(message, embedding, textFieldName, text, collectionName, keyValue,
+                        keyName);
+            default ->
+                throw new IllegalStateException("The only operations supported are create, updatebyid and query");
+        }
+    }
+
+    private static void createEmbeddingOperation(
+            Message message, Embedding embedding, String textFieldName, TextSegment text,
+            String collectionName, Object keyValue, String keyName) {
+        message.setBody(embedding.vectorAsList(), List.class);
+        setProperties(message, textFieldName, text, keyValue, keyName);
+    }
+
+    private static void updateEmbeddingOperation(
+            Message message, Embedding embedding, String textFieldName, TextSegment text,
+            String collectionName, Object keyValue, String keyName) {
+        message.setBody(embedding.vectorAsList(), List.class);
+        setProperties(message, textFieldName, text, keyValue, keyName);
+    }
+
+    /**
+     * Writes the object properties for a CREATE / UPDATE_BY_ID operation. The embedded text is stored under
+     * textFieldName so that the source passage can be retrieved later; without it only the vector (and optional id) was
+     * persisted and the original text was lost. Mirrors the Milvus transformer. Any PROPERTIES header the caller
+     * already set is preserved: the text (and optional id) are merged into a copy of it rather than replacing it.
+     */
+    private static void setProperties(
+            Message message, String textFieldName, TextSegment text, Object keyValue, String keyName) {
+        Map<String, Object> existing = message.getHeader(WeaviateVectorDbHeaders.PROPERTIES, Map.class);
+        HashMap<String, Object> maps = existing != null ? new HashMap<>(existing) : new HashMap<>();
+        if (text != null && text.text() != null) {
+            maps.put(textFieldName, text.text());
+        }
+        if (ObjectHelper.isNotEmpty(keyValue) && ObjectHelper.isNotEmpty(keyName)) {
+            maps.put(keyName, keyValue);
+        }
+        if (!maps.isEmpty()) {
+            message.setHeader(WeaviateVectorDbHeaders.PROPERTIES, maps);
+        }
+    }
+
+    private static void queryEmbeddingOperation(
+            Message message, Embedding embedding, String textFieldName, TextSegment text,
+            String collectionName, Object keyValue, String keyName) {
+        message.setBody(embedding.vectorAsList(), List.class);
+
+        if (ObjectHelper.isNotEmpty(keyValue) && ObjectHelper.isNotEmpty(keyName)) {
+            HashMap<String, Object> maps = new HashMap<String, Object>();
+            maps.put(keyName, keyValue);
+            message.setHeader(WeaviateVectorDbHeaders.PROPERTIES, maps);
+        }
+    }
+}

@@ -1,0 +1,535 @@
+= SFTP Component
+:doctitle: SFTP
+:shortname: sftp
+:artifactid: camel-ftp
+:description: Upload and download files to/from SFTP servers.
+:since: 1.1
+:supportlevel: Stable
+:tabs-sync-option:
+:component-header: Both producer and consumer are supported
+
+*Since Camel {since}*
+
+*{component-header}*
+
+This component provides access to remote file systems over the SFTP protocol.
+
+Maven users will need to add the following dependency to their `pom.xml`
+for this component:
+
+[source,xml]
+----
+<dependency>
+    <groupId>org.apache.camel</groupId>
+    <artifactId>camel-ftp</artifactId>
+    <version>x.x.x</version>
+    <!-- use the same version as your Camel core version -->
+</dependency>
+----
+
+// component options: START
+include::partial$component-configure-options.adoc[]
+include::partial$component-endpoint-options.adoc[]
+include::partial$component-endpoint-headers.adoc[]
+// component options: END
+
+
+== Usage
+
+=== URI format and paths
+
+----
+sftp://[username@]hostname[:port]/directoryname[?options]
+----
+
+The `directoryname` is relative to the directory the user logs in to, usually its home directory. For example,
+`sftp://admin@host/inbox` uses the `inbox` directory in the home directory of `admin`.
+
+Absolute paths are not supported. The component removes the leading slashes, also from `sftp://host//data/inbox`, and
+logs a WARN: that endpoint uses `data/inbox` under the login directory, not `/data/inbox`. As both the consumer and the
+producer create a missing directory (`autoCreate=true`, the default), a wrong path does not fail: the files are read
+from, or written to, a new directory under the login directory.
+
+To use a directory outside the login directory, either:
+
+* create a symbolic link to it in the login directory, and use the link as `directoryname`, or
+* go up with leading `../` segments, such as `sftp://host/../shared/inbox`, and set `jailStartingDirectory=false`. With
+  the default `jailStartingDirectory=true`, the consumer skips every file of such a directory, and the producer refuses
+  to write to it.
+
+For the producer, `directoryname` is the directory to write to, and the file name comes from the `CamelFileName` header
+or the `fileName` option. A file name that leaves the directory with `../` is refused unless
+`jailStartingDirectory=false`.
+
+=== Security Best Practices: Host Key Verification
+
+WARNING: By default, the SFTP component has `strictHostKeyChecking=no`, which disables host key verification and makes connections vulnerable to man-in-the-middle (MITM) attacks. For production environments, you should enable strict host key checking to ensure you are connecting to the expected server.
+
+==== Global Configuration (Component Level)
+
+You can configure host key verification settings globally on the SFTP component, which will apply to all SFTP endpoints unless overridden at the endpoint level:
+
+._Java-only: programmatic `SftpComponent` configuration via `CamelContext`_
+[source,java]
+----
+// Configure component for all SFTP endpoints
+SftpComponent sftp = context.getComponent("sftp", SftpComponent.class);
+sftp.setStrictHostKeyChecking("yes");
+sftp.setKnownHostsFile("/path/to/known_hosts");
+
+// All endpoints will inherit these settings
+from("sftp://host1/path1?username=user1&password=secret1")
+    .to("direct:result");
+
+from("sftp://host2/path2?username=user2&password=secret2")
+    .to("direct:result");
+----
+
+Or with application.properties configuration:
+
+[source,properties]
+----
+camel.component.sftp.strict-host-key-checking=yes
+camel.component.sftp.known-hosts-file=/path/to/known_hosts
+----
+
+==== Per-Endpoint Configuration
+
+Host key verification prevents MITM attacks by verifying the server's host key against a known list of trusted keys. When `strictHostKeyChecking=yes` is enabled, the SFTP client will reject connections to servers whose host key is not in the known hosts file.
+
+Endpoint-level configurations will override component-level settings. This allows you to set secure defaults globally while making exceptions for specific endpoints if needed.
+
+To enable strict host key checking at the endpoint level, set `strictHostKeyChecking=yes` and provide a known hosts file:
+
+[tabs]
+====
+Java::
++
+[source,java]
+----
+from("sftp://host:22/path?username=myuser&password=secret&knownHostsFile=/path/to/known_hosts&strictHostKeyChecking=yes")
+    .to("direct:result");
+----
+
+XML::
++
+[source,xml]
+----
+<route>
+  <from uri="sftp://host:22/path?username=myuser&amp;password=secret&amp;knownHostsFile=/path/to/known_hosts&amp;strictHostKeyChecking=yes"/>
+  <to uri="direct:result"/>
+</route>
+----
+
+YAML::
++
+[source,yaml]
+----
+- route:
+    from:
+      uri: sftp://host:22/path
+      parameters:
+        username: myuser
+        password: secret
+        knownHostsFile: /path/to/known_hosts
+        strictHostKeyChecking: "yes"
+      steps:
+        - to:
+            uri: direct:result
+----
+====
+
+Alternatively, load the known hosts from the classpath:
+
+[tabs]
+====
+Java::
++
+[source,java]
+----
+from("sftp://host:22/path?username=myuser&privateKeyFile=/path/to/id_rsa&knownHostsUri=classpath:known_hosts&strictHostKeyChecking=yes")
+    .to("direct:result");
+----
+
+XML::
++
+[source,xml]
+----
+<route>
+  <from uri="sftp://host:22/path?username=myuser&amp;privateKeyFile=/path/to/id_rsa&amp;knownHostsUri=classpath:known_hosts&amp;strictHostKeyChecking=yes"/>
+  <to uri="direct:result"/>
+</route>
+----
+
+YAML::
++
+[source,yaml]
+----
+- route:
+    from:
+      uri: sftp://host:22/path
+      parameters:
+        username: myuser
+        privateKeyFile: /path/to/id_rsa
+        knownHostsUri: "classpath:known_hosts"
+        strictHostKeyChecking: "yes"
+      steps:
+        - to:
+            uri: direct:result
+----
+====
+
+If you do not have a known hosts file, you can create one by connecting to the server using the `ssh` command, which will add the host key to `~/.ssh/known_hosts`. By default, the SFTP component will use this file if `useUserKnownHostsFile=true` (which is the default).
+
+[tabs]
+====
+Java::
++
+[source,java]
+----
+from("sftp://host:22/path?username=myuser&privateKeyFile=/path/to/id_rsa&strictHostKeyChecking=yes")
+    .to("direct:result");
+----
+
+XML::
++
+[source,xml]
+----
+<route>
+  <from uri="sftp://host:22/path?username=myuser&amp;privateKeyFile=/path/to/id_rsa&amp;strictHostKeyChecking=yes"/>
+  <to uri="direct:result"/>
+</route>
+----
+
+YAML::
++
+[source,yaml]
+----
+- route:
+    from:
+      uri: sftp://host:22/path
+      parameters:
+        username: myuser
+        privateKeyFile: /path/to/id_rsa
+        strictHostKeyChecking: "yes"
+      steps:
+        - to:
+            uri: direct:result
+----
+====
+
+NOTE: When `strictHostKeyChecking=yes` is enabled, Camel's security policy enforcement framework will not flag this as a security violation. The default `strictHostKeyChecking=no` may trigger warnings or failures depending on your configured security policy.
+
+=== Providing the private key
+
+For public key authentication, set the private key with one of these options:
+
+[cols="1,3"]
+|===
+|Option |Value
+
+|`privateKeyFile` |A path on the file system, such as `/home/camel/.ssh/id_rsa`.
+|`privateKeyUri` |A resource, loaded from the classpath by default, or from the file system with the `file:` prefix.
+|`privateKey` |The key as a `byte[]`, usually a bean reference such as `privateKey=#myKey`.
+|`keyPair` |A `java.security.KeyPair` bean, such as `keyPair=#myKeyPair`.
+|===
+
+Set `privateKeyPassphrase` when the key is encrypted. It applies to `privateKeyFile`, `privateKeyUri` and `privateKey`.
+
+The key must keep its line breaks. A key whose line breaks were replaced, for example with spaces when it was copied
+into a one-line property or environment variable, fails with `invalid privatekey`. Load such a key from a file instead,
+or from a bean that holds the original bytes.
+
+=== OpenSSH Certificate Authentication
+
+Camel supports OpenSSH certificate-based authentication for SFTP connections, where a user's public key is signed by a Certificate Authority (CA) rather than being individually authorized on the server. This is common in enterprise environments using tools like HashiCorp Vault or custom CA infrastructure.
+
+To use certificate authentication, provide the certificate file alongside the private key:
+
+[tabs]
+====
+Java::
++
+[source,java]
+----
+from("sftp://host:22/path?username=myuser&privateKeyFile=/path/to/user_key&certFile=/path/to/user_key-cert.pub")
+    .to("direct:result");
+----
+
+XML::
++
+[source,xml]
+----
+<route>
+  <from uri="sftp://host:22/path?username=myuser&amp;privateKeyFile=/path/to/user_key&amp;certFile=/path/to/user_key-cert.pub"/>
+  <to uri="direct:result"/>
+</route>
+----
+
+YAML::
++
+[source,yaml]
+----
+- route:
+    from:
+      uri: sftp://host:22/path
+      parameters:
+        username: myuser
+        privateKeyFile: /path/to/user_key
+        certFile: /path/to/user_key-cert.pub
+      steps:
+        - to:
+            uri: direct:result
+----
+====
+
+The certificate can also be loaded from a classpath resource using `certUri`:
+
+[tabs]
+====
+Java::
++
+[source,java]
+----
+from("sftp://host:22/path?username=myuser&privateKeyFile=/path/to/user_key&certUri=classpath:user_key-cert.pub")
+    .to("direct:result");
+----
+
+XML::
++
+[source,xml]
+----
+<route>
+  <from uri="sftp://host:22/path?username=myuser&amp;privateKeyFile=/path/to/user_key&amp;certUri=classpath:user_key-cert.pub"/>
+  <to uri="direct:result"/>
+</route>
+----
+
+YAML::
++
+[source,yaml]
+----
+- route:
+    from:
+      uri: sftp://host:22/path
+      parameters:
+        username: myuser
+        privateKeyFile: /path/to/user_key
+        certUri: "classpath:user_key-cert.pub"
+      steps:
+        - to:
+            uri: direct:result
+----
+====
+
+Or provided as raw bytes using `certBytes` (useful when the certificate is loaded programmatically, e.g., from a vault).
+
+NOTE: When a certificate is loaded, Camel automatically adds the certificate's key type to
+JSch's `PubkeyAcceptedAlgorithms` if it is not already present. This ensures certificate
+authentication works even when the key type has been removed from JSch's defaults due to
+SHA-1 deprecation (e.g., `ssh-rsa-cert-v01@openssh.com`). Both the legacy vendor-prefixed
+key type names (`<algorithm>-cert-v01@openssh.com`, used through
+https://datatracker.ietf.org/doc/html/draft-miller-ssh-cert-03[draft-03]) and the
+standardized short names (`<algorithm>-cert`, introduced in
+https://datatracker.ietf.org/doc/html/draft-miller-ssh-cert-04[draft-04]) are recognized.
+If you need to control the CA signature algorithms that JSch will accept, use the
+`caSignatureAlgorithms` parameter.
+
+=== Post-Quantum Key Exchange
+
+The SFTP client proposes the hybrid post-quantum key exchange `mlkem768x25519-sha256` ahead of the classical groups,
+so a connection to a server that offers it is protected against harvest-now-decrypt-later attacks without any
+configuration. ML-KEM is implemented either by the JDK, from Java 24 on, or by Bouncy Castle, which `camel-ftp` brings
+on the classpath for the Java 21 baseline. Where neither is available, the group is dropped from the proposal and the
+handshake falls back to a classical key exchange.
+
+The server decides as much as the client does. jsch proposes only `mlkem768x25519-sha256` by default, so a server that
+offers `sntrup761x25519-sha512@openssh.com` alone, such as OpenSSH before 9.9, takes the connection back to a classical
+key exchange unless that group is added to `keyExchangeProtocols`, and a server that offers no hybrid group does so in
+any case. To require the post-quantum exchange, and fail rather than fall back, pin the proposal to the hybrid groups:
+
+[source,text]
+----
+sftp://localhost/inbox?username=admin&keyExchangeProtocols=mlkem768x25519-sha256,sntrup761x25519-sha512@openssh.com
+----
+
+`keyExchangeProtocols` replaces the proposal rather than adding to it, so an endpoint that pins a list of classical
+groups never negotiates a post-quantum one. Check any value configured before Camel 4.24, and add
+`mlkem768x25519-sha256`, and `sntrup761x25519-sha512@openssh.com` for the servers before OpenSSH 9.9, to the front of
+it.
+
+The same applies to the `ssh` component through its `kex` option. The `scp` component (`camel-jsch`) has no endpoint
+option for the proposal: the `jsch.kex` system property sets it for the whole JVM.
+
+=== Restoring Deprecated Key Types and Algorithms
+
+As of Camel 3.17.0, key types and algorithms that use SHA1 are disabled by default: JSch no longer proposes the `ssh-rsa`
+and `ssh-dss` host keys, `ssh-rsa` signatures for public key authentication, or SHA1 key exchanges such as
+`diffie-hellman-group14-sha1`. If your server needs them, set them on the endpoint with these options:
+
+[cols="1,2"]
+|===
+|Option |Algorithms (JSch configuration key)
+
+|`serverHostKeys` |Host keys (`server_host_key`)
+|`publicKeyAcceptedAlgorithms` |Signatures for public key authentication (`PubkeyAcceptedAlgorithms`)
+|`keyExchangeProtocols` |Key exchange (`kex`)
+|`ciphers` |Ciphers (`cipher.c2s` and `cipher.s2c`)
+|===
+
+Each option replaces the default list of JSch for that endpoint, so list every algorithm the endpoint may use, the
+preferred one first. For example, for a server that has an RSA host key and only accepts `ssh-rsa` signatures:
+
+[source,text]
+----
+sftp://host/inbox?username=admin&privateKeyFile=/path/to/id_rsa&serverHostKeys=rsa-sha2-512,rsa-sha2-256,ssh-rsa&publicKeyAcceptedAlgorithms=rsa-sha2-512,rsa-sha2-256,ssh-rsa
+----
+
+The options apply to that endpoint only. Setting the JSch configuration directly changes the defaults of the whole JVM,
+so of every SFTP endpoint without these options:
+
+._Java-only: restoring deprecated JSch key types and algorithms for the whole JVM_
+[source,java]
+----
+JSch.setConfig("server_host_key",  JSch.getConfig("server_host_key") + ",ssh-rsa");
+JSch.setConfig("PubkeyAcceptedAlgorithms", JSch.getConfig("PubkeyAcceptedAlgorithms") + ",ssh-rsa");
+JSch.setConfig("kex", JSch.getConfig("kex") + ",diffie-hellman-group1-sha1,diffie-hellman-group14-sha1");
+----
+
+Note that the key types and algorithms your server supports may differ than the above example. You can use the following
+command to inspect your server's configuration:
+
+----
+ssh -vvv <server_address>
+----
+
+=== Connection errors
+
+When the connection fails, the exception is a `GenericFileOperationFailedException` with the message
+`Cannot connect to sftp://user@host:port`. The message of its cause, from JSch, tells what failed, and the consumer
+logs it in its WARN `Cannot connect/login to: sftp://user@host:port due to: ...`:
+
+[cols="2,3"]
+|===
+|Message of the cause |What to check
+
+|`reject HostKey: <host>`
+|With `strictHostKeyChecking=yes`, the known hosts have no key for the server. Set `knownHostsFile`, `knownHostsUri` or
+`knownHosts` with an entry for the host and port, for example from `ssh-keyscan -p <port> <host>`. For a port other
+than 22, the entry starts with `[host]:port`.
+
+|`Algorithm negotiation fail: algorithmName="..." jschProposal="..." serverProposal="..."`
+|JSch and the server have no algorithm in common. Add one that the server proposes with `serverHostKeys` for
+`server_host_key`, `keyExchangeProtocols` for `kex`, or `ciphers` for `cipher.c2s` and `cipher.s2c`. See
+<<_restoring_deprecated_key_types_and_algorithms,Restoring Deprecated Key Types and Algorithms>>.
+
+|`Auth fail for methods '...'`, `Auth fail for user '...': the server did not accept the password`
+|The server refused the credentials: check the username, password or key. With an RSA key and a server that only
+accepts `ssh-rsa` signatures, add `ssh-rsa` to `publicKeyAcceptedAlgorithms`. With `preferredAuthentications`, only
+the methods listed there are tried: the names are not case-sensitive, and a name that JSch does not know (it knows
+`password`, `keyboard-interactive`, `publickey` and `gssapi-with-mic`) is skipped, with a WARN when the endpoint starts.
+
+|`invalid privatekey`
+|JSch cannot read the key, for example because its line breaks were lost. See <<_providing_the_private_key,Providing the private key>>.
+
+|`Incorrect passphrase provided.`
+|`privateKeyPassphrase` does not decrypt the key. In a URI, set a passphrase with characters such as `+` or `&` as
+`RAW(...)`, see xref:manual::endpoint.adoc#_configuring_parameter_values_using_raw_values_such_as_passwords[raw values].
+|===
+
+A login that the server rejects is not retried, as each rejected login counts towards the lockout policy of a server,
+such as one that locks the account after a few failures. Camel gives the password once per connection, with the
+`password` or the `keyboard-interactive` method: when the server asks for it again, the connection ends with
+`Auth fail for user '...': the server did not accept the password`. So a server that asks for the password twice in
+one login, such as one that requires both the `password` and the `keyboard-interactive` methods
+(`AuthenticationMethods password,keyboard-interactive` in OpenSSH), rejects the login, with the same message, even when
+the password is right. A rejected login (`Auth fail ...` or `Auth cancel ...`) does not connect again for
+`maximumReconnectAttempts`, which applies to the other connection failures. The consumer tries again on its next
+poll, so a wrong password is sent once per poll (and once more when the consumer starts with `autoCreate=true`), and
+the producer tries again on its next message.
+
+=== Operation errors
+
+When the server refuses a request, such as a change of directory, a listing, an upload or a download, the exception is
+a `GenericFileOperationFailedException` whose message ends with the status of the server, for example
+`Cannot list directory: inbox: SSH_FX_NO_SUCH_FILE: No such file`. As with the reply of an FTP server, `getCode()`
+returns the SFTP status code, such as `2` for `SSH_FX_NO_SUCH_FILE` or `3` for `SSH_FX_PERMISSION_DENIED`, and
+`getReason()` its text. JSch reports an I/O failure as `SSH_FX_FAILURE` (`4`), with that failure as the cause.
+
+When the change to a relative directory fails, the message also gives the current directory, which the path starts
+from, such as `Cannot change directory to: inbox: SSH_FX_NO_SUCH_FILE: No such file. The path is relative to the
+current directory: /home/admin`. The directory of the endpoint starts from the login directory, see
+<<_uri_format_and_paths,URI format and paths>>.
+
+=== Symbolic links and the starting directory
+
+With `jailStartingDirectory` enabled (the default), the consumer resolves a listed file that the server reports as a
+symbolic link before it accepts the file. A link whose target is outside the starting directory, or cannot be resolved
+(such as a dangling link), is skipped and logged at WARN the first time. A link whose target contains a backslash (`\`)
+is skipped too, as a server may take it as a path separator or as part of a name. Links that resolve inside the
+starting directory, and a starting directory that is itself a link, work as usual. Set `jailStartingDirectory=false` to
+follow links to other directories.
+
+The link is resolved on the server one path segment at a time, with the `lstat` and `readlink` requests, so each listed
+link takes a few more requests per poll; other files take none. Only the files that the listing reports as links are
+resolved: OpenSSH and Apache MINA SSHD list a link as a link, but a server that lists the attributes of the target
+instead does not show it as a link, and with `useList=false` there is no listing. The check and the download that
+follows are not atomic, so the permissions and link settings of the SFTP server still matter.
+
+=== Read locks
+
+The sftp consumer supports the read locks `none`, `rename` and `changed`.
+`readLock=false` and `readLock=off` mean `none`.
+Any other `readLock` value, such as the `markerFile`, `fileLock`, `idempotent`, `idempotent-changed`
+and `idempotent-rename` read locks of the xref:file-component.adoc[File] component, fails when the
+consumer is created, also with `poll` and `pollEnrich`, with `IllegalArgumentException: ReadLock invalid`.
+The `readLock` option is not checked when a custom `exclusiveReadLockStrategy` or `processStrategy`
+is set, as it does not apply then.
+
+=== Timeouts and dead connections
+
+The SFTP endpoint opens the connection with `connectTimeout` (10 seconds) and uses `soTimeout` (5 minutes) as the read
+timeout of the JSch session. When nothing arrives from the server for `soTimeout`, JSch sends a keep-alive message and
+waits once more; it drops the session after `serverAliveCountMax` (1 by default) keep-alive messages without an answer.
+A connection that went silent (the host is gone, or a firewall or NAT drops the packets) is therefore noticed after
+about twice `soTimeout`: about 10 minutes with the defaults, during which the consumer or producer using it waits.
+These durations are how JSch behaves, approximately, not guarantees of Camel.
+
+Lower `soTimeout` to notice it sooner; `soTimeout=15000` notices it after about 30 seconds. As a server that is alive
+answers the keep-alive message, a command that takes longer than `soTimeout` does not drop the session.
+
+[source,text]
+----
+sftp://scott@sftp.example.com/inbox?password=RAW(tiger)&connectTimeout=5000&soTimeout=15000&throwExceptionOnConnectFailed=true
+----
+
+When `serverAliveInterval` is set, it replaces `soTimeout` as the read timeout of the session: the session is then
+dropped after about `serverAliveInterval` × (`serverAliveCountMax` + 1) without data from the server.
+
+As with FTP, set `throwExceptionOnConnectFailed=true` so that a consumer that cannot connect fails its poll and its
+health check reports it DOWN, and upload under a temporary name (`tempPrefix` or `tempFileName`) so that a broken
+upload does not leave a truncated file under its final name. See
+xref:ftp-component.adoc#_noticing_a_dead_or_silent_server[Noticing a dead or silent server] and
+xref:ftp-component.adoc#_uploads_interrupted_by_a_broken_connection[Uploads interrupted by a broken connection].
+
+=== Checking whether a file exists
+
+The `sftp` component checks whether a remote file exists with a single `lstat` request, whatever the number of files
+in the directory. This applies to `fileExist=Ignore`, `Fail` and `Move`, to `tempFileName` and `tempPrefix`, to a
+producer `doneFileName`, and to `readLock=changed`, which reads the size and modification time of the file with the same
+request on every check. So the `fastExistsCheck` option no longer makes a difference for these checks with `sftp`.
+
+The answer comes from the server for the path itself:
+
+* A symbolic link is not followed, as in a directory listing. A dangling link exists, and `readLock=changed` compares
+  the size and modification time of the link, not those of its target.
+* A server on a case-insensitive file system, such as one backed by Windows or macOS, finds a file whose name differs
+  only in case, which the upload would replace.
+
+When the server answers the request with another status than "no such file", for example because it does not permit or
+support it on the path, the component lists the directory instead and compares the names, as before. This listing is
+the same with and without `fastExistsCheck`.
+
+== More Information
+
+For more information, you can look at the xref:ftp-component.adoc[FTP component].
