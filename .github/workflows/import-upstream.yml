@@ -30,8 +30,10 @@ jobs:
           git merge --allow-unrelated-histories -s ours --no-edit FETCH_HEAD
           git rm -r --ignore-unmatch .
           git checkout "$UPSTREAM_SHA" -- .
+          git rm -rf --ignore-unmatch .github/workflows
+          git checkout ORIG_HEAD -- .github/workflows/import-upstream.yml
           mkdir -p .trillionai-reference
-          printf 'Upstream: https://github.com/apache/camel\nUpstream commit: %s\nImport strategy: merged upstream history, then checked out upstream snapshot\n' "$UPSTREAM_SHA" > .trillionai-reference/SOURCE.txt
+          printf 'Upstream: https://github.com/apache/camel\nUpstream commit: %s\nImport strategy: merged upstream history, checked out upstream snapshot, excluded upstream CI workflows due to token permissions\n' "$UPSTREAM_SHA" > .trillionai-reference/SOURCE.txt
           git add -A
           git commit -m "docs: import Apache Camel full upstream source at $UPSTREAM_SHA"
           git push origin HEAD:main
