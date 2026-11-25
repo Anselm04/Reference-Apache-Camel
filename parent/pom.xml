@@ -165,7 +165,7 @@
         <dnsjava-version>3.7.1</dnsjava-version>
         <djl-version>0.40.0</djl-version>
         <djl-python-version>0.34.0</djl-python-version>
-        <docling-java-version>0.7.0</docling-java-version>
+        <docling-java-version>0.7.2</docling-java-version>
         <docker-java-version>3.7.1</docker-java-version>
         <dropbox-version>8.0.2</dropbox-version>
         <duckdb-jdbc-version>2.0.0.1</duckdb-jdbc-version>
